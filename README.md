@@ -1,8 +1,17 @@
-# the core, by openglacier
- ![Version](https://img.shields.io/badge/version-0.22.5-blue)
+<p align="center">
+  <img src="github-static/logo.png" alt="openglacier" width="280">
+</p>
+
+<p align="center">
+
+![Version](https://img.shields.io/badge/version-0.22.5-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
+
+</p>
+
+openglacier - core
 
 > *Small core, long life.*
 
@@ -18,17 +27,17 @@
 
 > * steady state 6 with a lot of performance improvement on 24/08/2026 @13:28
 
+> * steady state 7, public release codename antaapalaa on 28/08/2026 @17:32
+
 ## Purpose
 
-og-core is the heart of the openglacier ecosystem.
+core is the heart of the openglacier ecosystem.
 
 It is responsible for maintaining a coherent and observable Place.
 
-It is not a user interface.
+A Place is the representation of where you can perform task and watch things being done.
 
-It is not a web server.
-
-It is not an application framework.
+It is not a user interface. It is not a web server. It is not an application framework.
 
 It is a long-lived execution engine that orchestrates resources, agents, missions and activities through events.
 
