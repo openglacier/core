@@ -15,6 +15,16 @@
 
 </p>
 
+<p align="center">
+
+![armhf v7](https://img.shields.io/badge/arch-armhf_v7-informational)
+![armhf v8](https://img.shields.io/badge/arch-armhf_v8-informational)
+![arm64](https://img.shields.io/badge/arch-arm64-informational)
+![i386](https://img.shields.io/badge/arch-i386-informational)
+![amd64](https://img.shields.io/badge/arch-amd64-informational)
+
+</p>
+
 > *Small core, long life.*
 
 > * steady state 1 on 30/07/2026 @12:12
