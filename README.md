@@ -13,15 +13,7 @@
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
 
-</p>
-
-<p align="center">
-
-![armhf v7](https://img.shields.io/badge/arch-armhf_v7-informational)
-![armhf v8](https://img.shields.io/badge/arch-armhf_v8-informational)
-![arm64](https://img.shields.io/badge/arch-arm64-informational)
-![i386](https://img.shields.io/badge/arch-i386-informational)
-![amd64](https://img.shields.io/badge/arch-amd64-informational)
+![Architectures](https://img.shields.io/badge/arch-armhf_v7%20%7C%20armhf_v8%20%7C%20arm64%20%7C%20i386%20%7C%20amd64-informational)
 
 </p>
 
