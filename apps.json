@@ -1,0 +1,92 @@
+[
+  {
+    "appId": "system.query",
+    "name": "Query",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.query",
+      "name": "Query",
+      "version": "1.0.0",
+      "kind": "system.query",
+      "tone": "glacier",
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [
+          {
+            "type": "text",
+            "value": "Query",
+            "role": "title"
+          },
+          {
+            "type": "text",
+            "value": "Explore documents with the native og-core pipeline language.",
+            "role": "body"
+          },
+          {
+            "type": "button",
+            "label": "Open",
+            "action": "open-full",
+            "variant": "quiet"
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "System App",
+            "title": "Query",
+            "description": "Native og-core query workspace."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "appId": "system.files",
+    "name": "Files",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.files",
+      "name": "Files",
+      "version": "1.0.0",
+      "description": "Browse and manage files scoped to this Place and App instance.",
+      "kind": "system.files",
+      "tone": "glacier",
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [
+          {
+            "type": "text",
+            "value": "Files",
+            "role": "title"
+          },
+          {
+            "type": "text",
+            "value": "Browse, upload and manage files in this Place.",
+            "role": "body"
+          },
+          {
+            "type": "badge",
+            "label": "Native · Core",
+            "tone": "glacier"
+          },
+          {
+            "type": "button",
+            "label": "Open files",
+            "action": "open-full",
+            "variant": "quiet"
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "Files · Core-backed",
+            "title": "Files",
+            "description": "Native file workspace scoped to this Place and App instance."
+          }
+        ]
+      }
+    }
+  }
+]
