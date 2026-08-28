@@ -1,0 +1,25 @@
+[package]
+name = "og-core"
+version = "0.22.5"
+edition = "2021"
+description = "Event-first, schema-less document database kernel"
+license = "MIT"
+publish = false
+
+[lib]
+name = "og_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+serde_json = "1"
+rustyline = "15"
+ed25519-dalek = "2"
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rpassword = "7"
+tungstenite = { version = "0.30.0", features = ["native-tls"] }
+
+[dev-dependencies]
+proptest = "1"

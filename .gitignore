@@ -1,0 +1,8 @@
+/target/
+*.tar.gz
+*.txt
+/data/
+/dist-package/
+bootstrap-password
+.env
+.env.*
