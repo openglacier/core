@@ -3,6 +3,10 @@
 </p>
 
 <p align="center">
+  <h1>openglacier - core</h1>
+</p>
+
+<p align="center">
 
 ![Version](https://img.shields.io/badge/version-0.22.5-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
@@ -10,8 +14,6 @@
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
 
 </p>
-
-openglacier - core
 
 > *Small core, long life.*
 
