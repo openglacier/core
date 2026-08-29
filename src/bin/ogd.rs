@@ -94,18 +94,28 @@ fn run() -> Result<(), DaemonError> {
     let configuration = Configuration::from_environment()?;
     let version = env!("CARGO_PKG_VERSION");
     let gateway_endpoint = gateway_endpoint(&configuration.bind_address);
-    let listener = if gateway_endpoint.is_none() {
-        Some(TcpListener::bind(&configuration.bind_address).map_err(|source| DaemonError::Bind {
-            address: configuration.bind_address.clone(),
-            source,
-        })?)
+    let listener_bind_address = if gateway_endpoint.is_some() {
+        configuration.local_bind_address.as_deref()
     } else {
-        None
+        Some(configuration.bind_address.as_str())
+    };
+    let listener = match listener_bind_address {
+        Some(address) => Some(TcpListener::bind(address).map_err(|source| DaemonError::Bind {
+            address: address.to_owned(),
+            source,
+        })?),
+        None => None,
     };
 
-    let local_address = match listener.as_ref() {
-        Some(listener) => listener.local_addr().map_err(DaemonError::LocalAddress)?.to_string(),
-        None => format!("outbound {}", configuration.bind_address),
+    let local_address = match (gateway_endpoint.as_ref(), listener.as_ref()) {
+        (Some(_), Some(listener)) => format!(
+            "outbound {}, local {}",
+            configuration.bind_address,
+            listener.local_addr().map_err(DaemonError::LocalAddress)?
+        ),
+        (Some(_), None) => format!("outbound {}", configuration.bind_address),
+        (None, Some(listener)) => listener.local_addr().map_err(DaemonError::LocalAddress)?.to_string(),
+        (None, None) => unreachable!("standalone ogd always has a listener"),
     };
 
     let (engine_value, glacier_storage) = build_engine(&configuration)?;
@@ -123,8 +133,19 @@ fn run() -> Result<(), DaemonError> {
         configuration.node_capabilities.names().join(","),
     ));
     start_debug_memory_reporter(Arc::clone(&engine));
+    let node_credential = if gateway_endpoint.is_some() {
+        load_node_identity_credential(&configuration)?
+    } else {
+        None
+    };
     if configuration.node_capabilities.contains(ServiceCapability::Auth) {
-        bootstrap_admin_if_needed(&engine, &configuration)?;
+        if gateway_endpoint.is_some() {
+            if let Some(credential) = node_credential.as_ref() {
+                ensure_node_device_credential(&engine, credential)?;
+            }
+        } else {
+            bootstrap_admin_if_needed(&engine, &configuration)?;
+        }
     }
     if configuration.node_capabilities.contains(ServiceCapability::Database) {
         bootstrap_apps_if_needed(&engine)?;
@@ -230,7 +251,28 @@ fn run() -> Result<(), DaemonError> {
                                           {with_modules14}
 "
     );
-    if let Some(listener) = listener {
+    if let Some(gateway_endpoint) = gateway_endpoint {
+        if let Some(listener) = listener {
+            spawn_listener_thread(
+                listener,
+                Arc::clone(&engine),
+                Arc::clone(&operation_router),
+                Arc::clone(&event_engine),
+                Arc::clone(&connection_settings),
+                "ogd-local-listener",
+            )?;
+        }
+        run_gateway_node(
+            gateway_endpoint,
+            &configuration,
+            node_credential,
+            engine,
+            operation_router,
+            event_engine,
+            connection_settings,
+        )
+    } else {
+        let listener = listener.expect("standalone ogd listener");
         for accepted in listener.incoming() {
             match accepted {
                 Ok(stream) => {
@@ -247,18 +289,39 @@ fn run() -> Result<(), DaemonError> {
             }
         }
         Ok(())
-    } else {
-        run_gateway_node(
-            gateway_endpoint.expect("gateway endpoint"),
-            &configuration,
-            engine,
-            operation_router,
-            event_engine,
-            connection_settings,
-        )
     }
 }
 
+fn spawn_listener_thread(
+    listener: TcpListener,
+    engine: Arc<Engine>,
+    operation_router: Arc<OperationRouter>,
+    event_engine: Arc<EventEngine>,
+    settings: Arc<ConnectionSettings>,
+    thread_name: &str,
+) -> Result<(), DaemonError> {
+    let name = thread_name.to_owned();
+    thread::Builder::new().name(name.clone()).spawn(move || {
+        for accepted in listener.incoming() {
+            match accepted {
+                Ok(stream) => {
+                    if let Err(error) = spawn_serving_connection(
+                        stream,
+                        Arc::clone(&engine),
+                        Arc::clone(&operation_router),
+                        Arc::clone(&event_engine),
+                        Arc::clone(&settings),
+                        "ogd-local-client",
+                    ) {
+                        eprintln!("{name}: cannot spawn client connection: {error}");
+                    }
+                }
+                Err(error) => eprintln!("{name} accept error: {error}"),
+            }
+        }
+    }).map_err(DaemonError::SpawnConnectionThread)?;
+    Ok(())
+}
 
 fn spawn_serving_connection(
     stream: TcpStream,
@@ -386,17 +449,13 @@ fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) 
 fn run_gateway_node(
     endpoint: String,
     configuration: &Configuration,
+    node_credential: Option<IdentityCredential>,
     engine: Arc<Engine>,
     operation_router: Arc<OperationRouter>,
     event_engine: Arc<EventEngine>,
     settings: Arc<ConnectionSettings>,
 ) -> Result<(), DaemonError> {
     let capabilities = configuration.node_capabilities.names();
-    let node_credential = match (&configuration.node_identity_file, &configuration.node_identity_password) {
-        (Some(path), Some(password)) => Some(identity_file::load(path, password.as_bytes()).map_err(DaemonError::NodeIdentity)?),
-        (Some(_), None) => return Err(DaemonError::NodeIdentityPasswordMissing),
-        _ => None,
-    };
     loop {
         debug::log(DebugTopic::Gateway, None, format!("connecting node fabric endpoint={endpoint}"));
         let (mut control, _) = match websocket_connect(endpoint.as_str()) {
@@ -510,6 +569,74 @@ fn run_gateway_node(
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn load_node_identity_credential(configuration: &Configuration) -> Result<Option<IdentityCredential>, DaemonError> {
+    match (&configuration.node_identity_file, &configuration.node_identity_password) {
+        (Some(path), Some(password)) => identity_file::load(path, password.as_bytes())
+            .map(Some)
+            .map_err(DaemonError::NodeIdentity),
+        (Some(_), None) => Err(DaemonError::NodeIdentityPasswordMissing),
+        _ => Ok(None),
+    }
+}
+
+/// Ensures that the credential used by this client/node to authenticate to its master can
+/// also authenticate to the local control listener.
+///
+/// This deliberately creates only the public `_devices` record. It does not bootstrap an
+/// identity, grant permissions, create a Place, or persist private key material. Existing
+/// records are never rewritten: an unexpected identity/key/state collision is treated as an
+/// inconsistent local store and fails startup.
+fn ensure_node_device_credential(engine: &Engine, credential: &IdentityCredential) -> Result<(), DaemonError> {
+    let lookup = format!(
+        "on _devices | where deviceId == {} | limit 1",
+        query_string(&credential.device_id),
+    );
+    let response = execute_request(engine, QueryRequest::new(0, lookup));
+    match response {
+        QueryResponse::Ok { documents, .. } => {
+            if let Some(document) = documents.first() {
+                let text = |field: &str| document.get(field).and_then(JsonValue::as_str);
+                let expected = text("identityId") == Some(credential.identity_id.as_str())
+                    && text("publicKey") == Some(credential.public_key.as_str())
+                    && text("algorithm") == Some("ed25519")
+                    && text("encoding") == Some("spki-der")
+                    && text("state") == Some("active");
+                if expected {
+                    return Ok(());
+                }
+                return Err(DaemonError::NodeDeviceCredentialConflict {
+                    device_id: credential.device_id.clone(),
+                });
+            }
+        }
+        // A fresh client store may not have `_devices` yet. Reads against a missing
+        // collection are therefore equivalent to "credential absent" here. The insert
+        // below creates/populates the collection through the normal Core query path. If
+        // that insert fails, we still surface a real local credential-state error.
+        QueryResponse::Error { .. } => {}
+    }
+
+    let created_at = unix_time_millis();
+    let insert = format!(
+        "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}}}",
+        query_string(&credential.device_id),
+        query_string(&credential.identity_id),
+        query_string(&credential.public_key),
+    );
+    if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
+        return Err(DaemonError::NodeDeviceCredentialState);
+    }
+    debug::log(
+        DebugTopic::Auth,
+        None,
+        format!(
+            "registered local node device credential identity={} device={}",
+            credential.identity_id, credential.device_id,
+        ),
+    );
+    Ok(())
 }
 
 fn bootstrap_admin_if_needed( engine: &Engine, configuration: &Configuration, ) -> Result<(), DaemonError> {
@@ -4530,6 +4657,7 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 #[derive(Debug)]
 struct Configuration {
     bind_address: String,
+    local_bind_address: Option<String>,
     read_timeout: Duration,
     write_timeout: Duration,
     storage_backend: StorageBackend,
@@ -4560,6 +4688,7 @@ struct Configuration {
 impl Configuration {
     fn from_environment() -> Result<Self, DaemonError> {
         let bind_address = env::var("OGD_BIND").unwrap_or_else(|_| DEFAULT_BIND_ADDRESS.to_owned());
+        let local_bind_address = env::var("OGD_LOCAL_BIND").ok().filter(|value| !value.trim().is_empty());
         let read_timeout = duration_from_environment("OGD_READ_TIMEOUT_MS", DEFAULT_READ_TIMEOUT_MS)?;
         let write_timeout = duration_from_environment("OGD_WRITE_TIMEOUT_MS", DEFAULT_WRITE_TIMEOUT_MS)?;
         let storage_backend = StorageBackend::parse( &env::var("OGD_STORAGE").unwrap_or_else(|_| DEFAULT_STORAGE_BACKEND.to_owned()), )?;
@@ -4620,6 +4749,7 @@ impl Configuration {
 
         Ok(Self {
             bind_address,
+            local_bind_address,
             read_timeout,
             write_timeout,
             storage_backend,
@@ -4861,6 +4991,8 @@ enum DaemonError {
     BootstrapIdentity(og_core::access::identity_file::IdentityFileError),
     NodeIdentity(og_core::access::identity_file::IdentityFileError),
     NodeIdentityPasswordMissing,
+    NodeDeviceCredentialState,
+    NodeDeviceCredentialConflict { device_id: String },
     BootstrapPasswordMissing,
     BootstrapAdminState,
     BootstrapAppsState,
@@ -4913,6 +5045,8 @@ impl Display for DaemonError {
             Self::BootstrapIdentity(source) => write!(formatter, "cannot create encrypted bootstrap identity: {source}"),
             Self::NodeIdentity(source) => write!(formatter, "cannot load node identity: {source}"),
             Self::NodeIdentityPasswordMissing => formatter.write_str("OGD_NODE_IDENTITY_FILE requires OGD_NODE_IDENTITY_PASSWORD"),
+            Self::NodeDeviceCredentialState => formatter.write_str("cannot persist local node device credential"),
+            Self::NodeDeviceCredentialConflict { device_id } => write!(formatter, "local device credential conflicts with configured node identity for device `{device_id}`"),
             Self::BootstrapPasswordMissing => formatter.write_str("bootstrap identity requires OGD_BOOTSTRAP_PASSWORD_FILE or OGD_BOOTSTRAP_PASSWORD"),
             Self::BootstrapAdminState => {
                 formatter.write_str("cannot persist bootstrap administrator")
@@ -4989,7 +5123,9 @@ impl Error for DaemonError {
             | Self::ZeroDuration { .. }
             | Self::InvalidStorageBackend { .. }
             | Self::Runtime(_)
-            | Self::NodeIdentityPasswordMissing => None,
+            | Self::NodeIdentityPasswordMissing
+            | Self::NodeDeviceCredentialState
+            | Self::NodeDeviceCredentialConflict { .. } => None,
         }
     }
 }
