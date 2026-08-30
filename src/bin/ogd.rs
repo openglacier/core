@@ -29,7 +29,7 @@ use og_core::{
         AppInstanceCreateInput, AppInstanceRemoveInput, AppUpdateInput, DataAnalyzeInput, DataImportInput, DataWorkerRunInput, DataMappingSaveInput, Audience, BackupNameInput,
         CollectionsListInput, FileEntryInput, FileListInput, FileMkdirInput, FileMoveInput,
         FileReadInput, FileScopeInput, FileVersionInput, FileVersionReadInput, FileWriteInput,
-        BackupRestoreInput, HandlerKind, OperationKind, OperationResponse, OperationRouter, PermissionGrantInput,
+        BackupRestoreInput, HandlerKind, OperationKind, OperationRequest, OperationResponse, OperationRouter, OperationScope, PermissionGrantInput,
         PermissionRevokeInput, PlaceAccessRemoveInput, PlaceAccessSetInput, PlaceCreateInput, PlacePublicSetInput,
         PlaceDeleteInput, PlaceIdInput, PlaceUpdateInput, PlaceResourceSetInput, PlaceResourceRemoveInput, Routed, RoutedOperation, SharingCreateInput,
         SharingDeleteInput, SharingUpdateInput,
@@ -125,6 +125,17 @@ fn run() -> Result<(), DaemonError> {
             path: configuration.files_path.clone(),
             source,
         })?;
+        if let Some(sync_root) = configuration.files_sync_root.as_ref() {
+            fs::create_dir_all(sync_root).map_err(|source| DaemonError::PrepareStorageDirectory {
+                path: sync_root.clone(),
+                source,
+            })?;
+            debug::log(
+                DebugTopic::Core,
+                None,
+                format!("Files sync root configured at {}", sync_root.display()),
+            );
+        }
     }
     debug::log(DebugTopic::Core, None, format!(
         "starting storage={} bind={} capabilities={}",
@@ -181,6 +192,8 @@ fn run() -> Result<(), DaemonError> {
         files_path: configuration.files_path.clone(),
         service_capabilities: configuration.node_capabilities,
         upstream: gateway_endpoint.as_ref().map(|_| configuration.bind_address.clone()),
+        upstream_client_endpoint: gateway_client_endpoint(&configuration.bind_address),
+        upstream_identity: node_credential.clone(),
         gateway_state: Mutex::new(if gateway_endpoint.is_some() { "connecting" } else { "standalone" }),
     });
     let with_engine = configuration.storage_backend.as_str();
@@ -378,6 +391,17 @@ fn gateway_endpoint(bind: &str) -> Option<String> {
     bind.strip_prefix("gw://").and_then(|raw| normalize(raw, true))
 }
 
+fn gateway_client_endpoint(bind: &str) -> Option<String> {
+    fn normalize(authority: &str, secure: bool) -> Option<String> {
+        let authority = authority.trim().trim_end_matches('/');
+        if authority.is_empty() { return None; }
+        let scheme = if secure { "wss" } else { "ws" };
+        Some(format!("{scheme}://{authority}/ws"))
+    }
+    if let Some(raw) = bind.strip_prefix("gw+insecure://") { return normalize(raw, false); }
+    bind.strip_prefix("gw://").and_then(|raw| normalize(raw, true))
+}
+
 type NodeWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
 fn write_node_message(websocket: &mut NodeWebSocket, value: &JsonValue) -> Result<(), String> {
@@ -399,6 +423,147 @@ fn read_node_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>,
             Ok(WebSocketMessage::Text(_)) => return Err("node control channel requires binary MessagePack frames".to_owned()),
             Ok(_) => {}
             Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn write_gateway_message(websocket: &mut NodeWebSocket, value: &JsonValue) -> Result<(), String> {
+    let payload = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    websocket.send(WebSocketMessage::Text(payload.into())).map_err(|error| error.to_string())
+}
+
+fn read_gateway_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>, String> {
+    loop {
+        match websocket.read() {
+            Ok(WebSocketMessage::Text(payload)) => {
+                return serde_json::from_str::<JsonValue>(&payload).map(Some).map_err(|error| error.to_string());
+            }
+            Ok(WebSocketMessage::Close(_)) => return Ok(None),
+            Ok(WebSocketMessage::Ping(payload)) => {
+                websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?;
+            }
+            Ok(WebSocketMessage::Pong(_)) => {}
+            Ok(WebSocketMessage::Binary(_)) => return Err("gateway client channel requires JSON text frames".to_owned()),
+            Ok(_) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &OperationRequest) -> Result<JsonValue, String> {
+    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
+    let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    write_gateway_message(websocket, &value)?;
+    loop {
+        let Some(message) = read_gateway_message(websocket)? else {
+            return Err("gateway client channel closed before the response".to_owned());
+        };
+        if message.get("kind").and_then(JsonValue::as_str) == Some("response")
+            && message.get("id") == Some(&request_id)
+        {
+            return Ok(message);
+        }
+    }
+}
+
+fn connect_authenticated_gateway_client(endpoint: &str, credential: &IdentityCredential) -> Result<NodeWebSocket, String> {
+    let (mut websocket, _) = websocket_connect(endpoint).map_err(|error| error.to_string())?;
+
+    // The Gateway attaches a dedicated Core connection before it emits gateway.ready.
+    // Waiting for that event keeps the node-side client independent from Gateway startup races.
+    loop {
+        let Some(message) = read_gateway_message(&mut websocket)? else {
+            return Err("gateway client channel closed before gateway.ready".to_owned());
+        };
+        if message.get("kind").and_then(JsonValue::as_str) == Some("event")
+            && message.get("type").and_then(JsonValue::as_str) == Some("gateway.ready")
+        {
+            break;
+        }
+    }
+
+    let begin = OperationRequest::new(
+        RequestId::Number(1),
+        "auth.begin",
+        serde_json::json!({
+            "identityId": credential.identity_id,
+            "deviceId": credential.device_id,
+        }),
+    );
+    let begin_response = gateway_response_for_request(&mut websocket, &begin)?;
+    if let Some(error) = begin_response.get("error") {
+        return Err(format!("upstream auth.begin rejected: {error}"));
+    }
+    let challenge_id = begin_response.get("data").and_then(|value| value.get("challengeId")).and_then(JsonValue::as_str)
+        .ok_or_else(|| "upstream auth.begin did not return challengeId".to_owned())?;
+    let challenge = begin_response.get("data").and_then(|value| value.get("challenge")).and_then(JsonValue::as_str)
+        .ok_or_else(|| "upstream auth.begin did not return challenge".to_owned())?;
+    let challenge = decode_base64(challenge).map_err(|error| error.to_string())?;
+    let complete = OperationRequest::new(
+        RequestId::Number(2),
+        "auth.complete",
+        serde_json::json!({
+            "challengeId": challenge_id,
+            "signature": credential.sign_base64(&challenge),
+        }),
+    );
+    let complete_response = gateway_response_for_request(&mut websocket, &complete)?;
+    if let Some(error) = complete_response.get("error") {
+        return Err(format!("upstream auth.complete rejected: {error}"));
+    }
+    if complete_response.get("status").and_then(JsonValue::as_str) != Some("ok") {
+        return Err("upstream authentication did not complete successfully".to_owned());
+    }
+
+    Ok(websocket)
+}
+
+fn write_json_wire_response(writer: &mut TcpStream, response: &JsonValue) -> Result<(), ConnectionError> {
+    let encoded = encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
+        .map_err(ConnectionError::Encode)?;
+    writer.write_all(&encoded).map_err(ConnectionError::Write)
+}
+
+fn forward_authority_operation(
+    writer: &mut TcpStream,
+    settings: &ConnectionSettings,
+    principal: &Principal,
+    request: &OperationRequest,
+) -> Result<bool, ConnectionError> {
+    if request.op.is_empty() || settings.upstream_client_endpoint.is_none() {
+        return Ok(false);
+    }
+    let Some(credential) = settings.upstream_identity.as_ref() else {
+        return Ok(false);
+    };
+    let Principal::Identity { identity_id, device_id } = principal else {
+        return Ok(false);
+    };
+
+    // Never turn a public/anonymous local request into the node Identity upstream.
+    // Authority forwarding is allowed only for the same authenticated Device that
+    // owns the node credential.
+    if identity_id != &credential.identity_id || device_id != &credential.device_id {
+        return Ok(false);
+    }
+
+    let endpoint = settings.upstream_client_endpoint.as_deref().expect("checked above");
+    debug::log(DebugTopic::Gateway, None, format!("forward authority op={} endpoint={endpoint}", request.op));
+    match connect_authenticated_gateway_client(endpoint, credential)
+        .and_then(|mut websocket| gateway_response_for_request(&mut websocket, request))
+    {
+        Ok(response) => {
+            write_json_wire_response(writer, &response)?;
+            Ok(true)
+        }
+        Err(error) => {
+            let response = QueryResponse::request_error(
+                request.id,
+                "gateway.upstream_failed",
+                format!("unable to execute {} on upstream authority: {error}", request.op),
+            );
+            write_response(writer, &response)?;
+            Ok(true)
         }
     }
 }
@@ -1013,11 +1178,19 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: &Engine, ope
                         operation_request.id, operation_request.op
                     ),
                 );
+                let authority_request = operation_request.clone();
                 match operation_router.route(operation_request) {
                     Ok(operation) => {
                         if !ensure_routed_static_authorized(
                             &mut writer, settings, engine, authentication.principal(), &operation,
                         )? { continue; }
+                        if operation.kind().scope() == OperationScope::Authority
+                            && forward_authority_operation(
+                                &mut writer, settings, authentication.principal(), &authority_request,
+                            )?
+                        {
+                            continue;
+                        }
                     match operation.execution_mode() {
                         ExecutionMode::Query => {
                             if handle_query_operation(&mut writer, settings, engine, event_engine, &authentication, delegation.as_ref(), connection_id, operation, &mut compact)? { continue; }
@@ -2367,7 +2540,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     "eligibleDevices": eligible_devices,
                                 }));
                             }
-                            RoutedOperation::PlaceResourceSet(Routed { id, input: PlaceResourceSetInput { place_id, identity_id: node_identity_id, device_id: node_device_id, capability, role } }) => {
+                            RoutedOperation::PlaceResourceSet(Routed { id, input: PlaceResourceSetInput { place_id, identity_id: node_identity_id, device_id: node_device_id, capability, role, service_role, storage_role } }) => {
                                 let owner_identity_id = identity_or_reject!(id, "an authenticated identity is required to manage Place resources");
                                 let place = or_reject!(load_place(engine, id, &place_id));
                                 place_owner_or_reject!(id, owner_identity_id, &place, "only a Place Owner may assign resource nodes");
@@ -2380,30 +2553,98 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 if !valid_resource_capability(&capability) {
                                     reject!(id, "place.resource.invalid_capability", "invalid resource capability");
                                 }
-                                if !matches!(role.as_str(), "primary" | "replica" | "provider") {
-                                    reject!(id, "place.resource.invalid_role", "resource role must be primary, replica or provider");
-                                }
+
                                 let mut assignments = place.resource_assignments.clone();
+                                let existing = assignments.iter().find(|entry| {
+                                    let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(node_identity_id.as_str());
+                                    let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
+                                    let same_device = stored_device.is_none() || stored_device == Some(node_device_id.as_str());
+                                    same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability.as_str())
+                                }).cloned();
+
                                 assignments.retain(|entry| {
                                     let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(node_identity_id.as_str());
                                     let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
                                     let same_device = stored_device.is_none() || stored_device == Some(node_device_id.as_str());
                                     !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability.as_str()))
                                 });
-                                if role == "primary" {
-                                    assignments.retain(|entry| {
-                                        entry.get("capability").and_then(JsonValue::as_str) != Some(capability.as_str())
-                                            || entry.get("role").and_then(JsonValue::as_str) != Some("primary")
-                                    });
+
+                                if capability == "files" {
+                                    let mut next_service_role = existing.as_ref().and_then(resource_assignment_service_role).map(str::to_owned);
+                                    let mut next_storage_role = existing.as_ref().and_then(resource_assignment_storage_role).map(str::to_owned);
+
+                                    if let Some(role) = role.as_deref() {
+                                        match role {
+                                            "primary" | "replica" => next_service_role = Some(role.to_owned()),
+                                            "provider" | "sync" => next_storage_role = Some(role.to_owned()),
+                                            _ => reject!(id, "place.resource.invalid_role", "files role must be primary, replica, provider or sync"),
+                                        }
+                                    }
+
+                                    if let Some(service_role) = service_role.as_deref() {
+                                        match service_role {
+                                            "none" => next_service_role = None,
+                                            "primary" | "replica" => next_service_role = Some(service_role.to_owned()),
+                                            _ => reject!(id, "place.resource.invalid_service_role", "files serviceRole must be none, primary or replica"),
+                                        }
+                                    }
+
+                                    if let Some(storage_role) = storage_role.as_deref() {
+                                        match storage_role {
+                                            "none" => next_storage_role = None,
+                                            "provider" | "sync" => next_storage_role = Some(storage_role.to_owned()),
+                                            _ => reject!(id, "place.resource.invalid_storage_role", "files storageRole must be none, provider or sync"),
+                                        }
+                                    }
+
+                                    if next_service_role.as_deref() == Some("primary") {
+                                        assignments.retain(|entry| {
+                                            entry.get("capability").and_then(JsonValue::as_str) != Some("files")
+                                                || resource_assignment_service_role(entry) != Some("primary")
+                                        });
+                                    }
+
+                                    if next_service_role.is_some() || next_storage_role.is_some() {
+                                        let compatibility_role = next_service_role.as_deref()
+                                            .or(next_storage_role.as_deref())
+                                            .expect("files assignment has at least one role");
+                                        assignments.push(serde_json::json!({
+                                            "identityId": node_identity_id,
+                                            "deviceId": node_device_id,
+                                            "capability": capability,
+                                            "role": compatibility_role,
+                                            "serviceRole": next_service_role,
+                                            "storageRole": next_storage_role,
+                                            "assignedBy": owner_identity_id,
+                                            "assignedAt": unix_time_millis(),
+                                        }));
+                                    }
+                                } else {
+                                    if service_role.is_some() || storage_role.is_some() {
+                                        reject!(id, "place.resource.invalid_role_dimensions", "serviceRole and storageRole are only supported for files");
+                                    }
+                                    let Some(role) = role.as_deref() else {
+                                        reject!(id, "place.resource.role_required", "role is required for non-files resources");
+                                    };
+                                    if !matches!(role, "primary" | "replica" | "provider") {
+                                        reject!(id, "place.resource.invalid_role", "resource role must be primary, replica or provider");
+                                    }
+                                    if role == "primary" {
+                                        assignments.retain(|entry| {
+                                            entry.get("capability").and_then(JsonValue::as_str) != Some(capability.as_str())
+                                                || entry.get("role").and_then(JsonValue::as_str) != Some("primary")
+                                        });
+                                    }
+                                    assignments.push(serde_json::json!({
+                                        "identityId": node_identity_id,
+                                        "deviceId": node_device_id,
+                                        "capability": capability,
+                                        "role": role,
+                                        "assignedBy": owner_identity_id,
+                                        "assignedAt": unix_time_millis(),
+                                    }));
                                 }
-                                assignments.push(serde_json::json!({
-                                    "identityId": node_identity_id,
-                                    "deviceId": node_device_id,
-                                    "capability": capability,
-                                    "role": role,
-                                    "assignedBy": owner_identity_id,
-                                    "assignedAt": unix_time_millis(),
-                                }));
+
                                 let encoded = serde_json::to_string(&assignments).expect("resource assignments serialize");
                                 execute_query_or_reject!(id, format!(
                                     "on _places | where placeId == {} and state == \"active\" | set resourceAssignments = {}, updatedAt = {}",
@@ -2413,7 +2654,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 publish_durable_event(engine, audience, "place.resources.updated", serde_json::json!({ "placeId": place_id }));
                                 reply!(id, serde_json::json!({ "placeId": place_id, "assignments": assignments }));
                             }
-                            RoutedOperation::PlaceResourceRemove(Routed { id, input: PlaceResourceRemoveInput { place_id, identity_id: node_identity_id, device_id: node_device_id, capability } }) => {
+                                                        RoutedOperation::PlaceResourceRemove(Routed { id, input: PlaceResourceRemoveInput { place_id, identity_id: node_identity_id, device_id: node_device_id, capability } }) => {
                                 let owner_identity_id = identity_or_reject!(id, "an authenticated identity is required to manage Place resources");
                                 let place = or_reject!(load_place(engine, id, &place_id));
                                 place_owner_or_reject!(id, owner_identity_id, &place, "only a Place Owner may remove resource assignments");
@@ -2850,6 +3091,33 @@ fn load_device_credential( engine: &Engine, request_id: RequestId, identity_id: 
 
 fn valid_resource_capability(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+
+fn resource_assignment_service_role(entry: &JsonValue) -> Option<&str> {
+    if let Some(role) = entry.get("serviceRole").and_then(JsonValue::as_str) {
+        return match role {
+            "primary" | "replica" => Some(role),
+            _ => None,
+        };
+    }
+    match entry.get("role").and_then(JsonValue::as_str) {
+        Some(role @ ("primary" | "replica")) => Some(role),
+        _ => None,
+    }
+}
+
+fn resource_assignment_storage_role(entry: &JsonValue) -> Option<&str> {
+    if let Some(role) = entry.get("storageRole").and_then(JsonValue::as_str) {
+        return match role {
+            "provider" | "sync" => Some(role),
+            _ => None,
+        };
+    }
+    match entry.get("role").and_then(JsonValue::as_str) {
+        Some(role @ ("provider" | "sync")) => Some(role),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -4674,6 +4942,7 @@ struct Configuration {
     storage_backend: StorageBackend,
     storage_path: PathBuf,
     files_path: PathBuf,
+    files_sync_root: Option<PathBuf>,
     import_metrics: bool,
     debug_query: bool,
     authorization_mode: AuthorizationMode,
@@ -4707,6 +4976,11 @@ impl Configuration {
         let files_path = env::var("OGD_FILES_PATH").map(PathBuf::from).unwrap_or_else(|_| {
             storage_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).join("files")
         });
+        let files_sync_root = env::var("OGD_FILES_SYNC_ROOT")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let import_metrics = boolean_from_environment("OGD_IMPORT_METRICS", false)?;
         let debug_query = boolean_from_environment("OGD_DEBUG_QUERY", false)?;
         let authorization_mode = if boolean_from_environment("OGD_AUTH_REQUIRED", false)? { AuthorizationMode::Enforced } else { AuthorizationMode::Permissive };
@@ -4766,6 +5040,7 @@ impl Configuration {
             storage_backend,
             storage_path,
             files_path,
+            files_sync_root,
             import_metrics,
             debug_query,
             authorization_mode,
@@ -4926,6 +5201,8 @@ struct ConnectionSettings {
     files_path: PathBuf,
     service_capabilities: ServiceCapabilities,
     upstream: Option<String>,
+    upstream_client_endpoint: Option<String>,
+    upstream_identity: Option<IdentityCredential>,
     gateway_state: Mutex<&'static str>,
 }
 

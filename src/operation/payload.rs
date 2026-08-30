@@ -139,7 +139,12 @@ pub struct PlaceResourceSetInput {
     #[serde(alias = "nodeDeviceId", alias = "nodeId")]
     pub device_id: String,
     pub capability: String,
-    pub role: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub service_role: Option<String>,
+    #[serde(default)]
+    pub storage_role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -655,7 +660,34 @@ validate_fields!(SharingDeleteInput => sharing_id: "sharingId");
 validate_fields!(PlaceCreateInput => name: "name");
 validate_fields!(PlaceIdInput => place_id: "placeId");
 validate_fields!(PlaceDeleteInput => place_id: "placeId");
-validate_fields!(PlaceResourceSetInput => place_id: "placeId", identity_id: "identityId", device_id: "deviceId", capability: "capability", role: "role");
+impl OperationPayload for PlaceResourceSetInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "placeId", &self.place_id)?;
+        non_empty(operation, "identityId", &self.identity_id)?;
+        non_empty(operation, "deviceId", &self.device_id)?;
+        non_empty(operation, "capability", &self.capability)?;
+
+        for (wire, value) in [
+            ("role", self.role.as_mut()),
+            ("serviceRole", self.service_role.as_mut()),
+            ("storageRole", self.storage_role.as_mut()),
+        ] {
+            if let Some(value) = value {
+                *value = value.trim().to_owned();
+                non_empty(operation, wire, value)?;
+            }
+        }
+
+        if self.role.is_none() && self.service_role.is_none() && self.storage_role.is_none() {
+            return Err(invalid_payload(
+                operation,
+                "one of role, serviceRole or storageRole is required",
+            ));
+        }
+
+        Ok(())
+    }
+}
 validate_fields!(PlaceResourceRemoveInput => place_id: "placeId", identity_id: "identityId", device_id: "deviceId", capability: "capability");
 validate_fields!(PlaceAccessRemoveInput => place_id: "placeId", identity_id: "identityId");
 validate_fields!(PlacePublicSetInput => place_id: "placeId");

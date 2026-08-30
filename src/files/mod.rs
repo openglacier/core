@@ -6,6 +6,7 @@
 mod model;
 mod native;
 mod store;
+mod sync;
 mod version;
 
 pub use model::{
@@ -15,6 +16,10 @@ pub use model::{
 pub use native::NativeFileStore;
 pub use store::{
     FileRange, FileReader, FileResult, FileStore, FileStoreEntry, FileStoreError, FileWrite,
+};
+pub use sync::{
+    FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelection,
+    APP_FILES_DIRECTORY, FILE_SYNC_CONFIG_VERSION, PRIMARY_APPS_COLLISION_NAME,
 };
 
 pub use version::FileVersion;

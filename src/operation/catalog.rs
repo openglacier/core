@@ -147,6 +147,16 @@ pub enum ExecutionMode {
     File,
 }
 
+/// Where the authoritative state for an operation lives.
+///
+/// `Authority` operations execute locally on a standalone/master Core and are
+/// forwarded to the configured upstream authority when this Core is a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationScope {
+    Local,
+    Authority,
+}
+
 /// Canonical handler domain for one operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandlerKind {
@@ -219,9 +229,32 @@ macro_rules! define_operations {
             #[must_use]
             pub const fn handler(self) -> HandlerKind { self.descriptor().handler }
 
+            /// Returns where the authoritative state for this operation lives.
+            ///
+            /// Keep this deliberately narrow: operations move here only when their
+            /// trust/authority semantics are owned by Core rather than by a UI or
+            /// Gateway adapter.
+            #[must_use]
+            pub const fn scope(self) -> OperationScope {
+                match self {
+                    Self::PlaceList
+                    | Self::PlaceGet
+                    | Self::PlaceAccessList
+                    | Self::PlaceResourceList
+                    | Self::PlaceResourceSet
+                    | Self::PlaceResourceRemove
+                    | Self::AppList
+                    | Self::AppInstanceList => OperationScope::Authority,
+                    _ => OperationScope::Local,
+                }
+            }
+
             /// Service capabilities required before this operation can be routed.
             #[must_use]
             pub const fn required_capabilities(self) -> ServiceCapabilities {
+                if matches!(self.scope(), OperationScope::Authority) {
+                    return ServiceCapabilities::NONE;
+                }
                 match self {
                     Self::CoreHealth | Self::Ping => ServiceCapabilities::NONE,
                     // data.analyze/data.import are control-plane operations: authorization,
@@ -304,7 +337,10 @@ mod tests {
             OperationKind::DeviceList.required_capabilities(),
             AUTH_DATABASE
         );
-        assert_eq!(OperationKind::PlaceList.required_capabilities(), DATABASE);
+        assert_eq!(
+            OperationKind::PlaceList.required_capabilities(),
+            ServiceCapabilities::NONE
+        );
         assert_eq!(OperationKind::DataImport.required_capabilities(), DATABASE);
         assert_eq!(
             OperationKind::DataWorkerRun.required_capabilities(),
@@ -314,6 +350,20 @@ mod tests {
             OperationKind::CoreHealth.required_capabilities(),
             ServiceCapabilities::NONE
         );
+    }
+
+    #[test]
+    fn authority_scope_is_explicit_and_narrow() {
+        assert_eq!(OperationKind::PlaceList.scope(), OperationScope::Authority);
+        assert_eq!(
+            OperationKind::PlaceResourceList.scope(),
+            OperationScope::Authority
+        );
+        assert_eq!(
+            OperationKind::AppInstanceList.scope(),
+            OperationScope::Authority
+        );
+        assert_eq!(OperationKind::Ping.scope(), OperationScope::Local);
     }
 
     #[test]
