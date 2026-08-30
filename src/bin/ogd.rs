@@ -180,6 +180,8 @@ fn run() -> Result<(), DaemonError> {
         glacier_storage,
         files_path: configuration.files_path.clone(),
         service_capabilities: configuration.node_capabilities,
+        upstream: gateway_endpoint.as_ref().map(|_| configuration.bind_address.clone()),
+        gateway_state: Mutex::new(if gateway_endpoint.is_some() { "connecting" } else { "standalone" }),
     });
     let with_engine = configuration.storage_backend.as_str();
     let with_storage_path = match configuration.storage_backend { StorageBackend::Memory => "virtual".to_owned(), StorageBackend::Glacier => configuration.storage_path.display().to_string(), };
@@ -457,10 +459,12 @@ fn run_gateway_node(
 ) -> Result<(), DaemonError> {
     let capabilities = configuration.node_capabilities.names();
     loop {
+        *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "connecting";
         debug::log(DebugTopic::Gateway, None, format!("connecting node fabric endpoint={endpoint}"));
         let (mut control, _) = match websocket_connect(endpoint.as_str()) {
             Ok(connection) => connection,
             Err(error) => {
+                *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "retrying";
                 eprintln!("ogd gateway connect {endpoint}: {error}; retrying");
                 thread::sleep(Duration::from_secs(2));
                 continue;
@@ -493,6 +497,7 @@ fn run_gateway_node(
             "token": configuration.gateway_token.clone(),
         });
         if let Err(error) = write_node_message(&mut control, &hello) {
+            *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "retrying";
             eprintln!("ogd gateway hello {endpoint}: {error}");
             thread::sleep(Duration::from_secs(2));
             continue;
@@ -505,6 +510,7 @@ fn run_gateway_node(
             };
             match message.get("kind").and_then(JsonValue::as_str) {
                 Some("node.accepted") => {
+                    *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "connected";
                     debug::log(DebugTopic::Gateway, None, format!("node accepted endpoint={endpoint}"));
                 }
                 Some("node.open") => {
@@ -567,6 +573,7 @@ fn run_gateway_node(
                 _ => {}
             }
         }
+        *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "retrying";
         thread::sleep(Duration::from_secs(1));
     }
 }
@@ -1884,6 +1891,10 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             HandlerKind::Core => match operation {
                                 RoutedOperation::CoreHealth(Routed { id, .. }) => {
                                 reply!(id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), }),);
+                            }
+                                RoutedOperation::NodeStatus(Routed { id, .. }) => {
+                                let state = *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                reply!(id, serde_json::json!({ "upstream": settings.upstream.as_deref(), "state": state }),);
                             }
                                 RoutedOperation::Ping(Routed { id, .. }) => {
                                 reply!(id, serde_json::json!({ "data": "pong", "version": PROTOCOL_VERSION, }),);
@@ -4914,6 +4925,8 @@ struct ConnectionSettings {
     glacier_storage: Option<Arc<GlacierStorage>>,
     files_path: PathBuf,
     service_capabilities: ServiceCapabilities,
+    upstream: Option<String>,
+    gateway_state: Mutex<&'static str>,
 }
 
 #[derive(Debug)]

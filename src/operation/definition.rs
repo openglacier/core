@@ -7,6 +7,7 @@ macro_rules! operation_definitions {
     ($consumer:ident) => {
         $consumer! {
             CORE_HEALTH => CoreHealth, "core.health", AccessPolicy::Public, ExecutionMode::Standard, HandlerKind::Core, UncheckedInput;
+            NODE_STATUS => NodeStatus, "node.status", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Core, EmptyInput;
             PING => Ping, "ping", AccessPolicy::Public, ExecutionMode::Standard, HandlerKind::Core, UncheckedInput;
             QUERY_EXECUTE => QueryExecute, "query.execute", AccessPolicy::Query, ExecutionMode::Query, HandlerKind::Query, QueryExecuteInput;
             QUERY_CONTEXT_RESOLVE => QueryContextResolve, "query.context.resolve", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::App, QueryContextResolveInput;
