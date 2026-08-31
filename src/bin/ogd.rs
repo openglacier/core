@@ -2128,6 +2128,8 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             let mut conflicts = 0u64;
                             let mut ignored = 0u64;
                             let mut errors = 0u64;
+                            let mut diagnostics = Vec::<JsonValue>::new();
+                            let mut reasons = HashMap::<String, u64>::new();
                             for entry in &index.entries {
                                 match entry.state {
                                     FileSyncEntryState::Synced => synced += 1,
@@ -2137,13 +2139,93 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                     FileSyncEntryState::Ignored => ignored += 1,
                                     FileSyncEntryState::Error => errors += 1,
                                 }
+
+                                // Keep normal status compact for healthy entries, but expose
+                                // enough evidence through ogcli to diagnose every non-synced
+                                // decision without enabling verbose daemon logging.
+                                if entry.state != FileSyncEntryState::Synced {
+                                    let reason = entry.last_error.clone().unwrap_or_else(|| "state has no recorded reason".to_owned());
+                                    *reasons.entry(reason.clone()).or_insert(0) += 1;
+                                    let local_path = runtime.config.as_ref().map(|config| config.root.join(&entry.materialized_path));
+                                    let local = local_path.as_ref().map(|path| {
+                                        match fs::symlink_metadata(path) {
+                                            Ok(metadata) => {
+                                                let kind = if metadata.file_type().is_symlink() {
+                                                    "symlink"
+                                                } else if metadata.is_dir() {
+                                                    "directory"
+                                                } else if metadata.is_file() {
+                                                    "file"
+                                                } else {
+                                                    "other"
+                                                };
+                                                let observed_modified_at = metadata.modified().ok()
+                                                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                                                    .map(|value| value.as_millis() as u64);
+                                                let observed_size = metadata.is_file().then_some(metadata.len());
+                                                serde_json::json!({
+                                                    "exists": true,
+                                                    "kind": kind,
+                                                    "size": observed_size,
+                                                    "modifiedAt": observed_modified_at,
+                                                    "matchesIndex": file_sync_local_matches(path, entry),
+                                                })
+                                            }
+                                            Err(error) if error.kind() == io::ErrorKind::NotFound => serde_json::json!({
+                                                "exists": false,
+                                                "matchesIndex": false,
+                                            }),
+                                            Err(error) => serde_json::json!({
+                                                "exists": null,
+                                                "matchesIndex": false,
+                                                "statError": error.to_string(),
+                                            }),
+                                        }
+                                    }).unwrap_or_else(|| serde_json::json!({"exists": null, "matchesIndex": false}));
+
+                                    diagnostics.push(serde_json::json!({
+                                        "state": entry.state,
+                                        "reason": reason,
+                                        "placeId": entry.place_id,
+                                        "instanceId": entry.app_instance_id,
+                                        "fileId": entry.file_id,
+                                        "path": entry.materialized_path,
+                                        "kind": entry.kind,
+                                        "base": {
+                                            "remoteEtag": entry.remote_etag,
+                                            "remoteModifiedAt": entry.remote_modified_at,
+                                            "localSize": entry.local_size,
+                                            "localModifiedAt": entry.local_modified_at,
+                                            "localFingerprint": entry.local_fingerprint,
+                                        },
+                                        "local": local,
+                                    }));
+                                }
                             }
+                            diagnostics.sort_by(|left, right| {
+                                left.get("path").and_then(JsonValue::as_str).unwrap_or_default()
+                                    .cmp(right.get("path").and_then(JsonValue::as_str).unwrap_or_default())
+                            });
+                            let mut reason_counts = reasons.into_iter()
+                                .map(|(reason, count)| serde_json::json!({"reason": reason, "count": count}))
+                                .collect::<Vec<_>>();
+                            reason_counts.sort_by(|left, right| {
+                                std::cmp::Reverse(left.get("count").and_then(JsonValue::as_u64).unwrap_or_default())
+                                    .cmp(&std::cmp::Reverse(right.get("count").and_then(JsonValue::as_u64).unwrap_or_default()))
+                                    .then_with(|| left.get("reason").and_then(JsonValue::as_str).unwrap_or_default()
+                                        .cmp(right.get("reason").and_then(JsonValue::as_str).unwrap_or_default()))
+                            });
                             reply!(id, serde_json::json!({
                                 "configured": runtime.config.is_some(),
                                 "root": runtime.config.as_ref().map(|config| &config.root),
                                 "selections": runtime.config.as_ref().map(|config| &config.selections).cloned().unwrap_or_default(),
                                 "worker": "continuous",
-                                "running": runtime.worker_running,
+                                // worker_running means the background worker thread is alive,
+                                // not that a reconciliation is currently executing. Expose
+                                // both concepts explicitly so Desktop can render Syncing only
+                                // while the reconciler is actually applying a run.
+                                "workerRunning": runtime.worker_running,
+                                "running": settings.file_sync_applying.load(Ordering::Acquire),
                                 "remoteEvents": runtime.remote_events.clone(),
                                 "localWatcher": runtime.local_watcher.clone(),
                                 "pending": runtime.worker_pending,
@@ -2158,6 +2240,10 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                     "conflicts": conflicts,
                                     "ignored": ignored,
                                     "errors": errors,
+                                },
+                                "diagnostics": {
+                                    "reasonCounts": reason_counts,
+                                    "problemEntries": diagnostics,
                                 }
                             }));
                         }
@@ -5931,11 +6017,30 @@ fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &OperationRe
 
 
 fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &OperationRequest, source: &Path) -> Result<JsonValue, String> {
+    // Open the local file before advertising the binary stream size. A native
+    // watcher can wake reconciliation while a large file is still being copied
+    // into the sync root. If we announce one size and then stream a growing or
+    // shrinking path, the receiver can wait forever for bytes that will never
+    // arrive (or the stream can bleed into the next request).
+    //
+    // Holding the open handle also gives this upload one coherent source object.
+    let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
+    let expected = input.metadata().map_err(|error| error.to_string())?.len();
+    let requested = request
+        .data
+        .get("size")
+        .and_then(JsonValue::as_u64)
+        .ok_or_else(|| "file.write request has no byte count".to_owned())?;
+    if requested != expected {
+        return Err(format!(
+            "local file changed before upload started (requested {requested} bytes, now {expected}); retrying on the next filesystem event"
+        ));
+    }
+
     let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
     let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
     write_gateway_message(websocket, &value)?;
 
-    let expected = fs::metadata(source).map_err(|error| error.to_string())?.len();
     loop {
         let message = websocket.read().map_err(|error| error.to_string())?;
         match message {
@@ -5959,13 +6064,23 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
                     return Err(format!("file.write expected {announced} bytes but local file has {expected}"));
                 }
 
-                let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
                 let mut buffer = vec![0u8; 64 * 1024];
-                loop {
-                    let count = input.read(&mut buffer).map_err(|error| error.to_string())?;
-                    if count == 0 { break; }
+                let mut remaining = expected;
+                while remaining > 0 {
+                    let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                        .map_err(|_| "file.write remaining byte count is invalid".to_owned())?;
+                    let count = input.read(&mut buffer[..limit]).map_err(|error| error.to_string())?;
+                    if count == 0 {
+                        // Abort the raw session explicitly. Otherwise Gateway/Core
+                        // legitimately keeps waiting for the announced tail forever.
+                        let _ = websocket.close(None);
+                        return Err(format!(
+                            "local file changed during upload: reached EOF with {remaining} bytes still announced; the upload was aborted"
+                        ));
+                    }
                     websocket.send(WebSocketMessage::Binary(buffer[..count].to_vec().into()))
                         .map_err(|error| error.to_string())?;
+                    remaining = remaining.saturating_sub(count as u64);
                 }
                 break;
             }
@@ -5986,8 +6101,23 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
                 if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
                     return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
                 }
-                if message.get("status").and_then(JsonValue::as_str) == Some("complete") {
-                    return message.get("data").cloned().ok_or_else(|| "file.write completed without data".to_owned());
+                // file.write is a two-response BinaryIn operation:
+                //   1. status=ok, data={ready:true, stream:"raw", bytes:N}
+                //   2. status=ok, data={file:..., bytes:N, stream:"raw"}
+                //
+                // "complete" is the stream status used by MessageStream (and the
+                // Gateway synthesizes one after BinaryOut/file.read). Native Core
+                // OperationResponse::new() deliberately uses status="ok", so waiting
+                // for "complete" here leaves the sync stuck forever after the first
+                // successfully persisted file.
+                if message.get("status").and_then(JsonValue::as_str) == Some("ok") {
+                    let data = message.get("data").cloned()
+                        .ok_or_else(|| "file.write completed without data".to_owned())?;
+                    if data.get("ready").and_then(JsonValue::as_bool) == Some(true) {
+                        // Defensive: a duplicate readiness response is not terminal.
+                        continue;
+                    }
+                    return Ok(data);
                 }
             }
             WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
@@ -6461,8 +6591,28 @@ fn file_sync_materialize_entry(
     index: &mut FileSyncIndex,
 ) -> Result<(FileSyncIndexEntry, bool, bool), String> {
     let key_matches = |entry: &&FileSyncIndexEntry| entry.place_id == logical.place_id && entry.app_instance_id == logical.app_instance_id && entry.file_id == logical.file_id.as_str();
-    let existing = index.entries.iter().find(key_matches).cloned();
     let destination = root.join(&relative_path);
+
+    // File IDs are authoritative while they remain stable, but an upload/create
+    // can replace the remote identity for a path that is already tracked locally.
+    // In that case treating the local file as "untracked" creates a false
+    // conflict even when it is byte-for-byte (size+mtime hot-path) the exact
+    // local state recorded in our base index.
+    //
+    // Rebind by path only when it is provably safe: same Place/instance/path and
+    // the current local object still matches that previous base entry. A genuinely
+    // untracked occupant therefore continues to conflict.
+    let existing = index.entries.iter().find(key_matches).cloned().or_else(|| {
+        if !destination.exists() {
+            return None;
+        }
+        index.entries.iter().find(|entry| {
+            entry.place_id == logical.place_id
+                && entry.app_instance_id == logical.app_instance_id
+                && entry.materialized_path == relative_path
+                && file_sync_local_matches(&destination, entry)
+        }).cloned()
+    });
     if let Some(previous) = existing.as_ref() {
         if previous.materialized_path != relative_path {
             let old_path = root.join(&previous.materialized_path);

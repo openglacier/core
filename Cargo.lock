@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "og-core"
-version = "0.40.1"
+version = "0.40.5"
 dependencies = [
  "argon2",
  "chacha20poly1305",
