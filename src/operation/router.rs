@@ -32,7 +32,7 @@ impl<T> Routed<T> {
 
 /// A validated operation ready for execution.
 macro_rules! define_routed_operations {
-    ($($constant:ident => $kind:ident, $name:literal, $access:expr, $execution:expr, $handler:expr, $payload:ty;)+) => {
+    ($($constant:ident => $kind:ident, $name:literal, $access:expr, $execution:expr, $handler:expr, $transport:expr, $connection:expr, $payload:ty;)+) => {
         #[derive(Debug, Clone, PartialEq, Eq)]
         pub enum RoutedOperation {
             $($kind(Routed<$payload>),)+
@@ -54,6 +54,12 @@ macro_rules! define_routed_operations {
 
             #[must_use]
             pub const fn handler(&self) -> HandlerKind { self.kind().handler() }
+
+            #[must_use]
+            pub const fn transport(&self) -> TransportKind { self.kind().transport() }
+
+            #[must_use]
+            pub const fn connection(&self) -> ConnectionKind { self.kind().connection() }
         }
     };
 }
@@ -165,7 +171,7 @@ impl OperationRouter {
         let data = request.data;
 
         macro_rules! dispatch_operations {
-            ($($constant:ident => $kind:ident, $name:literal, $access:expr, $execution:expr, $handler:expr, $payload:ty;)+) => {
+            ($($constant:ident => $kind:ident, $name:literal, $access:expr, $execution:expr, $handler:expr, $transport:expr, $connection:expr, $payload:ty;)+) => {
                 match kind {
                     $(OperationKind::$kind => Ok(RoutedOperation::$kind(
                         decode_routed::<$payload>($constant, id, data)?

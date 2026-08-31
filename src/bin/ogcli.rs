@@ -14,8 +14,7 @@ use std::{
 use og_core::access::identity_file::{self, IdentityCredential, IdentityFileError};
 use og_core::helpers::{decode_base64, Base64DecodeError};
 use og_core::operation::{
-    OperationRequest, OperationResponse, AUTH_BEGIN, AUTH_COMPLETE, BACKUP_CREATE, BACKUP_INSPECT,
-    BACKUP_RESTORE, COLLECTIONS_LIST, IDENTITY_RENEW, PING, STORAGE_STATS,
+    OperationRequest, OperationResponse, AUTH_BEGIN, AUTH_COMPLETE, IDENTITY_RENEW,
 };
 use og_core::protocol::{
     decode_stream_response, encode_request, ensure_payload_size, MessageKind, QueryRequest,
@@ -173,7 +172,7 @@ fn run_interactive_repl(
     let mut final_exit = ExitCode::SUCCESS;
 
     println!(
-        "Connected to {}. Type .help for commands.",
+        "Connected to {}. Type help for commands.",
         configuration.address
     );
 
@@ -241,12 +240,12 @@ fn handle_repl_line(
     final_exit: &mut ExitCode,
 ) -> Result<bool, CliError> {
     match query {
-        ".exit" | ".quit" => return Ok(true),
-        ".help" => {
+        "exit" | "quit" => return Ok(true),
+        "help" => {
             print_repl_help();
             return Ok(false);
         }
-        ".reconnect" => {
+        "reconnect" => {
             *client = Client::connect(configuration)?;
             if interactive {
                 println!("Reconnected to {}.", configuration.address);
@@ -256,111 +255,17 @@ fn handle_repl_line(
         _ => {}
     }
 
-    if query == ".collections" || query == ".collections stats" {
-        let response = client.operation(
-            COLLECTIONS_LIST,
-            serde_json::json!({"stats": query.ends_with(" stats")}),
-        )?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
-        return Ok(false);
-    }
-    if query.starts_with(".collections ") {
-        eprintln!("Usage: .collections [stats]");
-        return Ok(false);
-    }
-
-    if query == ".storage" || query == ".storage stats" {
-        let response = client.operation(STORAGE_STATS, serde_json::json!({}))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
-        return Ok(false);
-    }
-    /*if query.starts_with(".") {
-        eprintln!("Usage: .[operation]");
-        return Ok(false);
-    }*/
-    if query == ".ping" {
-        let response = client.operation(PING, serde_json::json!({}))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
-        return Ok(false);
-    }
-    if query.starts_with(".storage ") {
-        eprintln!("Usage: .storage stats");
-        return Ok(false);
-    }
-
-    if query == ".backup" {
-        eprintln!("Usage:\n  .backup create <name>\n  .backup inspect <name>");
-        return Ok(false);
-    }
-    if let Some(name) = query.strip_prefix(".backup inspect ") {
-        let name = name.trim();
-        if name.is_empty() {
-            eprintln!("Usage: .backup inspect <name>");
-            return Ok(false);
-        }
-        let response = client.operation(BACKUP_INSPECT, serde_json::json!({"name": name}))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
-        return Ok(false);
-    }
-    if let Some(name) = query.strip_prefix(".backup create ") {
-        let name = name.trim();
-        if name.is_empty() {
-            eprintln!("Usage: .backup create <name>");
-            return Ok(false);
-        }
-        let response = client.operation(BACKUP_CREATE, serde_json::json!({"name": name}))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
-        return Ok(false);
-    }
-    // Backward-compatible shorthand: `.backup <name>` creates a backup.
-    if let Some(name) = query.strip_prefix(".backup ") {
-        let name = name.trim();
-        if name.is_empty() {
-            eprintln!("Usage:\n  .backup create <name>\n  .backup inspect <name>");
-            return Ok(false);
-        }
-        let response = client.operation(BACKUP_CREATE, serde_json::json!({"name": name}))?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
-        return Ok(false);
-    }
-
-    if query == ".restore" {
-        eprintln!("Usage: .restore <name> [--replace]");
-        return Ok(false);
-    }
-    if let Some(rest) = query.strip_prefix(".restore ") {
-        let replace = rest.ends_with(" --replace");
-        let name = rest.strip_suffix(" --replace").unwrap_or(rest).trim();
-        if name.is_empty() {
-            eprintln!("Usage: .restore <name> [--replace]");
-            return Ok(false);
-        }
-        let response = client.operation(
-            BACKUP_RESTORE,
-            serde_json::json!({"name": name, "replace": replace}),
-        )?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&response.data).map_err(CliError::RenderJson)?
-        );
+    if let Some(operation) = query.strip_prefix('.') {
+        let (name, payload) = parse_operation_command(operation)?;
+        let response = match client.operation(name, payload.clone()) {
+            Ok(response) => response,
+            Err(CliError::ConnectionClosed) => {
+                *client = Client::connect(configuration)?;
+                client.operation(name, payload)?
+            }
+            Err(error) => return Err(error),
+        };
+        render_operation_data(&response.data, configuration.output)?;
         return Ok(false);
     }
 
@@ -377,6 +282,37 @@ fn handle_repl_line(
     }
 
     Ok(false)
+}
+
+fn parse_operation_command(input: &str) -> Result<(&str, Value), CliError> {
+    let input = input.trim();
+    let split_at = input.find(char::is_whitespace).unwrap_or(input.len());
+    let name = input[..split_at].trim();
+    if name.is_empty() {
+        return Err(CliError::MissingOperationName);
+    }
+
+    let payload = input[split_at..].trim();
+    if payload.is_empty() {
+        return Ok((name, serde_json::json!({})));
+    }
+
+    let payload = serde_json::from_str(payload).map_err(CliError::OperationPayloadJson)?;
+    Ok((name, payload))
+}
+
+fn render_operation_data(data: &Value, output: OutputMode) -> Result<(), CliError> {
+    match output {
+        OutputMode::Pretty => println!(
+            "{}",
+            serde_json::to_string_pretty(data).map_err(CliError::RenderJson)?
+        ),
+        OutputMode::Compact | OutputMode::Quiet => println!(
+            "{}",
+            serde_json::to_string(data).map_err(CliError::RenderJson)?
+        ),
+    }
+    Ok(())
 }
 
 struct Client {
@@ -1157,10 +1093,11 @@ ENVIRONMENT:
     OGCLI_IDENTITY_PASSWORD_FILE
     OGCLI_IDENTITY_PASSWORD
 
-REPL COMMANDS:
-    .help                     Show REPL commands
-    .reconnect                Reconnect to the daemon
-    .quit, .exit              Exit the REPL
+REPL:
+    .OPERATION [JSON]         Execute any Core operation; JSON defaults to {{}}
+    help                      Show REPL help
+    reconnect                 Reconnect to the daemon
+    quit, exit                Exit the REPL
 "
     );
 }
@@ -1168,26 +1105,30 @@ REPL COMMANDS:
 fn print_repl_help() {
     println!(
         "\
-REPL commands:
-    .help         Show this help
-    .reconnect    Reconnect to the daemon
-    .collections [stats]
-    .storage stats
-    .backup create NAME
-    .backup inspect NAME
-    .restore NAME [--replace]
-    .quit         Exit
-    .exit         Exit
+REPL:
+    .OPERATION [JSON]  Execute any Core operation
+                       JSON payload defaults to {{}}
+
+Examples:
+    .ping
+    .place.list
+    .file.sync.status
+    .file.sync.config.set {{\"root\":\"/tmp/openglacier-sync-test\"}}
+
+Local commands:
+    help               Show this help
+    reconnect          Reconnect to the daemon
+    quit, exit         Exit
 
 Editing:
-    Up / Down     Previous / next history entry
-    Left / Right  Move within the current query
-    Home / End    Move to start / end
-    Ctrl-A / E    Move to start / end
-    Ctrl-C        Cancel the current line
-    Ctrl-D        Exit when the line is empty
+    Up / Down          Previous / next history entry
+    Left / Right       Move within the current query
+    Home / End         Move to start / end
+    Ctrl-A / E         Move to start / end
+    Ctrl-C             Cancel the current line
+    Ctrl-D             Exit when the line is empty
 
-Any other non-empty line is sent as a query."
+Any non-empty line not starting with '.' is sent as a query."
     );
 }
 
@@ -1204,8 +1145,10 @@ enum CliError {
     IdentityPasswordMismatch,
     PasswordPrompt(io::Error),
     OperationDecode(rmp_serde::decode::Error),
+    OperationPayloadJson(serde_json::Error),
     OperationIdDecode(serde_json::Error),
     InvalidOperationResponseId,
+    MissingOperationName,
     OperationRejected {
         code: String,
         message: String,
@@ -1272,8 +1215,10 @@ impl Display for CliError {
             Self::PasswordPrompt(source) => write!(formatter, "cannot read identity password: {source}"),
             Self::Base64(source) => write!(formatter, "invalid base64 identity data: {source}"),
             Self::OperationDecode(source) => write!(formatter, "cannot decode protocol response: {source}"),
+            Self::OperationPayloadJson(source) => write!(formatter, "invalid operation JSON payload: {source}"),
             Self::OperationIdDecode(source) => write!(formatter, "cannot decode response identifier: {source}"),
             Self::InvalidOperationResponseId => formatter.write_str("protocol response has no identifier"),
+            Self::MissingOperationName => formatter.write_str("missing operation name after `.`"),
             Self::OperationRejected { code, message } => {
                 write!(formatter, "{code}: {message}")
             }
@@ -1354,6 +1299,7 @@ impl Error for CliError {
             Self::PasswordPrompt(source) => Some(source),
             Self::Base64(source) => Some(source),
             Self::OperationDecode(source) => Some(source),
+            Self::OperationPayloadJson(source) => Some(source),
             Self::OperationIdDecode(source) => Some(source),
             Self::Environment { source, .. } => Some(source),
             Self::InvalidPort { source, .. } => Some(source),
@@ -1371,6 +1317,7 @@ impl Error for CliError {
             Self::RenderJson(source) => Some(source),
             Self::OperationRejected { .. }
             | Self::InvalidOperationResponseId
+            | Self::MissingOperationName
             | Self::InvalidAuthResponse
             | Self::IdentityRequired
             | Self::IdentityPasswordRequired
@@ -1451,6 +1398,35 @@ mod tests {
             Action::Execute(query) => assert_eq!(query, ".storage stats"),
             _ => panic!("expected execute action"),
         }
+    }
+
+    #[test]
+    fn parses_generic_operation_without_payload() {
+        let (name, payload) =
+            parse_operation_command("file.sync.status").expect("operation parses");
+        assert_eq!(name, "file.sync.status");
+        assert_eq!(payload, serde_json::json!({}));
+    }
+
+    #[test]
+    fn parses_generic_operation_with_payload() {
+        let (name, payload) = parse_operation_command(
+            r#"file.sync.config.set {"root":"/tmp/openglacier-sync-test"}"#,
+        )
+        .expect("operation parses");
+        assert_eq!(name, "file.sync.config.set");
+        assert_eq!(
+            payload,
+            serde_json::json!({"root": "/tmp/openglacier-sync-test"})
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_generic_operation_payload() {
+        assert!(matches!(
+            parse_operation_command("file.sync.config.set {"),
+            Err(CliError::OperationPayloadJson(_))
+        ));
     }
 
     #[test]

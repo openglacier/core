@@ -147,6 +147,56 @@ pub enum ExecutionMode {
     File,
 }
 
+/// Wire payload shape declared by Core.
+///
+/// Gateway and other transports must select their forwarding primitive from
+/// this value rather than special-casing operation names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// One framed request followed by one framed response.
+    Message,
+    /// One framed request followed by zero or more correlated framed responses.
+    MessageStream,
+    /// Framed request/header followed by a binary payload sent to Core.
+    BinaryIn,
+    /// Framed request/header followed by a binary payload emitted by Core.
+    BinaryOut,
+}
+
+impl TransportKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::MessageStream => "message-stream",
+            Self::BinaryIn => "binary-in",
+            Self::BinaryOut => "binary-out",
+        }
+    }
+}
+
+/// Channel-use constraint declared by Core.
+///
+/// Core expresses the correctness constraint; Gateway remains free to realize
+/// it using a direct channel, a pool, or multiplexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionKind {
+    Shared,
+    Exclusive,
+    Persistent,
+}
+
+impl ConnectionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Exclusive => "exclusive",
+            Self::Persistent => "persistent",
+        }
+    }
+}
+
 /// Where the authoritative state for an operation lives.
 ///
 /// `Authority` operations execute locally on a standalone/master Core and are
@@ -200,10 +250,12 @@ pub struct OperationDescriptor {
     pub access: AccessPolicy,
     pub execution: ExecutionMode,
     pub handler: HandlerKind,
+    pub transport: TransportKind,
+    pub connection: ConnectionKind,
 }
 
 macro_rules! define_operations {
-    ($($constant:ident => $kind:ident, $name:literal, $access:expr, $execution:expr, $handler:expr, $payload:ty;)+) => {
+    ($($constant:ident => $kind:ident, $name:literal, $access:expr, $execution:expr, $handler:expr, $transport:expr, $connection:expr, $payload:ty;)+) => {
         $(pub const $constant: &str = $name;)+
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -228,6 +280,12 @@ macro_rules! define_operations {
 
             #[must_use]
             pub const fn handler(self) -> HandlerKind { self.descriptor().handler }
+
+            #[must_use]
+            pub const fn transport(self) -> TransportKind { self.descriptor().transport }
+
+            #[must_use]
+            pub const fn connection(self) -> ConnectionKind { self.descriptor().connection }
 
             /// Returns where the authoritative state for this operation lives.
             ///
@@ -278,7 +336,13 @@ macro_rules! define_operations {
 
         $(#[allow(non_upper_case_globals)]
         const $kind: OperationDescriptor = OperationDescriptor {
-            kind: OperationKind::$kind, name: $name, access: $access, execution: $execution, handler: $handler,
+            kind: OperationKind::$kind,
+            name: $name,
+            access: $access,
+            execution: $execution,
+            handler: $handler,
+            transport: $transport,
+            connection: $connection,
         };)+
 
         pub const OPERATION_CATALOG: &[OperationDescriptor] = &[$($kind,)+];
@@ -367,26 +431,49 @@ mod tests {
     }
 
     #[test]
-    fn execution_modes_match_handler_domains() {
+    fn transport_contract_is_independent_from_handler_domain() {
+        assert_eq!(OperationKind::FileSyncRun.handler(), HandlerKind::File);
+        assert_eq!(
+            OperationKind::FileSyncRun.transport(),
+            TransportKind::Message
+        );
+        assert_eq!(OperationKind::FileRead.handler(), HandlerKind::File);
+        assert_eq!(
+            OperationKind::FileRead.transport(),
+            TransportKind::BinaryOut
+        );
+        assert_eq!(
+            OperationKind::FileWrite.transport(),
+            TransportKind::BinaryIn
+        );
+        assert_eq!(
+            OperationKind::FileVersionRead.transport(),
+            TransportKind::BinaryOut
+        );
+        assert_eq!(
+            OperationKind::DataWorkerRun.transport(),
+            TransportKind::BinaryIn
+        );
+        assert_eq!(
+            OperationKind::QueryExecute.transport(),
+            TransportKind::MessageStream
+        );
+    }
+
+    #[test]
+    fn binary_transports_require_exclusive_channels() {
         for operation in OPERATION_CATALOG {
-            let compatible = match operation.execution {
-                ExecutionMode::Query => operation.handler == HandlerKind::Query,
-                ExecutionMode::Authentication => operation.handler == HandlerKind::Authentication,
-                ExecutionMode::Subscription => operation.handler == HandlerKind::Subscription,
-                ExecutionMode::File => operation.handler == HandlerKind::File,
-                ExecutionMode::Standard => !matches!(
-                    operation.handler,
-                    HandlerKind::Query
-                        | HandlerKind::Authentication
-                        | HandlerKind::Subscription
-                        | HandlerKind::File
-                ),
-            };
-            assert!(
-                compatible,
-                "incompatible execution/handler for {}",
-                operation.name
-            );
+            if matches!(
+                operation.transport,
+                TransportKind::BinaryIn | TransportKind::BinaryOut
+            ) {
+                assert_eq!(
+                    operation.connection,
+                    ConnectionKind::Exclusive,
+                    "binary operation {} must use an exclusive channel",
+                    operation.name
+                );
+            }
         }
     }
 }

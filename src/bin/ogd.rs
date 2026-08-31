@@ -2,7 +2,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
     env, thread, fs, error::Error, fmt::{self, Display, Formatter}, io::{self, BufReader, Read, Write},
-    net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::HashMap, sync::{ atomic::{AtomicU64, Ordering}, Arc, Mutex },
+    net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::{HashMap, HashSet}, sync::{ atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex },
     time::{Duration, Instant},
 };
 use og_core::access::{
@@ -21,18 +21,19 @@ use og_core::access::{
 use og_core::{
     debug::{self, DebugTopic},
     helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, unix_time_millis},
-    engine::Engine, files::{FileEntry, FileId, FileRange, FileStore, FileStoreEntry, FileStoreError, FileWrite, NativeFileStore, StoreId}, Principal, backup,
+    engine::Engine, files::{FileEntry, FileId, FileRange, FileStore, FileStoreEntry, FileStoreError, FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelectionMode, FileWrite, NativeFileStore, StoreId, APP_FILES_DIRECTORY, PRIMARY_APPS_COLLISION_NAME, file_sync_projection_component, file_sync_projection_suffix}, Principal, backup,
     event_engine::{EventEngine, EventSubscription},
     memory::{MemoryClass, MemoryGovernor, MemoryProfileConfig, WorkloadClass},
     operation::{
         decode_operation_request, AccessPolicy, ExecutionMode, ServiceCapability, ServiceCapabilities, AppCreateInput, AuthBeginInput, AuthEnrollBeginInput, ClassicAuthLoginInput, ClassicAuthRegisterInput, ChallengeSignatureInput, DeviceRegisterInput, DeviceRenameInput, DeviceRevokeInput, EventsSubscribeInput, IdentityOpenInput, IdentityRegisterInput, IdentityRenewInput, PasswordInput, QueryExecuteInput, QueryContextResolveInput, AppDeleteInput, AppIdInput,
         AppInstanceCreateInput, AppInstanceRemoveInput, AppUpdateInput, DataAnalyzeInput, DataImportInput, DataWorkerRunInput, DataMappingSaveInput, Audience, BackupNameInput,
         CollectionsListInput, FileEntryInput, FileListInput, FileMkdirInput, FileMoveInput,
-        FileReadInput, FileScopeInput, FileVersionInput, FileVersionReadInput, FileWriteInput,
+        FileReadInput, FileScopeInput, FileSyncConfigSetInput, FileSyncSelectionRemoveInput,
+        FileSyncSelectionSetInput, FileVersionInput, FileVersionReadInput, FileWriteInput,
         BackupRestoreInput, HandlerKind, OperationKind, OperationRequest, OperationResponse, OperationRouter, OperationScope, PermissionGrantInput,
         PermissionRevokeInput, PlaceAccessRemoveInput, PlaceAccessSetInput, PlaceCreateInput, PlacePublicSetInput,
         PlaceDeleteInput, PlaceIdInput, PlaceUpdateInput, PlaceResourceSetInput, PlaceResourceRemoveInput, Routed, RoutedOperation, SharingCreateInput,
-        SharingDeleteInput, SharingUpdateInput,
+        SharingDeleteInput, SharingUpdateInput, OPERATION_CATALOG,
     },
     protocol::{
         encode_message, ensure_payload_size, MessageKind, ProtocolError, QueryRequest,
@@ -51,6 +52,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use serde::{ ser::{Error as SerializeError, SerializeMap, SerializeSeq}, Deserialize, Serialize, Serializer, };
 use serde_json::Value as JsonValue;
 use tungstenite::{connect as websocket_connect, Message as WebSocketMessage, WebSocket, stream::MaybeTlsStream};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:7878";
 const DEFAULT_NODE_CAPABILITIES: &str = "auth,database,files,events";
@@ -153,6 +155,9 @@ fn run() -> Result<(), DaemonError> {
         if gateway_endpoint.is_some() {
             if let Some(credential) = node_credential.as_ref() {
                 ensure_node_device_credential(&engine, credential)?;
+                if configuration.node_capabilities.contains(ServiceCapability::Events) {
+                    ensure_node_events_permission(&engine, credential);
+                }
             }
         } else {
             bootstrap_admin_if_needed(&engine, &configuration)?;
@@ -190,12 +195,18 @@ fn run() -> Result<(), DaemonError> {
         storage_backend: configuration.storage_backend,
         glacier_storage,
         files_path: configuration.files_path.clone(),
+        file_sync: Mutex::new(load_file_sync_runtime(&configuration)?),
+        file_sync_run: Mutex::new(()),
+        file_sync_applying: Arc::new(AtomicBool::new(false)),
+        file_sync_watcher_dirty: Arc::new(AtomicBool::new(false)),
         service_capabilities: configuration.node_capabilities,
         upstream: gateway_endpoint.as_ref().map(|_| configuration.bind_address.clone()),
         upstream_client_endpoint: gateway_client_endpoint(&configuration.bind_address),
         upstream_identity: node_credential.clone(),
         gateway_state: Mutex::new(if gateway_endpoint.is_some() { "connecting" } else { "standalone" }),
     });
+    let _file_sync_worker = start_file_sync_worker(Arc::clone(&connection_settings), Arc::clone(&engine), Arc::clone(&event_engine));
+    let _upstream_event_relay = start_upstream_event_relay(Arc::clone(&connection_settings), Arc::clone(&event_engine));
     let with_engine = configuration.storage_backend.as_str();
     let with_storage_path = match configuration.storage_backend { StorageBackend::Memory => "virtual".to_owned(), StorageBackend::Glacier => configuration.storage_path.display().to_string(), };
     let with_modules = match configuration.storage_backend {
@@ -466,8 +477,15 @@ fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &Operati
     }
 }
 
-fn connect_authenticated_gateway_client(endpoint: &str, credential: &IdentityCredential) -> Result<NodeWebSocket, String> {
+fn connect_authenticated_gateway_client(
+    endpoint: &str,
+    credential: &IdentityCredential,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<NodeWebSocket, String> {
     let (mut websocket, _) = websocket_connect(endpoint).map_err(|error| error.to_string())?;
+    configure_websocket_timeouts(&mut websocket, read_timeout, write_timeout)
+        .map_err(|error| format!("cannot configure Gateway client timeouts: {error}"))?;
 
     // The Gateway attaches a dedicated Core connection before it emits gateway.ready.
     // Waiting for that event keeps the node-side client independent from Gateway startup races.
@@ -549,9 +567,17 @@ fn forward_authority_operation(
 
     let endpoint = settings.upstream_client_endpoint.as_deref().expect("checked above");
     debug::log(DebugTopic::Gateway, None, format!("forward authority op={} endpoint={endpoint}", request.op));
-    match connect_authenticated_gateway_client(endpoint, credential)
-        .and_then(|mut websocket| gateway_response_for_request(&mut websocket, request))
-    {
+    match connect_authenticated_gateway_client(
+        endpoint,
+        credential,
+        settings.read_timeout,
+        settings.write_timeout,
+    )
+    .and_then(|mut websocket| {
+        let response = gateway_response_for_request(&mut websocket, request);
+        let _ = websocket.close(None);
+        response
+    }) {
         Ok(response) => {
             write_json_wire_response(writer, &response)?;
             Ok(true)
@@ -565,6 +591,25 @@ fn forward_authority_operation(
             write_response(writer, &response)?;
             Ok(true)
         }
+    }
+}
+
+fn configure_websocket_timeouts(
+    websocket: &mut NodeWebSocket,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> io::Result<()> {
+    match websocket.get_mut() {
+        MaybeTlsStream::Plain(stream) => {
+            stream.set_read_timeout(Some(read_timeout))?;
+            stream.set_write_timeout(Some(write_timeout))
+        }
+        MaybeTlsStream::NativeTls(stream) => {
+            let stream = stream.get_mut();
+            stream.set_read_timeout(Some(read_timeout))?;
+            stream.set_write_timeout(Some(write_timeout))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -623,6 +668,19 @@ fn run_gateway_node(
     settings: Arc<ConnectionSettings>,
 ) -> Result<(), DaemonError> {
     let capabilities = configuration.node_capabilities.names();
+    let operation_contracts = OPERATION_CATALOG
+        .iter()
+        .filter(|operation| configuration.node_capabilities.contains_all(operation.kind.required_capabilities()))
+        .map(|operation| {
+            (
+                operation.name.to_owned(),
+                serde_json::json!({
+                    "transport": operation.transport.as_str(),
+                    "connection": operation.connection.as_str(),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<String, JsonValue>>();
     loop {
         *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "connecting";
         debug::log(DebugTopic::Gateway, None, format!("connecting node fabric endpoint={endpoint}"));
@@ -658,6 +716,7 @@ fn run_gateway_node(
             "signature": signature,
             "nodeVersion": env!("CARGO_PKG_VERSION"),
             "capabilities": capabilities.clone(),
+            "operationContracts": operation_contracts.clone(),
             "role": configuration.node_role.clone(),
             "token": configuration.gateway_token.clone(),
         });
@@ -809,6 +868,37 @@ fn ensure_node_device_credential(engine: &Engine, credential: &IdentityCredentia
         ),
     );
     Ok(())
+}
+
+fn ensure_node_events_permission(engine: &Engine, credential: &IdentityCredential) {
+    let identity = query_string(&credential.identity_id);
+    let lookup = format!(
+        r#"on _permissions | where identityId == {identity} and state == "active" and effect == "allow" and (action == "events.subscribe" or action == "*") and (resource == "*") | limit 1"#
+    );
+    if matches!(execute_request(engine, QueryRequest::new(0, lookup)), QueryResponse::Ok { documents, .. } if !documents.is_empty()) {
+        return;
+    }
+
+    let query = enrollment_events_permission_query(&credential.identity_id, unix_time_millis());
+    if execute_request(engine, QueryRequest::new(0, query)).is_ok() {
+        debug::log(
+            DebugTopic::Auth,
+            None,
+            format!(
+                "grant local node identity={} action=events.subscribe resource=* source=node-bootstrap",
+                credential.identity_id
+            ),
+        );
+    } else {
+        debug::log(
+            DebugTopic::Auth,
+            None,
+            format!(
+                "cannot grant local node identity={} action=events.subscribe resource=*",
+                credential.identity_id
+            ),
+        );
+    }
 }
 
 fn bootstrap_admin_if_needed( engine: &Engine, configuration: &Configuration, ) -> Result<(), DaemonError> {
@@ -1789,6 +1879,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
     }}; }
     macro_rules! some_or_reject { ($id:expr,$value:expr,$code:expr,$message:expr)=>{{match $value{Some(value)=>value,None=>reject!($id,$code,$message)}}}; }
     macro_rules! file_store_or_reject { ($id:expr,$result:expr)=>{{match $result{Ok(value)=>value,Err(error)=>{write_file_store_error(&mut writer,$id,error)?;return Ok(true);}}}}; }
+    macro_rules! sync_runtime_or_reject { ($id:expr)=>{{match settings.file_sync.lock(){Ok(value)=>value,Err(_)=>reject!($id,"file.sync.state_poisoned","Files sync local state is unavailable")}}}; }
     match operation {
                             RoutedOperation::DataWorkerRun(Routed { id, input: DataWorkerRunInput { place_id, file_name, size, operation, mapping } }) => {
                             let delegated = delegation.is_some_and(|value| value.capability == "data.import" && value.place_id == place_id);
@@ -1857,12 +1948,23 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             let mut stored=file_store_or_reject!(id,file_store.write(target,&mut limited));
                             stored.metadata.content_type=content_type.clone().or_else(||existing.as_ref().and_then(|entry|entry.metadata.content_type.clone()));
                             let updated=match existing{
-                                Some(previous)=>FileEntry{file_id:previous.file_id,store_id:previous.store_id,remote_id:stored.remote_id,parent_id:previous.parent_id,name:previous.name,kind:stored.kind,metadata:stored.metadata,place_id,app_instance_id:instance_id},
+                                Some(previous)=>FileEntry{file_id:previous.file_id,store_id:previous.store_id,remote_id:stored.remote_id,parent_id:previous.parent_id,name:previous.name,kind:stored.kind,metadata:stored.metadata,place_id:place_id.clone(),app_instance_id:instance_id.clone()},
                                 None=>file_entry_from_store(&place_id,&instance_id,parent_id.as_deref(),stored),
                             };
                             let result=if file_id.is_some(){replace_file_entry(engine,id,&updated)}else{persist_file_entry(engine,id,&updated)};
                             match result{
-                                Ok(json)=>reply!(id, serde_json::json!({"file":json,"bytes":size,"stream":"raw"})),
+                                Ok(json)=>{
+                                    if let Ok(audience)=place_audience(engine,id,&place_id) {
+                                        let event_type=if file_id.is_some(){"file.updated"}else{"file.created"};
+                                        publish_durable_event(engine,audience,event_type,serde_json::json!({
+                                            "placeId":place_id,
+                                            "instanceId":instance_id,
+                                            "fileId":updated.file_id.as_str(),
+                                            "name":updated.name,
+                                        }));
+                                    }
+                                    reply!(id, serde_json::json!({"file":json,"bytes":size,"stream":"raw"}))
+                                },
                                 Err(response)=>{
                                     if file_id.is_none(){let _=file_store.delete(&updated.remote_id);}
                                     write_response(&mut writer,&response)?;
@@ -1903,7 +2005,14 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             let stored=file_store_or_reject!(id,current_store.write(FileWrite{remote_id:Some(&current.remote_id),parent_remote_id:None,name:&current.name,content_type,size},&mut source));
                             let updated=FileEntry{file_id:current.file_id,store_id:current.store_id,remote_id:stored.remote_id,parent_id:current.parent_id,name:current.name,kind:stored.kind,metadata:stored.metadata,place_id,app_instance_id:instance_id};
                             match replace_file_entry(engine,id,&updated){
-                                Ok(file)=>reply!(id, serde_json::json!({"file":file,"restoredVersionId":version_id})),
+                                Ok(file)=>{
+                                    if let Ok(audience)=place_audience(engine,id,&updated.place_id) {
+                                        publish_durable_event(engine,audience,"file.updated",serde_json::json!({
+                                            "placeId":updated.place_id,"instanceId":updated.app_instance_id,"fileId":updated.file_id.as_str(),"restoredVersionId":version_id,
+                                        }));
+                                    }
+                                    reply!(id, serde_json::json!({"file":file,"restoredVersionId":version_id}));
+                                }
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
                         }
@@ -1917,6 +2026,194 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Ok(())=>reply!(id, serde_json::json!({"deleted":true,"versionId":version_id})),
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
+                        }
+                            RoutedOperation::FileSyncConfigGet(Routed { id, .. }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync configuration is local to this node");
+                            }
+                            let runtime = sync_runtime_or_reject!(id);
+                            reply!(id, serde_json::json!({
+                                "configured": runtime.config.is_some(),
+                                "config": runtime.config.as_ref(),
+                                "projection": {
+                                    "appsDirectory": APP_FILES_DIRECTORY,
+                                    "primaryAppsCollisionDirectory": PRIMARY_APPS_COLLISION_NAME,
+                                }
+                            }));
+                        }
+                            RoutedOperation::FileSyncConfigSet(Routed { id, input: FileSyncConfigSetInput { root } }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync configuration is local to this node");
+                            }
+                            let root = PathBuf::from(root);
+                            if let Err(error) = fs::create_dir_all(&root) {
+                                reject!(id, "file.sync.root_unavailable", format!("cannot prepare Files sync root {}: {error}", root.display()));
+                            }
+                            let mut runtime = sync_runtime_or_reject!(id);
+                            let mut config = runtime.config.clone().unwrap_or_else(|| FileSyncConfig::new(root.clone()));
+                            let changed = config.root != root;
+                            config.root = root;
+                            if changed {
+                                config.local_baseline_required = true;
+                            }
+                            if let Err(error) = config.save(&runtime.config_path) {
+                                reject!(id, "file.sync.config_write_failed", format!("cannot persist Files sync configuration: {error}"));
+                            }
+                            runtime.config = Some(config.clone());
+                            file_sync_signal(&runtime, "config.changed");
+                            reply!(id, serde_json::json!({
+                                "configured": true,
+                                "rootChanged": changed,
+                                "config": config,
+                            }));
+                        }
+                            RoutedOperation::FileSyncSelectionSet(Routed { id, input: FileSyncSelectionSetInput { place_id, instance_id, all, folder_ids } }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync selection is local to this node");
+                            }
+                            let mut runtime = sync_runtime_or_reject!(id);
+                            let Some(mut config) = runtime.config.clone() else {
+                                reject!(id, "file.sync.not_configured", "configure a Files sync root before selecting folders");
+                            };
+                            let mode = if all { FileSyncSelectionMode::All } else { FileSyncSelectionMode::Selected };
+                            config.set_selection(place_id.clone(), instance_id.clone(), mode, folder_ids);
+                            if let Err(error) = config.save(&runtime.config_path) {
+                                reject!(id, "file.sync.config_write_failed", format!("cannot persist Files sync selection: {error}"));
+                            }
+                            let selection = config.selection(&place_id, &instance_id).cloned();
+                            runtime.config = Some(config);
+                            file_sync_signal(&runtime, "selection.changed");
+                            reply!(id, serde_json::json!({
+                                "placeId": place_id,
+                                "instanceId": instance_id,
+                                "selection": selection,
+                            }));
+                        }
+                            RoutedOperation::FileSyncSelectionRemove(Routed { id, input: FileSyncSelectionRemoveInput { place_id, instance_id } }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync selection is local to this node");
+                            }
+                            let mut runtime = sync_runtime_or_reject!(id);
+                            let Some(mut config) = runtime.config.clone() else {
+                                reject!(id, "file.sync.not_configured", "Files sync is not configured");
+                            };
+                            let existed = config.selection(&place_id, &instance_id).is_some();
+                            config.remove_selection(&place_id, &instance_id);
+                            if let Err(error) = config.save(&runtime.config_path) {
+                                reject!(id, "file.sync.config_write_failed", format!("cannot persist Files sync selection: {error}"));
+                            }
+                            runtime.config = Some(config);
+                            file_sync_signal(&runtime, "selection.removed");
+                            reply!(id, serde_json::json!({
+                                "placeId": place_id,
+                                "instanceId": instance_id,
+                                "removed": existed,
+                            }));
+                        }
+                            RoutedOperation::FileSyncStatus(Routed { id, .. }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync status is local to this node");
+                            }
+                            let runtime = sync_runtime_or_reject!(id);
+                            let index = match FileSyncIndex::load(&runtime.index_path) {
+                                Ok(Some(index)) => index,
+                                Ok(None) => FileSyncIndex::default(),
+                                Err(error) => {
+                                    reject!(id, "file.sync.index_read_failed", format!("cannot read Files sync index: {error}"));
+                                }
+                            };
+                            let mut synced = 0u64;
+                            let mut pending_upload = 0u64;
+                            let mut pending_download = 0u64;
+                            let mut conflicts = 0u64;
+                            let mut ignored = 0u64;
+                            let mut errors = 0u64;
+                            for entry in &index.entries {
+                                match entry.state {
+                                    FileSyncEntryState::Synced => synced += 1,
+                                    FileSyncEntryState::PendingUpload => pending_upload += 1,
+                                    FileSyncEntryState::PendingDownload => pending_download += 1,
+                                    FileSyncEntryState::Conflict => conflicts += 1,
+                                    FileSyncEntryState::Ignored => ignored += 1,
+                                    FileSyncEntryState::Error => errors += 1,
+                                }
+                            }
+                            reply!(id, serde_json::json!({
+                                "configured": runtime.config.is_some(),
+                                "root": runtime.config.as_ref().map(|config| &config.root),
+                                "selections": runtime.config.as_ref().map(|config| &config.selections).cloned().unwrap_or_default(),
+                                "worker": "continuous",
+                                "running": runtime.worker_running,
+                                "remoteEvents": runtime.remote_events.clone(),
+                                "localWatcher": runtime.local_watcher.clone(),
+                                "pending": runtime.worker_pending,
+                                "lastTrigger": runtime.last_trigger.clone(),
+                                "lastRunAt": runtime.last_run_at,
+                                "lastRunError": runtime.last_run_error.clone(),
+                                "entries": {
+                                    "total": index.entries.len(),
+                                    "synced": synced,
+                                    "pendingUpload": pending_upload,
+                                    "pendingDownload": pending_download,
+                                    "conflicts": conflicts,
+                                    "ignored": ignored,
+                                    "errors": errors,
+                                }
+                            }));
+                        }
+                            RoutedOperation::FileSyncRun(Routed { id, .. }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync execution is local to this node");
+                            }
+                            {
+                                let runtime = sync_runtime_or_reject!(id);
+                                if runtime.config.is_none() {
+                                    reject!(id, "file.sync.not_configured", "configure a Files sync root before running synchronization");
+                                }
+                            }
+                            let (sync_identity_id, sync_device_id) = match authentication.principal() {
+                                Principal::Identity { identity_id, device_id } => (identity_id.clone(), device_id.clone()),
+                                Principal::Anonymous => reject!(id, "authorization.denied", "Files sync requires an authenticated device"),
+                            };
+                            if let Some(credential) = settings.upstream_identity.as_ref() {
+                                if credential.identity_id != sync_identity_id || credential.device_id != sync_device_id {
+                                    reject!(id, "file.sync.node_identity_required", "Files sync must be run by the node Identity configured for this ogd");
+                                }
+                            }
+                            // Keep the explicit operation useful for diagnostics/manual forcing,
+                            // while sharing the exact same reconciler and serialization lock as the
+                            // continuous worker.
+                            match run_file_sync_once(settings, engine, &sync_identity_id, &sync_device_id) {
+                                Ok((run_at, summary)) => reply!(id, serde_json::json!({"completedAt": run_at, "summary": summary})),
+                                Err(error) => reject!(id, "file.sync.run_failed", error),
+                            }
+                        }
+                            RoutedOperation::FileSyncFolders(Routed { id, input: FileListInput { place_id, instance_id, parent_id } }) => {
+                            if delegation.is_some() {
+                                reject!(id, "file.sync.local_only", "Files sync folder discovery is local to this node");
+                            }
+                            let (sync_identity_id, sync_device_id) = match authentication.principal() {
+                                Principal::Identity { identity_id, device_id } => (identity_id.clone(), device_id.clone()),
+                                Principal::Anonymous => reject!(id, "authorization.denied", "Files sync folder discovery requires an authenticated device"),
+                            };
+                            if let Some(credential) = settings.upstream_identity.as_ref() {
+                                if credential.identity_id != sync_identity_id || credential.device_id != sync_device_id {
+                                    reject!(id, "file.sync.node_identity_required", "Files sync folder discovery must use the node Identity configured for this ogd");
+                                }
+                            }
+                            let mut source = match FileSyncSource::connect(settings, engine) {
+                                Ok(source) => source,
+                                Err(error) => reject!(id, "file.sync.source_unavailable", error),
+                            };
+                            let entries = match source.file_children(&place_id, &instance_id, parent_id.as_deref()) {
+                                Ok(entries) => entries,
+                                Err(error) => reject!(id, "file.sync.folder_list_failed", error),
+                            };
+                            let folders = entries.into_iter()
+                                .filter(|entry| entry.kind == og_core::files::FileKind::Directory)
+                                .map(|entry| file_entry_json(&entry))
+                                .collect::<Vec<_>>();
+                            reply!(id, JsonValue::Array(folders));
                         }
                             RoutedOperation::FileCapabilities(Routed { id, input: FileScopeInput { place_id, instance_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
@@ -1941,7 +2238,14 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Ok(stored)=>{
                                     let entry=file_entry_from_store(&place_id,&instance_id,parent_id.as_deref(),stored);
                                     match persist_file_entry(engine,id,&entry) {
-                                        Ok(json)=>reply!(id, json),
+                                        Ok(json)=>{
+                                            if let Ok(audience)=place_audience(engine,id,&place_id) {
+                                                publish_durable_event(engine,audience,"file.created",serde_json::json!({
+                                                    "placeId":place_id,"instanceId":instance_id,"fileId":entry.file_id.as_str(),"name":entry.name,
+                                                }));
+                                            }
+                                            reply!(id, json)
+                                        },
                                         Err(response)=>{ let _=file_store.delete(&entry.remote_id); write_response(&mut writer,&response)?; }
                                     }
                                 }
@@ -1960,6 +2264,11 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                         Ok(json)=>{
                                             if updated.kind == og_core::files::FileKind::Directory {
                                                 if let Err(r)=sync_moved_children(engine,id,&file_store,&place_id,&instance_id,&updated){write_response(&mut writer,&r)?;return Ok(true);}
+                                            }
+                                            if let Ok(audience)=place_audience(engine,id,&place_id) {
+                                                publish_durable_event(engine,audience,"file.moved",serde_json::json!({
+                                                    "placeId":place_id,"instanceId":instance_id,"fileId":updated.file_id.as_str(),"name":updated.name,
+                                                }));
                                             }
                                             reply!(id, json)
                                         }
@@ -2002,7 +2311,17 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                         }
                             RoutedOperation::FileDelete(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
-                            respond!(id, trash_file_entry(engine,settings,id,&place_id,&instance_id,&file_id), |file| serde_json::json!({"trashed":true,"file":file}));
+                            match trash_file_entry(engine,settings,id,&place_id,&instance_id,&file_id) {
+                                Ok(file)=>{
+                                    if let Ok(audience)=place_audience(engine,id,&place_id) {
+                                        publish_durable_event(engine,audience,"file.deleted",serde_json::json!({
+                                            "placeId":place_id,"instanceId":instance_id,"fileId":file_id,
+                                        }));
+                                    }
+                                    reply!(id, serde_json::json!({"trashed":true,"file":file}))
+                                }
+                                Err(response)=>write_response(&mut writer,&response)?,
+                            }
                         }
                             RoutedOperation::FileTrashList(Routed { id, input: FileScopeInput { place_id, instance_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
@@ -2010,7 +2329,17 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                         }
                             RoutedOperation::FileRestore(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
-                            respond!(id, restore_file_entry(engine,settings,id,&place_id,&instance_id,&file_id), |file| serde_json::json!({"restored":true,"file":file}));
+                            match restore_file_entry(engine,settings,id,&place_id,&instance_id,&file_id) {
+                                Ok(file) => {
+                                    if let Ok(audience)=place_audience(engine,id,&place_id) {
+                                        publish_durable_event(engine,audience,"file.restored",serde_json::json!({
+                                            "placeId":place_id,"instanceId":instance_id,"fileId":file_id,
+                                        }));
+                                    }
+                                    reply!(id, serde_json::json!({"restored":true,"file":file}));
+                                }
+                                Err(response)=>write_response(&mut writer,&response)?,
+                            }
                         }
                             RoutedOperation::FileDeletePermanent(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
@@ -2064,6 +2393,18 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             HandlerKind::Core => match operation {
                                 RoutedOperation::CoreHealth(Routed { id, .. }) => {
                                 reply!(id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), }),);
+                            }
+                                RoutedOperation::CoreOperations(Routed { id, .. }) => {
+                                let operations = OPERATION_CATALOG
+                                    .iter()
+                                    .filter(|operation| settings.service_capabilities.contains_all(operation.kind.required_capabilities()))
+                                    .map(|operation| serde_json::json!({
+                                        "name": operation.name,
+                                        "transport": operation.transport.as_str(),
+                                        "connection": operation.connection.as_str(),
+                                    }))
+                                    .collect::<Vec<_>>();
+                                reply!(id, serde_json::json!({ "operations": operations }),);
                             }
                                 RoutedOperation::NodeStatus(Routed { id, .. }) => {
                                 let state = *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2212,7 +2553,11 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     reject!(id, "backup.invalid_name", "backup name must be a simple file name");
                                 };
                                 match backup::restore(engine.storage(), &path, replace) {
-                                    Ok(summary) => reply!(id, serde_json::json!({"restored": true, "name": name, "collections": summary.collections, "documents": summary.documents}),),
+                                    Ok(summary) => {
+                                        let payload = serde_json::json!({"name": name, "replace": replace, "collections": summary.collections, "documents": summary.documents});
+                                        publish_durable_event(engine, Audience::Global, "backup.restored", payload);
+                                        reply!(id, serde_json::json!({"restored": true, "name": name, "collections": summary.collections, "documents": summary.documents}));
+                                    }
                                     Err(error) => write_response(
                                         &mut writer,
                                         &QueryResponse::request_error(
@@ -4943,6 +5288,8 @@ struct Configuration {
     storage_path: PathBuf,
     files_path: PathBuf,
     files_sync_root: Option<PathBuf>,
+    files_sync_config_path: PathBuf,
+    files_sync_index_path: PathBuf,
     import_metrics: bool,
     debug_query: bool,
     authorization_mode: AuthorizationMode,
@@ -4981,6 +5328,17 @@ impl Configuration {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        let sync_state_dir = storage_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("sync");
+        let files_sync_config_path = env::var("OGD_FILES_SYNC_CONFIG_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| sync_state_dir.join("files.json"));
+        let files_sync_index_path = env::var("OGD_FILES_SYNC_INDEX_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| sync_state_dir.join("files-index.json"));
         let import_metrics = boolean_from_environment("OGD_IMPORT_METRICS", false)?;
         let debug_query = boolean_from_environment("OGD_DEBUG_QUERY", false)?;
         let authorization_mode = if boolean_from_environment("OGD_AUTH_REQUIRED", false)? { AuthorizationMode::Enforced } else { AuthorizationMode::Permissive };
@@ -5041,6 +5399,8 @@ impl Configuration {
             storage_path,
             files_path,
             files_sync_root,
+            files_sync_config_path,
+            files_sync_index_path,
             import_metrics,
             debug_query,
             authorization_mode,
@@ -5078,6 +5438,1825 @@ impl Configuration {
             .map(|value| value.as_bytes().to_vec())
             .ok_or(DaemonError::BootstrapPasswordMissing)
     }
+}
+
+
+#[derive(Clone, Debug)]
+struct FileSyncAppProjection {
+    name: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug)]
+struct FileSyncInstanceProjection {
+    app_id: String,
+    name: String,
+}
+
+struct FileSyncSource<'a> {
+    settings: &'a ConnectionSettings,
+    engine: &'a Engine,
+    gateway: Option<NodeWebSocket>,
+    next_request_id: u64,
+}
+
+impl<'a> FileSyncSource<'a> {
+    fn connect(settings: &'a ConnectionSettings, engine: &'a Engine) -> Result<Self, String> {
+        let gateway = match settings.upstream_client_endpoint.as_deref() {
+            Some(endpoint) => {
+                let credential = settings.upstream_identity.as_ref()
+                    .ok_or_else(|| "Files sync needs the node Identity to read from the upstream Gateway".to_owned())?;
+                Some(connect_authenticated_gateway_client(
+                    endpoint,
+                    credential,
+                    settings.read_timeout,
+                    settings.write_timeout,
+                )?)
+            }
+            None => None,
+        };
+        Ok(Self { settings, engine, gateway, next_request_id: 10_000 })
+    }
+
+    fn next_request_id(&mut self) -> RequestId {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        RequestId::Number(id)
+    }
+
+    fn gateway_data(&mut self, op: &str, data: JsonValue) -> Result<JsonValue, String> {
+        let id = self.next_request_id();
+        let request = OperationRequest::new(id, op, data);
+        let websocket = self.gateway.as_mut().ok_or_else(|| "upstream Gateway is not connected".to_owned())?;
+        let response = gateway_response_for_request(websocket, &request)?;
+        if response.get("status").and_then(JsonValue::as_str) == Some("error") || response.get("error").is_some() {
+            let error = response.get("error").cloned().unwrap_or(JsonValue::Null);
+            return Err(format!("{op} failed upstream: {error}"));
+        }
+        response.get("data").cloned().ok_or_else(|| format!("{op} returned no data"))
+    }
+
+    fn place_name(&mut self, place_id: &str) -> Result<String, String> {
+        if self.gateway.is_some() {
+            let data = self.gateway_data("place.get", serde_json::json!({"placeId": place_id}))?;
+            let place = data.get("place").unwrap_or(&data);
+            return place.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| format!("Place {place_id} has no visible name"));
+        }
+        let id = self.next_request_id();
+        load_place(self.engine, id, place_id)
+            .map(|place| place.name)
+            .map_err(query_response_message)
+    }
+
+    fn place_has_sync_assignment(&mut self, place_id: &str, identity_id: &str, device_id: &str) -> Result<bool, String> {
+        let assignments = if self.gateway.is_some() {
+            self.gateway_data("place.resource.list", serde_json::json!({"placeId": place_id}))?
+                .get("assignments").and_then(JsonValue::as_array).cloned()
+                .ok_or_else(|| format!("place.resource.list returned no assignments for Place {place_id}"))?
+        } else {
+            let id = self.next_request_id();
+            load_place(self.engine, id, place_id).map_err(query_response_message)?.resource_assignments
+        };
+        Ok(assignments.iter().any(|entry| {
+            let entry_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str);
+            let entry_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
+            let capability = entry.get("capability").and_then(JsonValue::as_str);
+            let storage_role = resource_assignment_storage_role(entry);
+            entry_identity == Some(identity_id) && entry_device == Some(device_id) && capability == Some("files") && storage_role == Some("sync")
+        }))
+    }
+
+    fn sync_place_ids(&mut self, identity_id: &str, device_id: &str) -> Result<Vec<String>, String> {
+        if self.gateway.is_some() {
+            // place.list already carries the authoritative resourceAssignments.
+            // Resolve every sync-enabled Place in one round-trip instead of one
+            // place.resource.list request per Place on every reconciliation.
+            let places = self.gateway_data("place.list", serde_json::json!({}))?
+                .get("places").and_then(JsonValue::as_array).cloned()
+                .ok_or_else(|| "place.list returned no places array".to_owned())?;
+            let mut result = Vec::new();
+            for place in places {
+                let Some(place_id) = place.get("placeId").or_else(|| place.get("id")).and_then(JsonValue::as_str) else { continue; };
+                let assignments = place.get("resourceAssignments").and_then(JsonValue::as_array);
+                let sync = assignments.is_some_and(|assignments| assignments.iter().any(|entry| {
+                    let entry_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str);
+                    let entry_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
+                    let capability = entry.get("capability").and_then(JsonValue::as_str);
+                    let storage_role = resource_assignment_storage_role(entry);
+                    entry_identity == Some(identity_id)
+                        && entry_device == Some(device_id)
+                        && capability == Some("files")
+                        && storage_role == Some("sync")
+                }));
+                if sync { result.push(place_id.to_owned()); }
+            }
+            return Ok(result);
+        }
+
+        // Continuous sync is currently daemon-owned only for connected nodes.
+        // Keep standalone/manual behaviour scoped to explicit selections.
+        Ok(Vec::new())
+    }
+
+    fn apps(&mut self) -> Result<HashMap<String, FileSyncAppProjection>, String> {
+        let documents = if self.gateway.is_some() {
+            self.gateway_data("app.list", serde_json::json!({}))?
+                .get("apps").and_then(JsonValue::as_array).cloned()
+                .ok_or_else(|| "app.list returned no apps array".to_owned())?
+        } else {
+            let id = self.next_request_id();
+            match execute_request(self.engine, QueryRequest::new(id, "on _apps | where state == \"active\" | sort name")) {
+                QueryResponse::Ok { documents, .. } => documents,
+                response => return Err(query_response_message(response)),
+            }
+        };
+        let mut apps = HashMap::new();
+        for document in documents {
+            let Some(app_id) = document.get("appId").and_then(JsonValue::as_str) else { continue; };
+            let name = document.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty()).unwrap_or(app_id).to_owned();
+            let kind = file_sync_app_kind(&document).unwrap_or_default();
+            apps.insert(app_id.to_owned(), FileSyncAppProjection { name, kind });
+        }
+        Ok(apps)
+    }
+
+    fn instances(&mut self, place_id: &str) -> Result<HashMap<String, FileSyncInstanceProjection>, String> {
+        let documents = if self.gateway.is_some() {
+            self.gateway_data("app.instance.list", serde_json::json!({"placeId": place_id}))?
+                .get("instances").and_then(JsonValue::as_array).cloned()
+                .ok_or_else(|| format!("app.instance.list returned no instances array for Place {place_id}"))?
+        } else {
+            let id = self.next_request_id();
+            let query = format!("on _app_instances | where placeId == {} and state == \"active\" | sort createdAt", query_string(place_id));
+            match execute_request(self.engine, QueryRequest::new(id, query)) {
+                QueryResponse::Ok { documents, .. } => documents,
+                response => return Err(query_response_message(response)),
+            }
+        };
+        let mut instances = HashMap::new();
+        for document in documents {
+            let Some(instance_id) = document.get("instanceId").and_then(JsonValue::as_str) else { continue; };
+            let Some(app_id) = document.get("appId").and_then(JsonValue::as_str) else { continue; };
+            let name = document.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty()).unwrap_or("Main").to_owned();
+            instances.insert(instance_id.to_owned(), FileSyncInstanceProjection { app_id: app_id.to_owned(), name });
+        }
+        Ok(instances)
+    }
+
+    fn file_children(&mut self, place_id: &str, instance_id: &str, parent_id: Option<&str>) -> Result<Vec<FileEntry>, String> {
+        let documents = if self.gateway.is_some() {
+            let data = self.gateway_data("file.list", serde_json::json!({
+                "placeId": place_id,
+                "instanceId": instance_id,
+                "parentId": parent_id,
+            }))?;
+            data.as_array().cloned().ok_or_else(|| "file.list returned no file array".to_owned())?
+        } else {
+            let id = self.next_request_id();
+            list_file_entries(self.engine, id, place_id, instance_id, parent_id)
+                .map_err(query_response_message)?
+        };
+        documents.into_iter().map(|document| {
+            json_to_file_entry(&document).map_err(|message| message.to_owned())
+        }).collect()
+    }
+
+    fn file_tree(&mut self, place_id: &str, instance_id: &str) -> Result<Vec<FileEntry>, String> {
+        let mut entries = Vec::new();
+        let mut parents = vec![None::<String>];
+        while let Some(parent_id) = parents.pop() {
+            let children = self.file_children(place_id, instance_id, parent_id.as_deref())?;
+            for child in &children {
+                if child.kind == og_core::files::FileKind::Directory {
+                    parents.push(Some(child.file_id.as_str().to_owned()));
+                }
+            }
+            entries.extend(children);
+        }
+        Ok(entries)
+    }
+
+    fn read_file_to_path(&mut self, entry: &FileEntry, destination: &Path) -> Result<u64, String> {
+        if self.gateway.is_some() {
+            let id = self.next_request_id();
+            let request = OperationRequest::new(id, "file.read", serde_json::json!({
+                "placeId": entry.place_id,
+                "instanceId": entry.app_instance_id,
+                "fileId": entry.file_id.as_str(),
+                "offset": 0,
+            }));
+            let websocket = self.gateway.as_mut().expect("checked above");
+            return gateway_raw_read_to_path(websocket, &request, destination);
+        }
+        let id = self.next_request_id();
+        let store = scoped_native_file_store(self.settings, id, &entry.place_id, &entry.app_instance_id)
+            .map_err(query_response_message)?;
+        let mut reader = store.read(&entry.remote_id, None).map_err(|error| error.to_string())?;
+        atomic_sync_write(destination, &mut reader)
+    }
+
+    fn write_existing_from_path(&mut self, entry: &FileEntry, source_path: &Path) -> Result<FileEntry, String> {
+        let size = fs::metadata(source_path).map_err(|error| error.to_string())?.len();
+        if self.gateway.is_some() {
+            let id = self.next_request_id();
+            let request = OperationRequest::new(id, "file.write", serde_json::json!({
+                "placeId": entry.place_id,
+                "instanceId": entry.app_instance_id,
+                "fileId": entry.file_id.as_str(),
+                "size": size,
+            }));
+            let websocket = self.gateway.as_mut().expect("checked above");
+            let data = gateway_raw_write_from_path(websocket, &request, source_path)?;
+            let file = data.get("file").ok_or_else(|| "file.write returned no file metadata".to_owned())?;
+            return json_to_file_entry(file).map_err(str::to_owned);
+        }
+
+        let id = self.next_request_id();
+        archive_current_file(self.engine, self.settings, id, entry).map_err(query_response_message)?;
+        let store = scoped_native_file_store(self.settings, id, &entry.place_id, &entry.app_instance_id)
+            .map_err(query_response_message)?;
+        let mut input = fs::File::open(source_path).map_err(|error| error.to_string())?;
+        let stored = store.write(
+            FileWrite {
+                remote_id: Some(&entry.remote_id),
+                parent_remote_id: None,
+                name: &entry.name,
+                content_type: entry.metadata.content_type.as_deref(),
+                size: Some(size),
+            },
+            &mut input,
+        ).map_err(|error| error.to_string())?;
+        let updated = FileEntry {
+            file_id: entry.file_id.clone(),
+            store_id: entry.store_id.clone(),
+            remote_id: stored.remote_id,
+            parent_id: entry.parent_id.clone(),
+            name: entry.name.clone(),
+            kind: stored.kind,
+            metadata: stored.metadata,
+            place_id: entry.place_id.clone(),
+            app_instance_id: entry.app_instance_id.clone(),
+        };
+        replace_file_entry(self.engine, id, &updated).map_err(query_response_message)?;
+        self.publish_file_event(id, "file.updated", &updated);
+        Ok(updated)
+    }
+
+    fn create_file_from_path(&mut self, place_id: &str, instance_id: &str, parent_id: Option<&str>, name: &str, source_path: &Path) -> Result<FileEntry, String> {
+        let size = fs::metadata(source_path).map_err(|error| error.to_string())?.len();
+        if self.gateway.is_some() {
+            let id = self.next_request_id();
+            let request = OperationRequest::new(id, "file.write", serde_json::json!({
+                "placeId": place_id,
+                "instanceId": instance_id,
+                "parentId": parent_id,
+                "name": name,
+                "size": size,
+            }));
+            let websocket = self.gateway.as_mut().expect("checked above");
+            let data = gateway_raw_write_from_path(websocket, &request, source_path)?;
+            let file = data.get("file").ok_or_else(|| "file.write returned no file metadata".to_owned())?;
+            return json_to_file_entry(file).map_err(str::to_owned);
+        }
+
+        let id = self.next_request_id();
+        let store = scoped_native_file_store(self.settings, id, place_id, instance_id)
+            .map_err(query_response_message)?;
+        let parent_remote = parent_id
+            .map(|parent| load_file_entry(self.engine, id, place_id, instance_id, parent))
+            .transpose().map_err(query_response_message)?
+            .map(|entry| entry.remote_id);
+        let mut input = fs::File::open(source_path).map_err(|error| error.to_string())?;
+        let stored = store.write(FileWrite {
+            remote_id: None,
+            parent_remote_id: parent_remote.as_deref(),
+            name,
+            content_type: None,
+            size: Some(size),
+        }, &mut input).map_err(|error| error.to_string())?;
+        let entry = file_entry_from_store(place_id, instance_id, parent_id, stored);
+        persist_file_entry(self.engine, id, &entry).map_err(query_response_message)?;
+        self.publish_file_event(id, "file.created", &entry);
+        Ok(entry)
+    }
+
+    fn mkdir(&mut self, place_id: &str, instance_id: &str, parent_id: Option<&str>, name: &str) -> Result<FileEntry, String> {
+        if self.gateway.is_some() {
+            let data = self.gateway_data("file.mkdir", serde_json::json!({
+                "placeId": place_id,
+                "instanceId": instance_id,
+                "parentId": parent_id,
+                "name": name,
+            }))?;
+            return json_to_file_entry(&data).map_err(str::to_owned);
+        }
+
+        let id = self.next_request_id();
+        let store = scoped_native_file_store(self.settings, id, place_id, instance_id)
+            .map_err(query_response_message)?;
+        let parent_remote = parent_id
+            .map(|parent| load_file_entry(self.engine, id, place_id, instance_id, parent))
+            .transpose().map_err(query_response_message)?
+            .map(|entry| entry.remote_id);
+        let stored = store.mkdir(parent_remote.as_deref(), name).map_err(|error| error.to_string())?;
+        let entry = file_entry_from_store(place_id, instance_id, parent_id, stored);
+        persist_file_entry(self.engine, id, &entry).map_err(query_response_message)?;
+        self.publish_file_event(id, "file.created", &entry);
+        Ok(entry)
+    }
+
+    fn move_entry(&mut self, entry: &FileEntry, parent_id: Option<&str>, name: &str) -> Result<FileEntry, String> {
+        if self.gateway.is_some() {
+            let data = self.gateway_data("file.move", serde_json::json!({
+                "placeId": entry.place_id,
+                "instanceId": entry.app_instance_id,
+                "fileId": entry.file_id.as_str(),
+                "parentId": parent_id,
+                "name": name,
+            }))?;
+            return json_to_file_entry(&data).map_err(str::to_owned);
+        }
+
+        let id = self.next_request_id();
+        let store = scoped_native_file_store(self.settings, id, &entry.place_id, &entry.app_instance_id)
+            .map_err(query_response_message)?;
+        let parent_remote = parent_id
+            .map(|parent| load_file_entry(self.engine, id, &entry.place_id, &entry.app_instance_id, parent))
+            .transpose().map_err(query_response_message)?
+            .map(|parent| parent.remote_id);
+        let stored = store.move_entry(&entry.remote_id, parent_remote.as_deref(), name).map_err(|error| error.to_string())?;
+        let updated = FileEntry {
+            file_id: entry.file_id.clone(),
+            store_id: entry.store_id.clone(),
+            remote_id: stored.remote_id,
+            parent_id: parent_id.map(FileId::from),
+            name: stored.name,
+            kind: stored.kind,
+            metadata: stored.metadata,
+            place_id: entry.place_id.clone(),
+            app_instance_id: entry.app_instance_id.clone(),
+        };
+        replace_file_entry(self.engine, id, &updated).map_err(query_response_message)?;
+        if updated.kind == og_core::files::FileKind::Directory {
+            sync_moved_children(self.engine, id, &store, &entry.place_id, &entry.app_instance_id, &updated)
+                .map_err(query_response_message)?;
+        }
+        self.publish_file_event(id, "file.moved", &updated);
+        Ok(updated)
+    }
+
+    fn delete_entry(&mut self, entry: &FileEntry) -> Result<(), String> {
+        if self.gateway.is_some() {
+            self.gateway_data("file.delete", serde_json::json!({
+                "placeId": entry.place_id,
+                "instanceId": entry.app_instance_id,
+                "fileId": entry.file_id.as_str(),
+            }))?;
+            return Ok(());
+        }
+        let id = self.next_request_id();
+        trash_file_entry(self.engine, self.settings, id, &entry.place_id, &entry.app_instance_id, entry.file_id.as_str())
+            .map_err(query_response_message)?;
+        self.publish_file_event(id, "file.deleted", entry);
+        Ok(())
+    }
+
+    fn publish_file_event(&self, id: RequestId, event_type: &str, entry: &FileEntry) {
+        if let Ok(audience) = place_audience(self.engine, id, &entry.place_id) {
+            publish_durable_event(self.engine, audience, event_type, serde_json::json!({
+                "placeId": entry.place_id,
+                "instanceId": entry.app_instance_id,
+                "fileId": entry.file_id.as_str(),
+                "name": entry.name,
+            }));
+        }
+    }
+}
+
+impl Drop for FileSyncSource<'_> {
+    fn drop(&mut self) {
+        if let Some(mut websocket) = self.gateway.take() {
+            let _ = websocket.close(None);
+        }
+    }
+}
+
+fn file_sync_app_kind(document: &JsonValue) -> Option<String> {
+    if let Some(kind) = document.get("definition").and_then(|definition| definition.get("kind")).and_then(JsonValue::as_str) {
+        return Some(kind.to_owned());
+    }
+    if let Some(serialized) = document.get("definition").and_then(JsonValue::as_str) {
+        if let Ok(definition) = serde_json::from_str::<JsonValue>(serialized) {
+            return definition.get("kind").and_then(JsonValue::as_str).map(str::to_owned);
+        }
+    }
+    document.get("kind").and_then(JsonValue::as_str).map(str::to_owned)
+}
+
+fn query_response_message(response: QueryResponse) -> String {
+    match serde_json::to_string(&response) {
+        Ok(value) => value,
+        Err(_) => "OpenGlacier operation failed".to_owned(),
+    }
+}
+
+fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &OperationRequest, destination: &Path) -> Result<u64, String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
+    let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    write_gateway_message(websocket, &value)?;
+
+    let temporary = sync_temporary_path(destination);
+    let mut output: Option<fs::File> = None;
+    let mut expected = None::<u64>;
+    let mut received = 0u64;
+    loop {
+        let message = websocket.read().map_err(|error| error.to_string())?;
+        match message {
+            WebSocketMessage::Text(payload) => {
+                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
+                if message.get("kind").and_then(JsonValue::as_str) != Some("response") || message.get("id") != Some(&request_id) {
+                    continue;
+                }
+                if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(format!("file.read failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
+                }
+                if message.get("status").and_then(JsonValue::as_str) == Some("complete") {
+                    let Some(expected) = expected else { return Err("file.read completed without a raw header".to_owned()); };
+                    if received != expected {
+                        let _ = fs::remove_file(&temporary);
+                        return Err(format!("file.read ended after {received} of {expected} bytes"));
+                    }
+                    if let Some(mut file) = output.take() {
+                        file.flush().map_err(|error| error.to_string())?;
+                        file.sync_all().map_err(|error| error.to_string())?;
+                    } else {
+                        fs::File::create(&temporary).map_err(|error| error.to_string())?;
+                    }
+                    replace_sync_file(&temporary, destination)?;
+                    return Ok(received);
+                }
+                if message.get("data").and_then(|data| data.get("stream")).and_then(JsonValue::as_str) == Some("raw") {
+                    let bytes = message.get("data").and_then(|data| data.get("bytes")).and_then(JsonValue::as_u64)
+                        .ok_or_else(|| "file.read raw header has no byte count".to_owned())?;
+                    expected = Some(bytes);
+                    output = Some(fs::OpenOptions::new().write(true).create(true).truncate(true).open(&temporary).map_err(|error| error.to_string())?);
+                }
+            }
+            WebSocketMessage::Binary(payload) => {
+                let limit = expected.ok_or_else(|| "file.read sent binary data before its header".to_owned())?;
+                let next = received.saturating_add(payload.len() as u64);
+                if next > limit {
+                    let _ = fs::remove_file(&temporary);
+                    return Err("file.read sent more bytes than announced".to_owned());
+                }
+                let file = output.as_mut().ok_or_else(|| "file.read has no local output".to_owned())?;
+                file.write_all(&payload).map_err(|error| error.to_string())?;
+                received = next;
+            }
+            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
+            WebSocketMessage::Close(_) => {
+                let _ = fs::remove_file(&temporary);
+                return Err("gateway closed during file.read".to_owned());
+            }
+            _ => {}
+        }
+    }
+}
+
+
+fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &OperationRequest, source: &Path) -> Result<JsonValue, String> {
+    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
+    let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    write_gateway_message(websocket, &value)?;
+
+    let expected = fs::metadata(source).map_err(|error| error.to_string())?.len();
+    loop {
+        let message = websocket.read().map_err(|error| error.to_string())?;
+        match message {
+            WebSocketMessage::Text(payload) => {
+                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
+                if message.get("kind").and_then(JsonValue::as_str) != Some("response") || message.get("id") != Some(&request_id) {
+                    continue;
+                }
+                if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
+                    return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
+                }
+                let ready = message.get("data")
+                    .is_some_and(|data| data.get("stream").and_then(JsonValue::as_str) == Some("raw")
+                        && data.get("ready").and_then(JsonValue::as_bool) == Some(true));
+                if !ready {
+                    continue;
+                }
+                let announced = message.get("data").and_then(|data| data.get("bytes")).and_then(JsonValue::as_u64)
+                    .ok_or_else(|| "file.write raw header has no byte count".to_owned())?;
+                if announced != expected {
+                    return Err(format!("file.write expected {announced} bytes but local file has {expected}"));
+                }
+
+                let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
+                let mut buffer = vec![0u8; 64 * 1024];
+                loop {
+                    let count = input.read(&mut buffer).map_err(|error| error.to_string())?;
+                    if count == 0 { break; }
+                    websocket.send(WebSocketMessage::Binary(buffer[..count].to_vec().into()))
+                        .map_err(|error| error.to_string())?;
+                }
+                break;
+            }
+            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
+            WebSocketMessage::Close(_) => return Err("gateway closed before file.write became ready".to_owned()),
+            _ => {}
+        }
+    }
+
+    loop {
+        let message = websocket.read().map_err(|error| error.to_string())?;
+        match message {
+            WebSocketMessage::Text(payload) => {
+                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
+                if message.get("kind").and_then(JsonValue::as_str) != Some("response") || message.get("id") != Some(&request_id) {
+                    continue;
+                }
+                if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
+                    return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
+                }
+                if message.get("status").and_then(JsonValue::as_str) == Some("complete") {
+                    return message.get("data").cloned().ok_or_else(|| "file.write completed without data".to_owned());
+                }
+            }
+            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
+            WebSocketMessage::Close(_) => return Err("gateway closed during file.write".to_owned()),
+            _ => {}
+        }
+    }
+}
+
+fn atomic_sync_write(destination: &Path, source: &mut dyn Read) -> Result<u64, String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let temporary = sync_temporary_path(destination);
+    let mut output = fs::OpenOptions::new().write(true).create(true).truncate(true).open(&temporary).map_err(|error| error.to_string())?;
+    let copied = io::copy(source, &mut output).map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    output.sync_all().map_err(|error| error.to_string())?;
+    drop(output);
+    replace_sync_file(&temporary, destination)?;
+    Ok(copied)
+}
+
+fn sync_temporary_path(destination: &Path) -> PathBuf {
+    let name = destination.file_name().and_then(|value| value.to_str()).unwrap_or("file");
+    destination.with_file_name(format!(".{name}.ogsync-{}.part", std::process::id()))
+}
+
+fn replace_sync_file(temporary: &Path, destination: &Path) -> Result<(), String> {
+    if destination.exists() {
+        fs::remove_file(destination).map_err(|error| error.to_string())?;
+    }
+    fs::rename(temporary, destination).map_err(|error| error.to_string())
+}
+
+fn file_sync_local_metadata(path: &Path) -> Result<(Option<u64>, Option<u64>), String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let size = metadata.is_file().then_some(metadata.len());
+    let modified = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+    Ok((size, modified))
+}
+
+fn file_sync_local_matches(path: &Path, entry: &FileSyncIndexEntry) -> bool {
+    if entry.kind.as_deref() == Some("directory") {
+        return path.is_dir();
+    }
+    let Ok((size, modified)) = file_sync_local_metadata(path) else { return false; };
+    // Size + millisecond mtime is the hot-path change detector. The watcher is
+    // only a trigger and every mutation is reconciled against remote metadata,
+    // so re-reading hundreds of MiB just to prove a file is unchanged is both
+    // unnecessary and disastrous for large-file sync performance.
+    size == entry.local_size && modified == entry.local_modified_at
+}
+
+fn file_sync_local_fingerprint(path: &Path) -> Result<String, String> {
+    fn update(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("symbolic links are not supported by Files sync: {}", path.display()));
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    if metadata.is_file() {
+        // Move correlation must stay cheap for large files. Size + mtime is
+        // name-independent and avoids reading the file contents a second time.
+        update(&mut hash, b"F");
+        update(&mut hash, &metadata.len().to_le_bytes());
+    } else if metadata.is_dir() {
+        // Never recursively fingerprint directories: the scanner already walks
+        // every entry once, and recursive hashes make nested trees O(n²).
+        update(&mut hash, b"D");
+    } else {
+        return Err(format!("unsupported filesystem entry in Files sync: {}", path.display()));
+    }
+    let modified = metadata.modified().ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+    update(&mut hash, &modified.to_le_bytes());
+    Ok(format!("fnv1a64-meta:{hash:016x}"))
+}
+
+#[derive(Clone, Debug)]
+struct FileSyncLocalEntry {
+    kind: &'static str,
+    size: Option<u64>,
+    modified_at: Option<u64>,
+    fingerprint: String,
+}
+
+fn file_sync_scan_local_root(root: &Path, scan_root: &Path, output: &mut HashMap<PathBuf, FileSyncLocalEntry>) -> Result<(), String> {
+    if !scan_root.exists() { return Ok(()); }
+    let metadata = fs::symlink_metadata(scan_root).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("symbolic links are not supported by Files sync: {}", scan_root.display()));
+    }
+    if !metadata.is_dir() { return Ok(()); }
+    let mut pending = vec![scan_root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let mut children = fs::read_dir(&directory).map_err(|error| error.to_string())?
+            .collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let file_type = child.file_type().map_err(|error| error.to_string())?;
+            if file_type.is_symlink() {
+                return Err(format!("symbolic links are not supported by Files sync: {}", path.display()));
+            }
+            let relative_path = path.strip_prefix(root).map_err(|_| format!("sync path escaped configured root: {}", path.display()))?.to_path_buf();
+            let (size, modified_at) = file_sync_local_metadata(&path)?;
+            if file_type.is_dir() {
+                let fingerprint = file_sync_local_fingerprint(&path)?;
+                output.insert(relative_path, FileSyncLocalEntry { kind: "directory", size: None, modified_at, fingerprint });
+                pending.push(path);
+            } else if file_type.is_file() {
+                let fingerprint = file_sync_local_fingerprint(&path)?;
+                output.insert(relative_path, FileSyncLocalEntry { kind: "file", size, modified_at, fingerprint });
+            } else {
+                return Err(format!("unsupported filesystem entry in Files sync: {}", path.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn file_sync_mutable_ids(entries: &[FileEntry], selection: &og_core::files::FileSyncSelection) -> HashSet<String> {
+    if selection.mode == FileSyncSelectionMode::All {
+        return entries.iter().map(|entry| entry.file_id.as_str().to_owned()).collect();
+    }
+    let by_id: HashMap<String, &FileEntry> = entries.iter().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
+    let selected: HashSet<&str> = selection.folder_ids.iter().map(String::as_str).collect();
+    entries.iter().filter_map(|entry| {
+        let mut current = Some(entry.file_id.as_str());
+        let mut guard = 0usize;
+        while let Some(file_id) = current {
+            if selected.contains(file_id) { return Some(entry.file_id.as_str().to_owned()); }
+            guard = guard.saturating_add(1);
+            if guard > entries.len() { break; }
+            current = by_id.get(file_id).and_then(|value| value.parent_id.as_ref().map(|parent| parent.as_str()));
+        }
+        None
+    }).collect()
+}
+
+#[derive(Default)]
+struct FileSyncMutationSummary {
+    created: u64,
+    moved: u64,
+    deleted: u64,
+    conflicts: Vec<FileSyncIndexEntry>,
+    errors: Vec<JsonValue>,
+}
+
+fn file_sync_remote_unchanged(previous: &FileSyncIndexEntry, logical: &FileEntry) -> bool {
+    previous.remote_etag == logical.metadata.etag && previous.remote_modified_at == logical.metadata.modified_at
+}
+
+fn file_sync_local_name(path: &Path, kind: &str) -> Result<String, String> {
+    let name = path.file_name().and_then(|value| value.to_str()).filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Files sync path has no portable UTF-8 name: {}", path.display()))?;
+    let fallback = if kind == "directory" { "Folder" } else { "File" };
+    if file_sync_projection_component(name, fallback) != name {
+        return Err(format!("local name cannot be represented safely by Files sync: {name}"));
+    }
+    Ok(name.to_owned())
+}
+
+fn file_sync_reconcile_local_mutations(
+    source: &mut FileSyncSource<'_>,
+    root: &Path,
+    selection: &og_core::files::FileSyncSelection,
+    base: &Path,
+    primary_files: bool,
+    tree: &[FileEntry],
+    paths: &HashMap<String, PathBuf>,
+    index: &FileSyncIndex,
+) -> Result<FileSyncMutationSummary, String> {
+    let mutable_ids = file_sync_mutable_ids(tree, selection);
+    let by_id: HashMap<String, FileEntry> = tree.iter().cloned().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
+    let previous: HashMap<String, FileSyncIndexEntry> = index.entries.iter()
+        .filter(|entry| entry.place_id == selection.place_id && entry.app_instance_id == selection.app_instance_id && mutable_ids.contains(&entry.file_id))
+        .cloned().map(|entry| (entry.file_id.clone(), entry)).collect();
+
+    let mut local = HashMap::<PathBuf, FileSyncLocalEntry>::new();
+    if selection.mode == FileSyncSelectionMode::All {
+        file_sync_scan_local_root(root, &root.join(base), &mut local)?;
+        if primary_files {
+            let reserved = base.join(APP_FILES_DIRECTORY);
+            local.retain(|path, _| !path.starts_with(&reserved));
+        }
+    } else {
+        for folder_id in &selection.folder_ids {
+            if let Some(path) = paths.get(folder_id) {
+                file_sync_scan_local_root(root, &root.join(path), &mut local)?;
+                if let Some(directory) = root.join(path).strip_prefix(root).ok().map(Path::to_path_buf) {
+                    if root.join(path).is_dir() {
+                        let (size, modified_at) = file_sync_local_metadata(&root.join(path))?;
+                        local.entry(directory).or_insert(FileSyncLocalEntry {
+                            kind: "directory",
+                            size,
+                            modified_at,
+                            fingerprint: file_sync_local_fingerprint(&root.join(path))?,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let tracked_paths: HashSet<PathBuf> = previous.values().map(|entry| entry.materialized_path.clone()).collect();
+    let remote_paths: HashSet<PathBuf> = paths.values().cloned().collect();
+    let mut candidates: HashSet<PathBuf> = local.keys()
+        .filter(|path| !tracked_paths.contains(*path) && !remote_paths.contains(*path))
+        .cloned().collect();
+    let mut path_to_id: HashMap<PathBuf, String> = previous.values()
+        .filter(|entry| root.join(&entry.materialized_path).exists())
+        .map(|entry| (entry.materialized_path.clone(), entry.file_id.clone())).collect();
+    let mut handled_missing_prefixes = Vec::<PathBuf>::new();
+    let mut summary = FileSyncMutationSummary::default();
+
+    let mut missing: Vec<&FileSyncIndexEntry> = previous.values().filter(|entry| !root.join(&entry.materialized_path).exists()).collect();
+    missing.sort_by_key(|entry| entry.materialized_path.components().count());
+    for previous_entry in missing {
+        if handled_missing_prefixes.iter().any(|prefix| previous_entry.materialized_path.starts_with(prefix)) { continue; }
+        let Some(logical) = by_id.get(&previous_entry.file_id) else { continue; };
+        if paths.get(&previous_entry.file_id).is_some_and(|path| path != &previous_entry.materialized_path) {
+            // The logical object moved remotely. Remote projection wins here;
+            // materialization below will move the unchanged tracked local copy.
+            continue;
+        }
+        if !file_sync_remote_unchanged(previous_entry, logical) {
+            let mut conflict = previous_entry.clone();
+            conflict.state = FileSyncEntryState::Conflict;
+            conflict.last_error = Some("local entry disappeared while the remote entry changed".to_owned());
+            summary.conflicts.push(conflict);
+            handled_missing_prefixes.push(previous_entry.materialized_path.clone());
+            continue;
+        }
+
+        let expected_kind = previous_entry.kind.as_deref().unwrap_or(logical.kind.as_str());
+        let mut matches = candidates.iter().filter_map(|path| {
+            let candidate = local.get(path)?;
+            if candidate.kind != expected_kind { return None; }
+            let fingerprint_matches = previous_entry.local_fingerprint.as_ref()
+                .is_some_and(|value| value.starts_with("fnv1a64-meta:") && value == &candidate.fingerprint);
+            let legacy_file_match = expected_kind == "file"
+                && !previous_entry.local_fingerprint.as_deref().is_some_and(|value| value.starts_with("fnv1a64-meta:"))
+                && previous_entry.local_size == candidate.size && previous_entry.local_modified_at == candidate.modified_at;
+            (fingerprint_matches || legacy_file_match).then_some(path.clone())
+        }).collect::<Vec<_>>();
+        matches.sort();
+        if matches.len() == 1 {
+            let candidate_path = matches.remove(0);
+            let parent_path = candidate_path.parent().map(Path::to_path_buf).unwrap_or_default();
+            let parent_id = if parent_path == base { None } else { path_to_id.get(&parent_path).map(String::as_str) };
+            if parent_path != base && parent_id.is_none() {
+                let mut conflict = previous_entry.clone();
+                conflict.state = FileSyncEntryState::Conflict;
+                conflict.last_error = Some("local move targets a parent that is not synchronized".to_owned());
+                summary.conflicts.push(conflict);
+                continue;
+            }
+            let name = match file_sync_local_name(&candidate_path, expected_kind) {
+                Ok(name) => name,
+                Err(error) => {
+                    summary.errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"fileId":previous_entry.file_id,"error":error}));
+                    continue;
+                }
+            };
+            match source.move_entry(logical, parent_id, &name) {
+                Ok(_) => {
+                    summary.moved = summary.moved.saturating_add(1);
+                    candidates.remove(&candidate_path);
+                    path_to_id.remove(&previous_entry.materialized_path);
+                    path_to_id.insert(candidate_path.clone(), previous_entry.file_id.clone());
+                    if expected_kind == "directory" {
+                        handled_missing_prefixes.push(previous_entry.materialized_path.clone());
+                        let descendants = previous.values().filter(|entry| entry.materialized_path.starts_with(&previous_entry.materialized_path) && entry.file_id != previous_entry.file_id).cloned().collect::<Vec<_>>();
+                        for descendant in descendants {
+                            if let Ok(suffix) = descendant.materialized_path.strip_prefix(&previous_entry.materialized_path) {
+                                path_to_id.remove(&descendant.materialized_path);
+                                path_to_id.insert(candidate_path.join(suffix), descendant.file_id);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    summary.errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"fileId":previous_entry.file_id,"error":error}));
+                    continue;
+                }
+            }
+        }
+
+        if expected_kind == "directory"
+            && !previous_entry.local_fingerprint.as_deref().is_some_and(|value| value.starts_with("fnv1a64-meta:"))
+            && candidates.iter().any(|path| local.get(path).is_some_and(|entry| entry.kind == "directory")) {
+            let mut conflict = previous_entry.clone();
+            conflict.state = FileSyncEntryState::Conflict;
+            conflict.last_error = Some("directory disappeared but its previous fingerprint is unavailable; refusing destructive reconciliation".to_owned());
+            summary.conflicts.push(conflict);
+            handled_missing_prefixes.push(previous_entry.materialized_path.clone());
+            continue;
+        }
+
+        match source.delete_entry(logical) {
+            Ok(()) => {
+                summary.deleted = summary.deleted.saturating_add(1);
+                handled_missing_prefixes.push(previous_entry.materialized_path.clone());
+            }
+            Err(error) => summary.errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"fileId":previous_entry.file_id,"error":error})),
+        }
+    }
+
+    let mut new_paths: Vec<PathBuf> = candidates.into_iter().collect();
+    new_paths.sort_by_key(|path| path.components().count());
+    for path in new_paths {
+        let Some(candidate) = local.get(&path) else { continue; };
+        if tracked_paths.contains(&path) || path_to_id.contains_key(&path) { continue; }
+        let parent_path = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let parent_id = if parent_path == base { None } else { path_to_id.get(&parent_path).map(String::as_str) };
+        if parent_path != base && parent_id.is_none() { continue; }
+        let name = match file_sync_local_name(&path, candidate.kind) {
+            Ok(name) => name,
+            Err(error) => {
+                summary.errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"path":path,"error":error}));
+                continue;
+            }
+        };
+        let created = if candidate.kind == "directory" {
+            source.mkdir(&selection.place_id, &selection.app_instance_id, parent_id, &name)
+        } else {
+            source.create_file_from_path(&selection.place_id, &selection.app_instance_id, parent_id, &name, &root.join(&path))
+        };
+        match created {
+            Ok(entry) => {
+                summary.created = summary.created.saturating_add(1);
+                path_to_id.insert(path, entry.file_id.as_str().to_owned());
+            }
+            Err(error) => summary.errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"path":path,"error":error})),
+        }
+    }
+
+    Ok(summary)
+}
+
+fn file_sync_prune_empty_ancestors(mut path: Option<&Path>, root: &Path) {
+    while let Some(directory) = path {
+        if directory == root || !directory.starts_with(root) { break; }
+        match fs::remove_dir(directory) {
+            Ok(()) => path = directory.parent(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => path = directory.parent(),
+            Err(_) => break,
+        }
+    }
+}
+
+fn file_sync_entry_depth(entry: &FileEntry, by_id: &HashMap<String, FileEntry>) -> usize {
+    let mut depth = 0usize;
+    let mut current = entry.parent_id.as_ref().map(|value| value.as_str());
+    let mut guard = 0usize;
+    while let Some(parent_id) = current {
+        depth = depth.saturating_add(1);
+        guard = guard.saturating_add(1);
+        if guard > by_id.len() { break; }
+        current = by_id.get(parent_id).and_then(|parent| parent.parent_id.as_ref().map(|value| value.as_str()));
+    }
+    depth
+}
+
+fn file_sync_selected_ids(entries: &[FileEntry], selection: &og_core::files::FileSyncSelection) -> Result<HashSet<String>, String> {
+    if selection.mode == FileSyncSelectionMode::All {
+        return Ok(entries.iter().map(|entry| entry.file_id.as_str().to_owned()).collect());
+    }
+    let by_id: HashMap<String, &FileEntry> = entries.iter().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
+    for folder_id in &selection.folder_ids {
+        let folder = by_id.get(folder_id).ok_or_else(|| format!("selected Files folder {folder_id} no longer exists"))?;
+        if folder.kind != og_core::files::FileKind::Directory {
+            return Err(format!("selected Files object {folder_id} is not a directory"));
+        }
+    }
+
+    let selected: HashSet<&str> = selection.folder_ids.iter().map(String::as_str).collect();
+    let mut materialized = HashSet::new();
+    for entry in entries {
+        let mut current = Some(entry.file_id.as_str());
+        let mut included = false;
+        let mut guard = 0usize;
+        while let Some(file_id) = current {
+            if selected.contains(file_id) { included = true; break; }
+            guard = guard.saturating_add(1);
+            if guard > entries.len() { break; }
+            current = by_id.get(file_id).and_then(|value| value.parent_id.as_ref().map(|parent| parent.as_str()));
+        }
+        if included {
+            materialized.insert(entry.file_id.as_str().to_owned());
+        }
+    }
+    // Ancestor directories are materialized as containers so a selected nested
+    // folder keeps its natural path from the instance root.
+    for folder_id in &selection.folder_ids {
+        let mut current = by_id.get(folder_id).and_then(|entry| entry.parent_id.as_ref().map(|parent| parent.as_str()));
+        let mut guard = 0usize;
+        while let Some(file_id) = current {
+            materialized.insert(file_id.to_owned());
+            guard = guard.saturating_add(1);
+            if guard > entries.len() { break; }
+            current = by_id.get(file_id).and_then(|value| value.parent_id.as_ref().map(|parent| parent.as_str()));
+        }
+    }
+    Ok(materialized)
+}
+
+fn file_sync_reserve_component(base: &Path, desired: String, stable_id: &str, claimed: &mut HashMap<String, String>) -> String {
+    let candidate = base.join(&desired);
+    let key = candidate.to_string_lossy().to_lowercase();
+    match claimed.get(&key) {
+        None => { claimed.insert(key, stable_id.to_owned()); desired }
+        Some(existing) if existing == stable_id => desired,
+        Some(_) => {
+            let suffix = file_sync_projection_suffix(stable_id);
+            let disambiguated = format!("{desired} ({suffix})");
+            claimed.insert(base.join(&disambiguated).to_string_lossy().to_lowercase(), stable_id.to_owned());
+            disambiguated
+        }
+    }
+}
+
+fn file_sync_relative_paths(
+    entries: &[FileEntry],
+    included: &HashSet<String>,
+    base: &Path,
+    primary_files: bool,
+    claimed: &mut HashMap<String, String>,
+) -> HashMap<String, PathBuf> {
+    let by_id: HashMap<String, FileEntry> = entries.iter().cloned().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
+    let mut ordered: Vec<&FileEntry> = entries.iter().filter(|entry| included.contains(entry.file_id.as_str())).collect();
+    ordered.sort_by_key(|entry| file_sync_entry_depth(entry, &by_id));
+    let mut paths = HashMap::new();
+    for entry in ordered {
+        let parent = entry.parent_id.as_ref().and_then(|parent| paths.get(parent.as_str())).cloned().unwrap_or_else(|| base.to_path_buf());
+        let fallback = if entry.kind == og_core::files::FileKind::Directory { "Folder" } else { "File" };
+        let mut name = file_sync_projection_component(&entry.name, fallback);
+        if primary_files && entry.parent_id.is_none() && name.eq_ignore_ascii_case(APP_FILES_DIRECTORY) {
+            name = PRIMARY_APPS_COLLISION_NAME.to_owned();
+        }
+        let name = file_sync_reserve_component(&parent, name, entry.file_id.as_str(), claimed);
+        paths.insert(entry.file_id.as_str().to_owned(), parent.join(name));
+    }
+    paths
+}
+
+fn file_sync_rebase_index_paths(index: &mut FileSyncIndex, old_prefix: &Path, new_prefix: &Path) {
+    for entry in &mut index.entries {
+        if let Ok(suffix) = entry.materialized_path.strip_prefix(old_prefix) {
+            entry.materialized_path = new_prefix.join(suffix);
+        }
+    }
+}
+
+fn file_sync_materialize_entry(
+    source: &mut FileSyncSource<'_>,
+    root: &Path,
+    logical: &FileEntry,
+    relative_path: PathBuf,
+    index: &mut FileSyncIndex,
+) -> Result<(FileSyncIndexEntry, bool, bool), String> {
+    let key_matches = |entry: &&FileSyncIndexEntry| entry.place_id == logical.place_id && entry.app_instance_id == logical.app_instance_id && entry.file_id == logical.file_id.as_str();
+    let existing = index.entries.iter().find(key_matches).cloned();
+    let destination = root.join(&relative_path);
+    if let Some(previous) = existing.as_ref() {
+        if previous.materialized_path != relative_path {
+            let old_path = root.join(&previous.materialized_path);
+            if old_path.exists() && !destination.exists() && file_sync_local_matches(&old_path, previous) {
+                if let Some(parent) = destination.parent() { fs::create_dir_all(parent).map_err(|error| error.to_string())?; }
+                fs::rename(&old_path, &destination).map_err(|error| error.to_string())?;
+                file_sync_prune_empty_ancestors(old_path.parent(), root);
+                if logical.kind == og_core::files::FileKind::Directory {
+                    file_sync_rebase_index_paths(index, &previous.materialized_path, &relative_path);
+                }
+            }
+        }
+    }
+
+    if logical.kind == og_core::files::FileKind::Directory {
+        if destination.exists() && !destination.is_dir() {
+            return Ok((FileSyncIndexEntry {
+                place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
+                materialized_path: relative_path, kind: Some("directory".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+                local_size: None, local_modified_at: None, local_fingerprint: None, state: FileSyncEntryState::Conflict,
+                last_error: Some("a local file occupies the directory required by OpenGlacier".to_owned()),
+            }, false, false));
+        }
+        fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+        let (_, modified) = file_sync_local_metadata(&destination)?;
+        return Ok((FileSyncIndexEntry {
+            place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
+            materialized_path: relative_path, kind: Some("directory".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+            local_size: None, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced, last_error: None,
+        }, false, false));
+    }
+
+    if let Some(previous) = existing.as_ref() {
+        let tracked_path = root.join(&previous.materialized_path);
+        if tracked_path.exists() && !file_sync_local_matches(&tracked_path, previous) {
+            let remote_unchanged = previous.remote_etag == logical.metadata.etag
+                && previous.remote_modified_at == logical.metadata.modified_at;
+            if remote_unchanged {
+                let updated = source.write_existing_from_path(logical, &tracked_path)?;
+                let (size, modified) = file_sync_local_metadata(&tracked_path)?;
+                return Ok((FileSyncIndexEntry {
+                    place_id: updated.place_id.clone(), app_instance_id: updated.app_instance_id.clone(), file_id: updated.file_id.as_str().to_owned(),
+                    materialized_path: previous.materialized_path.clone(), kind: Some("file".to_owned()), remote_etag: updated.metadata.etag.clone(), remote_modified_at: updated.metadata.modified_at,
+                    local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced,
+                    last_error: None,
+                }, false, true));
+            }
+            return Ok((FileSyncIndexEntry {
+                place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
+                materialized_path: previous.materialized_path.clone(), kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+                local_size: previous.local_size, local_modified_at: previous.local_modified_at, local_fingerprint: previous.local_fingerprint.clone(), state: FileSyncEntryState::Conflict,
+                last_error: Some("local and remote content both changed since the last synchronization".to_owned()),
+            }, false, false));
+        }
+    } else if destination.exists() {
+        let (size, modified) = file_sync_local_metadata(&destination)?;
+        return Ok((FileSyncIndexEntry {
+            place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
+            materialized_path: relative_path, kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+            local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Conflict,
+            last_error: Some("an untracked local file already occupies this OpenGlacier path".to_owned()),
+        }, false, false));
+    }
+
+    let remote_unchanged = existing.as_ref().is_some_and(|previous| previous.remote_etag == logical.metadata.etag && previous.remote_modified_at == logical.metadata.modified_at);
+    if remote_unchanged && destination.exists() && existing.as_ref().is_some_and(|previous| file_sync_local_matches(&destination, previous)) {
+        let (size, modified) = file_sync_local_metadata(&destination)?;
+        return Ok((FileSyncIndexEntry {
+            place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
+            materialized_path: relative_path, kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+            local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced, last_error: None,
+        }, false, false));
+    }
+
+    let bytes = source.read_file_to_path(logical, &destination)?;
+    if logical.metadata.size.is_some_and(|expected| expected != bytes) {
+        return Err(format!("downloaded {bytes} bytes for {} but metadata announced {}", logical.file_id, logical.metadata.size.unwrap_or_default()));
+    }
+    let (size, modified) = file_sync_local_metadata(&destination)?;
+    Ok((FileSyncIndexEntry {
+        place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
+        materialized_path: relative_path, kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+        local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced, last_error: None,
+    }, true, false))
+}
+
+fn run_file_sync_materialization(settings: &ConnectionSettings, engine: &Engine, config: &FileSyncConfig, index: &mut FileSyncIndex, identity_id: &str, device_id: &str, allow_local_mutations: bool) -> Result<JsonValue, String> {
+    if !config.root.is_dir() {
+        return Err(format!(
+            "Files sync root {} is unavailable; refusing local deletions until the root is restored or reconfigured",
+            config.root.display()
+        ));
+    }
+    let mut source = FileSyncSource::connect(settings, engine)?;
+    let apps = source.apps()?;
+
+    // storageRole=sync is the Place-level switch. Folder selections are only
+    // overrides. A newly assigned sync Place therefore defaults to syncing all
+    // active App-instance file scopes, even before Desktop has saved a tree
+    // selection. This also guarantees that an empty Place directory is created.
+    let mut effective_selections = config.selections.clone();
+    let sync_places = source.sync_place_ids(identity_id, device_id)?;
+    let mut selected_places: HashSet<String> = sync_places.iter().cloned().collect();
+    selected_places.extend(config.selections.iter().map(|selection| selection.place_id.clone()));
+    let mut instance_cache = HashMap::<String, HashMap<String, FileSyncInstanceProjection>>::new();
+    for place_id in &sync_places {
+        let instances = source.instances(place_id)?;
+        for instance_id in instances.keys() {
+            if !effective_selections.iter().any(|selection| selection.place_id.as_str() == place_id.as_str() && selection.app_instance_id.as_str() == instance_id.as_str()) {
+                effective_selections.push(og_core::files::FileSyncSelection {
+                    place_id: place_id.clone(),
+                    app_instance_id: instance_id.clone(),
+                    mode: FileSyncSelectionMode::All,
+                    folder_ids: Vec::new(),
+                });
+            }
+        }
+        instance_cache.insert(place_id.clone(), instances);
+    }
+
+    let mut place_names = HashMap::new();
+    let mut place_name_counts = HashMap::<String, usize>::new();
+    for place_id in &selected_places {
+        let name = file_sync_projection_component(&source.place_name(place_id)?, "Place");
+        *place_name_counts.entry(name.to_lowercase()).or_insert(0) += 1;
+        place_names.insert(place_id.clone(), name);
+    }
+
+    let mut claimed = HashMap::<String, String>::new();
+    let mut seen = HashSet::<(String, String, String)>::new();
+    let mut next_entries = Vec::<FileSyncIndexEntry>::new();
+    let mut downloaded = 0u64;
+    let mut uploaded = 0u64;
+    let mut created = 0u64;
+    let mut moved = 0u64;
+    let mut deleted = 0u64;
+    let mut materialized = 0u64;
+    let mut conflicts = 0u64;
+    let mut errors = Vec::<JsonValue>::new();
+
+    for selection in &effective_selections {
+        if !source.place_has_sync_assignment(&selection.place_id, identity_id, device_id)? {
+            errors.push(serde_json::json!({
+                "placeId": selection.place_id,
+                "instanceId": selection.app_instance_id,
+                "error": "this device is not assigned files.storageRole=sync for the Place"
+            }));
+            continue;
+        }
+        let raw_place_name = place_names.get(&selection.place_id).cloned().unwrap_or_else(|| "Place".to_owned());
+        let place_name = if place_name_counts.get(&raw_place_name.to_lowercase()).copied().unwrap_or(0) > 1 {
+            format!("{} ({})", raw_place_name, file_sync_projection_suffix(&selection.place_id))
+        } else { raw_place_name };
+        let place_base = PathBuf::from(file_sync_reserve_component(Path::new(""), place_name, &format!("place:{}", selection.place_id), &mut claimed));
+        fs::create_dir_all(config.root.join(&place_base))
+            .map_err(|error| format!("cannot prepare sync Place directory {}: {error}", config.root.join(&place_base).display()))?;
+        let apps_namespace = place_base.join(APP_FILES_DIRECTORY);
+        claimed.entry(apps_namespace.to_string_lossy().to_lowercase()).or_insert_with(|| format!("apps:{}", selection.place_id));
+
+        if !instance_cache.contains_key(&selection.place_id) {
+            instance_cache.insert(selection.place_id.clone(), source.instances(&selection.place_id)?);
+        }
+        let instances = instance_cache.get(&selection.place_id).expect("inserted above");
+        let Some(instance) = instances.get(&selection.app_instance_id) else {
+            errors.push(serde_json::json!({"placeId": selection.place_id, "instanceId": selection.app_instance_id, "error": "selected App instance is not active"}));
+            continue;
+        };
+        let app = apps.get(&instance.app_id).cloned().unwrap_or(FileSyncAppProjection { name: instance.app_id.clone(), kind: String::new() });
+        let primary_files = app.kind == "system.files";
+        let base = if primary_files {
+            place_base.clone()
+        } else {
+            let app_name = file_sync_projection_component(&app.name, "App");
+            let app_dir = file_sync_reserve_component(&apps_namespace, app_name, &format!("app:{}", instance.app_id), &mut claimed);
+            let app_base = apps_namespace.join(app_dir);
+            let instance_name = file_sync_projection_component(&instance.name, "Main");
+            let instance_dir = file_sync_reserve_component(&app_base, instance_name, &format!("instance:{}", selection.app_instance_id), &mut claimed);
+            app_base.join(instance_dir)
+        };
+
+        let tree = match source.file_tree(&selection.place_id, &selection.app_instance_id) {
+            Ok(tree) => tree,
+            Err(error) => {
+                errors.push(serde_json::json!({"placeId": selection.place_id, "instanceId": selection.app_instance_id, "error": error}));
+                continue;
+            }
+        };
+        let included = match file_sync_selected_ids(&tree, selection) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(serde_json::json!({"placeId": selection.place_id, "instanceId": selection.app_instance_id, "error": error}));
+                continue;
+            }
+        };
+        let mut paths = file_sync_relative_paths(&tree, &included, &base, primary_files, &mut claimed);
+        let mutations = if allow_local_mutations {
+            match file_sync_reconcile_local_mutations(&mut source, &config.root, selection, &base, primary_files, &tree, &paths, index) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"error":error}));
+                    continue;
+                }
+            }
+        } else {
+            FileSyncMutationSummary::default()
+        };
+        created = created.saturating_add(mutations.created);
+        moved = moved.saturating_add(mutations.moved);
+        deleted = deleted.saturating_add(mutations.deleted);
+        errors.extend(mutations.errors);
+        let mut blocked_ids = HashSet::<String>::new();
+        if !mutations.conflicts.is_empty() {
+            let old_by_id: HashMap<String, FileEntry> = tree.iter().cloned().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
+            for conflict in mutations.conflicts {
+                blocked_ids.insert(conflict.file_id.clone());
+                if conflict.kind.as_deref() == Some("directory") {
+                    for candidate in &tree {
+                        let mut current = candidate.parent_id.as_ref().map(|value| value.as_str());
+                        let mut guard = 0usize;
+                        while let Some(parent_id) = current {
+                            if parent_id == conflict.file_id {
+                                blocked_ids.insert(candidate.file_id.as_str().to_owned());
+                                break;
+                            }
+                            guard = guard.saturating_add(1);
+                            if guard > tree.len() { break; }
+                            current = old_by_id.get(parent_id).and_then(|entry| entry.parent_id.as_ref().map(|value| value.as_str()));
+                        }
+                    }
+                }
+                seen.insert((conflict.place_id.clone(), conflict.app_instance_id.clone(), conflict.file_id.clone()));
+                conflicts = conflicts.saturating_add(1);
+                next_entries.push(conflict);
+            }
+        }
+
+        let changed_remote = mutations.created > 0 || mutations.moved > 0 || mutations.deleted > 0;
+        let tree = if changed_remote {
+            match source.file_tree(&selection.place_id, &selection.app_instance_id) {
+                Ok(value) => value,
+                Err(error) => {
+                    errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"error":error}));
+                    continue;
+                }
+            }
+        } else { tree };
+        let included = match file_sync_selected_ids(&tree, selection) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"error":error}));
+                continue;
+            }
+        };
+        paths = file_sync_relative_paths(&tree, &included, &base, primary_files, &mut claimed);
+        let by_id: HashMap<String, FileEntry> = tree.iter().cloned().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
+        let mut ordered: Vec<&FileEntry> = tree.iter().filter(|entry| included.contains(entry.file_id.as_str()) && !blocked_ids.contains(entry.file_id.as_str())).collect();
+        ordered.sort_by_key(|entry| file_sync_entry_depth(entry, &by_id));
+        for logical in ordered {
+            let Some(relative_path) = paths.get(logical.file_id.as_str()).cloned() else { continue; };
+            let key = (logical.place_id.clone(), logical.app_instance_id.clone(), logical.file_id.as_str().to_owned());
+            seen.insert(key.clone());
+            match file_sync_materialize_entry(&mut source, &config.root, logical, relative_path, index) {
+                Ok((entry, was_downloaded, was_uploaded)) => {
+                    materialized = materialized.saturating_add(1);
+                    if was_downloaded { downloaded = downloaded.saturating_add(1); }
+                    if was_uploaded { uploaded = uploaded.saturating_add(1); }
+                    if entry.state == FileSyncEntryState::Conflict { conflicts = conflicts.saturating_add(1); }
+                    next_entries.push(entry);
+                }
+                Err(error) => {
+                    errors.push(serde_json::json!({"placeId": logical.place_id, "instanceId": logical.app_instance_id, "fileId": logical.file_id.as_str(), "error": error}));
+                    next_entries.push(FileSyncIndexEntry {
+                        place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(), materialized_path: paths.get(logical.file_id.as_str()).cloned().unwrap_or_default(),
+                        kind: Some(logical.kind.as_str().to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
+                        local_size: None, local_modified_at: None, local_fingerprint: None, state: FileSyncEntryState::Error, last_error: Some(error),
+                    });
+                }
+            }
+        }
+    }
+
+    // Entries that are no longer selected are removed only when their local
+    // copy still matches the last synchronized state. Local modifications are
+    // retained as conflicts until bidirectional reconciliation exists.
+    let mut stale: Vec<FileSyncIndexEntry> = index.entries.iter().filter(|entry| {
+        !seen.contains(&(entry.place_id.clone(), entry.app_instance_id.clone(), entry.file_id.clone()))
+    }).cloned().collect();
+    stale.sort_by_key(|entry| std::cmp::Reverse(entry.materialized_path.components().count()));
+    for mut entry in stale {
+        let path = config.root.join(&entry.materialized_path);
+        if !path.exists() { continue; }
+        if entry.kind.as_deref() == Some("file") {
+            if file_sync_local_matches(&path, &entry) {
+                if let Err(error) = fs::remove_file(&path) {
+                    entry.state = FileSyncEntryState::Error; entry.last_error = Some(error.to_string()); next_entries.push(entry);
+                } else {
+                    file_sync_prune_empty_ancestors(path.parent(), &config.root);
+                }
+            } else {
+                entry.state = FileSyncEntryState::Conflict;
+                entry.last_error = Some("local file changed after it left the sync selection".to_owned());
+                conflicts = conflicts.saturating_add(1);
+                next_entries.push(entry);
+            }
+        } else if entry.kind.as_deref() == Some("directory") {
+            match fs::remove_dir(&path) {
+                Ok(()) => { file_sync_prune_empty_ancestors(path.parent(), &config.root); }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                    entry.state = FileSyncEntryState::Conflict;
+                    entry.last_error = Some("directory is no longer selected but still contains local content".to_owned());
+                    conflicts = conflicts.saturating_add(1);
+                    next_entries.push(entry);
+                }
+                Err(error) => { entry.state = FileSyncEntryState::Error; entry.last_error = Some(error.to_string()); next_entries.push(entry); }
+            }
+        }
+    }
+
+    for entry in &mut next_entries {
+        if entry.state != FileSyncEntryState::Synced { continue; }
+        let path = config.root.join(&entry.materialized_path);
+        if !path.exists() { continue; }
+        if let Ok((size, modified_at)) = file_sync_local_metadata(&path) {
+            entry.local_size = size;
+            entry.local_modified_at = modified_at;
+        }
+        if let Ok(fingerprint) = file_sync_local_fingerprint(&path) {
+            entry.local_fingerprint = Some(fingerprint);
+        }
+    }
+    next_entries.sort_by(|left, right| (&left.place_id, &left.app_instance_id, &left.file_id).cmp(&(&right.place_id, &right.app_instance_id, &right.file_id)));
+    index.entries = next_entries;
+    Ok(serde_json::json!({
+        "materialized": materialized,
+        "downloaded": downloaded,
+        "uploaded": uploaded,
+        "created": created,
+        "moved": moved,
+        "deleted": deleted,
+        "conflicts": conflicts,
+        "errors": errors,
+        "projection": {"appsDirectory": APP_FILES_DIRECTORY, "primaryAppsCollisionDirectory": PRIMARY_APPS_COLLISION_NAME},
+    }))
+}
+
+
+
+fn start_upstream_event_relay(
+    settings: Arc<ConnectionSettings>,
+    event_engine: Arc<EventEngine>,
+) -> Option<thread::JoinHandle<()>> {
+    if settings.upstream_client_endpoint.is_none()
+        || settings.upstream_identity.is_none()
+        || !settings.service_capabilities.contains(ServiceCapability::Events)
+    {
+        return None;
+    }
+
+    thread::Builder::new()
+        .name("og-upstream-events".to_owned())
+        .spawn(move || loop {
+            match run_upstream_event_relay_session(&settings, &event_engine) {
+                Ok(()) => {}
+                Err(error) => {
+                    debug::log(DebugTopic::Events, None, format!("upstream event relay reconnecting: {error}"));
+                    if let Ok(mut runtime) = settings.file_sync.lock() {
+                        runtime.remote_events = "retrying".to_owned();
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(1));
+        })
+        .ok()
+}
+
+fn run_upstream_event_relay_session(
+    settings: &ConnectionSettings,
+    event_engine: &EventEngine,
+) -> Result<(), String> {
+    let endpoint = settings
+        .upstream_client_endpoint
+        .as_deref()
+        .ok_or_else(|| "no upstream Gateway client endpoint".to_owned())?;
+    let credential = settings
+        .upstream_identity
+        .as_ref()
+        .ok_or_else(|| "no node Identity for upstream event relay".to_owned())?;
+    let mut websocket = connect_authenticated_gateway_client(
+        endpoint,
+        credential,
+        Duration::from_secs(120),
+        settings.write_timeout,
+    )?;
+    let request = OperationRequest::new(
+        RequestId::Number(9_001),
+        "events.subscribe",
+        serde_json::json!({"types": ["*"]}),
+    );
+    let response = gateway_response_for_request(&mut websocket, &request)?;
+    if response.get("status").and_then(JsonValue::as_str) == Some("error") || response.get("error").is_some() {
+        return Err(format!("events.subscribe rejected: {}", response.get("error").cloned().unwrap_or(JsonValue::Null)));
+    }
+    if let Ok(mut runtime) = settings.file_sync.lock() {
+        runtime.remote_events = "connected".to_owned();
+        file_sync_signal(&runtime, "remote.events.connected");
+    }
+    debug::log(DebugTopic::Events, None, "upstream event relay connected");
+
+    loop {
+        let Some(message) = read_gateway_message(&mut websocket)? else {
+            return Err("Gateway event channel closed".to_owned());
+        };
+        if message.get("kind").and_then(JsonValue::as_str) != Some("event") {
+            continue;
+        }
+        // Preserve the Core event envelope (id, audience, timestamp, payload).
+        // Local consumers such as Desktop and Files sync then observe exactly
+        // the same event contract as Hub clients connected to Gateway.
+        if let Ok(event) = serde_json::from_value::<og_core::CoreEvent>(message) {
+            event_engine.publish(event);
+        }
+    }
+}
+
+fn file_sync_signal(runtime: &FileSyncRuntime, trigger: &str) {
+    if let Some(sender) = runtime.trigger.as_ref() {
+        let _ = sender.send(trigger.to_owned());
+    }
+}
+
+fn file_sync_event_relevant(event_type: &str) -> bool {
+    if event_type == "backup.restored" {
+        return true;
+    }
+    if event_type.starts_with("file.sync.") {
+        return false;
+    }
+    event_type.starts_with("file.")
+        || matches!(event_type, "place.created" | "place.updated" | "place.deleted")
+        || event_type.starts_with("place.resource.")
+        || event_type == "place.resources.updated"
+        || event_type.starts_with("place.access.")
+        || matches!(event_type, "app.created" | "app.updated" | "app.deleted")
+        || event_type.starts_with("app.instance.")
+}
+
+fn run_file_sync_once(
+    settings: &ConnectionSettings,
+    engine: &Engine,
+    identity_id: &str,
+    device_id: &str,
+) -> Result<(u64, JsonValue), String> {
+    let _run = settings
+        .file_sync_run
+        .lock()
+        .map_err(|_| "Files sync execution lock is unavailable".to_owned())?;
+    let (config, index_path) = {
+        let runtime = settings
+            .file_sync
+            .lock()
+            .map_err(|_| "Files sync local state is unavailable".to_owned())?;
+        let config = runtime
+            .config
+            .clone()
+            .ok_or_else(|| "configure a Files sync root before running synchronization".to_owned())?;
+        (config, runtime.index_path.clone())
+    };
+    let mut index = match FileSyncIndex::load(&index_path) {
+        Ok(Some(index)) => index,
+        Ok(None) => FileSyncIndex::default(),
+        Err(error) => return Err(format!("cannot read Files sync index: {error}")),
+    };
+    let run_at = unix_time_millis();
+    let allow_local_mutations = !config.local_baseline_required;
+    let result = run_file_sync_materialization(settings, engine, &config, &mut index, identity_id, device_id, allow_local_mutations)
+        .and_then(|summary| {
+            index
+                .save(&index_path)
+                .map_err(|error| format!("cannot persist Files sync index: {error}"))?;
+            if config.local_baseline_required {
+                let mut updated = config.clone();
+                updated.local_baseline_required = false;
+                let config_path = settings
+                    .file_sync
+                    .lock()
+                    .map_err(|_| "Files sync local state is unavailable".to_owned())?
+                    .config_path
+                    .clone();
+                updated
+                    .save(&config_path)
+                    .map_err(|error| format!("cannot persist Files sync configuration after root baseline: {error}"))?;
+                if let Ok(mut runtime) = settings.file_sync.lock() {
+                    runtime.config = Some(updated);
+                }
+            }
+            Ok(summary)
+        });
+    if let Ok(mut runtime) = settings.file_sync.lock() {
+        runtime.last_run_at = Some(run_at);
+        runtime.last_run_error = result.as_ref().err().cloned();
+    }
+    result.map(|summary| (run_at, summary))
+}
+
+fn start_file_sync_worker(
+    settings: Arc<ConnectionSettings>,
+    engine: Arc<Engine>,
+    event_engine: Arc<EventEngine>,
+) -> Option<thread::JoinHandle<()>> {
+    if !settings.service_capabilities.contains(ServiceCapability::Files) {
+        return None;
+    }
+
+    let (trigger_tx, trigger_rx) = std::sync::mpsc::channel::<String>();
+    if let Ok(mut runtime) = settings.file_sync.lock() {
+        runtime.trigger = Some(trigger_tx.clone());
+        runtime.worker_running = true;
+        runtime.remote_events = if settings.upstream_client_endpoint.is_some()
+            && settings.service_capabilities.contains(ServiceCapability::Events)
+        {
+            "connecting".to_owned()
+        } else if settings.upstream_client_endpoint.is_some() {
+            "disabled".to_owned()
+        } else {
+            "local".to_owned()
+        };
+    }
+
+    // Local Core events cover standalone operation and provider-side mutations.
+    // They are only triggers: reconciliation remains the source of truth.
+    {
+        let subscription = event_engine.subscribe(vec![
+            "file.*".to_owned(),
+            "place.created".to_owned(), "place.updated".to_owned(), "place.deleted".to_owned(),
+            "place.resource.*".to_owned(), "place.resources.updated".to_owned(), "place.access.*".to_owned(),
+            "app.created".to_owned(), "app.updated".to_owned(), "app.deleted".to_owned(),
+            "app.instance.*".to_owned(),
+        ]);
+        let sender = trigger_tx.clone();
+        thread::Builder::new()
+            .name("og-file-sync-events-local".to_owned())
+            .spawn(move || {
+                loop {
+                    match subscription.try_recv() {
+                        Ok(event) => {
+                            if file_sync_event_relevant(&event.event_type) {
+                                let _ = sender.send(format!("core:{}", event.event_type));
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(100)),
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // Remote authoritative events are relayed into the local EventEngine once per
+    // connected ogd. The same local subscription above therefore covers both
+    // provider-local and upstream mutations without opening a second event socket.
+
+    // The native watcher never decides what changed. It only wakes the same
+    // canonical reconciler used by remote Core events and file.sync.run.
+    {
+        let watch_settings = Arc::clone(&settings);
+        let sender = trigger_tx.clone();
+        thread::Builder::new()
+            .name("og-file-sync-watcher".to_owned())
+            .spawn(move || run_file_sync_watcher(watch_settings, sender))
+            .ok();
+    }
+
+    let _ = trigger_tx.send("startup".to_owned());
+    let worker_events = Arc::clone(&event_engine);
+    thread::Builder::new()
+        .name("og-file-sync-worker".to_owned())
+        .spawn(move || {
+            while let Ok(mut trigger) = trigger_rx.recv() {
+                if let Ok(mut runtime) = settings.file_sync.lock() {
+                    runtime.worker_pending = true;
+                    runtime.last_trigger = Some(trigger.clone());
+                }
+
+                // Quiet-period debounce. Large copies or remote batches therefore
+                // collapse to one reconciliation rather than one run per event.
+                while let Ok(next) = trigger_rx.recv_timeout(Duration::from_millis(350)) {
+                    trigger = next;
+                    if let Ok(mut runtime) = settings.file_sync.lock() {
+                        runtime.last_trigger = Some(trigger.clone());
+                    }
+                }
+
+                let configured = settings.file_sync.lock().ok().is_some_and(|runtime| runtime.config.is_some());
+                if !configured {
+                    if let Ok(mut runtime) = settings.file_sync.lock() {
+                        runtime.worker_pending = false;
+                    }
+                    continue;
+                }
+
+                let Some(credential) = settings.upstream_identity.as_ref() else {
+                    // Standalone Core has no daemon-owned Identity. Manual file.sync.run
+                    // remains available from an authenticated local session.
+                    if let Ok(mut runtime) = settings.file_sync.lock() {
+                        runtime.worker_pending = false;
+                        runtime.last_run_error = Some("continuous sync is waiting for a daemon node Identity".to_owned());
+                    }
+                    continue;
+                };
+
+                worker_events.publish_global("file.sync.started", serde_json::json!({"trigger": trigger}));
+                settings.file_sync_applying.store(true, Ordering::Release);
+                settings.file_sync_watcher_dirty.store(false, Ordering::Release);
+                let result = run_file_sync_once(&settings, &engine, &credential.identity_id, &credential.device_id);
+                settings.file_sync_applying.store(false, Ordering::Release);
+                let watcher_changed_during_run = settings.file_sync_watcher_dirty.swap(false, Ordering::AcqRel);
+                if let Ok(mut runtime) = settings.file_sync.lock() {
+                    runtime.worker_pending = false;
+                }
+                if watcher_changed_during_run {
+                    if let Ok(runtime) = settings.file_sync.lock() {
+                        file_sync_signal(&runtime, "filesystem.post_sync");
+                    }
+                }
+                match result {
+                    Ok((completed_at, summary)) => {
+                        worker_events.publish_global("file.sync.completed", serde_json::json!({
+                            "completedAt": completed_at,
+                            "summary": summary,
+                        }));
+                    }
+                    Err(error) => {
+                        worker_events.publish_global("file.sync.failed", serde_json::json!({"error": error}));
+                    }
+                }
+            }
+        })
+        .ok()
+}
+
+fn run_file_sync_watcher(settings: Arc<ConnectionSettings>, sender: std::sync::mpsc::Sender<String>) {
+    let callback_sender = sender.clone();
+    let applying = Arc::clone(&settings.file_sync_applying);
+    let dirty = Arc::clone(&settings.file_sync_watcher_dirty);
+    let mut watcher: RecommendedWatcher = match notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        if let Ok(event) = result {
+            // Access-only noise does not represent a local mutation.
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            if applying.load(Ordering::Acquire) {
+                // Remote materialization can generate thousands of native events
+                // for one large file. Remember only that one verification pass is
+                // needed after the current reconciliation.
+                dirty.store(true, Ordering::Release);
+                return;
+            }
+            if !event.paths.is_empty() && event.paths.iter().all(|path| {
+                path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(".ogsync-") && name.ends_with(".part"))
+            }) {
+                return;
+            }
+            let _ = callback_sender.send("filesystem.changed".to_owned());
+        }
+    }) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            if let Ok(mut runtime) = settings.file_sync.lock() {
+                runtime.local_watcher = format!("error: {error}");
+            }
+            return;
+        }
+    };
+
+    let mut watched_root: Option<PathBuf> = None;
+    loop {
+        let root = settings
+            .file_sync
+            .lock()
+            .ok()
+            .and_then(|runtime| runtime.config.as_ref().map(|config| config.root.clone()));
+        if root != watched_root {
+            if let Some(previous) = watched_root.take() {
+                let _ = watcher.unwatch(&previous);
+            }
+            match root {
+                Some(root) => {
+                    if !root.is_dir() {
+                        if let Ok(mut runtime) = settings.file_sync.lock() {
+                            runtime.local_watcher = "waiting_root".to_owned();
+                            runtime.last_run_error = Some(format!(
+                                "Files sync root {} is unavailable; restore or reconfigure it",
+                                root.display()
+                            ));
+                        }
+                    } else if let Err(error) = watcher.watch(&root, RecursiveMode::Recursive).map_err(io::Error::other) {
+                        if let Ok(mut runtime) = settings.file_sync.lock() {
+                            runtime.local_watcher = format!("error: {error}");
+                        }
+                    } else {
+                        watched_root = Some(root);
+                        if let Ok(mut runtime) = settings.file_sync.lock() {
+                            runtime.local_watcher = "active".to_owned();
+                        }
+                        let _ = sender.send("filesystem.root.changed".to_owned());
+                    }
+                }
+                None => {
+                    if let Ok(mut runtime) = settings.file_sync.lock() {
+                        runtime.local_watcher = "waiting_config".to_owned();
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[derive(Debug)]
+struct FileSyncRuntime {
+    config_path: PathBuf,
+    index_path: PathBuf,
+    config: Option<FileSyncConfig>,
+    last_run_at: Option<u64>,
+    last_run_error: Option<String>,
+    worker_running: bool,
+    worker_pending: bool,
+    remote_events: String,
+    local_watcher: String,
+    last_trigger: Option<String>,
+    trigger: Option<std::sync::mpsc::Sender<String>>,
+}
+
+fn load_file_sync_runtime(configuration: &Configuration) -> Result<FileSyncRuntime, DaemonError> {
+    let config_path = configuration.files_sync_config_path.clone();
+    let index_path = configuration.files_sync_index_path.clone();
+    let mut config = FileSyncConfig::load(&config_path).map_err(|error| {
+        DaemonError::Runtime(format!(
+            "cannot load Files sync configuration {}: {error}",
+            config_path.display()
+        ))
+    })?;
+
+    if config.is_none() {
+        if let Some(root) = configuration.files_sync_root.as_ref() {
+            let bootstrap = FileSyncConfig::new(root.clone());
+            fs::create_dir_all(&bootstrap.root).map_err(|source| {
+                DaemonError::PrepareStorageDirectory {
+                    path: bootstrap.root.clone(),
+                    source,
+                }
+            })?;
+            bootstrap.save(&config_path).map_err(|error| {
+                DaemonError::Runtime(format!(
+                    "cannot persist Files sync configuration {}: {error}",
+                    config_path.display()
+                ))
+            })?;
+            config = Some(bootstrap);
+        }
+    }
+
+    if let Some(config) = config.as_ref() {
+        if config.root.exists() && !config.root.is_dir() {
+            return Err(DaemonError::Runtime(format!(
+                "Files sync root {} exists but is not a directory",
+                config.root.display()
+            )));
+        }
+        debug::log(
+            DebugTopic::Core,
+            None,
+            if config.root.is_dir() {
+                format!("Files sync configured at {}", config.root.display())
+            } else {
+                format!("Files sync root unavailable at {}; waiting for restore/reconfiguration", config.root.display())
+            },
+        );
+    }
+
+    Ok(FileSyncRuntime {
+        config_path,
+        index_path,
+        config,
+        last_run_at: None,
+        last_run_error: None,
+        worker_running: false,
+        worker_pending: false,
+        remote_events: "disabled".to_owned(),
+        local_watcher: "starting".to_owned(),
+        last_trigger: None,
+        trigger: None,
+    })
 }
 
 fn load_or_create_instance_id(storage_path: &Path) -> Result<String, DaemonError> {
@@ -5199,6 +7378,10 @@ struct ConnectionSettings {
     storage_backend: StorageBackend,
     glacier_storage: Option<Arc<GlacierStorage>>,
     files_path: PathBuf,
+    file_sync: Mutex<FileSyncRuntime>,
+    file_sync_run: Mutex<()>,
+    file_sync_applying: Arc<AtomicBool>,
+    file_sync_watcher_dirty: Arc<AtomicBool>,
     service_capabilities: ServiceCapabilities,
     upstream: Option<String>,
     upstream_client_endpoint: Option<String>,

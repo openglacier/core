@@ -18,8 +18,10 @@ pub use store::{
     FileRange, FileReader, FileResult, FileStore, FileStoreEntry, FileStoreError, FileWrite,
 };
 pub use sync::{
-    FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelection,
-    APP_FILES_DIRECTORY, FILE_SYNC_CONFIG_VERSION, PRIMARY_APPS_COLLISION_NAME,
+    file_sync_projection_component, file_sync_projection_suffix, FileSyncConfig,
+    FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelection,
+    FileSyncSelectionMode, APP_FILES_DIRECTORY, FILE_SYNC_CONFIG_VERSION,
+    PRIMARY_APPS_COLLISION_NAME,
 };
 
 pub use version::FileVersion;

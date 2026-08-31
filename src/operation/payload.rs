@@ -465,6 +465,30 @@ pub struct FileScopeInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileSyncConfigSetInput {
+    pub root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileSyncSelectionSetInput {
+    pub place_id: String,
+    pub instance_id: String,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub folder_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FileSyncSelectionRemoveInput {
+    pub place_id: String,
+    pub instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FileListInput {
     pub place_id: String,
     pub instance_id: String,
@@ -899,6 +923,37 @@ impl OperationPayload for DataMappingSaveInput {
 }
 
 impl OperationPayload for FileScopeInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        file_scope(operation, &self.place_id, &self.instance_id)
+    }
+}
+impl OperationPayload for FileSyncConfigSetInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        self.root = self.root.trim().to_owned();
+        non_empty(operation, "root", &self.root)
+    }
+}
+impl OperationPayload for FileSyncSelectionSetInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        file_scope(operation, &self.place_id, &self.instance_id)?;
+        for folder_id in &mut self.folder_ids {
+            *folder_id = folder_id.trim().to_owned();
+            non_empty(operation, "folderIds", folder_id)?;
+        }
+        self.folder_ids.sort();
+        self.folder_ids.dedup();
+        if self.all {
+            self.folder_ids.clear();
+        } else if self.folder_ids.is_empty() {
+            return Err(invalid_payload(
+                operation,
+                "folderIds must contain at least one folder when all is false",
+            ));
+        }
+        Ok(())
+    }
+}
+impl OperationPayload for FileSyncSelectionRemoveInput {
     fn validate(&mut self, operation: &str) -> Result<()> {
         file_scope(operation, &self.place_id, &self.instance_id)
     }
