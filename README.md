@@ -8,12 +8,47 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-0.51.0-blue)
+![Version](https://img.shields.io/badge/version-0.51.1-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
 
-![Architectures](https://img.shields.io/badge/arch-armhf_v7%20%7C%20armhf_v8%20%7C%20arm64%20%7C%20i386%20%7C%20amd64-informational)
+![Architectures](https://img.shields.io/badge/release_targets-18-informational)
+
+<details>
+<summary><strong>Supported release targets</strong></summary>
+
+### Linux GNU
+
+- `x86_64-unknown-linux-gnu`
+- `aarch64-unknown-linux-gnu`
+- `armv7-unknown-linux-gnueabihf`
+- `arm-unknown-linux-gnueabihf`
+- `i686-unknown-linux-gnu`
+- `riscv64gc-unknown-linux-gnu`
+- `powerpc64le-unknown-linux-gnu`
+- `s390x-unknown-linux-gnu`
+- `loongarch64-unknown-linux-gnu`
+
+### Linux musl
+
+- `x86_64-unknown-linux-musl`
+- `aarch64-unknown-linux-musl`
+- `armv7-unknown-linux-musleabihf`
+- `i686-unknown-linux-musl`
+
+### macOS
+
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+### Windows
+
+- `x86_64-pc-windows-msvc`
+- `aarch64-pc-windows-msvc`
+- `i686-pc-windows-msvc`
+
+</details>
 
 </p>
 
