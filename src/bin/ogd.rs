@@ -67,18 +67,6 @@ const CLASSIC_AUTH_MEMORY_KIB: u32 = 64 * 1024;
 const CLASSIC_AUTH_ITERATIONS: u32 = 3;
 const CLASSIC_AUTH_LANES: u32 = 1;
 const BUILTIN_APPS_JSON: &str = include_str!("../../apps.json");
-const SYSTEM_ASSISTANT_APP_ID: &str = "system.assistant";
-const SYSTEM_ASSISTANT_APP_NAME: &str = "Assistant";
-const SYSTEM_ASSISTANT_APP_VERSION: &str = "1.0.0";
-const SYSTEM_PROJECTS_APP_ID: &str = "system.projects";
-const SYSTEM_PROJECTS_APP_NAME: &str = "Projects";
-const SYSTEM_PROJECTS_APP_VERSION: &str = "1.0.0";
-const SYSTEM_RESOURCES_APP_ID: &str = "system.ressources";
-const SYSTEM_RESOURCES_APP_NAME: &str = "Resources";
-const SYSTEM_RESOURCES_APP_VERSION: &str = "1.0.0";
-const SYSTEM_CALLS_APP_ID: &str = "system.calls";
-const SYSTEM_CALLS_APP_NAME: &str = "Calls";
-const SYSTEM_CALLS_APP_VERSION: &str = "1.0.0";
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
@@ -995,116 +983,20 @@ fn validate_app_definition_model(definition: &JsonValue) -> Result<(), String> {
 }
 
 fn bootstrap_apps_if_needed(engine: &Engine) -> Result<(), DaemonError> {
-    let mut apps: Vec<BuiltinApp> = serde_json::from_str(BUILTIN_APPS_JSON)
+    let apps: Vec<BuiltinApp> = serde_json::from_str(BUILTIN_APPS_JSON)
         .expect("embedded apps.json must be valid");
-    if !apps.iter().any(|app| app.app_id == SYSTEM_ASSISTANT_APP_ID) {
-        apps.push(BuiltinApp {
-            app_id: SYSTEM_ASSISTANT_APP_ID.to_owned(),
-            name: SYSTEM_ASSISTANT_APP_NAME.to_owned(),
-            version: SYSTEM_ASSISTANT_APP_VERSION.to_owned(),
-            definition: serde_json::json!({
-                "id": SYSTEM_ASSISTANT_APP_ID,
-                "name": SYSTEM_ASSISTANT_APP_NAME,
-                "version": SYSTEM_ASSISTANT_APP_VERSION,
-                "tone": "glacier",
-                "hub": { "description": "Ask, explore and work with what this Place knows.", "meta": "Ready when you are", "mark": "○" },
-                "kind": "system.assistant",
-                "requires": { "capabilities": [] },
-                "views": {
-                    "tile": [{ "type": "section", "kicker": "Ready when you are", "title": "Assistant", "description": "Ask, explore and work with what this Place knows." }],
-                    "full": [{ "type": "section", "kicker": "Assistant", "title": "Assistant", "description": "Ask, explore and work with what this Place knows." }]
-                }
-            }),
-        });
-    }
-    if !apps.iter().any(|app| app.app_id == SYSTEM_PROJECTS_APP_ID) {
-        apps.push(BuiltinApp {
-            app_id: SYSTEM_PROJECTS_APP_ID.to_owned(),
-            name: SYSTEM_PROJECTS_APP_NAME.to_owned(),
-            version: SYSTEM_PROJECTS_APP_VERSION.to_owned(),
-            definition: serde_json::json!({
-                "id": SYSTEM_PROJECTS_APP_ID,
-                "name": SYSTEM_PROJECTS_APP_NAME,
-                "version": SYSTEM_PROJECTS_APP_VERSION,
-                "tone": "sage",
-                "hub": { "description": "Keep ongoing work, missions and shared context together.", "meta": "No active mission", "mark": "□" },
-                "kind": "system.projects",
-                "requires": { "capabilities": [] },
-                "views": {
-                    "tile": [{ "type": "section", "kicker": "No active mission", "title": "Projects", "description": "Keep ongoing work, missions and shared context together." }],
-                    "full": [{ "type": "section", "kicker": "Projects", "title": "Projects", "description": "Keep ongoing work, missions and shared context together." }]
-                }
-            }),
-        });
-    }
-    if !apps.iter().any(|app| app.app_id == SYSTEM_RESOURCES_APP_ID) {
-        apps.push(BuiltinApp {
-            app_id: SYSTEM_RESOURCES_APP_ID.to_owned(),
-            name: SYSTEM_RESOURCES_APP_NAME.to_owned(),
-            version: SYSTEM_RESOURCES_APP_VERSION.to_owned(),
-            definition: serde_json::json!({
-                "id": SYSTEM_RESOURCES_APP_ID,
-                "name": SYSTEM_RESOURCES_APP_NAME,
-                "version": SYSTEM_RESOURCES_APP_VERSION,
-                "tone": "glacier",
-                "hub": { "description": "See the things, services and systems available here.", "meta": "Connected by trust", "mark": "◇" },
-                "kind": "system.ressources",
-                "requires": { "capabilities": ["database", "files", "events"] },
-                "views": {
-                    "tile": [
-                        { "type": "metric", "label": "Resources", "value": "Live", "detail": "Nodes & capabilities" }
-                    ],
-                    "full": [
-                        { "type": "section", "kicker": "System", "title": "Resources", "description": "Govern the nodes and capabilities assigned to this Place." },
-                        { "type": "section", "kicker": "Database", "title": "Primary & replicas", "description": "Resource assignments are managed by Place Owners." },
-                        { "type": "section", "kicker": "Files", "title": "Storage providers", "description": "Choose which node provides file storage for this Place." },
-                        { "type": "section", "kicker": "Nodes", "title": "Connected resources", "description": "Live node status will be resolved through the Gateway fabric." }
-                    ]
-                }
-            }),
-        });
-    }
-    if !apps.iter().any(|app| app.app_id == SYSTEM_CALLS_APP_ID) {
-        apps.push(BuiltinApp {
-            app_id: SYSTEM_CALLS_APP_ID.to_owned(),
-            name: SYSTEM_CALLS_APP_NAME.to_owned(),
-            version: SYSTEM_CALLS_APP_VERSION.to_owned(),
-            definition: serde_json::json!({
-                "id": SYSTEM_CALLS_APP_ID,
-                "name": SYSTEM_CALLS_APP_NAME,
-                "version": SYSTEM_CALLS_APP_VERSION,
-                "tone": "glacier",
-                "kind": "system.calls",
-                "requires": { "capabilities": [] },
-                "views": {
-                    "tile": [
-                        { "type": "metric", "label": "Calls", "value": "Audio · Video", "detail": "Call any OpenGlacier Identity by _id" }
-                    ],
-                    "full": [
-                        { "type": "section", "kicker": "System", "title": "Calls", "description": "Peer-to-peer audio and video calls between OpenGlacier identities." }
-                    ]
-                }
-            }),
-        });
-    }
+    bootstrap_apps(engine, &apps)
+}
+
+fn bootstrap_apps(engine: &Engine, apps: &[BuiltinApp]) -> Result<(), DaemonError> {
     let now = unix_time_millis();
     for app in apps {
         if let Err(message) = validate_app_definition_model(&app.definition) {
             eprintln!("openglacier: invalid built-in App {}: {message}", app.app_id);
             return Err(DaemonError::BootstrapAppsState);
         }
+
         let app_id = query_string(&app.app_id);
-        let active = format!("on _apps | where appId == {app_id} and state == \"active\" | count");
-        let active = match execute_request(engine, QueryRequest::new(0, active)) {
-            QueryResponse::Ok { documents, .. } => documents.first()
-                .and_then(|value| value.get("count"))
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(0) > 0,
-            QueryResponse::Error { .. } => false,
-        };
-        if active {
-            continue;
-        }
         let definition = serde_json::to_string(&app.definition)
             .expect("embedded App definition serializes");
         let exists = match app_record_exists(engine, RequestId::Number(0), &app.app_id) {
@@ -5530,7 +5422,7 @@ impl Configuration {
 #[derive(Clone, Debug)]
 struct FileSyncAppProjection {
     name: String,
-    kind: String,
+    place_root_projection: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -5662,8 +5554,8 @@ impl<'a> FileSyncSource<'a> {
         for document in documents {
             let Some(app_id) = document.get("appId").and_then(JsonValue::as_str) else { continue; };
             let name = document.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty()).unwrap_or(app_id).to_owned();
-            let kind = file_sync_app_kind(&document).unwrap_or_default();
-            apps.insert(app_id.to_owned(), FileSyncAppProjection { name, kind });
+            let place_root_projection = file_sync_app_place_root_projection(&document);
+            apps.insert(app_id.to_owned(), FileSyncAppProjection { name, place_root_projection });
         }
         Ok(apps)
     }
@@ -5929,16 +5821,27 @@ impl Drop for FileSyncSource<'_> {
     }
 }
 
-fn file_sync_app_kind(document: &JsonValue) -> Option<String> {
-    if let Some(kind) = document.get("definition").and_then(|definition| definition.get("kind")).and_then(JsonValue::as_str) {
-        return Some(kind.to_owned());
+fn file_sync_app_place_root_projection(document: &JsonValue) -> bool {
+    fn declared(definition: &JsonValue) -> bool {
+        definition
+            .get("files")
+            .and_then(|files| files.get("projection"))
+            .and_then(JsonValue::as_str)
+            == Some("place-root")
     }
-    if let Some(serialized) = document.get("definition").and_then(JsonValue::as_str) {
-        if let Ok(definition) = serde_json::from_str::<JsonValue>(serialized) {
-            return definition.get("kind").and_then(JsonValue::as_str).map(str::to_owned);
+
+    if let Some(definition) = document.get("definition") {
+        if declared(definition) { return true; }
+        if let Some(serialized) = definition.as_str() {
+            if let Ok(definition) = serde_json::from_str::<JsonValue>(serialized) {
+                if declared(&definition) { return true; }
+            }
         }
     }
-    document.get("kind").and_then(JsonValue::as_str).map(str::to_owned)
+
+    // Accept a flattened App Definition too; the sync projection depends on the
+    // generic Files contract, never on a concrete App id or kind.
+    declared(document)
 }
 
 fn query_response_message(response: QueryResponse) -> String {
@@ -6780,8 +6683,8 @@ fn run_file_sync_materialization(settings: &ConnectionSettings, engine: &Engine,
             errors.push(serde_json::json!({"placeId": selection.place_id, "instanceId": selection.app_instance_id, "error": "selected App instance is not active"}));
             continue;
         };
-        let app = apps.get(&instance.app_id).cloned().unwrap_or(FileSyncAppProjection { name: instance.app_id.clone(), kind: String::new() });
-        let primary_files = app.kind == "system.files";
+        let app = apps.get(&instance.app_id).cloned().unwrap_or(FileSyncAppProjection { name: instance.app_id.clone(), place_root_projection: false });
+        let primary_files = app.place_root_projection;
         let base = if primary_files {
             place_base.clone()
         } else {
@@ -7757,6 +7660,117 @@ impl Error for DaemonError {
 mod tests {
     use super::*;
     use og_core::storage::CollectionId;
+
+    fn app_bootstrap_test_engine() -> Engine {
+        let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let runtime = Arc::new(build_runtime().expect("runtime builds"));
+        let lowerer = Arc::new(ScanPlanLowerer::new());
+        Engine::new(storage, runtime, lowerer)
+    }
+
+    #[test]
+    fn app_bootstrap_with_empty_manifest_is_a_noop() {
+        let engine = app_bootstrap_test_engine();
+        bootstrap_apps(&engine, &[]).expect("empty App manifest bootstraps");
+        assert!(!app_record_exists(&engine, RequestId::Number(1), "system.files")
+            .expect("App lookup succeeds"));
+    }
+
+    #[test]
+    fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() {
+        let engine = app_bootstrap_test_engine();
+        let v1 = BuiltinApp {
+            app_id: "system.test".to_owned(),
+            name: "System test".to_owned(),
+            version: "1.0.0".to_owned(),
+            definition: serde_json::json!({
+                "id": "system.test",
+                "name": "System test",
+                "version": "1.0.0"
+            }),
+        };
+        bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds");
+
+        let drifted = execute_request(
+            &engine,
+            QueryRequest::new(
+                2,
+                r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#,
+            ),
+        );
+        assert!(drifted.is_ok());
+        let custom = execute_request(
+            &engine,
+            QueryRequest::new(
+                3,
+                r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#,
+            ),
+        );
+        assert!(custom.is_ok());
+
+        let v2 = BuiltinApp {
+            app_id: "system.test".to_owned(),
+            name: "System test v2".to_owned(),
+            version: "2.0.0".to_owned(),
+            definition: serde_json::json!({
+                "id": "system.test",
+                "name": "System test v2",
+                "version": "2.0.0"
+            }),
+        };
+        bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds");
+
+        let response = execute_request(
+            &engine,
+            QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#),
+        );
+        let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); };
+        let managed = documents.first().expect("managed App exists");
+        assert_eq!(managed.get("state").and_then(JsonValue::as_str), Some("active"));
+        assert_eq!(managed.get("name").and_then(JsonValue::as_str), Some("System test v2"));
+        assert_eq!(managed.get("version").and_then(JsonValue::as_str), Some("2.0.0"));
+        assert_eq!(managed.get("updatedBy").and_then(JsonValue::as_str), Some("system"));
+        assert_eq!(managed.get("definition"), Some(&v2.definition));
+
+        let response = execute_request(
+            &engine,
+            QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#),
+        );
+        let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); };
+        let unmanaged = documents.first().expect("custom App exists");
+        assert_eq!(unmanaged.get("state").and_then(JsonValue::as_str), Some("active"));
+        assert_eq!(unmanaged.get("name").and_then(JsonValue::as_str), Some("Custom"));
+        assert_eq!(unmanaged.get("version").and_then(JsonValue::as_str), Some("7.0.0"));
+        assert_eq!(unmanaged.get("createdBy").and_then(JsonValue::as_str), Some("user"));
+        assert!(unmanaged.get("updatedBy").is_none());
+    }
+    #[test]
+    fn file_sync_place_root_projection_is_definition_driven() {
+        let declared = serde_json::json!({
+            "appId": "custom.files",
+            "definition": {
+                "id": "custom.files",
+                "kind": "custom.anything",
+                "files": {"projection": "place-root"}
+            }
+        });
+        assert!(file_sync_app_place_root_projection(&declared));
+
+        let serialized = serde_json::json!({
+            "definition": r#"{"files":{"projection":"place-root"}}"#
+        });
+        assert!(file_sync_app_place_root_projection(&serialized));
+
+        let legacy_identity_only = serde_json::json!({
+            "appId": "system.files",
+            "definition": {"kind": "system.files"}
+        });
+        assert!(!file_sync_app_place_root_projection(&legacy_identity_only));
+        assert!(!file_sync_app_place_root_projection(&serde_json::json!({
+            "definition": {"files": {"projection": "app"}}
+        })));
+    }
+
     #[test] fn borrowed_partial_document_encodes_large_js_safe_integers_as_numbers() { let document = Document::from_fields([ ("created_at", Value::from(1_785_680_802_608_u64)), ("small", Value::from(42_u64)), ("negative", Value::from(-5_000_000_000_i64)), ]); let response = BorrowedPlainDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id: RequestId::string("query-1").unwrap(), data: BorrowedDocument(&document), }; let payload = rmp_serde::to_vec_named(&response).unwrap(); let decoded: JsonValue = rmp_serde::from_slice(&payload).unwrap(); assert!(decoded["data"]["created_at"].is_f64()); assert!(decoded["data"]["negative"].is_f64()); assert!(decoded["data"]["small"].is_u64()); }
     #[test] fn enrollment_grants_event_subscription_permission() { let query = enrollment_events_permission_query("identity-a", 42); assert_eq!( query, r#"on _permissions | insert {identityId: "identity-a", action: "events.subscribe", resource: "*", effect: "allow", state: "active", createdAt: 42}"# ); }
     #[test] fn wildcard_permission_authorizes_events_subscribe() { let storage = MemoryStorage::new(); let storage: Arc<dyn StorageEngine> = Arc::new(storage); let runtime = Arc::new(build_runtime().expect("runtime builds")); let lowerer = Arc::new(ScanPlanLowerer::new()); let engine = Engine::new(storage, runtime, lowerer); let insert = execute_request( &engine, QueryRequest::new( 1, r#"on _permissions | insert {identityId: "identity-a", action: "*", resource: "*", effect: "allow", state: "active"}"#, ), ); assert!(insert.is_ok()); let request = AuthorizationRequest { identity_id: "identity-a".to_owned(), action: AuthorizationAction::EventsSubscribe, resource: "*".to_owned(), }; assert!(permission_exists(&engine, &request)); }

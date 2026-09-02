@@ -44,14 +44,17 @@
   {
     "appId": "system.files",
     "name": "Files",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "definition": {
       "id": "system.files",
       "name": "Files",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "description": "Browse and manage files scoped to this Place and App instance.",
       "kind": "system.files",
       "tone": "glacier",
+      "files": {
+        "projection": "place-root"
+      },
       "data": {},
       "actions": {},
       "views": {
@@ -84,6 +87,222 @@
             "kicker": "Files · Core-backed",
             "title": "Files",
             "description": "Native file workspace scoped to this Place and App instance."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "appId": "system.assistant",
+    "name": "Assistant",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.assistant",
+      "name": "Assistant",
+      "version": "1.0.0",
+      "tone": "glacier",
+      "hub": {
+        "description": "Ask, explore and work with what this Place knows.",
+        "meta": "Ready when you are",
+        "mark": "○"
+      },
+      "kind": "system.assistant",
+      "requires": {
+        "capabilities": []
+      },
+      "views": {
+        "tile": [
+          {
+            "type": "section",
+            "kicker": "Ready when you are",
+            "title": "Assistant",
+            "description": "Ask, explore and work with what this Place knows."
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "Assistant",
+            "title": "Assistant",
+            "description": "Ask, explore and work with what this Place knows."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "appId": "system.projects",
+    "name": "Projects",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.projects",
+      "name": "Projects",
+      "version": "1.0.0",
+      "tone": "sage",
+      "hub": {
+        "description": "Keep ongoing work, missions and shared context together.",
+        "meta": "No active mission",
+        "mark": "□"
+      },
+      "kind": "system.projects",
+      "requires": {
+        "capabilities": []
+      },
+      "views": {
+        "tile": [
+          {
+            "type": "section",
+            "kicker": "No active mission",
+            "title": "Projects",
+            "description": "Keep ongoing work, missions and shared context together."
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "Projects",
+            "title": "Projects",
+            "description": "Keep ongoing work, missions and shared context together."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "appId": "system.ressources",
+    "name": "Resources",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.ressources",
+      "name": "Resources",
+      "version": "1.0.0",
+      "tone": "glacier",
+      "hub": {
+        "description": "See the things, services and systems available here.",
+        "meta": "Connected by trust",
+        "mark": "◇"
+      },
+      "kind": "system.ressources",
+      "requires": {
+        "capabilities": [
+          "database",
+          "files",
+          "events"
+        ]
+      },
+      "views": {
+        "tile": [
+          {
+            "type": "metric",
+            "label": "Resources",
+            "value": "Live",
+            "detail": "Nodes & capabilities"
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "System",
+            "title": "Resources",
+            "description": "Govern the nodes and capabilities assigned to this Place."
+          },
+          {
+            "type": "section",
+            "kicker": "Database",
+            "title": "Primary & replicas",
+            "description": "Resource assignments are managed by Place Owners."
+          },
+          {
+            "type": "section",
+            "kicker": "Files",
+            "title": "Storage providers",
+            "description": "Choose which node provides file storage for this Place."
+          },
+          {
+            "type": "section",
+            "kicker": "Nodes",
+            "title": "Connected resources",
+            "description": "Live node status will be resolved through the Gateway fabric."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "appId": "system.calls",
+    "name": "Calls",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.calls",
+      "name": "Calls",
+      "version": "1.0.0",
+      "tone": "glacier",
+      "kind": "system.calls",
+      "requires": {
+        "capabilities": []
+      },
+      "views": {
+        "tile": [
+          {
+            "type": "metric",
+            "label": "Calls",
+            "value": "Audio · Video",
+            "detail": "Call any OpenGlacier Identity by _id"
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "System",
+            "title": "Calls",
+            "description": "Peer-to-peer audio and video calls between OpenGlacier identities."
+          }
+        ]
+      }
+    }
+  },
+  {
+    "appId": "system.builder",
+    "name": "Builder",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.builder",
+      "name": "Builder",
+      "version": "1.0.0",
+      "description": "Build and maintain App Definitions from Core primitives and Hub runtime components.",
+      "kind": "system.builder",
+      "tone": "glacier",
+      "hub": {
+        "description": "Build Apps from Core primitives and Hub runtime components.",
+        "meta": "App Builder",
+        "mark": "+"
+      },
+      "requires": {
+        "capabilities": []
+      },
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [
+          {
+            "type": "section",
+            "kicker": "System App",
+            "title": "Builder",
+            "description": "Build and maintain App Definitions for this OpenGlacier system."
+          },
+          {
+            "type": "button",
+            "label": "Open Builder",
+            "action": "open-full",
+            "variant": "quiet"
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": "Builder",
+            "title": "App Builder",
+            "description": "Compose Apps from Core primitives and Hub runtime components."
           }
         ]
       }
