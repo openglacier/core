@@ -592,7 +592,7 @@ fn configure_websocket_timeouts(
             stream.set_read_timeout(Some(read_timeout))?;
             stream.set_write_timeout(Some(write_timeout))
         }
-        MaybeTlsStream::NativeTls(stream) => {
+        MaybeTlsStream::Rustls(stream) => {
             let stream = stream.get_mut();
             stream.set_read_timeout(Some(read_timeout))?;
             stream.set_write_timeout(Some(write_timeout))
@@ -605,7 +605,7 @@ fn configure_websocket_polling(websocket: &mut NodeWebSocket) -> io::Result<()> 
     let timeout = Some(Duration::from_millis(25));
     match websocket.get_mut() {
         MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
-        MaybeTlsStream::NativeTls(stream) => stream.get_mut().set_read_timeout(timeout),
+        MaybeTlsStream::Rustls(stream) => stream.get_mut().set_read_timeout(timeout),
         _ => Ok(()),
     }
 }
