@@ -1,0 +1,734 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release
+
+    runs-on: ubuntu-24.04
+
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and Cargo version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="${GITHUB_REF_NAME}"
+
+          if [[ "$TAG" != v* ]]; then
+            echo "ERROR: release tag must start with v"
+            exit 1
+          fi
+
+          TAG_VERSION="${TAG#v}"
+
+          CARGO_VERSION="$(
+            sed -n \
+              '/^\[package\]/,/^\[/s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+              Cargo.toml |
+            head -1
+          )"
+
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "ERROR: unable to determine version from Cargo.toml"
+            exit 1
+          fi
+
+          echo "Tag version:   $TAG_VERSION"
+          echo "Cargo version: $CARGO_VERSION"
+
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "ERROR: tag version and Cargo.toml version differ."
+            exit 1
+          fi
+
+          echo "version=$CARGO_VERSION" >> "$GITHUB_OUTPUT"
+
+          TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
+
+          echo "Release commit:"
+          git show \
+            --no-patch \
+            --format='  %H%n  %s' \
+            "$TAG_COMMIT"
+
+  linux:
+    name: ${{ matrix.name }}
+
+    needs:
+      - validate
+
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          # ------------------------------------------------------------
+          # Linux GNU
+          # ------------------------------------------------------------
+
+          - name: linux-x86_64-gnu
+            target: x86_64-unknown-linux-gnu
+            builder: cross
+
+          - name: linux-aarch64-gnu
+            target: aarch64-unknown-linux-gnu
+            builder: cross
+
+          - name: linux-armv7-gnu
+            target: armv7-unknown-linux-gnueabihf
+            builder: cross
+
+          - name: linux-armv6-gnu
+            target: arm-unknown-linux-gnueabihf
+            builder: cross
+
+          - name: linux-i686-gnu
+            target: i686-unknown-linux-gnu
+            builder: cross
+
+          - name: linux-riscv64-gnu
+            target: riscv64gc-unknown-linux-gnu
+            builder: cross
+
+          - name: linux-ppc64le-gnu
+            target: powerpc64le-unknown-linux-gnu
+            builder: cross
+
+          - name: linux-s390x-gnu
+            target: s390x-unknown-linux-gnu
+            builder: cross
+
+          - name: linux-loongarch64-gnu
+            target: loongarch64-unknown-linux-gnu
+            builder: cross
+
+          # ------------------------------------------------------------
+          # Linux musl
+          # ------------------------------------------------------------
+
+          - name: linux-x86_64-musl
+            target: x86_64-unknown-linux-musl
+            builder: cross
+
+          - name: linux-aarch64-musl
+            target: aarch64-unknown-linux-musl
+            builder: cross
+
+          - name: linux-armv7-musl
+            target: armv7-unknown-linux-musleabihf
+            builder: cross
+
+          # cross does not currently provide this image.
+          # cargo-zigbuild does support the Rust target.
+          - name: linux-i686-musl
+            target: i686-unknown-linux-musl
+            builder: zig
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup update stable
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+          rustc --version
+          cargo --version
+
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo install cross \
+            --git https://github.com/cross-rs/cross \
+            --locked
+
+          cross --version
+
+      - name: Install cargo-zigbuild
+        if: matrix.builder == 'zig'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m pip install \
+            --user \
+            "cargo-zigbuild==0.23.3"
+
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build with cross
+        if: matrix.builder == 'cross'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cross build \
+            --release \
+            --locked \
+            --bins \
+            --target "${{ matrix.target }}"
+
+      - name: Build with cargo-zigbuild
+        if: matrix.builder == 'zig'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo zigbuild \
+            --release \
+            --locked \
+            --bins \
+            --target "${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE="og-core-${VERSION}-${RELEASE_NAME}"
+
+          mkdir -p "package/${PACKAGE}/bin"
+          mkdir -p dist
+
+          OGD="target/${TARGET}/release/ogd"
+          OGCLI="target/${TARGET}/release/ogcli"
+
+          if [ ! -f "$OGD" ]; then
+            echo "ERROR: ogd binary not found:"
+            echo "  $OGD"
+            exit 1
+          fi
+
+          cp "$OGD" "package/${PACKAGE}/bin/ogd"
+          chmod 755 "package/${PACKAGE}/bin/ogd"
+
+          if [ -f "$OGCLI" ]; then
+            cp "$OGCLI" "package/${PACKAGE}/bin/ogcli"
+            chmod 755 "package/${PACKAGE}/bin/ogcli"
+          fi
+
+          if [ -f LICENSE ]; then
+            cp LICENSE "package/${PACKAGE}/LICENSE"
+          fi
+
+          cat > "package/${PACKAGE}/VERSION" <<EOF
+          VERSION=${VERSION}
+          TARGET=${TARGET}
+          PLATFORM=${RELEASE_NAME}
+          EOF
+
+          echo "==> Built binaries"
+
+          file "package/${PACKAGE}/bin/"* || true
+
+          tar \
+            -C package \
+            -czf "dist/${PACKAGE}.tar.gz" \
+            "$PACKAGE"
+
+          (
+            cd dist
+            sha256sum "${PACKAGE}.tar.gz" \
+              > "${PACKAGE}.tar.gz.sha256"
+          )
+
+          echo "==> Release files"
+
+          ls -lh dist/
+
+          cat "dist/${PACKAGE}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  macos:
+    name: ${{ matrix.name }}
+
+    needs:
+      - validate
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - name: macos-x86_64
+            target: x86_64-apple-darwin
+            os: macos-15-intel
+
+          - name: macos-aarch64
+            target: aarch64-apple-darwin
+            os: macos-15
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup update stable
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+          rustc --version
+          cargo --version
+
+      - name: Install native dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          brew install pkg-config openssl@3 || true
+
+          echo "OPENSSL_DIR=$(brew --prefix openssl@3)" \
+            >> "$GITHUB_ENV"
+
+          echo "PKG_CONFIG_PATH=$(brew --prefix openssl@3)/lib/pkgconfig" \
+            >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cargo build \
+            --release \
+            --locked \
+            --bins \
+            --target "${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE="og-core-${VERSION}-${RELEASE_NAME}"
+
+          mkdir -p "package/${PACKAGE}/bin"
+          mkdir -p dist
+
+          OGD="target/${TARGET}/release/ogd"
+          OGCLI="target/${TARGET}/release/ogcli"
+
+          if [ ! -f "$OGD" ]; then
+            echo "ERROR: ogd binary not found:"
+            echo "  $OGD"
+            exit 1
+          fi
+
+          cp "$OGD" "package/${PACKAGE}/bin/ogd"
+          chmod 755 "package/${PACKAGE}/bin/ogd"
+
+          if [ -f "$OGCLI" ]; then
+            cp "$OGCLI" "package/${PACKAGE}/bin/ogcli"
+            chmod 755 "package/${PACKAGE}/bin/ogcli"
+          fi
+
+          if [ -f LICENSE ]; then
+            cp LICENSE "package/${PACKAGE}/LICENSE"
+          fi
+
+          cat > "package/${PACKAGE}/VERSION" <<EOF
+          VERSION=${VERSION}
+          TARGET=${TARGET}
+          PLATFORM=${RELEASE_NAME}
+          EOF
+
+          echo "==> Built binaries"
+
+          file "package/${PACKAGE}/bin/"* || true
+
+          tar \
+            -C package \
+            -czf "dist/${PACKAGE}.tar.gz" \
+            "$PACKAGE"
+
+          (
+            cd dist
+            shasum -a 256 "${PACKAGE}.tar.gz" \
+              > "${PACKAGE}.tar.gz.sha256"
+          )
+
+          echo "==> Release files"
+
+          ls -lh dist/
+
+          cat "dist/${PACKAGE}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  windows:
+    name: ${{ matrix.name }}
+
+    needs:
+      - validate
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - name: windows-x86_64
+            target: x86_64-pc-windows-msvc
+            os: windows-2025
+
+          - name: windows-aarch64
+            target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+
+          - name: windows-i686
+            target: i686-pc-windows-msvc
+            os: windows-2025
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust target
+        shell: pwsh
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add "${{ matrix.target }}"
+
+          rustc --version
+          cargo --version
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cargo build `
+            --release `
+            --locked `
+            --bins `
+            --target "${{ matrix.target }}"
+
+          if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+          }
+
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          RELEASE_NAME: ${{ matrix.name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Version = $env:VERSION
+          $Target = $env:TARGET
+          $ReleaseName = $env:RELEASE_NAME
+
+          $Package = "og-core-$Version-$ReleaseName"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "package\$Package\bin" `
+            | Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "dist" `
+            | Out-Null
+
+          $Ogd = "target\$Target\release\ogd.exe"
+          $Ogcli = "target\$Target\release\ogcli.exe"
+
+          if (-not (Test-Path $Ogd)) {
+              throw "ogd binary not found: $Ogd"
+          }
+
+          Copy-Item `
+            $Ogd `
+            "package\$Package\bin\ogd.exe"
+
+          if (Test-Path $Ogcli) {
+              Copy-Item `
+                $Ogcli `
+                "package\$Package\bin\ogcli.exe"
+          }
+
+          if (Test-Path "LICENSE") {
+              Copy-Item `
+                "LICENSE" `
+                "package\$Package\LICENSE"
+          }
+
+          $VersionFile = @(
+              "VERSION=$Version"
+              "TARGET=$Target"
+              "PLATFORM=$ReleaseName"
+          ) -join "`n"
+
+          [System.IO.File]::WriteAllText(
+              "package\$Package\VERSION",
+              "$VersionFile`n",
+              [System.Text.Encoding]::ASCII
+          )
+
+          Write-Host "==> Package contents"
+
+          Get-ChildItem `
+            -Recurse `
+            "package\$Package"
+
+          $Archive = "dist\$Package.tar.gz"
+
+          tar `
+            -C package `
+            -czf $Archive `
+            $Package
+
+          if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+          }
+
+          $Hash = (
+              Get-FileHash `
+                -Algorithm SHA256 `
+                $Archive
+          ).Hash.ToLowerInvariant()
+
+          [System.IO.File]::WriteAllText(
+              "$Archive.sha256",
+              "$Hash  $Package.tar.gz`n",
+              [System.Text.Encoding]::ASCII
+          )
+
+          Write-Host "==> Release files"
+
+          Get-ChildItem dist
+
+          Get-Content "$Archive.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  release:
+    name: Create GitHub Release
+
+    needs:
+      - validate
+      - linux
+      - macos
+      - windows
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "==> Release assets"
+
+          find release-assets \
+            -maxdepth 1 \
+            -type f \
+            -print \
+            | sort
+
+          TARBALL_COUNT="$(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              -name '*.tar.gz' \
+              | wc -l
+          )"
+
+          CHECKSUM_COUNT="$(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              -name '*.tar.gz.sha256' \
+              | wc -l
+          )"
+
+          echo
+          echo "Archives:  $TARBALL_COUNT"
+          echo "Checksums: $CHECKSUM_COUNT"
+
+          if [ "$TARBALL_COUNT" -ne 18 ]; then
+            echo "ERROR: expected 18 tar.gz archives."
+            exit 1
+          fi
+
+          if [ "$CHECKSUM_COUNT" -ne 18 ]; then
+            echo "ERROR: expected 18 SHA256 files."
+            exit 1
+          fi
+
+          echo
+          echo "==> Verifying SHA256"
+
+          (
+            cd release-assets
+            sha256sum -c ./*.tar.gz.sha256
+          )
+
+      - name: Prepare release notes prefix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG_COMMIT="$(
+            git rev-list \
+              -n 1 \
+              "$GITHUB_REF_NAME"
+          )"
+
+          git show \
+            -s \
+            --format='%b' \
+            "$TAG_COMMIT" \
+            | sed '/^Source-Commit:/d' \
+            > release-notes-prefix.md
+
+          echo "==> Additional release notes"
+
+          if [ -s release-notes-prefix.md ]; then
+            cat release-notes-prefix.md
+          else
+            echo "(none)"
+          fi
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t ASSETS < <(
+            find release-assets \
+              -maxdepth 1 \
+              -type f \
+              \( \
+                -name '*.tar.gz' \
+                -o \
+                -name '*.tar.gz.sha256' \
+              \) \
+              -print \
+              | sort
+          )
+
+          if [ "${#ASSETS[@]}" -ne 36 ]; then
+            echo "ERROR: expected 36 release assets."
+            echo "Found: ${#ASSETS[@]}"
+            exit 1
+          fi
+
+          CMD=(
+            gh release create
+            "$GITHUB_REF_NAME"
+            --verify-tag
+            --generate-notes
+            --fail-on-no-commits
+          )
+
+          if [ -s release-notes-prefix.md ]; then
+            CMD+=(
+              --notes
+              "$(cat release-notes-prefix.md)"
+            )
+          fi
+
+          CMD+=("${ASSETS[@]}")
+
+          echo "==> Creating release $GITHUB_REF_NAME"
+
+          "${CMD[@]}"
+
+          echo
+          echo "==> Release created successfully"
+
+          gh release view "$GITHUB_REF_NAME"
