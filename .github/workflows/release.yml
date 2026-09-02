@@ -14,6 +14,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  EXPECTED_RELEASE_ARCHIVES: 19
 
 jobs:
   validate:
@@ -95,6 +96,13 @@ jobs:
           - name: linux-x86_64-gnu
             target: x86_64-unknown-linux-gnu
             builder: cross
+
+          # Optimized build for CPUs implementing the x86-64-v3 baseline
+          # (AVX/AVX2, BMI1/2, FMA, etc.).
+          - name: linux-x86_64-v3-gnu
+            target: x86_64-unknown-linux-gnu
+            builder: cross
+            rustflags: "-C target-cpu=x86-64-v3"
 
           - name: linux-aarch64-gnu
             target: aarch64-unknown-linux-gnu
@@ -193,6 +201,10 @@ jobs:
       - name: Build with cross
         if: matrix.builder == 'cross'
         shell: bash
+        env:
+          # Target-specific flags are safer than global RUSTFLAGS here:
+          # host build scripts/proc-macros keep the runner's normal CPU baseline.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags || '' }}
         run: |
           set -euo pipefail
 
@@ -637,13 +649,13 @@ jobs:
           echo "Archives:  $TARBALL_COUNT"
           echo "Checksums: $CHECKSUM_COUNT"
 
-          if [ "$TARBALL_COUNT" -ne 18 ]; then
-            echo "ERROR: expected 18 tar.gz archives."
+          if [ "$TARBALL_COUNT" -ne "$EXPECTED_RELEASE_ARCHIVES" ]; then
+            echo "ERROR: expected ${EXPECTED_RELEASE_ARCHIVES} tar.gz archives."
             exit 1
           fi
 
-          if [ "$CHECKSUM_COUNT" -ne 18 ]; then
-            echo "ERROR: expected 18 SHA256 files."
+          if [ "$CHECKSUM_COUNT" -ne "$EXPECTED_RELEASE_ARCHIVES" ]; then
+            echo "ERROR: expected ${EXPECTED_RELEASE_ARCHIVES} SHA256 files."
             exit 1
           fi
 
@@ -701,8 +713,10 @@ jobs:
               | sort
           )
 
-          if [ "${#ASSETS[@]}" -ne 36 ]; then
-            echo "ERROR: expected 36 release assets."
+          EXPECTED_ASSETS=$((EXPECTED_RELEASE_ARCHIVES * 2))
+
+          if [ "${#ASSETS[@]}" -ne "$EXPECTED_ASSETS" ]; then
+            echo "ERROR: expected ${EXPECTED_ASSETS} release assets."
             echo "Found: ${#ASSETS[@]}"
             exit 1
           fi
