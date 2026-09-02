@@ -708,9 +708,110 @@ mod tests {
                 input: QueryExecuteInput { query, context: Some(RequestedExecutionContext { place_id, app_instance_id }) },
             }) if query == "on inventory | limit 1"
                 && place_id == "place-workshop"
-                && app_instance_id == "inventory-main"
+                && app_instance_id.as_deref() == Some("inventory-main")
         ));
     }
+    #[test]
+    fn query_execute_accepts_place_only_context() {
+        let router = OperationRouter::default();
+        let request = OperationRequest::new(
+            92,
+            QUERY_EXECUTE,
+            serde_json::json!({
+                "query": "on inventory | limit 1",
+                "context": {
+                    "placeId": "place-workshop"
+                }
+            }),
+        );
+        let routed_request = router.route(request).unwrap();
+        assert!(matches!(
+            routed_request,
+            RoutedOperation::QueryExecute(Routed {
+                id: RequestId::Number(92),
+                input: QueryExecuteInput { query, context: Some(RequestedExecutionContext { place_id, app_instance_id }) },
+            }) if query == "on inventory | limit 1"
+                && place_id == "place-workshop"
+                && app_instance_id.is_none()
+        ));
+    }
+
+    #[test]
+    fn query_context_resolve_accepts_place_only_scope() {
+        let routed = OperationRouter::default()
+            .route(OperationRequest::new(
+                93,
+                QUERY_CONTEXT_RESOLVE,
+                serde_json::json!({ "placeId": "place-workshop" }),
+            ))
+            .unwrap();
+        assert!(matches!(
+            routed,
+            RoutedOperation::QueryContextResolve(Routed {
+                id: RequestId::Number(93),
+                input: QueryContextResolveInput { place_id, app_instance_id },
+            }) if place_id == "place-workshop" && app_instance_id.is_none()
+        ));
+    }
+
+    #[test]
+    fn collections_list_accepts_place_scope() {
+        let routed = OperationRouter::default()
+            .route(OperationRequest::new(
+                94,
+                COLLECTIONS_LIST,
+                serde_json::json!({ "placeId": "place-workshop", "stats": true }),
+            ))
+            .unwrap();
+        assert!(matches!(
+            routed,
+            RoutedOperation::CollectionsList(Routed {
+                id: RequestId::Number(94),
+                input: CollectionsListInput { stats: true, place_id: Some(place_id) },
+            }) if place_id == "place-workshop"
+        ));
+    }
+
+    #[test]
+    fn data_mapping_crud_routes_typed_place_scoped_payloads() {
+        let router = OperationRouter::default();
+        let list = router
+            .route(OperationRequest::new(
+                95,
+                DATA_MAPPING_LIST,
+                json!({"placeId":"place-a","fingerprint":"fp-a"}),
+            ))
+            .unwrap();
+        assert!(
+            matches!(list, RoutedOperation::DataMappingList(Routed { input: DataMappingListInput { ref place_id, fingerprint: Some(ref fingerprint) }, .. }) if place_id == "place-a" && fingerprint == "fp-a")
+        );
+
+        let update = router.route(OperationRequest::new(96, DATA_MAPPING_UPDATE, json!({"placeId":"place-a","mappingId":"mapping-a","name":"Updated","definition":{"columns":[]}}))).unwrap();
+        assert!(
+            matches!(update, RoutedOperation::DataMappingUpdate(Routed { input: DataMappingUpdateInput { ref place_id, ref mapping_id, name: Some(ref name), .. }, .. }) if place_id == "place-a" && mapping_id == "mapping-a" && name == "Updated")
+        );
+
+        let delete = router
+            .route(OperationRequest::new(
+                97,
+                DATA_MAPPING_DELETE,
+                json!({"placeId":"place-a","mappingId":"mapping-a"}),
+            ))
+            .unwrap();
+        assert!(
+            matches!(delete, RoutedOperation::DataMappingDelete(Routed { input: DataMappingDeleteInput { ref place_id, ref mapping_id }, .. }) if place_id == "place-a" && mapping_id == "mapping-a")
+        );
+
+        let error = router
+            .route(OperationRequest::new(
+                98,
+                DATA_MAPPING_UPDATE,
+                json!({"placeId":"place-a","mappingId":"mapping-a"}),
+            ))
+            .unwrap_err();
+        assert_eq!(error.code(), "operation.invalid_payload");
+    }
+
     #[test]
     fn file_operations_require_app_scope() {
         let routed = OperationRouter::default()

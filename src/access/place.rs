@@ -18,7 +18,8 @@ use crate::access::auth::Principal;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequestedExecutionContext {
     pub place_id: String,
-    pub app_instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_instance_id: Option<String>,
 }
 
 /// Trusted execution context built by og-core after validating a request.
@@ -30,7 +31,8 @@ pub struct RequestedExecutionContext {
 pub struct ExecutionContext {
     pub principal: Principal,
     pub place_id: String,
-    pub app_instance_id: String,
+    /// Optional AppInstance sub-scope. `None` means the whole Place.
+    pub app_instance_id: Option<String>,
     pub place_role: PlaceRole,
     /// Public access mode used when an anonymous connection enters a public Place.
     pub public_access: Option<PublicAccess>,

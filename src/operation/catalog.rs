@@ -318,7 +318,7 @@ macro_rules! define_operations {
                     // data.analyze/data.import are control-plane operations: authorization,
                     // mappings and destination writes live on a database provider. The actual
                     // Python execution is isolated behind data.worker.run on a data.import node.
-                    Self::DataAnalyze | Self::DataImport | Self::DataMappingSave => DATABASE,
+                    Self::DataAnalyze | Self::DataImport | Self::DataMappingSave | Self::DataMappingList | Self::DataMappingUpdate | Self::DataMappingDelete => DATABASE,
                     Self::DataWorkerRun => CAP_DATA_IMPORT,
                     _ => match self.handler() {
                         HandlerKind::Core => ServiceCapabilities::NONE,
@@ -406,6 +406,18 @@ mod tests {
             ServiceCapabilities::NONE
         );
         assert_eq!(OperationKind::DataImport.required_capabilities(), DATABASE);
+        assert_eq!(
+            OperationKind::DataMappingList.required_capabilities(),
+            DATABASE
+        );
+        assert_eq!(
+            OperationKind::DataMappingUpdate.required_capabilities(),
+            DATABASE
+        );
+        assert_eq!(
+            OperationKind::DataMappingDelete.required_capabilities(),
+            DATABASE
+        );
         assert_eq!(
             OperationKind::DataWorkerRun.required_capabilities(),
             CAP_DATA_IMPORT

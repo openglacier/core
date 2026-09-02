@@ -2,7 +2,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
     env, thread, fs, error::Error, fmt::{self, Display, Formatter}, io::{self, BufReader, Read, Write},
-    net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::{HashMap, HashSet}, sync::{ atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex },
+    net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::{HashMap, HashSet}, sync::{ atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock },
     time::{Duration, Instant},
 };
 use og_core::access::{
@@ -20,13 +20,13 @@ use og_core::access::{
 };
 use og_core::{
     debug::{self, DebugTopic},
-    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, unix_time_millis},
+    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, unix_time_millis, PLACE_SCOPE_FIELD},
     engine::Engine, files::{FileEntry, FileId, FileRange, FileStore, FileStoreEntry, FileStoreError, FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelectionMode, FileWrite, NativeFileStore, StoreId, APP_FILES_DIRECTORY, PRIMARY_APPS_COLLISION_NAME, file_sync_projection_component, file_sync_projection_suffix}, Principal, backup,
     event_engine::{EventEngine, EventSubscription},
     memory::{MemoryClass, MemoryGovernor, MemoryProfileConfig, WorkloadClass},
     operation::{
         decode_operation_request, AccessPolicy, ExecutionMode, ServiceCapability, ServiceCapabilities, AppCreateInput, AuthBeginInput, AuthEnrollBeginInput, ClassicAuthLoginInput, ClassicAuthRegisterInput, ChallengeSignatureInput, DeviceRegisterInput, DeviceRenameInput, DeviceRevokeInput, EventsSubscribeInput, IdentityOpenInput, IdentityRegisterInput, IdentityRenewInput, PasswordInput, QueryExecuteInput, QueryContextResolveInput, AppDeleteInput, AppIdInput,
-        AppInstanceCreateInput, AppInstanceRemoveInput, AppUpdateInput, DataAnalyzeInput, DataImportInput, DataWorkerRunInput, DataMappingSaveInput, Audience, BackupNameInput,
+        AppInstanceCreateInput, AppInstanceRemoveInput, AppUpdateInput, DataAnalyzeInput, DataImportInput, DataWorkerRunInput, DataMappingSaveInput, DataMappingListInput, DataMappingUpdateInput, DataMappingDeleteInput, Audience, BackupNameInput,
         CollectionsListInput, FileEntryInput, FileListInput, FileMkdirInput, FileMoveInput,
         FileReadInput, FileScopeInput, FileSyncConfigSetInput, FileSyncSelectionRemoveInput,
         FileSyncSelectionSetInput, FileVersionInput, FileVersionReadInput, FileWriteInput,
@@ -44,7 +44,7 @@ use og_core::{
         parse as parse_query, value_expression_runtime, vcollections, DocumentScope, PlannerPipeline,
         QueryRuntime, QueryRuntimeMaterializationExt, ScanPlanLowerer,
     },
-    storage::{GlacierStorage, MemoryStorage, StorageEngine, StorageError, UuidV7Generator},
+    storage::{GlacierStorage, MemoryStorage, ScanOptions, StorageEngine, StorageError, StorageRead, UuidV7Generator},
     Document, Number, Value,
 };
 
@@ -68,6 +68,50 @@ const CLASSIC_AUTH_ITERATIONS: u32 = 3;
 const CLASSIC_AUTH_LANES: u32 = 1;
 const BUILTIN_APPS_JSON: &str = include_str!("../../apps.json");
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+static EVENT_OUTBOX_WAKE: OnceLock<EventOutboxWake> = OnceLock::new();
+static EVENT_OUTBOX_ID_GENERATOR: OnceLock<UuidV7Generator> = OnceLock::new();
+const EVENT_OUTBOX_RETRY_DELAY: Duration = Duration::from_millis(250);
+const EVENT_OUTBOX_MAX_IDLE_RECOVERY: Duration = Duration::from_secs(30);
+
+#[derive(Debug)]
+struct EventOutboxWake {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl EventOutboxWake {
+    fn new() -> Self {
+        Self { generation: Mutex::new(0), changed: Condvar::new() }
+    }
+
+    fn notify(&self) {
+        let mut generation = self.generation.lock().expect("event outbox wake lock poisoned");
+        *generation = (*generation).wrapping_add(1);
+        self.changed.notify_one();
+    }
+
+    fn wait(&self, observed: &mut u64, timeout: Option<Duration>) {
+        let mut generation = self.generation.lock().expect("event outbox wake lock poisoned");
+        if *generation != *observed {
+            *observed = *generation;
+            return;
+        }
+        generation = match timeout {
+            Some(timeout) => {
+                let (generation, _) = self.changed
+                    .wait_timeout(generation, timeout)
+                    .expect("event outbox wake lock poisoned");
+                generation
+            }
+            None => self.changed.wait(generation).expect("event outbox wake lock poisoned"),
+        };
+        *observed = *generation;
+    }
+}
+
+fn event_outbox_wake() -> &'static EventOutboxWake {
+    EVENT_OUTBOX_WAKE.get_or_init(EventOutboxWake::new)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1263,7 +1307,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                 format!("id={id} {}", query),
                             );
 
-                            // Place/App instance context is optional for backward compatibility.
+                            // Place context is optional for backward compatibility; AppInstance is an optional sub-scope.
                             // When supplied, it is untrusted wire data until og-core resolves it
                             // against the authenticated principal and persisted system records.
                             let execution_context = match context {
@@ -1271,7 +1315,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                     let delegated_context = delegation.and_then(|value| {
                                         if value.capability == "database"
                                             && value.place_id == requested.place_id
-                                            && value.app_instance_id.as_deref() == Some(requested.app_instance_id.as_str())
+                                            && value.app_instance_id.as_deref() == requested.app_instance_id.as_deref()
                                         {
                                             value.place_role.map(|place_role| ExecutionContext {
                                                 principal: value.principal.clone(),
@@ -1302,7 +1346,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                 .map(|access| access.collection.clone());
 
                             // The resolved Place role is the capability ceiling for a scoped
-                            // App query. Reads are allowed to every Place participant; writes are
+                            // Place query. Reads are allowed to every Place participant; writes are
                             // limited to Resident and Owner before the scoped grant is considered.
                             if let (Some(context), Some(access)) =
                                 (execution_context.as_ref(), analyzed_access.as_ref())
@@ -1344,10 +1388,11 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                     }
                                 };
 
-                                // A validated Place + AppInstance context is itself the grant for
-                                // ordinary App collections. The physical executor applies the
-                                // trusted DocumentScope below the query language, so this grant can
-                                // never escape the requested Place/App instance. Place roles remain
+                                // A validated Place context is itself the grant for ordinary App
+                                // collections. When an AppInstance is supplied it narrows the scope.
+                                // The physical executor applies the trusted DocumentScope below the
+                                // query language, so this grant can never escape the requested Place.
+                                // Place roles remain
                                 // the capability ceiling: Member=read, Resident/Owner=read+write.
                                 // System collections keep the explicit global permission model.
                                 let scoped_app_collection = execution_context.is_some()
@@ -1375,7 +1420,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                             "resource": access.collection,
                                             "principal": authentication.principal(),
                                             "placeId": execution_context.as_ref().map(|context| &context.place_id),
-                                            "appInstanceId": execution_context.as_ref().map(|context| &context.app_instance_id),
+                                            "appInstanceId": execution_context.as_ref().and_then(|context| context.app_instance_id.as_deref()),
                                         }),
                                     );
                                     return Ok(true);
@@ -2394,37 +2439,29 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
                             HandlerKind::Collections => match operation {
-                                RoutedOperation::CollectionsList(Routed { id, input: CollectionsListInput { stats } }) => {
+                                RoutedOperation::CollectionsList(Routed { id, input: CollectionsListInput { stats, place_id } }) => {
+                                if let Some(place_id) = place_id.as_deref() {
+                                    let place = or_reject!(load_place(engine, id, place_id));
+                                    or_reject!(resolve_place_access_for_principal(
+                                        engine, id, authentication.principal(), &place,
+                                        !settings.authorization_mode.is_enforced(),
+                                    ));
+                                } else {
+                                    authorize_resource_or_reject!(id, OperationKind::CollectionsList, "*");
+                                }
+
                                 let snapshot = match engine.storage().read() {
                                     Ok(snapshot) => snapshot,
                                     Err(error) => {
                                         reject!(id, "collections.failed", error.to_string());
                                     }
                                 };
-                                let mut collections = Vec::new();
-                                match snapshot.collections() {
-                                    Ok(names) => {
-                                        for name in names {
-                                            let mut item = serde_json::json!({"name": name.as_str(), "system": name.as_str().starts_with('_')});
-                                            if stats {
-                                                if let Ok(count) = snapshot.count(&name) {
-                                                    item["documents"] = serde_json::json!(count);
-                                                }
-                                            }
-                                            collections.push(item);
-                                        }
-                                    }
-                                    Err(error) => {
-                                        reject!(id, "collections.failed", error.to_string());
-                                    }
-                                }
-                                for name in vcollections::ALL {
-                                    if !collections.iter().any(|item| {
-                                        item.get("name").and_then(JsonValue::as_str) == Some(name)
-                                    }) {
-                                        collections.push(serde_json::json!({"name": name, "system": true, "virtual": true}));
-                                    }
-                                }
+                                let collections = match list_storage_collections(
+                                    snapshot.as_ref(), stats, place_id.as_deref(),
+                                ) {
+                                    Ok(collections) => collections,
+                                    Err(error) => reject!(id, "collections.failed", error.to_string()),
+                                };
                                 reply!(id, serde_json::json!({"collections": collections}),);
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
@@ -3183,7 +3220,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                         reject!(id,"capability.unavailable","data.analyze requires a data.import worker result on this database node");
                                     };
                                     let fingerprint=result.get("fingerprint").and_then(JsonValue::as_str).unwrap_or_default();
-                                    let mappings=if fingerprint.is_empty(){Vec::new()}else{query_documents_or_reject!(id,format!("on _data_mappings | where fingerprint == {} and state == \"active\" | limit 5",query_string(fingerprint)))};
+                                    let mappings=if fingerprint.is_empty(){Vec::new()}else{query_documents_or_reject!(id,format!("on _data_mappings | where placeId == {} and fingerprint == {} and state == \"active\" | limit 5",query_string(&place_id),query_string(fingerprint)))};
                                     let mut response=result; if let Some(object)=response.as_object_mut(){object.insert("recognized".into(),JsonValue::Bool(!mappings.is_empty())); object.insert("mappings".into(),JsonValue::Array(mappings));}
                                     reply!(id,response);
                                 }
@@ -3194,6 +3231,39 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     let mapping_id=UuidV7Generator::new().next_id().to_string(); let now=unix_time_millis();
                                     let query=format!("on _data_mappings | insert {{mappingId:{},placeId:{},fingerprint:{},name:{},targetAppId:{},targetTable:{},definition:{},createdBy:{},state:\"active\",createdAt:{}}}",query_string(&mapping_id),query_string(&place_id),query_string(&fingerprint),query_string(&name),query_string(&target_app_id),query_string(&target_table),serde_json::to_string(&definition).expect("mapping serializes"),query_string(identity_id),now);
                                     execute_query_or_reject!(id,query); reply!(id,serde_json::json!({"mappingId":mapping_id,"fingerprint":fingerprint,"name":name,"targetAppId":target_app_id,"targetTable":target_table,"definition":definition}));
+                                }
+                                RoutedOperation::DataMappingList(Routed { id, input: DataMappingListInput { place_id, fingerprint } }) => {
+                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to list mappings");
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let _role=place_role_or_reject!(id,identity_id,&place);
+                                    let fingerprint_filter=fingerprint.as_deref().map(|value|format!(" and fingerprint == {}",query_string(value))).unwrap_or_default();
+                                    let mappings=query_documents_or_reject!(id,format!("on _data_mappings | where placeId == {}{} and state == \"active\"",query_string(&place_id),fingerprint_filter));
+                                    reply!(id,serde_json::json!({"placeId":place_id,"mappings":mappings}));
+                                }
+                                RoutedOperation::DataMappingUpdate(Routed { id, input: DataMappingUpdateInput { place_id, mapping_id, name, target_app_id, target_table, definition } }) => {
+                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to update a mapping");
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
+                                    if !role.can_write(){reject!(id,"authorization.denied","updating a Mapping requires write access to the Place");}
+                                    let existing=query_documents_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&mapping_id),query_string(&place_id)));
+                                    if existing.is_empty(){reject!(id,"data.mapping_not_found","mapping was not found in this Place");}
+                                    let mut assignments=Vec::new();
+                                    if let Some(value)=name { assignments.push(format!("name = {}",query_string(&value))); }
+                                    if let Some(value)=target_app_id { assignments.push(format!("targetAppId = {}",query_string(&value))); }
+                                    if let Some(value)=target_table { assignments.push(format!("targetTable = {}",query_string(&value))); }
+                                    if let Some(value)=definition { assignments.push(format!("definition = {}",serde_json::to_string(&value).expect("mapping definition serializes"))); }
+                                    assignments.push(format!("updatedBy = {}",query_string(identity_id))); assignments.push(format!("updatedAt = {}",unix_time_millis()));
+                                    execute_query_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | set {}",query_string(&mapping_id),query_string(&place_id),assignments.join(", ")));
+                                    let mapping=query_documents_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&mapping_id),query_string(&place_id))).into_iter().next();
+                                    reply!(id,serde_json::json!({"mapping":mapping}));
+                                }
+                                RoutedOperation::DataMappingDelete(Routed { id, input: DataMappingDeleteInput { place_id, mapping_id } }) => {
+                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to delete a mapping");
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
+                                    if !role.can_write(){reject!(id,"authorization.denied","deleting a Mapping requires write access to the Place");}
+                                    let existing=query_documents_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&mapping_id),query_string(&place_id)));
+                                    if existing.is_empty(){reject!(id,"data.mapping_not_found","mapping was not found in this Place");}
+                                    let deleted_at=unix_time_millis();
+                                    execute_query_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | set state = \"deleted\", deletedBy = {}, deletedAt = {}",query_string(&mapping_id),query_string(&place_id),query_string(identity_id),deleted_at));
+                                    reply!(id,serde_json::json!({"mappingId":mapping_id,"placeId":place_id,"state":"deleted","deletedAt":deleted_at}));
                                 }
                                 RoutedOperation::DataImport(Routed { id, input: DataImportInput { place_id, files_instance_id, file_id, target_instance_id, table, mapping, mode, worker_result, plan_only } }) => {
                                     let identity_id=identity_or_reject!(id,"an authenticated identity is required to import data");
@@ -3244,7 +3314,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     let import_context=ExecutionContext{
                                         principal:authentication.principal().clone(),
                                         place_id:place_id.clone(),
-                                        app_instance_id:target_instance_id.clone(),
+                                        app_instance_id:Some(target_instance_id.clone()),
                                         place_role:role,
                                         public_access:None,
                                     };
@@ -3836,6 +3906,70 @@ fn list_public_places(engine: &Engine, request_id: RequestId) -> Result<Vec<Json
     Ok(visible)
 }
 
+fn list_storage_collections(
+    snapshot: &dyn StorageRead,
+    stats: bool,
+    place_id: Option<&str>,
+) -> Result<Vec<JsonValue>, StorageError> {
+    let mut collections = Vec::new();
+    for name in snapshot.collections()? {
+        if let Some(place_id) = place_id {
+            if name.as_str().starts_with('_') {
+                continue;
+            }
+            let expected_place = Value::from(place_id);
+            let mut documents = 0u64;
+            snapshot.scan_each(
+                &name,
+                ScanOptions::default(),
+                &mut |stored| {
+                    if stored.document().get(PLACE_SCOPE_FIELD) == Some(&expected_place) {
+                        documents = documents.saturating_add(1);
+                        return Ok(stats);
+                    }
+                    Ok(true)
+                },
+            )?;
+            if documents == 0 {
+                continue;
+            }
+            let mut item = serde_json::json!({"name": name.as_str(), "system": false});
+            if stats {
+                item["documents"] = serde_json::json!(documents);
+            }
+            collections.push(item);
+            continue;
+        }
+
+        let mut item = serde_json::json!({
+            "name": name.as_str(),
+            "system": name.as_str().starts_with('_'),
+        });
+        if stats {
+            if let Ok(count) = snapshot.count(&name) {
+                item["documents"] = serde_json::json!(count);
+            }
+        }
+        collections.push(item);
+    }
+
+    if place_id.is_none() {
+        for name in vcollections::ALL {
+            if !collections.iter().any(|item| {
+                item.get("name").and_then(JsonValue::as_str) == Some(name)
+            }) {
+                collections.push(serde_json::json!({
+                    "name": name,
+                    "system": true,
+                    "virtual": true,
+                }));
+            }
+        }
+    }
+
+    Ok(collections)
+}
+
 fn resolve_query_execution_context(
     engine: &Engine,
     request_id: RequestId,
@@ -3852,16 +3986,18 @@ fn resolve_query_execution_context(
         allow_public,
     )?;
 
-    let instance = load_app_instance(engine, request_id, &requested.app_instance_id)?;
-    if instance.place_id != requested.place_id {
-        return Err(QueryResponse::request_error(
-            request_id,
-            "app.instance_place_mismatch",
-            format!(
-                "App instance {:?} does not belong to Place {:?}",
-                requested.app_instance_id, requested.place_id
-            ),
-        ));
+    if let Some(app_instance_id) = requested.app_instance_id.as_deref() {
+        let instance = load_app_instance(engine, request_id, app_instance_id)?;
+        if instance.place_id != requested.place_id {
+            return Err(QueryResponse::request_error(
+                request_id,
+                "app.instance_place_mismatch",
+                format!(
+                    "App instance {:?} does not belong to Place {:?}",
+                    app_instance_id, requested.place_id
+                ),
+            ));
+        }
     }
 
     Ok(ExecutionContext {
@@ -4333,7 +4469,7 @@ static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 fn resolve_file_context(
     engine:&Engine, id:RequestId, principal:&Principal, allow_public:bool, place_id:&str, instance_id:&str, write:bool
 )->Result<ExecutionContext,QueryResponse>{
-    let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:instance_id.to_owned()},allow_public)?;
+    let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:Some(instance_id.to_owned())},allow_public)?;
     if write && !context.place_role.can_write(){
         return Err(QueryResponse::request_error(id,"authorization.denied","Place access is read-only for Files"));
     }
@@ -4771,14 +4907,23 @@ fn publish_durable_event(
     event_type: &str,
     payload: JsonValue,
 ) -> bool {
-    static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
     let created_at = unix_time_millis();
-    let sequence = NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed);
-    let event_id = format!("event-{created_at}-{}-{sequence}", std::process::id());
+    let event_id = EVENT_OUTBOX_ID_GENERATOR
+        .get_or_init(UuidV7Generator::new)
+        .next_id()
+        .to_string();
     let audience_json = serde_json::to_string(&audience).expect("audience serializes");
     let payload_json = serde_json::to_string(&payload).expect("payload serializes");
-    let query = format!( "on _event_outbox | insert {{eventId: {}, type: {}, audience: {audience_json}, payload: {payload_json}, state: \"pending\", attempts: 0, availableAt: {created_at}, createdAt: {created_at}}}", query_string(&event_id), query_string(event_type), );
+    let query = format!(
+        "on _event_outbox | insert {{_id: {}, eventId: {}, type: {}, audience: {audience_json}, payload: {payload_json}, state: \"pending\", attempts: 0, availableAt: {created_at}, createdAt: {created_at}}}",
+        query_string(&event_id),
+        query_string(&event_id),
+        query_string(event_type),
+    );
     let stored = execute_request(engine, QueryRequest::new(0, query)).is_ok();
+    if stored {
+        event_outbox_wake().notify();
+    }
     debug::log(
         DebugTopic::Events,
         None,
@@ -4791,35 +4936,149 @@ fn publish_durable_event(
 }
 
 fn start_event_outbox_worker(engine: Arc<Engine>, events: Arc<EventEngine>) {
-    thread::Builder::new().name("og-event-outbox".to_owned()).spawn(move || loop {
-        let now = unix_time_millis();
-        let query = format!("on _event_outbox | where state == \"pending\" and availableAt <= {now} | sort createdAt | limit 16");
-        let response = execute_request(&engine, QueryRequest::new(0, query));
-        if let QueryResponse::Ok { documents, .. } = response {
-            for document in documents {
-                let estimate = serde_json::to_vec(&document).map_or(4096, |bytes| bytes.len().saturating_add(1024));
-                let Ok(_permit) = engine.memory_governor().reserve(MemoryClass::Indexing, estimate) else {
-                    debug::log(DebugTopic::Events, None, format!("outbox deferred reason=memory estimate={estimate}"));
-                    break;
-                };
-                let Some(event_id) = document.get("eventId").and_then(JsonValue::as_str) else { continue; };
-                let Some(event_type) = document.get("type").and_then(JsonValue::as_str) else { continue; };
-                let audience = document.get("audience").cloned().and_then(|value| serde_json::from_value::<Audience>(value).ok()).unwrap_or(Audience::Global);
-                let payload = document.get("payload").cloned().unwrap_or(JsonValue::Null);
-                let event = og_core::CoreEvent::new(event_id, event_type, audience, unix_time_millis(), payload);
-                if events.publish(event) {
-                    debug::log(DebugTopic::Events, None, format!("publish type={event_type} event_id={event_id}"));
-                    let delivered = format!("on _event_outbox | where eventId == {} | set state = \"delivered\", deliveredAt = {}", query_string(event_id), unix_time_millis());
-                    let _ = execute_request(&engine, QueryRequest::new(0, delivered));
-                } else {
-                    debug::log(DebugTopic::Events, None, format!("retry type={event_type} event_id={event_id} reason=queue_full"));
-                    let retry = format!("on _event_outbox | where eventId == {} | set attempts = attempts + 1, availableAt = {}", query_string(event_id), unix_time_millis().saturating_add(250));
-                    let _ = execute_request(&engine, QueryRequest::new(0, retry));
-                }
+    thread::Builder::new()
+        .name("og-event-outbox".to_owned())
+        .spawn(move || {
+            // Old versions retained delivered rows forever. New deliveries are
+            // deleted immediately; this one-time sweep bounds legacy growth.
+            let _ = execute_request(
+                &engine,
+                QueryRequest::new(0, "on _event_outbox | where state == \"delivered\" | delete"),
+            );
+
+            let wake = event_outbox_wake();
+            let mut observed_generation = *wake
+                .generation
+                .lock()
+                .expect("event outbox wake lock poisoned");
+
+            loop {
+                let next_wake = drain_event_outbox(&engine, &events);
+                wake.wait(&mut observed_generation, next_wake);
             }
+        })
+        .expect("event outbox worker must start");
+}
+
+fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration> {
+    loop {
+        // Event-driven: query on startup, insertion, or retry deadline instead
+        // of polling the database every 100 ms while idle.
+        let response = execute_request(
+            engine,
+            QueryRequest::new(
+                0,
+                "on _event_outbox | where state == \"pending\" | sort availableAt | limit 16",
+            ),
+        );
+        let QueryResponse::Ok { documents, .. } = response else {
+            return Some(EVENT_OUTBOX_MAX_IDLE_RECOVERY);
+        };
+        if documents.is_empty() {
+            return None;
         }
-        thread::sleep(Duration::from_millis(100));
-    }).expect("event outbox worker must start");
+
+        let now = unix_time_millis();
+        let mut processed = 0usize;
+        let mut next_retry: Option<Duration> = None;
+
+        for document in documents {
+            let available_at = document
+                .get("availableAt")
+                .and_then(JsonValue::as_u64)
+                .unwrap_or(now);
+            if available_at > now {
+                let delay = Duration::from_millis(available_at.saturating_sub(now));
+                next_retry = Some(next_retry.map_or(delay, |current| current.min(delay)));
+                break;
+            }
+
+            let Some(row_id) = document.get("_id").and_then(JsonValue::as_str) else {
+                debug::log(DebugTopic::Events, None, "outbox invalid row missing _id");
+                return Some(EVENT_OUTBOX_MAX_IDLE_RECOVERY);
+            };
+            let event_id = document
+                .get("eventId")
+                .and_then(JsonValue::as_str)
+                .unwrap_or(row_id);
+            let Some(event_type) = document.get("type").and_then(JsonValue::as_str) else {
+                let discard = format!(
+                    "on _event_outbox | where _id == {} | delete",
+                    query_string(row_id),
+                );
+                let _ = execute_request(engine, QueryRequest::new(0, discard));
+                processed += 1;
+                continue;
+            };
+
+            let estimate = serde_json::to_vec(&document)
+                .map_or(4096, |bytes| bytes.len().saturating_add(1024));
+            let Ok(_permit) = engine.memory_governor().reserve(MemoryClass::Indexing, estimate) else {
+                debug::log(
+                    DebugTopic::Events,
+                    None,
+                    format!("outbox deferred reason=memory estimate={estimate}"),
+                );
+                return Some(EVENT_OUTBOX_RETRY_DELAY);
+            };
+            let audience = document
+                .get("audience")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Audience>(value).ok())
+                .unwrap_or(Audience::Global);
+            let payload = document.get("payload").cloned().unwrap_or(JsonValue::Null);
+            let event = og_core::CoreEvent::new(
+                event_id,
+                event_type,
+                audience,
+                unix_time_millis(),
+                payload,
+            );
+
+            if events.publish(event) {
+                debug::log(
+                    DebugTopic::Events,
+                    None,
+                    format!("publish type={event_type} event_id={event_id}"),
+                );
+                let delivered = format!(
+                    "on _event_outbox | where _id == {} | delete",
+                    query_string(row_id),
+                );
+                if !execute_request(engine, QueryRequest::new(0, delivered)).is_ok() {
+                    // A transient delete failure can expose this row again; the
+                    // EventEngine suppresses a second delivery of the same id.
+                    return Some(EVENT_OUTBOX_RETRY_DELAY);
+                }
+            } else {
+                debug::log(
+                    DebugTopic::Events,
+                    None,
+                    format!("retry type={event_type} event_id={event_id} reason=queue_full"),
+                );
+                let retry_at = unix_time_millis().saturating_add(
+                    u64::try_from(EVENT_OUTBOX_RETRY_DELAY.as_millis()).unwrap_or(u64::MAX),
+                );
+                let retry = format!(
+                    "on _event_outbox | where _id == {} | set attempts = attempts + 1, availableAt = {}",
+                    query_string(row_id),
+                    retry_at,
+                );
+                let _ = execute_request(engine, QueryRequest::new(0, retry));
+                next_retry = Some(EVENT_OUTBOX_RETRY_DELAY);
+            }
+            processed += 1;
+        }
+
+        if let Some(delay) = next_retry {
+            return Some(delay);
+        }
+        if processed == 0 {
+            return Some(EVENT_OUTBOX_MAX_IDLE_RECOVERY);
+        }
+        // Continue immediately: there may be more than 16 due rows. Once empty,
+        // the worker blocks on the Condvar until a producer wakes it.
+    }
 }
 
 fn start_debug_memory_reporter(engine: Arc<Engine>) {
@@ -4922,7 +5181,10 @@ fn execute_request_scoped(
 
     let execute_started = Instant::now();
     let execution = if let Some(context) = context {
-        let scope = DocumentScope::new(context.place_id.as_str(), context.app_instance_id.as_str());
+        let scope = match context.app_instance_id.as_deref() {
+            Some(app_instance_id) => DocumentScope::new(context.place_id.as_str(), app_instance_id),
+            None => DocumentScope::for_place(context.place_id.as_str()),
+        };
         engine.execute_physical_scoped(planned.physical(), &scope)
     } else if compact {
         engine.execute_physical_compact(planned.physical())
@@ -7059,15 +7321,9 @@ fn start_file_sync_worker(
         thread::Builder::new()
             .name("og-file-sync-events-local".to_owned())
             .spawn(move || {
-                loop {
-                    match subscription.try_recv() {
-                        Ok(event) => {
-                            if file_sync_event_relevant(&event.event_type) {
-                                let _ = sender.send(format!("core:{}", event.event_type));
-                            }
-                        }
-                        Err(std::sync::mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(100)),
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                while let Ok(event) = subscription.recv() {
+                    if file_sync_event_relevant(&event.event_type) {
+                        let _ = sender.send(format!("core:{}", event.event_type));
                     }
                 }
             })
@@ -7670,6 +7926,81 @@ mod tests {
 
     #[test] fn app_bootstrap_with_empty_manifest_is_a_noop() { let engine = app_bootstrap_test_engine(); bootstrap_apps(&engine, &[]).expect("empty App manifest bootstraps"); assert!(!app_record_exists(&engine, RequestId::Number(1), "system.files") .expect("App lookup succeeds")); }
     #[test] fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() { let engine = app_bootstrap_test_engine(); let v1 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test".to_owned(), version: "1.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test", "version": "1.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds"); let drifted = execute_request( &engine, QueryRequest::new( 2, r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#, ), ); assert!(drifted.is_ok()); let custom = execute_request( &engine, QueryRequest::new( 3, r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#, ), ); assert!(custom.is_ok()); let v2 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test v2".to_owned(), version: "2.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test v2", "version": "2.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds"); let response = execute_request( &engine, QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); }; let managed = documents.first().expect("managed App exists"); assert_eq!(managed.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(managed.get("name").and_then(JsonValue::as_str), Some("System test v2")); assert_eq!(managed.get("version").and_then(JsonValue::as_str), Some("2.0.0")); assert_eq!(managed.get("updatedBy").and_then(JsonValue::as_str), Some("system")); assert_eq!(managed.get("definition"), Some(&v2.definition)); let response = execute_request( &engine, QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); }; let unmanaged = documents.first().expect("custom App exists"); assert_eq!(unmanaged.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(unmanaged.get("name").and_then(JsonValue::as_str), Some("Custom")); assert_eq!(unmanaged.get("version").and_then(JsonValue::as_str), Some("7.0.0")); assert_eq!(unmanaged.get("createdBy").and_then(JsonValue::as_str), Some("user")); assert!(unmanaged.get("updatedBy").is_none()); }
+    #[test]
+    fn place_scoped_collection_listing_filters_and_counts_by_place() {
+        let engine = app_bootstrap_test_engine();
+        for (id, collection, place_id) in [
+            (20, "shared_items", "place-a"),
+            (21, "shared_items", "place-a"),
+            (22, "shared_items", "place-b"),
+            (23, "other_items", "place-b"),
+        ] {
+            let response = execute_request(
+                &engine,
+                QueryRequest::new(
+                    id,
+                    format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)),
+                ),
+            );
+            assert!(response.is_ok());
+        }
+        let snapshot = engine.storage().read().expect("snapshot opens");
+        let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"))
+            .expect("Place collections list succeeds");
+        assert_eq!(collections.len(), 1);
+        assert_eq!(collections[0].get("name").and_then(JsonValue::as_str), Some("shared_items"));
+        assert_eq!(collections[0].get("documents").and_then(JsonValue::as_u64), Some(2));
+    }
+
+    #[test]
+    fn place_only_query_scope_spans_instances_without_leaking_other_places() {
+        let engine = app_bootstrap_test_engine();
+        let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext {
+            principal: Principal::Anonymous,
+            place_id: place_id.to_owned(),
+            app_instance_id: app_instance_id.map(str::to_owned),
+            place_role: PlaceRole::Owner,
+            public_access: None,
+        };
+
+        for (id, place_id, app_instance_id, name) in [
+            (10, "place-a", "app-1", "one"),
+            (11, "place-a", "app-2", "two"),
+            (12, "place-b", "app-3", "other"),
+        ] {
+            let response = execute_request_scoped(
+                &engine,
+                QueryRequest::new(id, format!("on studio_scope_test | insert {{name: {}}}", query_string(name))),
+                Some(&context(place_id, Some(app_instance_id))),
+            );
+            assert!(response.is_ok());
+        }
+
+        let place_response = execute_request_scoped(
+            &engine,
+            QueryRequest::new(13, "on studio_scope_test | sort name"),
+            Some(&context("place-a", None)),
+        );
+        let QueryResponse::Ok { documents, .. } = place_response else {
+            panic!("Place scoped query must succeed");
+        };
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one"));
+        assert_eq!(documents[1].get("name").and_then(JsonValue::as_str), Some("two"));
+        assert!(documents.iter().all(|document| document.get("_place").and_then(JsonValue::as_str) == Some("place-a")));
+
+        let app_response = execute_request_scoped(
+            &engine,
+            QueryRequest::new(14, "on studio_scope_test | sort name"),
+            Some(&context("place-a", Some("app-1"))),
+        );
+        let QueryResponse::Ok { documents, .. } = app_response else {
+            panic!("AppInstance scoped query must succeed");
+        };
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one"));
+    }
+
     #[test] fn file_sync_place_root_projection_is_definition_driven() { let declared = serde_json::json!({ "appId": "custom.files", "definition": { "id": "custom.files", "kind": "custom.anything", "files": {"projection": "place-root"} } }); assert!(file_sync_app_place_root_projection(&declared)); let serialized = serde_json::json!({ "definition": r#"{"files":{"projection":"place-root"}}"# }); assert!(file_sync_app_place_root_projection(&serialized)); let legacy_identity_only = serde_json::json!({ "appId": "system.files", "definition": {"kind": "system.files"} }); assert!(!file_sync_app_place_root_projection(&legacy_identity_only)); assert!(!file_sync_app_place_root_projection(&serde_json::json!({ "definition": {"files": {"projection": "app"}} }))); }
     #[test] fn borrowed_partial_document_encodes_large_js_safe_integers_as_numbers() { let document = Document::from_fields([ ("created_at", Value::from(1_785_680_802_608_u64)), ("small", Value::from(42_u64)), ("negative", Value::from(-5_000_000_000_i64)), ]); let response = BorrowedPlainDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id: RequestId::string("query-1").unwrap(), data: BorrowedDocument(&document), }; let payload = rmp_serde::to_vec_named(&response).unwrap(); let decoded: JsonValue = rmp_serde::from_slice(&payload).unwrap(); assert!(decoded["data"]["created_at"].is_f64()); assert!(decoded["data"]["negative"].is_f64()); assert!(decoded["data"]["small"].is_u64()); }
     #[test] fn enrollment_grants_event_subscription_permission() { let query = enrollment_events_permission_query("identity-a", 42); assert_eq!( query, r#"on _permissions | insert {identityId: "identity-a", action: "events.subscribe", resource: "*", effect: "allow", state: "active", createdAt: 42}"# ); }

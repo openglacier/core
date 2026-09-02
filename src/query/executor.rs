@@ -4,7 +4,7 @@ use std::{cmp::Ordering, error::Error as StdError, fmt, io, mem::size_of, sync::
 
 use crate::{
     compare,
-    helpers::{document_scope_matches, enforce_document_scope},
+    helpers::{document_scope_matches, enforce_document_scope, PLACE_SCOPE_FIELD},
     memory::{MemoryClass, MemoryGovernor, MemoryReservation, MemoryReservationError},
     model::{CoercionPolicy, Document, Number, Value},
     spill::{SpillEngine, SpillRun, SpillRunReader},
@@ -26,28 +26,50 @@ use super::logical_plan::{InsertDocument as LogicalInsertDocument, PivotSpecific
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentScope {
     place_id: Arc<str>,
-    app_instance_id: Arc<str>,
+    app_instance_id: Option<Arc<str>>,
 }
 
 impl DocumentScope {
+    /// Creates a Place + AppInstance scope.
     #[must_use]
     pub fn new(place_id: impl Into<Arc<str>>, app_instance_id: impl Into<Arc<str>>) -> Self {
         Self {
             place_id: place_id.into(),
-            app_instance_id: app_instance_id.into(),
+            app_instance_id: Some(app_instance_id.into()),
+        }
+    }
+
+    /// Creates a Place-wide scope without restricting documents to one AppInstance.
+    #[must_use]
+    pub fn for_place(place_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            place_id: place_id.into(),
+            app_instance_id: None,
         }
     }
 
     fn matches(&self, document: &Document) -> bool {
-        document_scope_matches(document, &self.place_id, &self.app_instance_id)
+        match self.app_instance_id.as_deref() {
+            Some(app_instance_id) => {
+                document_scope_matches(document, &self.place_id, app_instance_id)
+            }
+            None => document.get(PLACE_SCOPE_FIELD) == Some(&Value::from(self.place_id.as_ref())),
+        }
     }
 
     fn enforce(&self, document: &Document) -> Arc<Document> {
-        Arc::new(enforce_document_scope(
-            document,
-            &self.place_id,
-            &self.app_instance_id,
-        ))
+        match self.app_instance_id.as_deref() {
+            Some(app_instance_id) => Arc::new(enforce_document_scope(
+                document,
+                &self.place_id,
+                app_instance_id,
+            )),
+            None => {
+                let mut scoped = document.clone();
+                scoped.insert(PLACE_SCOPE_FIELD, self.place_id.as_ref());
+                Arc::new(scoped)
+            }
+        }
     }
 }
 
@@ -3376,6 +3398,44 @@ mod tests {
         let scoped = scope.enforce(&document);
         assert_eq!(scoped.get("_place"), Some(&Value::from("place-a")));
         assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-1")));
+        assert_eq!(scoped.get("name"), Some(&Value::from("item")));
+    }
+
+    #[test]
+    fn place_document_scope_matches_all_instances_in_the_place() {
+        let scope = DocumentScope::for_place("place-a");
+        let app_one = Document::from_fields([
+            ("_place", Value::from("place-a")),
+            ("_app_instance", Value::from("app-1")),
+        ]);
+        let app_two = Document::from_fields([
+            ("_place", Value::from("place-a")),
+            ("_app_instance", Value::from("app-2")),
+        ]);
+        let place_only = Document::from_fields([("_place", Value::from("place-a"))]);
+        let other_place = Document::from_fields([
+            ("_place", Value::from("place-b")),
+            ("_app_instance", Value::from("app-1")),
+        ]);
+
+        assert!(scope.matches(&app_one));
+        assert!(scope.matches(&app_two));
+        assert!(scope.matches(&place_only));
+        assert!(!scope.matches(&other_place));
+    }
+
+    #[test]
+    fn place_document_scope_forces_place_without_overwriting_app_instance() {
+        let scope = DocumentScope::for_place("place-a");
+        let document = Document::from_fields([
+            ("_place", Value::from("place-evil")),
+            ("_app_instance", Value::from("app-2")),
+            ("name", Value::from("item")),
+        ]);
+        let scoped = scope.enforce(&document);
+
+        assert_eq!(scoped.get("_place"), Some(&Value::from("place-a")));
+        assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-2")));
         assert_eq!(scoped.get("name"), Some(&Value::from("item")));
     }
 

@@ -318,6 +318,36 @@ pub struct DataMappingSaveInput {
     pub definition: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataMappingListInput {
+    pub place_id: String,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataMappingUpdateInput {
+    pub place_id: String,
+    pub mapping_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub target_app_id: Option<String>,
+    #[serde(default)]
+    pub target_table: Option<String>,
+    #[serde(default)]
+    pub definition: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DataMappingDeleteInput {
+    pub place_id: String,
+    pub mapping_id: String,
+}
+
 fn default_algorithm() -> String {
     "ed25519".to_owned()
 }
@@ -337,7 +367,8 @@ pub struct QueryExecuteInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryContextResolveInput {
     pub place_id: String,
-    pub app_instance_id: String,
+    #[serde(default)]
+    pub app_instance_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -576,10 +607,12 @@ pub struct FileVersionInput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CollectionsListInput {
     #[serde(default)]
     pub stats: bool,
+    #[serde(default)]
+    pub place_id: Option<String>,
 }
 
 /// Validation and normalization owned by a typed operation payload.
@@ -659,12 +692,17 @@ macro_rules! valid_payload {
     )+};
 }
 
-valid_payload!(
-    UncheckedInput,
-    EmptyInput,
-    EventsSubscribeInput,
-    CollectionsListInput
-);
+valid_payload!(UncheckedInput, EmptyInput, EventsSubscribeInput);
+
+impl OperationPayload for CollectionsListInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        if let Some(place_id) = self.place_id.as_ref() {
+            non_empty(operation, "placeId", place_id)?;
+        }
+        Ok(())
+    }
+}
+
 validate_fields!(AuthBeginInput => identity_id: "identityId", device_id: "deviceId");
 validate_fields!(ChallengeSignatureInput => challenge_id: "challengeId", signature: "signature");
 validate_fields!(AuthEnrollBeginInput =>
@@ -756,8 +794,6 @@ impl OperationPayload for PlaceUpdateInput {
     }
 }
 
-validate_fields!(QueryContextResolveInput => place_id: "placeId", app_instance_id: "appInstanceId");
-
 impl OperationPayload for QueryExecuteInput {
     fn validate(&mut self, operation: &str) -> Result<()> {
         if self.query.trim().is_empty() {
@@ -765,7 +801,19 @@ impl OperationPayload for QueryExecuteInput {
         }
         if let Some(context) = self.context.as_ref() {
             non_empty(operation, "context.placeId", &context.place_id)?;
-            non_empty(operation, "context.appInstanceId", &context.app_instance_id)?;
+            if let Some(app_instance_id) = context.app_instance_id.as_ref() {
+                non_empty(operation, "context.appInstanceId", app_instance_id)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OperationPayload for QueryContextResolveInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "placeId", &self.place_id)?;
+        if let Some(app_instance_id) = self.app_instance_id.as_ref() {
+            non_empty(operation, "appInstanceId", app_instance_id)?;
         }
         Ok(())
     }
@@ -919,6 +967,56 @@ impl OperationPayload for DataMappingSaveInput {
             return Err(invalid_payload(operation, "definition must be an object"));
         }
         Ok(())
+    }
+}
+impl OperationPayload for DataMappingListInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "placeId", &self.place_id)?;
+        if let Some(fingerprint) = &self.fingerprint {
+            non_empty(operation, "fingerprint", fingerprint)?;
+        }
+        Ok(())
+    }
+}
+
+impl OperationPayload for DataMappingUpdateInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "placeId", &self.place_id)?;
+        non_empty(operation, "mappingId", &self.mapping_id)?;
+        if let Some(name) = &self.name {
+            non_empty(operation, "name", name)?;
+        }
+        if let Some(app_id) = &self.target_app_id {
+            non_empty(operation, "targetAppId", app_id)?;
+        }
+        if let Some(table) = &self.target_table {
+            non_empty(operation, "targetTable", table)?;
+        }
+        if self
+            .definition
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+        {
+            return Err(invalid_payload(operation, "definition must be an object"));
+        }
+        if self.name.is_none()
+            && self.target_app_id.is_none()
+            && self.target_table.is_none()
+            && self.definition.is_none()
+        {
+            return Err(invalid_payload(
+                operation,
+                "at least one mapping field must be provided",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OperationPayload for DataMappingDeleteInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "placeId", &self.place_id)?;
+        non_empty(operation, "mappingId", &self.mapping_id)
     }
 }
 

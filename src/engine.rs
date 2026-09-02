@@ -921,7 +921,7 @@ impl Engine {
         Ok(output)
     }
 
-    /// Executes a physical plan under a trusted App Instance document scope.
+    /// Executes a physical plan under a trusted Place or AppInstance document scope.
     pub fn execute_physical_scoped(
         &self,
         physical: &PhysicalPlan,
@@ -932,7 +932,7 @@ impl Engine {
             return Err(EngineError::execution(
                 ExecutionError::unsupported_operator(
                     "scoped-system-collection",
-                    "App Instance scoped queries cannot target system collections",
+                    "Place-scoped queries cannot target system collections",
                 ),
             ));
         }

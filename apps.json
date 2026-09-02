@@ -12,24 +12,7 @@
       "data": {},
       "actions": {},
       "views": {
-        "tile": [
-          {
-            "type": "text",
-            "value": "Query",
-            "role": "title"
-          },
-          {
-            "type": "text",
-            "value": "Explore documents with the native og-core pipeline language.",
-            "role": "body"
-          },
-          {
-            "type": "button",
-            "label": "Open",
-            "action": "open-full",
-            "variant": "quiet"
-          }
-        ],
+        "tile": [],
         "full": [
           {
             "type": "section",
@@ -58,73 +41,13 @@
       "data": {},
       "actions": {},
       "views": {
-        "tile": [
-          {
-            "type": "text",
-            "value": "Files",
-            "role": "title"
-          },
-          {
-            "type": "text",
-            "value": "Browse, upload and manage files in this Place.",
-            "role": "body"
-          },
-          {
-            "type": "badge",
-            "label": "Native · Core",
-            "tone": "glacier"
-          },
-          {
-            "type": "button",
-            "label": "Open files",
-            "action": "open-full",
-            "variant": "quiet"
-          }
-        ],
+        "tile": [],
         "full": [
           {
             "type": "section",
             "kicker": "Files · Core-backed",
             "title": "Files",
             "description": "Native file workspace scoped to this Place and App instance."
-          }
-        ]
-      }
-    }
-  },
-  {
-    "appId": "system.assistant",
-    "name": "Assistant",
-    "version": "1.0.0",
-    "definition": {
-      "id": "system.assistant",
-      "name": "Assistant",
-      "version": "1.0.0",
-      "tone": "glacier",
-      "hub": {
-        "description": "Ask, explore and work with what this Place knows.",
-        "meta": "Ready when you are",
-        "mark": "○"
-      },
-      "kind": "system.assistant",
-      "requires": {
-        "capabilities": []
-      },
-      "views": {
-        "tile": [
-          {
-            "type": "section",
-            "kicker": "Ready when you are",
-            "title": "Assistant",
-            "description": "Ask, explore and work with what this Place knows."
-          }
-        ],
-        "full": [
-          {
-            "type": "section",
-            "kicker": "Assistant",
-            "title": "Assistant",
-            "description": "Ask, explore and work with what this Place knows."
           }
         ]
       }
@@ -149,14 +72,7 @@
         "capabilities": []
       },
       "views": {
-        "tile": [
-          {
-            "type": "section",
-            "kicker": "No active mission",
-            "title": "Projects",
-            "description": "Keep ongoing work, missions and shared context together."
-          }
-        ],
+        "tile": [],
         "full": [
           {
             "type": "section",
@@ -256,53 +172,6 @@
             "kicker": "System",
             "title": "Calls",
             "description": "Peer-to-peer audio and video calls between OpenGlacier identities."
-          }
-        ]
-      }
-    }
-  },
-  {
-    "appId": "system.builder",
-    "name": "Builder",
-    "version": "1.0.0",
-    "definition": {
-      "id": "system.builder",
-      "name": "Builder",
-      "version": "1.0.0",
-      "description": "Build and maintain App Definitions from Core primitives and Hub runtime components.",
-      "kind": "system.builder",
-      "tone": "glacier",
-      "hub": {
-        "description": "Build Apps from Core primitives and Hub runtime components.",
-        "meta": "App Builder",
-        "mark": "+"
-      },
-      "requires": {
-        "capabilities": []
-      },
-      "data": {},
-      "actions": {},
-      "views": {
-        "tile": [
-          {
-            "type": "section",
-            "kicker": "System App",
-            "title": "Builder",
-            "description": "Build and maintain App Definitions for this OpenGlacier system."
-          },
-          {
-            "type": "button",
-            "label": "Open Builder",
-            "action": "open-full",
-            "variant": "quiet"
-          }
-        ],
-        "full": [
-          {
-            "type": "section",
-            "kicker": "Builder",
-            "title": "App Builder",
-            "description": "Compose Apps from Core primitives and Hub runtime components."
           }
         ]
       }

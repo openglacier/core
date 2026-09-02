@@ -1,9 +1,9 @@
 //! Bounded ephemeral event bus used by the daemon.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
@@ -21,6 +21,38 @@ use crate::{
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 pub const DEFAULT_SUBSCRIBER_CAPACITY: usize = 256;
+const DEFAULT_RECENT_EVENT_CAPACITY: usize = 4096;
+
+#[derive(Debug)]
+struct RecentEventIds {
+    capacity: usize,
+    order: VecDeque<String>,
+    ids: HashSet<String>,
+}
+
+impl RecentEventIds {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            order: VecDeque::new(),
+            ids: HashSet::new(),
+        }
+    }
+
+    fn contains(&self, event_id: &str) -> bool { self.ids.contains(event_id) }
+
+    fn insert(&mut self, event_id: String) {
+        if !self.ids.insert(event_id.clone()) {
+            return;
+        }
+        self.order.push_back(event_id);
+        while self.order.len() > self.capacity {
+            if let Some(expired) = self.order.pop_front() {
+                self.ids.remove(&expired);
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 struct Subscriber {
@@ -49,6 +81,8 @@ impl EventSubscription {
     #[must_use]
     pub const fn id(&self) -> u64 { self.id }
 
+    pub fn recv(&self) -> Result<Event, mpsc::RecvError> { self.receiver.recv() }
+
     pub fn try_recv(&self) -> Result<Event, mpsc::TryRecvError> { self.receiver.try_recv() }
 }
 
@@ -64,13 +98,19 @@ impl Drop for EventSubscription {
 /// Running heartbeat producer. Dropping the handle stops its thread.
 #[derive(Debug)]
 pub struct HeartbeatHandle {
-    stop: Arc<AtomicBool>,
+    stop: Option<mpsc::Sender<()>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl HeartbeatHandle {
+    fn signal_stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+
     pub fn stop(mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.signal_stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -79,7 +119,7 @@ impl HeartbeatHandle {
 
 impl Drop for HeartbeatHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.signal_stop();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -96,6 +136,7 @@ pub struct EventEngine {
     published: Arc<AtomicU64>,
     delivered: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    recent_event_ids: Arc<Mutex<RecentEventIds>>,
 }
 
 impl Default for EventEngine {
@@ -152,14 +193,28 @@ impl EventEngine {
             published: Arc::new(AtomicU64::new(0)),
             delivered,
             dropped,
+            recent_event_ids: Arc::new(Mutex::new(RecentEventIds::new(DEFAULT_RECENT_EVENT_CAPACITY))),
         }
     }
 
     pub fn publish(&self, event: Event) -> bool {
         let event_type = event.event_type.clone();
         let event_id = event.id.clone();
+        let mut recent = self.recent_event_ids
+            .lock()
+            .expect("recent event ids lock poisoned");
+        if recent.contains(&event_id) {
+            debug::log(
+                DebugTopic::Events,
+                None,
+                format!("deduplicated type={event_type} event_id={event_id}"),
+            );
+            return true;
+        }
         match self.input.try_send(event) {
             Ok(()) => {
+                recent.insert(event_id.clone());
+                drop(recent);
                 self.published.fetch_add(1, Ordering::Relaxed);
                 debug::log(
                     DebugTopic::Events,
@@ -221,14 +276,17 @@ impl EventEngine {
     #[must_use]
     pub fn start_heartbeat(&self, interval: Duration) -> HeartbeatHandle {
         let engine = self.clone();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
+        let (stop, worker_stop) = mpsc::channel::<()>();
         let started = Instant::now();
         let worker = thread::Builder::new()
             .name("og-event-heartbeat".to_owned())
             .spawn(move || {
                 let mut sequence = 0u64;
-                while !sleep_interruptibly(interval, &worker_stop) {
+                loop {
+                    match worker_stop.recv_timeout(interval) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                     sequence = sequence.saturating_add(1);
                     let snapshot = engine.snapshot();
                     let payload = json!({
@@ -255,7 +313,7 @@ impl EventEngine {
             })
             .expect("heartbeat thread must start");
         HeartbeatHandle {
-            stop,
+            stop: Some(stop),
             worker: Some(worker),
         }
     }
@@ -273,20 +331,6 @@ impl EventEngine {
                 .len(),
         }
     }
-}
-
-fn sleep_interruptibly(interval: Duration, stop: &AtomicBool) -> bool {
-    const SLICE: Duration = Duration::from_millis(50);
-    let mut remaining = interval;
-    while !remaining.is_zero() {
-        if stop.load(Ordering::Acquire) {
-            return true;
-        }
-        let sleep_for = remaining.min(SLICE);
-        thread::sleep(sleep_for);
-        remaining = remaining.saturating_sub(sleep_for);
-    }
-    stop.load(Ordering::Acquire)
 }
 
 fn normalize_types(types: Vec<String>) -> Vec<String> {
@@ -320,5 +364,6 @@ mod tests {
     #[test] fn unmatched_events_are_not_delivered() { let engine = EventEngine::new(8); let subscription = engine.subscribe(vec!["sharing.*".to_owned()]); assert!(engine.publish_global("query.started", json!({}))); assert!(subscription .receiver .recv_timeout(Duration::from_millis(50)) .is_err()); }
     #[test] fn targeted_event_preserves_its_logical_audience() { let engine = EventEngine::new(8); let subscription = engine.subscribe(vec!["sharing.*".to_owned()]); assert!(engine.publish_to( Audience::identities(["identity-a".to_owned(), "identity-b".to_owned()]), "sharing.created", json!({"sharingId": "sharing-a"}), )); let event = subscription .receiver .recv_timeout(Duration::from_secs(1)) .unwrap(); assert_eq!( event.audience, Audience::Identities { identity_ids: vec!["identity-a".to_owned(), "identity-b".to_owned()], } ); }
     #[test] fn dropping_subscription_unregisters_it() { let engine = EventEngine::new(8); let subscription = engine.subscribe(vec!["*".to_owned()]); assert_eq!(engine.snapshot().subscribers, 1); drop(subscription); assert_eq!(engine.snapshot().subscribers, 0); }
+    #[test] fn duplicate_event_ids_are_delivered_once() { let engine = EventEngine::new(8); let subscription = engine.subscribe(vec!["app.data.changed".to_owned()]); let event = Event::new("event-a", "app.data.changed", Audience::Global, unix_time_millis(), json!({"collection": "items"})); assert!(engine.publish(event.clone())); assert!(engine.publish(event)); let first = subscription.receiver.recv_timeout(Duration::from_secs(1)).unwrap(); assert_eq!(first.id, "event-a"); assert!(subscription.receiver.recv_timeout(Duration::from_millis(50)).is_err()); }
     #[test] fn heartbeat_contains_js_safe_runtime_metrics_and_stops_cleanly() { let engine = EventEngine::new(8); let subscription = engine.subscribe(vec!["core.heartbeat".to_owned()]); let heartbeat = engine.start_heartbeat(Duration::from_millis(10)); let event = subscription .receiver .recv_timeout(Duration::from_secs(1)) .unwrap(); assert_eq!(event.event_type, "core.heartbeat"); assert!(event.payload["sequence"].is_f64()); assert!(event.payload["uptimeMs"].is_f64()); assert!(event.payload["eventEngine"]["published"].is_f64()); heartbeat.stop(); }
 }
