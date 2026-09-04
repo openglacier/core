@@ -72,18 +72,20 @@ use crate::{
     indexing::{IndexingEngine, IndexingSnapshot, ObservedAccess, QueryObservation},
     memory::{MemoryGovernor, MemorySnapshot, ProcessMemoryPressure},
     query::{
-        decode_execution_row, encode_execution_row, execution_row_working_bytes,
-        reserve_query_memory, stable_sort, BoundedProjectedTopN, BoundedTopN, ExecutionError,
+        decode_execution_row, encode_execution_row_into, execution_row_encoded_len,
+        execution_row_working_bytes, projected_row_working_bytes_refs,
+        reserve_query_memory, stable_projected_order, stable_sort, BoundedProjectedTopN, BoundedTopN,
+        ExecutionError,
         ExecutionOutput, ExecutionRow, ExecutionRuntime, ExecutionStatistics, ExecutionStrategies,
         ExecutionStrategy, Executor, LogicalPlan, LookupDocuments, Order, PhysicalOperator,
         PhysicalPlan, PhysicalPlanError, PhysicalPlanner, PhysicalSubPipeline, Planner,
-        PlannerCache, PlannerCacheStats, PlannerError, PlannerPipeline, ProjectedValueLayout,
-        ProjectedValuePipeline, SortKey, vcollections,
+        PlannerCache, PlannerCacheStats, PlannerError, PlannerPipeline, ProjectedRowLocator,
+        ProjectedRowSet, ProjectedValueLayout, ProjectedValuePipeline, SortKey, vcollections,
     },
     spill::{SpillEngine, SpillRun, SpillRunReader},
     storage::{
-        CollectionId, DocumentId, DocumentVersion, MemoryStorage, StorageEngine, StorageError,
-        StoredDocument,
+        CollectionId, DocumentId, DocumentVersion, MemoryStorage, ProjectedValueRef, ScanOptions,
+        StorageEngine, StorageError, StorageRead, StoredDocument,
     },
     Document, Value,
 };
@@ -1185,6 +1187,117 @@ impl Engine {
         }
     }
 
+    /// Compiles the standard projected-value source prefix for one blocking
+    /// consumer. This is the single query/storage boundary used by projected
+    /// sort, distinct and Top-N; unsupported shapes return `None` and preserve
+    /// the established Document pipeline.
+    fn projected_collection_pipeline<I>(
+        &self,
+        prefix: &PhysicalPlan,
+        downstream_fields: I,
+    ) -> EngineResult<Option<(ScanOptions, ProjectedValuePipeline)>>
+    where
+        I: IntoIterator<Item = crate::query::ExpressionFieldPath>,
+    {
+        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access()
+        else {
+            return Ok(None);
+        };
+        let Some(projected) = ProjectedValuePipeline::compile(
+            prefix.operators(),
+            downstream_fields,
+        )
+        .map_err(EngineError::execution)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((*options, projected)))
+    }
+
+    /// Scans one projected source prefix and applies all compatible row stages
+    /// before handing the borrowed row to a blocking consumer. The method owns
+    /// no operator semantics beyond access-vector composition.
+    #[inline]
+    fn scan_projected_prefix_refs<F>(
+        &self,
+        read: &dyn StorageRead,
+        prefix: &PhysicalPlan,
+        options: ScanOptions,
+        projected: &ProjectedValuePipeline,
+        visitor: &mut F,
+    ) -> EngineResult<ExecutionStatistics>
+    where
+        F: for<'a> FnMut(
+            DocumentId,
+            DocumentVersion,
+            &[Option<ProjectedValueRef<'a>>],
+        ) -> EngineResult<bool>,
+    {
+        let mut scanned = 0u64;
+        let mut filtered = 0u64;
+        let mut returned = 0u64;
+        read.scan_projected_row_refs_unordered_each(
+            prefix.source().collection(),
+            options,
+            projected.layout().storage_fields(),
+            &mut |id, version, values| {
+                scanned = scanned.saturating_add(1);
+                let accepted = projected
+                    .accepts_refs_with(values, |expression, resolver| {
+                        self.runtime
+                            .evaluate_resolved_predicate(expression, resolver)
+                    })
+                    .map_err(backend_storage_error)?;
+                if !accepted {
+                    filtered = filtered.saturating_add(1);
+                    return Ok(true);
+                }
+                returned = returned.saturating_add(1);
+                visitor(id, version, values).map_err(backend_storage_error)
+            },
+        )
+        .map_err(storage_engine_error)?;
+
+        Ok(ExecutionStatistics::streamed_pipeline(
+            scanned,
+            filtered,
+            returned,
+            ExecutionStrategy::CollectionScan,
+        ))
+    }
+
+    /// Hydrates one retained locator from the same storage snapshot and
+    /// reapplies any pre-blocking Select stage that was deferred by the
+    /// projected access vector.
+    fn hydrate_projected_locator(
+        &self,
+        read: &dyn StorageRead,
+        collection: &CollectionId,
+        locator: ProjectedRowLocator,
+        projected: &ProjectedValuePipeline,
+    ) -> EngineResult<Option<ExecutionRow>> {
+        let Some(stored) = read
+            .get(collection, &locator.id())
+            .map_err(storage_engine_error)?
+        else {
+            return Ok(None);
+        };
+        if stored.version() != locator.version() {
+            return Ok(None);
+        }
+
+        let mut row = ExecutionRow::from_stored(stored);
+        if let Some(fields) = projected.hydration_projection() {
+            let evaluation_document = row.evaluation_document();
+            let document = self
+                .runtime
+                .apply_select(fields, &evaluation_document)
+                .map_err(EngineError::execution)?;
+            row.replace_document(document, false);
+        }
+        Ok(Some(row))
+    }
+
     /// Executes Top-N from the shared projected-value access vector and
     /// hydrates only retained winners. Filter prefixes compose on the same
     /// borrowed scalar row, so combinations inherit late materialization
@@ -1203,17 +1316,11 @@ impl Engine {
         {
             return Ok(None);
         }
-        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access()
-        else {
-            return Ok(None);
-        };
 
-        let Some(projected) = ProjectedValuePipeline::compile(
-            prefix.operators(),
+        let Some((options, projected)) = self.projected_collection_pipeline(
+            prefix,
             keys.iter().map(|key| key.field().clone()),
-        )
-        .map_err(EngineError::execution)?
-        else {
+        )? else {
             return Ok(None);
         };
         let sort_fields = keys
@@ -1227,41 +1334,31 @@ impl Engine {
 
         let read = self.storage.read().map_err(storage_engine_error)?;
         let mut top = BoundedProjectedTopN::new(limit);
-        let mut scanned = 0u64;
-        read.scan_projected_row_refs_unordered_each(
-            prefix.source().collection(),
-            *options,
-            projected.layout().storage_fields(),
+        let prefix_stats = self.scan_projected_prefix_refs(
+            read.as_ref(),
+            prefix,
+            options,
+            &projected,
             &mut |id, version, values| {
-                scanned = scanned.saturating_add(1);
-                let accepted = projected
-                    .accepts_refs_with(values, |expression, resolver| {
-                        self.runtime
-                            .evaluate_resolved_predicate(expression, resolver)
-                    })
-                    .map_err(backend_storage_error)?;
-                if accepted {
-                    top.push_refs(keys, &sort_slots, id, version, values)
-                        .map_err(backend_storage_error)?;
-                }
+                top.push_refs(keys, &sort_slots, id, version, values)
+                    .map_err(EngineError::execution)?;
                 Ok(true)
             },
-        )
-        .map_err(storage_engine_error)?;
+        )?;
 
-        let projected = top
+        let projected_winners = top
             .into_sorted_winners(keys)
             .map_err(EngineError::execution)?;
-        let mut hydrated = Vec::with_capacity(projected.len());
-        for winner in projected {
-            let Some(stored) = read
-                .get(prefix.source().collection(), winner.id())
-                .map_err(storage_engine_error)?
-            else {
-                continue;
-            };
-            if stored.version() == winner.version() {
-                hydrated.push(ExecutionRow::from_stored(stored));
+        let mut hydrated = Vec::with_capacity(projected_winners.len());
+        for winner in projected_winners {
+            let locator = ProjectedRowLocator::new(*winner.id(), winner.version());
+            if let Some(row) = self.hydrate_projected_locator(
+                read.as_ref(),
+                prefix.source().collection(),
+                locator,
+                &projected,
+            )? {
+                hydrated.push(row);
             }
         }
 
@@ -1269,8 +1366,10 @@ impl Engine {
         Ok(Some((
             hydrated,
             ExecutionStatistics::streamed_with_strategies(
-                scanned,
-                scanned.saturating_sub(returned),
+                prefix_stats.scanned(),
+                prefix_stats
+                    .filtered()
+                    .saturating_add(prefix_stats.returned().saturating_sub(returned)),
                 returned,
                 ExecutionStrategies::default()
                     .with(ExecutionStrategy::CollectionScan)
@@ -1279,46 +1378,316 @@ impl Engine {
         )))
     }
 
+    /// Executes a complete blocking sort from projected values when the compact
+    /// locator+key working set fits the governed budget. If it does not fit, the
+    /// caller falls back to the established external Document sort.
+    fn try_projected_in_memory_sort(
+        &self,
+        prefix: &PhysicalPlan,
+        keys: &[crate::query::SortKey],
+        budget: usize,
+        visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
+    ) -> EngineResult<Option<ExecutionStatistics>> {
+        if keys.is_empty() || !self.runtime.supports_projected_sort() {
+            return Ok(None);
+        }
+
+        let sort_fields = keys
+            .iter()
+            .map(|key| key.field().clone())
+            .collect::<Vec<_>>();
+        let Some((options, projected)) =
+            self.projected_collection_pipeline(prefix, sort_fields.clone())?
+        else {
+            return Ok(None);
+        };
+        let sort_slots = projected
+            .layout()
+            .slots(&sort_fields)
+            .map_err(EngineError::execution)?;
+
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let mut rows = ProjectedRowSet::new(sort_slots.len());
+        let mut estimated_bytes = 0usize;
+        let exceeded = std::cell::Cell::new(false);
+        let prefix_stats = self.scan_projected_prefix_refs(
+            read.as_ref(),
+            prefix,
+            options,
+            &projected,
+            &mut |id, version, values| {
+                let estimate = projected_row_working_bytes_refs(values, &sort_slots);
+                if estimated_bytes.saturating_add(estimate) > budget {
+                    exceeded.set(true);
+                    return Ok(false);
+                }
+                estimated_bytes = estimated_bytes.saturating_add(estimate);
+                rows.push_refs(id, version, values, &sort_slots)
+                    .map_err(EngineError::execution)?;
+                Ok(true)
+            },
+        )?;
+        if exceeded.get() {
+            return Ok(None);
+        }
+
+        let order = stable_projected_order(
+            self.runtime.as_ref(),
+            keys,
+            &rows,
+            options.direction(),
+        )
+        .map_err(EngineError::execution)?;
+        let mut returned = 0u64;
+        for index in order {
+            let locator = rows
+                .locator(index)
+                .expect("projected sort permutation must reference a locator");
+            if let Some(row) = self.hydrate_projected_locator(
+                read.as_ref(),
+                prefix.source().collection(),
+                locator,
+                &projected,
+            )? {
+                visitor(row)?;
+                returned = returned.saturating_add(1);
+            }
+        }
+
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            prefix_stats.scanned(),
+            prefix_stats
+                .filtered()
+                .saturating_add(prefix_stats.returned().saturating_sub(returned)),
+            returned,
+            ExecutionStrategies::default()
+                .with(ExecutionStrategy::CollectionScan)
+                .with(ExecutionStrategy::InMemorySort),
+        )))
+    }
+
+    /// Executes explicit-field distinct directly from projected values. The
+    /// canonical key remains owned by the runtime; the engine retains only one
+    /// source locator per key and hydrates winners after deduplication. A trailing
+    /// limit bounds the retained key frontier without changing key-order output.
+    fn try_projected_in_memory_distinct(
+        &self,
+        prefix: &PhysicalPlan,
+        fields: &[crate::query::ExpressionFieldPath],
+        budget: usize,
+        output_limit: Option<usize>,
+        visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
+    ) -> EngineResult<Option<ExecutionStatistics>> {
+        if fields.is_empty() || !self.runtime.supports_projected_distinct() {
+            return Ok(None);
+        }
+
+        let Some((options, projected)) =
+            self.projected_collection_pipeline(prefix, fields.iter().cloned())?
+        else {
+            return Ok(None);
+        };
+        let field_slots = projected
+            .layout()
+            .slots(fields)
+            .map_err(EngineError::execution)?;
+
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let mut rows: BTreeMap<Arc<[u8]>, (ProjectedRowLocator, usize)> = BTreeMap::new();
+        let mut key_buffer = Vec::<u8>::with_capacity(64);
+        let mut estimated_bytes = 0usize;
+        let exceeded = std::cell::Cell::new(false);
+
+        let prefix_stats = self.scan_projected_prefix_refs(
+            read.as_ref(),
+            prefix,
+            options,
+            &projected,
+            &mut |id, version, values| {
+                key_buffer.clear();
+                let supported = self
+                    .runtime
+                    .write_projected_distinct_key(fields, values, &field_slots, &mut key_buffer)
+                    .map_err(EngineError::execution)?;
+                if !supported {
+                    return Err(EngineError::execution(ExecutionError::unsupported_operator(
+                        "distinct",
+                        "projected distinct-key runtime is not configured",
+                    )));
+                }
+                if output_limit == Some(0) {
+                    return Ok(true);
+                }
+
+                let locator = ProjectedRowLocator::new(id, version);
+                if let Some((retained, _)) = rows.get_mut(key_buffer.as_slice()) {
+                    let earlier = match options.direction() {
+                        crate::storage::ScanDirection::Forward => locator.id() < retained.id(),
+                        crate::storage::ScanDirection::Reverse => locator.id() > retained.id(),
+                    };
+                    if earlier {
+                        *retained = locator;
+                    }
+                    return Ok(true);
+                }
+
+                let estimate = key_buffer.len().saturating_mul(2).saturating_add(160);
+                if estimate > budget {
+                    exceeded.set(true);
+                    return Ok(false);
+                }
+
+                if let Some(limit) = output_limit {
+                    if rows.len() >= limit {
+                        let keep = rows
+                            .last_key_value()
+                            .is_some_and(|(largest, _)| key_buffer.as_slice() < largest.as_ref());
+                        if !keep {
+                            return Ok(true);
+                        }
+                        if let Some((_, (_, removed_bytes))) = rows.pop_last() {
+                            estimated_bytes = estimated_bytes.saturating_sub(removed_bytes);
+                        }
+                    }
+                } else if estimated_bytes.saturating_add(estimate) > budget {
+                    exceeded.set(true);
+                    return Ok(false);
+                }
+
+                if estimated_bytes.saturating_add(estimate) > budget {
+                    exceeded.set(true);
+                    return Ok(false);
+                }
+                estimated_bytes = estimated_bytes.saturating_add(estimate);
+                rows.insert(Arc::from(key_buffer.as_slice()), (locator, estimate));
+                Ok(true)
+            },
+        )?;
+        if exceeded.get() {
+            return Ok(None);
+        }
+
+        let mut returned = 0u64;
+        for (_, (locator, _)) in rows {
+            if let Some(row) = self.hydrate_projected_locator(
+                read.as_ref(),
+                prefix.source().collection(),
+                locator,
+                &projected,
+            )? {
+                visitor(row)?;
+                returned = returned.saturating_add(1);
+            }
+        }
+
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            prefix_stats.scanned(),
+            prefix_stats.filtered(),
+            returned,
+            ExecutionStrategies::default()
+                .with(ExecutionStrategy::CollectionScan)
+                .with(ExecutionStrategy::InMemoryDistinct),
+        )))
+    }
+
     fn try_in_memory_distinct(
         &self,
         prefix: &PhysicalPlan,
         fields: &[crate::query::ExpressionFieldPath],
         budget: usize,
+        output_limit: Option<usize>,
     ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
-        let mut rows: BTreeMap<Arc<[u8]>, ExecutionRow> = BTreeMap::new();
+        let mut rows: BTreeMap<Arc<[u8]>, (ExecutionRow, usize)> = BTreeMap::new();
         let mut estimated_bytes = 0usize;
         let exceeded = std::cell::Cell::new(false);
+        let buffered_keys = self.runtime.supports_buffered_distinct();
+        let mut key_buffer = Vec::<u8>::with_capacity(128);
         let statistics = self
             .stream_read_pipeline(prefix, &mut |stored| {
                 if exceeded.get() {
                     return Ok(());
                 }
                 let row = ExecutionRow::from_stored(stored);
-                let key = self
-                    .runtime
-                    .distinct_key(fields, row.document())
-                    .map_err(EngineError::execution)?;
-                if rows.contains_key(&key) {
+
+                let buffered = if buffered_keys {
+                    key_buffer.clear();
+                    self.runtime
+                        .write_distinct_key(fields, row.document(), &mut key_buffer)
+                        .map_err(EngineError::execution)?
+                } else {
+                    false
+                };
+                let owned_key = if buffered {
+                    None
+                } else {
+                    Some(
+                        self.runtime
+                            .distinct_key(fields, row.document())
+                            .map_err(EngineError::execution)?,
+                    )
+                };
+                let key_bytes = owned_key
+                    .as_deref()
+                    .unwrap_or_else(|| key_buffer.as_slice());
+
+                if output_limit == Some(0) {
                     return Ok(());
                 }
-                let row_bytes = encode_execution_row(&row)
-                    .map_err(EngineError::execution)?
-                    .len();
-                let estimate = key.len().saturating_add(row_bytes).saturating_add(96);
+                if rows.contains_key(key_bytes) {
+                    return Ok(());
+                }
+
+                // DISTINCT emits canonical-key order. With a trailing LIMIT only
+                // the N smallest keys can ever be observable, so keys above the
+                // moving frontier need no retained Document or tree node.
+                if let Some(limit) = output_limit {
+                    if rows.len() >= limit {
+                        let keep = rows
+                            .last_key_value()
+                            .is_some_and(|(largest, _)| key_bytes < largest.as_ref());
+                        if !keep {
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let row_bytes = execution_row_encoded_len(&row);
+                let estimate = key_bytes
+                    .len()
+                    .saturating_add(row_bytes)
+                    .saturating_add(96);
+                if estimate > budget {
+                    exceeded.set(true);
+                    rows.clear();
+                    return Ok(());
+                }
+
+                if let Some(limit) = output_limit {
+                    if rows.len() >= limit {
+                        if let Some((_, (_, removed_bytes))) = rows.pop_last() {
+                            estimated_bytes = estimated_bytes.saturating_sub(removed_bytes);
+                        }
+                    }
+                }
+
                 if estimated_bytes.saturating_add(estimate) > budget {
                     exceeded.set(true);
                     rows.clear();
                     return Ok(());
                 }
                 estimated_bytes = estimated_bytes.saturating_add(estimate);
-                rows.insert(key, row);
+                let key = owned_key.unwrap_or_else(|| Arc::from(key_buffer.as_slice()));
+                rows.insert(key, (row, estimate));
                 Ok(())
             })?
             .expect("validated streaming prefix");
         if exceeded.get() {
             Ok(None)
         } else {
-            Ok(Some((rows.into_values().collect(), statistics)))
+            Ok(Some((
+                rows.into_values().map(|(row, _)| row).collect(),
+                statistics,
+            )))
         }
     }
 
@@ -2619,6 +2988,16 @@ impl Engine {
                     working_budget,
                 )
                 .map_err(EngineError::execution)?;
+                if let Some(statistics) = self.try_projected_in_memory_sort(
+                    &prefix,
+                    keys,
+                    working_budget,
+                    visitor,
+                )? {
+                    drop(reservation);
+                    return Ok(Some(statistics));
+                }
+
                 let spill = SpillEngine::default();
                 let sort_input_budget = bounded_sort_input_budget(working_budget);
                 let late_materialize = prefix
@@ -2723,8 +3102,18 @@ impl Engine {
                     working_budget,
                 )
                 .map_err(EngineError::execution)?;
+                if let Some(statistics) = self.try_projected_in_memory_distinct(
+                    &prefix,
+                    fields,
+                    working_budget,
+                    output_limit,
+                    visitor,
+                )? {
+                    drop(reservation);
+                    return Ok(Some(statistics));
+                }
                 if let Some((rows, prefix_stats)) =
-                    self.try_in_memory_distinct(&prefix, fields, working_budget)?
+                    self.try_in_memory_distinct(&prefix, fields, working_budget, output_limit)?
                 {
                     let mut returned = 0u64;
                     for row in rows {
@@ -2758,11 +3147,7 @@ impl Engine {
                             .map_err(EngineError::execution)?;
                         let estimated = key
                             .len()
-                            .saturating_add(
-                                encode_execution_row(&row)
-                                    .map_err(EngineError::execution)?
-                                    .len(),
-                            )
+                            .saturating_add(execution_row_encoded_len(&row))
                             .saturating_add(72);
                         if estimated > working_budget {
                             return Err(EngineError::execution(ExecutionError::evaluation(
@@ -3225,6 +3610,14 @@ impl Engine {
                 optional_usize_value(process.map(|p| p.anonymous_bytes))?,
             ),
             (
+                "non_anonymous_rss_bytes",
+                optional_usize_value(process.map(|p| p.non_anonymous_rss_bytes()))?,
+            ),
+            (
+                "process_pressure_bytes",
+                optional_usize_value(process.map(|p| p.pressure_bytes(snapshot.current_bytes)))?,
+            ),
+            (
                 "unmanaged_bytes",
                 optional_usize_value(process.map(|p| p.unmanaged_bytes))?,
             ),
@@ -3233,7 +3626,18 @@ impl Engine {
             (
                 "process_headroom_bytes",
                 optional_usize_value(match (process, hard_limit_bytes) {
-                    (Some(process), Some(limit)) => Some(limit.saturating_sub(process.rss_bytes)),
+                    (Some(process), Some(limit)) => {
+                        Some(limit.saturating_sub(process.pressure_bytes(snapshot.current_bytes)))
+                    }
+                    _ => None,
+                })?,
+            ),
+            (
+                "process_pressure_over_limit_bytes",
+                optional_usize_value(match (process, hard_limit_bytes) {
+                    (Some(process), Some(limit)) => {
+                        Some(process.pressure_bytes(snapshot.current_bytes).saturating_sub(limit))
+                    }
                     _ => None,
                 })?,
             ),
@@ -3437,10 +3841,13 @@ impl Engine {
                 ("hard_limit_bytes", Value::Null),
                 ("rss_bytes", Value::Null),
                 ("anonymous_bytes", Value::Null),
+                ("non_anonymous_rss_bytes", Value::Null),
+                ("process_pressure_bytes", Value::Null),
                 ("unmanaged_bytes", Value::Null),
                 ("memory_enforcement", Value::Null),
                 ("rss_enforced", Value::Null),
                 ("process_headroom_bytes", Value::Null),
+                ("process_pressure_over_limit_bytes", Value::Null),
                 ("rss_over_limit_bytes", Value::Null),
                 ("spill_runs_created", Value::Null),
                 ("spill_runs_active", Value::Null),
@@ -3850,10 +4257,10 @@ fn flush_sorted_run(
 ) -> Result<(), ExecutionError> {
     stable_sort(runtime, keys, chunk)?;
     let mut writer = spill.create_run().map_err(spill_engine_error)?;
+    let mut encoded = Vec::new();
     for row in chunk.iter() {
-        writer
-            .append(&encode_execution_row(row)?)
-            .map_err(spill_engine_error)?;
+        encode_execution_row_into(row, &mut encoded)?;
+        writer.append(&encoded).map_err(spill_engine_error)?;
     }
     runs.push(writer.finish().map_err(spill_engine_error)?);
     chunk.clear();
@@ -4062,8 +4469,14 @@ fn flush_partial_group_run(
     // rewriting common key prefixes for high-cardinality sorted runs.
     let mut block = Vec::with_capacity(GROUP_SPILL_BLOCK_BYTES);
     let mut previous_key = Vec::<u8>::new();
+    let mut payload_scratch = Vec::<u8>::new();
     for record in chunk.iter() {
-        append_group_spill_block_record(&mut block, &mut previous_key, record)
+        append_group_spill_block_record(
+            &mut block,
+            &mut previous_key,
+            &mut payload_scratch,
+            record,
+        )
             .map_err(EngineError::execution)?;
         if block.len() >= GROUP_SPILL_BLOCK_BYTES {
             writer.append(&block).map_err(engine_spill_error)?;
@@ -4123,16 +4536,10 @@ fn take_group_varint(bytes: &[u8], position: &mut usize) -> Result<usize, Execut
     Err(ExecutionError::evaluation("group spill varint overflow"))
 }
 
-fn group_spill_partial_bytes(partial: &GroupSpillPartial) -> Result<(u8, Vec<u8>), ExecutionError> {
-    Ok(match partial {
-        GroupSpillPartial::Compact(payload) => (1, payload.clone()),
-        GroupSpillPartial::Document(row) => (0, encode_execution_row(row)?),
-    })
-}
-
 fn append_group_spill_block_record(
     block: &mut Vec<u8>,
     previous_key: &mut Vec<u8>,
+    payload_scratch: &mut Vec<u8>,
     record: &GroupSpillRecord,
 ) -> Result<(), ExecutionError> {
     if block.is_empty() {
@@ -4140,13 +4547,24 @@ fn append_group_spill_block_record(
     }
     let common = common_prefix_len(previous_key, &record.key);
     let suffix = &record.key[common..];
-    let (tag, payload) = group_spill_partial_bytes(&record.partial)?;
+
     put_group_varint(block, common);
     put_group_varint(block, suffix.len());
-    block.push(tag);
-    put_group_varint(block, payload.len());
-    block.extend_from_slice(suffix);
-    block.extend_from_slice(&payload);
+    match &record.partial {
+        GroupSpillPartial::Compact(payload) => {
+            block.push(1);
+            put_group_varint(block, payload.len());
+            block.extend_from_slice(suffix);
+            block.extend_from_slice(payload);
+        }
+        GroupSpillPartial::Document(row) => {
+            encode_execution_row_into(row, payload_scratch)?;
+            block.push(0);
+            put_group_varint(block, payload_scratch.len());
+            block.extend_from_slice(suffix);
+            block.extend_from_slice(payload_scratch);
+        }
+    }
     previous_key.clear();
     previous_key.extend_from_slice(&record.key);
     Ok(())
@@ -4286,10 +4704,12 @@ fn flush_keyed_run(
 ) -> EngineResult<u64> {
     chunk.sort_by(|left, right| left.key.cmp(&right.key));
     let mut writer = spill.create_run().map_err(engine_spill_error)?;
+    let mut encoded = Vec::new();
+    let mut row_encoded = Vec::new();
     for keyed in chunk.iter() {
-        writer
-            .append(&encode_keyed_row(keyed).map_err(EngineError::execution)?)
-            .map_err(engine_spill_error)?;
+        encode_keyed_row_into(keyed, &mut encoded, &mut row_encoded)
+            .map_err(EngineError::execution)?;
+        writer.append(&encoded).map_err(engine_spill_error)?;
     }
     let run = writer.finish().map_err(engine_spill_error)?;
     let bytes = run.bytes();
@@ -4298,15 +4718,24 @@ fn flush_keyed_run(
     Ok(bytes)
 }
 
-fn encode_keyed_row(keyed: &KeyedRow) -> Result<Vec<u8>, ExecutionError> {
+fn encode_keyed_row_into(
+    keyed: &KeyedRow,
+    output: &mut Vec<u8>,
+    row_output: &mut Vec<u8>,
+) -> Result<(), ExecutionError> {
     let key_len = u32::try_from(keyed.key.len())
         .map_err(|_| ExecutionError::evaluation("blocking key exceeds u32"))?;
-    let row = encode_execution_row(&keyed.row)?;
-    let mut output = Vec::with_capacity(4 + keyed.key.len() + row.len());
+    encode_execution_row_into(&keyed.row, row_output)?;
+    output.clear();
+    output.reserve(
+        4usize
+            .saturating_add(keyed.key.len())
+            .saturating_add(row_output.len()),
+    );
     output.extend_from_slice(&key_len.to_le_bytes());
     output.extend_from_slice(&keyed.key);
-    output.extend_from_slice(&row);
-    Ok(output)
+    output.extend_from_slice(row_output);
+    Ok(())
 }
 
 fn decode_keyed_row(bytes: &[u8]) -> Result<KeyedRow, ExecutionError> {
@@ -4544,16 +4973,14 @@ fn merge_group_runs(
                 )));
             }
         };
-        let row_bytes = encode_execution_row(&row)
-            .map_err(EngineError::execution)?
-            .len();
+        let row_bytes = execution_row_encoded_len(&row);
         group_bytes = group_bytes.saturating_add(row_bytes);
         if group_bytes > group_budget {
             return Err(EngineError::execution(ExecutionError::evaluation(
                 "one group exceeds the governed query working set; incremental group aggregation is required",
             )));
         }
-        documents.push(Arc::new(row.document().clone()));
+        documents.push(row.shared_document());
         heads[index] =
             read_group_spill_record(&mut readers[index]).map_err(EngineError::execution)?;
     }

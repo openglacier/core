@@ -60,9 +60,18 @@ impl QueryRuntimeMaterializationExt for QueryRuntime {
         .with_compare(move |keys, left, right| {
             materializer.materialize_sort_comparison(keys, left, right)
         })
+        .with_projected_compare(move |keys, left, right| {
+            materializer.materialize_projected_sort_comparison(keys, left, right)
+        })
         .with_select(move |fields, document| materializer.materialize_select(fields, document))
         .with_distinct(move |fields, document| {
             materializer.materialize_distinct_key(fields, document)
+        })
+        .with_buffered_distinct(move |fields, document, key| {
+            materializer.write_distinct_key(fields, document, key)
+        })
+        .with_projected_distinct(move |fields, values, indexes, key| {
+            materializer.write_projected_ref_distinct_key(fields, values, indexes, key)
         })
         .with_count(move |alias, count| materializer.materialize_count(alias, count))
         .with_group(move |keys, documents| group_materializer.materialize_group(keys, documents))
@@ -393,6 +402,48 @@ impl RuntimeMaterializer {
         Ok(Ordering::Equal)
     }
 
+    /// Compares values already aligned with the requested sort keys.
+    ///
+    /// This is semantically identical to `materialize_sort_comparison` but avoids
+    /// building temporary Documents for projected blocking operators.
+    pub fn materialize_projected_sort_comparison(
+        &self,
+        keys: &[SortKey],
+        left: &[Option<Value>],
+        right: &[Option<Value>],
+    ) -> ExecutionResult<Ordering> {
+        if left.len() != keys.len() || right.len() != keys.len() {
+            return Err(ExecutionError::evaluation(
+                "projected sort values do not match the sort-key layout",
+            ));
+        }
+
+        for (index, key) in keys.iter().enumerate() {
+            let ordering = match (left[index].as_ref(), right[index].as_ref()) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(left), Some(right)) => compare(left, right, CoercionPolicy::Numeric)
+                    .map_err(|error| {
+                        ExecutionError::evaluation(format!(
+                            "cannot sort field {}: {error}",
+                            key.field()
+                        ))
+                    })?
+                    .into_ordering(),
+            };
+
+            if ordering != Ordering::Equal {
+                return Ok(match key.direction() {
+                    SortDirection::Ascending => ordering,
+                    SortDirection::Descending => ordering.reverse(),
+                });
+            }
+        }
+
+        Ok(Ordering::Equal)
+    }
+
     /// Projects a document to the requested field paths.
     pub fn materialize_select(
         &self,
@@ -419,26 +470,60 @@ impl RuntimeMaterializer {
         document: &Document,
     ) -> ExecutionResult<Arc<[u8]>> {
         let mut key = Vec::new();
+        self.write_distinct_key(fields, document, &mut key)?;
+        Ok(Arc::from(key))
+    }
 
+    /// Encodes the canonical distinct key into a reusable caller-owned buffer.
+    /// This is byte-for-byte identical to `materialize_distinct_key`.
+    pub fn write_distinct_key(
+        &self,
+        fields: &[ExpressionFieldPath],
+        document: &Document,
+        key: &mut Vec<u8>,
+    ) -> ExecutionResult<()> {
+        key.clear();
         if fields.is_empty() {
             key.push(0);
-            encode_document(&mut key, document);
+            encode_document(key, document);
         } else {
             key.push(1);
-            encode_len(&mut key, fields.len());
-
+            encode_len(key, fields.len());
             for field in fields {
                 match path_value(document, field) {
                     Some(value) => {
                         key.push(1);
-                        encode_value(&mut key, value);
+                        encode_value(key, value);
                     }
                     None => key.push(0),
                 }
             }
         }
+        Ok(())
+    }
 
-        Ok(Arc::from(key))
+    /// Encodes an explicit-field equality key directly from storage-borrowed
+    /// projected values. Missing values remain distinct from physical nulls.
+    pub fn write_projected_ref_distinct_key(
+        &self,
+        fields: &[ExpressionFieldPath],
+        values: &[Option<crate::storage::ProjectedValueRef<'_>>],
+        indexes: &[usize],
+        key: &mut Vec<u8>,
+    ) -> ExecutionResult<()> {
+        if fields.is_empty() || fields.len() != indexes.len() {
+            return Err(ExecutionError::evaluation(
+                "projected distinct requires an explicit field layout",
+            ));
+        }
+        if indexes.iter().any(|index| *index >= values.len()) {
+            return Err(ExecutionError::evaluation(
+                "projected distinct slots do not match the source layout",
+            ));
+        }
+
+        self.write_projected_ref_distinct_key_indexes(values, indexes, key);
+        Ok(())
     }
 
     /// Encodes the explicit-field equality key directly into a reusable
@@ -2258,6 +2343,63 @@ mod tests {
             materializer
                 .materialize_distinct_key(&fields, &null)
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn buffered_distinct_matches_allocating_key() {
+        let mut document = Document::new();
+        document.insert("a", Value::unsigned(1));
+        document.insert("b", Value::string("two"));
+        let materializer = RuntimeMaterializer::new();
+        let expected = materializer
+            .materialize_distinct_key(&[], &document)
+            .unwrap();
+        let mut key = Vec::new();
+        materializer
+            .write_distinct_key(&[], &document, &mut key)
+            .unwrap();
+        assert_eq!(expected.as_ref(), key.as_slice());
+    }
+
+    #[test]
+    fn projected_distinct_matches_document_key_for_explicit_fields() {
+        let field = ExpressionFieldPath::new(["a"]).unwrap();
+        let fields = [field];
+        let mut document = Document::new();
+        document.insert("a", Value::string("hello"));
+        let materializer = RuntimeMaterializer::new();
+        let expected = materializer
+            .materialize_distinct_key(&fields, &document)
+            .unwrap();
+        let values = [Some(crate::storage::ProjectedValueRef::String("hello"))];
+        let mut key = Vec::new();
+        materializer
+            .write_projected_ref_distinct_key(&fields, &values, &[0], &mut key)
+            .unwrap();
+        assert_eq!(expected.as_ref(), key.as_slice());
+    }
+
+    #[test]
+    fn projected_sort_matches_document_sort_semantics() {
+        let field = ExpressionFieldPath::new(["a"]).unwrap();
+        let keys = [SortKey::ascending(field)];
+        let mut one = Document::new();
+        one.insert("a", Value::unsigned(1));
+        let mut two = Document::new();
+        two.insert("a", Value::unsigned(2));
+        let materializer = RuntimeMaterializer::new();
+        assert_eq!(
+            materializer
+                .materialize_projected_sort_comparison(
+                    &keys,
+                    &[Some(Value::unsigned(1))],
+                    &[Some(Value::unsigned(2))],
+                )
+                .unwrap(),
+            materializer
+                .materialize_sort_comparison(&keys, &one, &two)
+                .unwrap(),
         );
     }
 

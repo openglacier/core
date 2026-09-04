@@ -694,7 +694,7 @@ impl PhysicalOperator {
 
     /// Returns the resolved execution properties for this operator instance.
     #[must_use]
-    pub const fn execution_properties(&self) -> ExecutionProperties<'_> {
+    pub fn execution_properties(&self) -> ExecutionProperties<'_> {
         use super::execution_properties::Scope::{Row, Set};
         use Bound::{AtMost, Exact, Unknown as U};
         use CardinalityEffect::{Expand, Preserve, Reduce, Unknown};
@@ -726,9 +726,22 @@ impl PhysicalOperator {
                     NoPv,
                 ),
                 Self::Skip { .. } => (S, Reduce, U, Preserved, SameFields, L, Set, R, NoPv),
+                Self::Distinct { fields } if !fields.is_empty() => {
+                    (B, Reduce, U, NoOrder, UnknownFields, L, Set, R, PvConsumer)
+                }
                 Self::Distinct { .. } => (B, Reduce, U, NoOrder, UnknownFields, L, Set, R, NoPv),
                 Self::Group { .. } => (B, Reduce, U, NoOrder, UnknownFields, L, Set, R, PvConsumer),
-                Self::Sort { keys } => (B, Preserve, U, Ordered(keys), SameFields, L, Set, R, NoPv),
+                Self::Sort { keys } => (
+                    B,
+                    Preserve,
+                    U,
+                    Ordered(keys),
+                    SameFields,
+                    L,
+                    Set,
+                    R,
+                    PvConsumer,
+                ),
                 Self::Select { fields } => (
                     S,
                     Preserve,
@@ -1758,6 +1771,39 @@ mod tests {
         assert_eq!(
             negotiate_source_access_vector(&operators),
             (AccessVector::ProjectedValues, 1)
+        );
+    }
+
+    #[test]
+    fn negotiates_projected_values_for_filter_sort_source_prefix() {
+        let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap();
+        let field = ExpressionFieldPath::new(["score"]).unwrap();
+        let operators = vec![
+            PhysicalOperator::Filter { predicate },
+            PhysicalOperator::Sort {
+                keys: Arc::from([SortKey::ascending(field)]),
+            },
+        ];
+        assert_eq!(
+            negotiate_source_access_vector(&operators),
+            (AccessVector::ProjectedValues, 1)
+        );
+    }
+
+    #[test]
+    fn explicit_distinct_negotiates_projected_values_but_document_distinct_does_not() {
+        let field = ExpressionFieldPath::new(["name"]).unwrap();
+        assert_eq!(
+            negotiate_source_access_vector(&[PhysicalOperator::Distinct {
+                fields: Arc::from([field]),
+            }]),
+            (AccessVector::ProjectedValues, 0)
+        );
+        assert_eq!(
+            negotiate_source_access_vector(&[PhysicalOperator::Distinct {
+                fields: Arc::from([]),
+            }]),
+            (AccessVector::Document, 0)
         );
     }
 

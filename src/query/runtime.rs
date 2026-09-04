@@ -11,7 +11,7 @@ use super::{
     PhysicalLoadMode, SetAssignment, SortKey, StageName, StreamingLoadMutation, SyntheticDocument,
 };
 use crate::{
-    storage::{CollectionId, StorageRead},
+    storage::{CollectionId, ProjectedValueRef, StorageRead},
     Document, Value,
 };
 
@@ -44,11 +44,27 @@ type LoadHandler = dyn Fn(&str, &Document) -> ExecutionResult<Arc<Document>> + S
 type CompareHandler =
     dyn Fn(&[SortKey], &Document, &Document) -> ExecutionResult<Ordering> + Send + Sync;
 
+type ProjectedCompareHandler = dyn Fn(&[SortKey], &[Option<Value>], &[Option<Value>]) -> ExecutionResult<Ordering>
+    + Send
+    + Sync;
+
+type ProjectedDistinctHandler = dyn for<'a> Fn(
+        &[ExpressionFieldPath],
+        &[Option<ProjectedValueRef<'a>>],
+        &[usize],
+        &mut Vec<u8>,
+    ) -> ExecutionResult<()>
+    + Send
+    + Sync;
+
 type SelectHandler =
     dyn Fn(&[ExpressionFieldPath], &Document) -> ExecutionResult<Arc<Document>> + Send + Sync;
 
 type DistinctHandler =
     dyn Fn(&[ExpressionFieldPath], &Document) -> ExecutionResult<Arc<[u8]>> + Send + Sync;
+
+type BufferedDistinctHandler =
+    dyn Fn(&[ExpressionFieldPath], &Document, &mut Vec<u8>) -> ExecutionResult<()> + Send + Sync;
 
 type CountHandler = dyn Fn(&str, u64) -> ExecutionResult<Arc<Document>> + Send + Sync;
 
@@ -86,8 +102,11 @@ pub struct QueryRuntime {
     streaming_load: Option<Arc<StreamingLoadHandler>>,
     load: Option<Arc<LoadHandler>>,
     compare: Option<Arc<CompareHandler>>,
+    projected_compare: Option<Arc<ProjectedCompareHandler>>,
     select: Option<Arc<SelectHandler>>,
     distinct: Option<Arc<DistinctHandler>>,
+    buffered_distinct: Option<Arc<BufferedDistinctHandler>>,
+    projected_distinct: Option<Arc<ProjectedDistinctHandler>>,
     count: Option<Arc<CountHandler>>,
     group: Option<Arc<GroupHandler>>,
     incremental_group: Option<Arc<IncrementalGroupHandler>>,
@@ -116,8 +135,11 @@ impl QueryRuntime {
             streaming_load: None,
             load: None,
             compare: None,
+            projected_compare: None,
             select: None,
             distinct: None,
+            buffered_distinct: None,
+            projected_distinct: None,
             count: None,
             group: None,
             incremental_group: None,
@@ -228,6 +250,23 @@ impl QueryRuntime {
             + 'static,
     {
         self.compare = Some(Arc::new(compare));
+        // A replacement document comparator may define different coercion or
+        // ordering semantics. Require an explicit projected companion instead
+        // of silently keeping a stale fast-path comparator.
+        self.projected_compare = None;
+        self
+    }
+
+    /// Installs projected sort comparison over rows aligned one-for-one with sort keys.
+    #[must_use]
+    pub fn with_projected_compare<C>(mut self, compare: C) -> Self
+    where
+        C: Fn(&[SortKey], &[Option<Value>], &[Option<Value>]) -> ExecutionResult<Ordering>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.projected_compare = Some(Arc::new(compare));
         self
     }
 
@@ -254,6 +293,42 @@ impl QueryRuntime {
             + 'static,
     {
         self.distinct = Some(Arc::new(distinct));
+        // Canonical distinct-key bytes are runtime semantics. A replacement
+        // handler invalidates accelerated encoders until compatible companions
+        // are installed explicitly.
+        self.buffered_distinct = None;
+        self.projected_distinct = None;
+        self
+    }
+
+    /// Installs ordinary distinct-key encoding into a reusable buffer.
+    #[must_use]
+    pub fn with_buffered_distinct<D>(mut self, distinct: D) -> Self
+    where
+        D: Fn(&[ExpressionFieldPath], &Document, &mut Vec<u8>) -> ExecutionResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.buffered_distinct = Some(Arc::new(distinct));
+        self
+    }
+
+    /// Installs projected explicit-field distinct-key encoding into a reusable buffer.
+    #[must_use]
+    pub fn with_projected_distinct<D>(mut self, distinct: D) -> Self
+    where
+        D: for<'a> Fn(
+                &[ExpressionFieldPath],
+                &[Option<ProjectedValueRef<'a>>],
+                &[usize],
+                &mut Vec<u8>,
+            ) -> ExecutionResult<()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.projected_distinct = Some(Arc::new(distinct));
         self
     }
 
@@ -362,6 +437,12 @@ impl QueryRuntime {
         self.compare.is_some()
     }
 
+    /// Returns whether projected sorting is configured.
+    #[must_use]
+    pub const fn supports_projected_sort(&self) -> bool {
+        self.projected_compare.is_some()
+    }
+
     /// Returns whether projection is configured.
     #[must_use]
     pub const fn supports_select(&self) -> bool {
@@ -372,6 +453,18 @@ impl QueryRuntime {
     #[must_use]
     pub const fn supports_distinct(&self) -> bool {
         self.distinct.is_some()
+    }
+
+    /// Returns whether buffered ordinary distinct encoding is configured.
+    #[must_use]
+    pub const fn supports_buffered_distinct(&self) -> bool {
+        self.buffered_distinct.is_some()
+    }
+
+    /// Returns whether projected explicit-field distinct encoding is configured.
+    #[must_use]
+    pub const fn supports_projected_distinct(&self) -> bool {
+        self.projected_distinct.is_some()
     }
 
     /// Returns whether count result construction is configured.
@@ -422,8 +515,11 @@ impl fmt::Debug for QueryRuntime {
             .field("streaming_load", &self.supports_streaming_load())
             .field("load", &self.supports_load())
             .field("sort", &self.supports_sort())
+            .field("projected_sort", &self.supports_projected_sort())
             .field("select", &self.supports_select())
             .field("distinct", &self.supports_distinct())
+            .field("buffered_distinct", &self.supports_buffered_distinct())
+            .field("projected_distinct", &self.supports_projected_distinct())
             .field("count", &self.supports_count())
             .field("group", &self.supports_group())
             .field("incremental_group", &self.incremental_group.is_some())
@@ -534,6 +630,22 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
+    fn supports_projected_sort(&self) -> bool {
+        self.projected_compare.is_some()
+    }
+
+    fn compare_projected_values(
+        &self,
+        keys: &[SortKey],
+        left: &[Option<Value>],
+        right: &[Option<Value>],
+    ) -> ExecutionResult<Option<Ordering>> {
+        match &self.projected_compare {
+            Some(compare) => compare(keys, left, right).map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn apply_select(
         &self,
         fields: &[ExpressionFieldPath],
@@ -559,6 +671,45 @@ impl ExecutionRuntime for QueryRuntime {
                 "distinct",
                 "distinct-key runtime is not configured",
             )),
+        }
+    }
+
+    fn supports_buffered_distinct(&self) -> bool {
+        self.buffered_distinct.is_some()
+    }
+
+    fn write_distinct_key(
+        &self,
+        fields: &[ExpressionFieldPath],
+        document: &Document,
+        key: &mut Vec<u8>,
+    ) -> ExecutionResult<bool> {
+        match &self.buffered_distinct {
+            Some(distinct) => {
+                distinct(fields, document, key)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    fn supports_projected_distinct(&self) -> bool {
+        self.projected_distinct.is_some()
+    }
+
+    fn write_projected_distinct_key(
+        &self,
+        fields: &[ExpressionFieldPath],
+        values: &[Option<ProjectedValueRef<'_>>],
+        indexes: &[usize],
+        key: &mut Vec<u8>,
+    ) -> ExecutionResult<bool> {
+        match &self.projected_distinct {
+            Some(distinct) => {
+                distinct(fields, values, indexes, key)?;
+                Ok(true)
+            }
+            None => Ok(false),
         }
     }
 
@@ -882,8 +1033,11 @@ impl QueryRuntimeBuilder {
             streaming_load: self.streaming_load,
             load: self.load,
             compare: self.compare,
+            projected_compare: None,
             select: self.select,
             distinct: self.distinct,
+            buffered_distinct: None,
+            projected_distinct: None,
             count: self.count,
             group: self.group,
             incremental_group: self.incremental_group,
@@ -930,8 +1084,11 @@ mod tests {
         assert!(!runtime.supports_streaming_load());
         assert!(!runtime.supports_load());
         assert!(!runtime.supports_sort());
+        assert!(!runtime.supports_projected_sort());
         assert!(!runtime.supports_select());
         assert!(!runtime.supports_distinct());
+        assert!(!runtime.supports_buffered_distinct());
+        assert!(!runtime.supports_projected_distinct());
         assert!(!runtime.supports_count());
         assert!(!runtime.supports_group());
         assert!(!runtime.supports_pivot());
@@ -969,8 +1126,11 @@ mod tests {
         assert!(!runtime.supports_streaming_load());
         assert!(!runtime.supports_load());
         assert!(!runtime.supports_sort());
+        assert!(!runtime.supports_projected_sort());
         assert!(!runtime.supports_select());
         assert!(!runtime.supports_distinct());
+        assert!(!runtime.supports_buffered_distinct());
+        assert!(!runtime.supports_projected_distinct());
         assert!(!runtime.supports_count());
         assert!(!runtime.supports_group());
         assert!(!runtime.supports_pivot());

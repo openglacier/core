@@ -7,6 +7,7 @@
 //! selected backend.
 
 pub mod glacier;
+mod glacier_mmap;
 pub mod memory;
 
 use super::{

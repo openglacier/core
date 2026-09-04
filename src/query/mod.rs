@@ -89,8 +89,10 @@ pub use executor::{
 };
 
 pub(crate) use executor::{
-    decode_execution_row, encode_execution_row, execution_row_working_bytes, reserve_query_memory,
-    stable_sort, BoundedProjectedTopN, BoundedTopN,
+    decode_execution_row, encode_execution_row_into, execution_row_encoded_len,
+    execution_row_working_bytes, projected_row_working_bytes_refs, reserve_query_memory,
+    stable_projected_order, stable_sort, BoundedProjectedTopN, BoundedTopN, ProjectedRowLocator,
+    ProjectedRowSet,
 };
 
 mod lowerer;

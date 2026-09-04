@@ -1,6 +1,6 @@
 [package]
 name = "og-core"
-version = "0.60.6"
+version = "0.70.1"
 edition = "2021"
 description = "Event-first, schema-less document database kernel"
 license = "MIT"
@@ -22,6 +22,9 @@ rpassword = "7"
 notify = "8"
 tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
 
+[target.'cfg(all(target_pointer_width = "64", target_family = "unix"))'.dependencies]
+mmap-guard = "=0.2.2"
+
 [dev-dependencies]
 proptest = "1"
 
@@ -29,7 +32,3 @@ proptest = "1"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-
-[toolchain]
-channel = "1.98.0"
-profile = "minimal"

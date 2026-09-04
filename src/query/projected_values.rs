@@ -117,15 +117,16 @@ enum ProjectedValueStage {
 /// A sequence of physical stages that can consume the standard
 /// [`AccessVector::ProjectedValues`] representation.
 ///
-/// `.25` initially supports filters. Downstream operators such as group remain
-/// consumers outside this prefix and receive only the slots they require.
-/// Unsupported operators return `None`, preserving the established document
-/// pipeline as the correctness fallback.
+/// Filter and Select stages compose ahead of blocking projected consumers such
+/// as group, sort and explicit-field distinct. Unsupported operators return
+/// `None`, preserving the established Document pipeline as the correctness
+/// fallback.
 #[derive(Clone, Debug)]
 pub struct ProjectedValuePipeline {
     layout: ProjectedValueLayout,
     stages: Arc<[ProjectedValueStage]>,
     gate_field_count: usize,
+    hydration_projection: Option<Arc<[ExpressionFieldPath]>>,
 }
 
 impl ProjectedValuePipeline {
@@ -190,6 +191,7 @@ impl ProjectedValuePipeline {
         }
 
         let mut stages = Vec::with_capacity(operators.len());
+        let mut hydration_projection = None;
         for operator in operators {
             match operator {
                 PhysicalOperator::Filter { predicate } => {
@@ -197,10 +199,12 @@ impl ProjectedValuePipeline {
                         predicate, &layout,
                     )?));
                 }
-                _ if matches!(operator.execution_properties().fields, Fields::Projected(_)) => {
-                    // Projection only constrains visibility during compilation.
-                    // It does not require every exposed field to be present in
-                    // the physical layout when downstream stages do not use it.
+                PhysicalOperator::Select { fields } => {
+                    // Projection constrains visibility during compilation while the
+                    // source scan still requests only fields needed downstream. Keep
+                    // the user-visible projection so late hydration can reproduce the
+                    // normal Document pipeline exactly.
+                    hydration_projection = Some(Arc::clone(fields));
                     stages.push(ProjectedValueStage::Select);
                 }
                 _ => unreachable!("projected-value compatibility was checked above"),
@@ -211,6 +215,7 @@ impl ProjectedValuePipeline {
             layout,
             stages: Arc::from(stages),
             gate_field_count,
+            hydration_projection,
         }))
     }
 
@@ -224,6 +229,13 @@ impl ProjectedValuePipeline {
     #[must_use]
     pub const fn gate_field_count(&self) -> usize {
         self.gate_field_count
+    }
+
+    /// Projection that must be re-applied after late hydration, when a projected
+    /// `select` appeared before the blocking consumer.
+    #[must_use]
+    pub fn hydration_projection(&self) -> Option<&[ExpressionFieldPath]> {
+        self.hydration_projection.as_deref()
     }
 
     /// Applies every compatible stage to one projected row.

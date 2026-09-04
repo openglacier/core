@@ -7,7 +7,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
 };
 
@@ -61,6 +61,25 @@ impl fmt::Display for MemoryClass {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// Best-effort source of revocable governed memory.
+///
+/// Reclaimers are deliberately backend-agnostic: the governor only asks for
+/// bytes to be surrendered and never knows what data structure is being
+/// evicted. Implementations must not call back into [`MemoryGovernor::reserve`]
+/// while reclaiming.
+pub trait MemoryReclaimer: Send + Sync + fmt::Debug {
+    /// Tries to make at least `target_bytes` available and returns the number of
+    /// governed bytes actually released. Reclaim is best-effort and may return
+    /// fewer bytes than requested.
+    fn reclaim(&self, target_bytes: usize) -> usize;
+}
+
+#[derive(Debug)]
+struct RegisteredReclaimer {
+    class: MemoryClass,
+    reclaimer: Weak<dyn MemoryReclaimer>,
 }
 
 use crate::helpers::u128_to_usize_saturating;
@@ -212,6 +231,28 @@ pub struct ProcessMemorySnapshot {
     pub anonymous_bytes: usize,
     /// RSS not represented by active governor reservations.
     pub unmanaged_bytes: usize,
+}
+
+impl ProcessMemorySnapshot {
+    /// Resident bytes that are not anonymous. Clean file-backed mmap pages
+    /// are included here.
+    #[must_use]
+    pub const fn non_anonymous_rss_bytes(self) -> usize {
+        self.rss_bytes.saturating_sub(self.anonymous_bytes)
+    }
+
+    /// Effective process pressure used for soft/hard-limit decisions.
+    ///
+    /// This deliberately excludes non-anonymous RSS that the kernel can reclaim,
+    /// while never dropping below active governor reservations.
+    #[must_use]
+    pub const fn pressure_bytes(self, governed_bytes: usize) -> usize {
+        if self.anonymous_bytes > governed_bytes {
+            self.anonymous_bytes
+        } else {
+            governed_bytes
+        }
+    }
 }
 
 /// Automatically selected memory operating profile.
@@ -446,6 +487,7 @@ struct MemoryGovernorInner {
     classes: [ClassCounters; MEMORY_CLASS_COUNT],
     next_event_sequence: AtomicU64,
     events: Mutex<MemoryEventLog>,
+    reclaimers: Mutex<Vec<RegisteredReclaimer>>,
 }
 
 /// Shared hard memory budget with lock-free accounting.
@@ -525,6 +567,7 @@ impl MemoryGovernor {
                 classes: std::array::from_fn(|_| ClassCounters::default()),
                 next_event_sequence: AtomicU64::new(1),
                 events: Mutex::new(MemoryEventLog::new(event_capacity)),
+                reclaimers: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -538,6 +581,59 @@ impl MemoryGovernor {
     #[must_use]
     pub fn profile(&self) -> MemoryProfileConfig {
         self.inner.profile
+    }
+
+    /// Registers a weak revocation hook for one governed class.
+    ///
+    /// The caller retains the strong [`Arc`] and therefore controls the hook
+    /// lifetime. Dead registrations are removed lazily during reclaim.
+    pub fn register_reclaimer(
+        &self,
+        class: MemoryClass,
+        reclaimer: &Arc<dyn MemoryReclaimer>,
+    ) {
+        let mut reclaimers = self
+            .inner
+            .reclaimers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reclaimers.push(RegisteredReclaimer {
+            class,
+            reclaimer: Arc::downgrade(reclaimer),
+        });
+    }
+
+    fn reclaim_revocable(&self, class: MemoryClass, target_bytes: usize) -> usize {
+        if target_bytes == 0 || class == MemoryClass::PageCache {
+            return 0;
+        }
+
+        // PageCache is intentionally lower priority than execution memory.
+        // Snapshot strong handles under the registry mutex, then drop the lock
+        // before invoking backend code so reclaimers can take their own locks.
+        let candidates = {
+            let mut reclaimers = self
+                .inner
+                .reclaimers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reclaimers.retain(|entry| entry.reclaimer.strong_count() > 0);
+            reclaimers
+                .iter()
+                .filter(|entry| entry.class == MemoryClass::PageCache)
+                .filter_map(|entry| entry.reclaimer.upgrade())
+                .collect::<Vec<_>>()
+        };
+
+        let mut reclaimed = 0usize;
+        for reclaimer in candidates {
+            let remaining = target_bytes.saturating_sub(reclaimed);
+            if remaining == 0 {
+                break;
+            }
+            reclaimed = reclaimed.saturating_add(reclaimer.reclaim(remaining));
+        }
+        reclaimed
     }
 
     /// Attempts to reserve bytes for one logical class.
@@ -559,8 +655,15 @@ impl MemoryGovernor {
                 return Err(self.reject(class, bytes, current));
             };
 
-            if matches!(self.inner.limit_bytes, Some(limit) if next > limit) {
-                return Err(self.reject(class, bytes, current));
+            if let Some(limit) = self.inner.limit_bytes {
+                if next > limit {
+                    let shortfall = next.saturating_sub(limit);
+                    if self.reclaim_revocable(class, shortfall) > 0 {
+                        current = self.inner.current_bytes.load(Ordering::Acquire);
+                        continue;
+                    }
+                    return Err(self.reject(class, bytes, current));
+                }
             }
 
             match self.inner.current_bytes.compare_exchange_weak(
@@ -674,40 +777,27 @@ impl MemoryGovernor {
 
     /// Returns the current process-pressure state derived from the configured
     /// process limit. The soft threshold is 90% of the hard limit.
+    ///
+    /// Pressure is based on the larger of anonymous resident memory and active
+    /// governor reservations. Non-anonymous RSS (notably clean read-only mmap
+    /// pages) remains observable but does not by itself trigger memory pressure.
     #[must_use]
     pub fn process_pressure(&self) -> ProcessMemoryPressure {
         let Some(limit_bytes) = self.inner.process_limit_bytes else {
             return ProcessMemoryPressure::Unlimited;
         };
-        let Some(process) = self.process_memory_snapshot() else {
+        let governed_bytes = self.inner.current_bytes.load(Ordering::Acquire);
+        let Some(process) = process_memory_snapshot(governed_bytes) else {
             return ProcessMemoryPressure::Unavailable { limit_bytes };
         };
-        let soft_limit_bytes = limit_bytes.saturating_mul(9) / 10;
-        if process.rss_bytes > limit_bytes {
-            ProcessMemoryPressure::Hard {
-                rss_bytes: process.rss_bytes,
-                soft_limit_bytes,
-                hard_limit_bytes: limit_bytes,
-            }
-        } else if process.rss_bytes > soft_limit_bytes {
-            ProcessMemoryPressure::Soft {
-                rss_bytes: process.rss_bytes,
-                soft_limit_bytes,
-                hard_limit_bytes: limit_bytes,
-            }
-        } else {
-            ProcessMemoryPressure::Normal {
-                rss_bytes: process.rss_bytes,
-                soft_limit_bytes,
-                hard_limit_bytes: limit_bytes,
-            }
-        }
+        classify_process_pressure(limit_bytes, process, governed_bytes)
     }
 
-    /// Rejects an allocation-producing operation when the real process RSS is
-    /// already above the hard limit. This check is deliberately separate from
+    /// Rejects an allocation-producing operation when effective process memory
+    /// pressure is already above the hard limit. This check is deliberately
+    /// separate from
     /// [`Self::reserve`]: zero-byte reservations and pure accounting operations
-    /// must never fail because of process RSS.
+    /// must never fail because of process pressure.
     pub fn ensure_process_capacity(
         &self,
         class: MemoryClass,
@@ -877,19 +967,19 @@ pub enum ProcessMemoryPressure {
     Unlimited,
     /// Linux process metrics are unavailable.
     Unavailable { limit_bytes: usize },
-    /// RSS is below the soft threshold.
+    /// Effective process pressure is below the soft threshold.
     Normal {
         rss_bytes: usize,
         soft_limit_bytes: usize,
         hard_limit_bytes: usize,
     },
-    /// RSS is above the soft threshold but not above the hard limit.
+    /// Effective process pressure is above the soft threshold but not the hard limit.
     Soft {
         rss_bytes: usize,
         soft_limit_bytes: usize,
         hard_limit_bytes: usize,
     },
-    /// RSS is above the configured hard limit.
+    /// Effective process pressure is above the configured hard limit.
     Hard {
         rss_bytes: usize,
         soft_limit_bytes: usize,
@@ -982,33 +1072,43 @@ impl MemoryReservation {
         self.release_inner();
     }
 
-    fn release_inner(&mut self) {
-        if self.released || self.bytes == 0 {
-            return;
+    /// Returns part of this reservation to the governor while keeping the
+    /// remainder live. This is primarily used by revocable caches.
+    pub fn shrink_by(&mut self, bytes: usize) -> usize {
+        if self.released || self.bytes == 0 || bytes == 0 {
+            return 0;
         }
-
+        let released = bytes.min(self.bytes);
         let previous = self
             .inner
             .current_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
-        let current = previous.saturating_sub(self.bytes);
-        self.inner
-            .active_reservations
-            .fetch_sub(1, Ordering::Relaxed);
-
+            .fetch_sub(released, Ordering::AcqRel);
+        let current = previous.saturating_sub(released);
         let counters = &self.inner.classes[self.class.index()];
         counters
             .current_bytes
-            .fetch_sub(self.bytes, Ordering::AcqRel);
-        counters.active_reservations.fetch_sub(1, Ordering::Relaxed);
+            .fetch_sub(released, Ordering::AcqRel);
+        self.bytes = self.bytes.saturating_sub(released);
         record_event(
             &self.inner,
             MemoryEventKind::Released,
             self.class,
-            self.bytes,
+            released,
             current,
         );
-        self.released = true;
+        if self.bytes == 0 {
+            self.inner
+                .active_reservations
+                .fetch_sub(1, Ordering::Relaxed);
+            counters.active_reservations.fetch_sub(1, Ordering::Relaxed);
+            self.released = true;
+        }
+        released
+    }
+
+    fn release_inner(&mut self) {
+        let remaining = self.bytes;
+        let _ = self.shrink_by(remaining);
     }
 }
 
@@ -1057,18 +1157,59 @@ fn process_memory_snapshot(governed_bytes: usize) -> Option<ProcessMemorySnapsho
                 _ => {}
             }
         }
-        let rss_bytes = rss_kib?.saturating_mul(1024);
-        let anonymous_bytes = anonymous_kib.unwrap_or(0).saturating_mul(1024);
-        return Some(ProcessMemorySnapshot {
+        let rss_kib = rss_kib?;
+        let rss_bytes = rss_kib.saturating_mul(1024);
+        let anonymous_bytes = anonymous_kib.unwrap_or(rss_kib).saturating_mul(1024);
+        return Some(process_memory_snapshot_from_parts(
             rss_bytes,
             anonymous_bytes,
-            unmanaged_bytes: rss_bytes.saturating_sub(governed_bytes),
-        });
+            governed_bytes,
+        ));
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = governed_bytes;
         None
+    }
+}
+
+fn process_memory_snapshot_from_parts(
+    rss_bytes: usize,
+    anonymous_bytes: usize,
+    governed_bytes: usize,
+) -> ProcessMemorySnapshot {
+    ProcessMemorySnapshot {
+        rss_bytes,
+        anonymous_bytes,
+        unmanaged_bytes: rss_bytes.saturating_sub(governed_bytes),
+    }
+}
+
+fn classify_process_pressure(
+    limit_bytes: usize,
+    process: ProcessMemorySnapshot,
+    governed_bytes: usize,
+) -> ProcessMemoryPressure {
+    let soft_limit_bytes = limit_bytes.saturating_mul(9) / 10;
+    let pressure_bytes = process.pressure_bytes(governed_bytes);
+    if pressure_bytes > limit_bytes {
+        ProcessMemoryPressure::Hard {
+            rss_bytes: process.rss_bytes,
+            soft_limit_bytes,
+            hard_limit_bytes: limit_bytes,
+        }
+    } else if pressure_bytes > soft_limit_bytes {
+        ProcessMemoryPressure::Soft {
+            rss_bytes: process.rss_bytes,
+            soft_limit_bytes,
+            hard_limit_bytes: limit_bytes,
+        }
+    } else {
+        ProcessMemoryPressure::Normal {
+            rss_bytes: process.rss_bytes,
+            soft_limit_bytes,
+            hard_limit_bytes: limit_bytes,
+        }
     }
 }
 
@@ -1103,6 +1244,60 @@ mod tests {
         let snapshot = governor.snapshot();
         assert_eq!(snapshot.current_bytes, 80);
         assert_eq!(snapshot.failed_reservations, 1);
+    }
+
+    #[derive(Debug)]
+    struct TestReclaimer {
+        reservation: Mutex<Option<MemoryReservation>>,
+    }
+
+    impl MemoryReclaimer for TestReclaimer {
+        fn reclaim(&self, target_bytes: usize) -> usize {
+            let mut reservation = self
+                .reservation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(reservation) = reservation.as_mut() else {
+                return 0;
+            };
+            reservation.shrink_by(target_bytes)
+        }
+    }
+
+    #[test]
+    fn query_reservation_reclaims_page_cache_before_rejecting() {
+        let governor = MemoryGovernor::with_limit(100);
+        let cache = governor.reserve(MemoryClass::PageCache, 80).unwrap();
+        let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(TestReclaimer {
+            reservation: Mutex::new(Some(cache)),
+        });
+        governor.register_reclaimer(MemoryClass::PageCache, &reclaimer);
+
+        let query = governor
+            .reserve(MemoryClass::Query, 40)
+            .expect("query should evict revocable page cache");
+        assert_eq!(query.bytes(), 40);
+        let snapshot = governor.snapshot();
+        assert_eq!(snapshot.current_bytes, 100);
+        assert_eq!(
+            snapshot.classes[MemoryClass::PageCache.index()].current_bytes,
+            60
+        );
+        assert_eq!(
+            snapshot.classes[MemoryClass::Query.index()].current_bytes,
+            40
+        );
+    }
+
+    #[test]
+    fn page_cache_does_not_reclaim_itself() {
+        let governor = MemoryGovernor::with_limit(100);
+        let cache = governor.reserve(MemoryClass::PageCache, 80).unwrap();
+        let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(TestReclaimer {
+            reservation: Mutex::new(Some(cache)),
+        });
+        governor.register_reclaimer(MemoryClass::PageCache, &reclaimer);
+        assert!(governor.reserve(MemoryClass::PageCache, 21).is_err());
     }
 
     #[test]
@@ -1162,6 +1357,36 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("RSS is 300 bytes"));
         assert!(!rendered.contains("already reserved"));
+    }
+
+    #[test]
+    fn file_backed_rss_does_not_trigger_process_pressure() {
+        let process = process_memory_snapshot_from_parts(7000, 768, 512);
+        assert_eq!(process.non_anonymous_rss_bytes(), 6232);
+        assert_eq!(process.pressure_bytes(512), 768);
+        assert!(matches!(
+            classify_process_pressure(1024, process, 512),
+            ProcessMemoryPressure::Normal { .. }
+        ));
+    }
+
+    #[test]
+    fn anonymous_rss_still_triggers_hard_process_pressure() {
+        let process = process_memory_snapshot_from_parts(1200, 1100, 512);
+        assert!(matches!(
+            classify_process_pressure(1024, process, 512),
+            ProcessMemoryPressure::Hard { .. }
+        ));
+    }
+
+    #[test]
+    fn governed_reservations_are_a_floor_for_process_pressure() {
+        let process = process_memory_snapshot_from_parts(900, 400, 950);
+        assert_eq!(process.pressure_bytes(950), 950);
+        assert!(matches!(
+            classify_process_pressure(1024, process, 950),
+            ProcessMemoryPressure::Soft { .. }
+        ));
     }
 
     #[test]

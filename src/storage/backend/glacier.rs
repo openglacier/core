@@ -5,7 +5,7 @@ use std::{
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock, Weak,
     },
     thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -14,7 +14,7 @@ use serde::{
     de::{DeserializeSeed, SeqAccess, Visitor}, Deserialize, Serialize,
 };
 
-use super::StorageBackend;
+use super::{glacier_mmap::GlacierReadOnlyMap, StorageBackend};
 use crate::helpers::{elapsed_micros, elapsed_nanos, u64_to_usize_saturating, usize_to_u64_saturating};
 use crate::model::{Document, Number, Value};
 use crate::storage::{
@@ -23,7 +23,9 @@ use crate::storage::{
     StorageError, StorageMutation, StorageRead, StorageReadCapability, StorageResult,
     StorageSupport, StorageTransaction, StoredDocument, VersionPrecondition,
 };
-use crate::{capabilities_of, Capability, MemoryClass, MemoryGovernor, MemoryReservation};
+use crate::{
+    capabilities_of, Capability, MemoryClass, MemoryGovernor, MemoryReclaimer, MemoryReservation,
+};
 
 pub const GLACIER_FORMAT_VERSION: u16 = 5;
 pub const GLACIER_PAGE_SIZE: u32 = 16 * 1024;
@@ -424,6 +426,9 @@ fn disk_primary_append_batch( index: &mut DiskPrimaryIndex, entries: &mut Vec<Co
 #[derive(Clone, Debug)]
 struct CollectionIndex {
     primary: Vec<CompactPrimaryEntry>,
+    /// Prefix of `primary` duplicated by `disk_primary` and therefore safely
+    /// revocable under governor pressure. New writes are never counted here.
+    reclaimable_primary: usize,
     disk_primary: Option<DiskPrimaryIndex>,
     exceptions: HashMap<DocumentId, InlineIndexVersions>,
     count_history: Vec<(u64, u64)>,
@@ -435,6 +440,7 @@ impl Default for CollectionIndex {
     fn default() -> Self {
         Self {
             primary: Vec::new(),
+            reclaimable_primary: 0,
             disk_primary: None,
             exceptions: HashMap::new(),
             count_history: Vec::new(),
@@ -757,13 +763,15 @@ define_atomic_metrics! {
     GlacierStartupMetrics => GlacierStartupMetricsSnapshot {
         total_us, checkpoint_loaded, checkpoint_generation, checkpoint_bytes,
         checkpoint_load_us, segments, records, directory_decode_us,
-        index_rebuild_us, metadata_rebuild_us
+        index_rebuild_us, metadata_rebuild_us, segment_catalog_segments, segment_catalog_build_us
     }
 }
 
 define_atomic_metrics! {
     GlacierReadMetrics => GlacierReadMetricsSnapshot {
         scans, segments, records, projected_records, decoded_fields, io_us, decode_us,
+        mmap_segments, mmap_bytes, mmap_us, mmap_map_creates, mmap_reuses, mmap_remaps, mmap_fallback_segments, mmap_bypass_segments,
+        segment_catalog_hits, segment_catalog_refreshes, segment_catalog_rebuilds, segment_catalog_refresh_us, segment_catalog_skipped_segments,
         directory_decode_us, directory_bypass_segments, directory_fallback_segments,
         checksum_us, trusted_header_records, verified_header_records,
         projection_layout_hits, projection_layout_misses, visitor_us, record_loop_us,
@@ -818,6 +826,8 @@ pub struct GlacierResidentMemorySnapshot {
     pub primary_head_estimated_bytes: u64,
     pub count_history_estimated_bytes: u64,
     pub metadata_estimated_bytes: u64,
+    pub segment_catalog_entries: u64,
+    pub segment_catalog_estimated_bytes: u64,
     pub state_estimated_bytes: u64,
 }
 
@@ -971,6 +981,23 @@ fn resident_memory_snapshot(state: &GlacierState) -> GlacierResidentMemorySnapsh
     snapshot
 }
 
+fn add_segment_catalog_memory(
+    snapshot: &mut GlacierResidentMemorySnapshot,
+    catalog: &Mutex<Arc<SegmentCatalogSnapshot>>,
+) {
+    let guard = catalog
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entries = guard.segments.len();
+    let bytes = std::mem::size_of::<SegmentCatalogSnapshot>()
+        .saturating_add(entries.saturating_mul(std::mem::size_of::<SegmentCatalogEntry>()));
+    snapshot.segment_catalog_entries = usize_to_u64_saturating(entries);
+    snapshot.segment_catalog_estimated_bytes = usize_to_u64_saturating(bytes);
+    snapshot.state_estimated_bytes = snapshot
+        .state_estimated_bytes
+        .saturating_add(usize_to_u64_saturating(bytes));
+}
+
 struct GlacierReadScanGuard<'a> {
     metrics: &'a GlacierReadMetrics,
     started: Instant,
@@ -1067,6 +1094,89 @@ impl Drop for GlacierReadScanGuard<'_> {
 }
 
 
+struct GlacierPageCacheReclaimer {
+    inner: Weak<GlacierInner>,
+}
+
+impl std::fmt::Debug for GlacierPageCacheReclaimer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GlacierPageCacheReclaimer")
+    }
+}
+
+impl MemoryReclaimer for GlacierPageCacheReclaimer {
+    fn reclaim(&self, target_bytes: usize) -> usize {
+        if target_bytes == 0 {
+            return 0;
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return 0;
+        };
+
+        // `reclaimable_primary` tracks only checkpoint entries duplicated by
+        // the ordered disk sidecar. Removing that prefix never touches entries
+        // created by later writes and therefore cannot change write semantics.
+        let entry_bytes = std::mem::size_of::<CompactPrimaryEntry>().max(1);
+        let freed = {
+            let mut state = inner
+                .state
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut freed = 0usize;
+            for collection in state.collections.values_mut() {
+                let reclaimable = collection
+                    .reclaimable_primary
+                    .min(collection.primary.len());
+                if reclaimable == 0 || collection.disk_primary.is_none() {
+                    continue;
+                }
+                let remaining = target_bytes.saturating_sub(freed);
+                let requested_entries = remaining
+                    .saturating_add(entry_bytes.saturating_sub(1))
+                    / entry_bytes;
+                let requested_entries = requested_entries.max(1);
+                let evict = reclaimable.min(requested_entries);
+                collection.primary.drain(..evict);
+                collection.primary.shrink_to_fit();
+                collection.reclaimable_primary =
+                    collection.reclaimable_primary.saturating_sub(evict);
+                freed = freed.saturating_add(evict.saturating_mul(entry_bytes));
+                if freed >= target_bytes {
+                    break;
+                }
+            }
+            freed
+        };
+
+        if freed == 0 {
+            return 0;
+        }
+        let released = {
+            let mut reservation = inner
+                .page_cache_reservation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            reservation
+                .as_mut()
+                .map(|reservation| reservation.shrink_by(freed))
+                .unwrap_or(0)
+        };
+        if let Some(governor) = inner.memory_governor.as_ref() {
+            let mut resident = inner
+                .state
+                .read()
+                .map(|state| resident_memory_snapshot(&state))
+                .unwrap_or_default();
+            add_segment_catalog_memory(&mut resident, &inner.segment_catalog);
+            governor.set_observed_bytes(
+                MemoryClass::Indexing,
+                u64_to_usize_saturating(resident.state_estimated_bytes),
+            );
+        }
+        released
+    }
+}
+
 struct GlacierInner {
     path: PathBuf,
     format: GlacierFormatInfo,
@@ -1075,8 +1185,11 @@ struct GlacierInner {
     write_metrics: GlacierWriteMetrics,
     startup_metrics: GlacierStartupMetrics,
     read_metrics: GlacierReadMetrics,
+    read_mmap: Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
+    segment_catalog: Mutex<Arc<SegmentCatalogSnapshot>>,
     memory_governor: Option<MemoryGovernor>,
-    _page_cache_reservation: Option<MemoryReservation>,
+    page_cache_reservation: Mutex<Option<MemoryReservation>>,
+    page_cache_reclaimer: Mutex<Option<Arc<dyn MemoryReclaimer>>>,
     checkpoint_offset: AtomicU64,
     next_checkpoint_offset: AtomicU64,
     checkpoint_scheduled: AtomicBool,
@@ -1138,13 +1251,55 @@ impl GlacierBackend {
             ),
         };
 
-        let state = scan_data_file(
+        let (state, mut replay_catalog) = scan_data_file(
             path,
             &startup_metrics,
             initial_state,
             replay_offset,
             memory_governor.as_ref(),
         )?;
+        let catalog_started = Instant::now();
+        let catalog_file_len = std::fs::metadata(path)
+            .map_err(io_error("stat segment catalog", path))?
+            .len();
+        let mut catalog_entries = if replay_offset > GLACIER_SUPERBLOCK_BYTES as u64 {
+            read_segment_catalog_headers(path, GLACIER_SUPERBLOCK_BYTES as u64, replay_offset, 1)?
+        } else {
+            Vec::new()
+        };
+        catalog_entries.append(&mut replay_catalog);
+        if catalog_entries
+            .last()
+            .map(|entry| entry.generation)
+            .unwrap_or(0)
+            != state.generation
+        {
+            return Err(StorageError::backend(
+                "GlacierStorage segment catalog generation disagrees with state",
+            ));
+        }
+        if catalog_entries
+            .last()
+            .map(SegmentCatalogEntry::end)
+            .transpose()?
+            .unwrap_or(GLACIER_SUPERBLOCK_BYTES as u64)
+            != catalog_file_len
+        {
+            return Err(StorageError::backend(
+                "GlacierStorage segment catalog does not cover the data file",
+            ));
+        }
+        startup_metrics.segment_catalog_segments.store(
+            usize_to_u64_saturating(catalog_entries.len()),
+            Ordering::Relaxed,
+        );
+        startup_metrics
+            .segment_catalog_build_us
+            .store(elapsed_micros(catalog_started), Ordering::Relaxed);
+        let segment_catalog = Arc::new(SegmentCatalogSnapshot {
+            file_len: catalog_file_len,
+            segments: Arc::from(catalog_entries),
+        });
         startup_metrics
             .total_us
             .store(elapsed_micros(startup_started), Ordering::Relaxed);
@@ -1158,8 +1313,11 @@ impl GlacierBackend {
                 write_metrics: GlacierWriteMetrics::default(),
                 startup_metrics,
                 read_metrics: GlacierReadMetrics::default(),
+                read_mmap: Mutex::new(None),
+                segment_catalog: Mutex::new(segment_catalog),
                 memory_governor,
-                _page_cache_reservation: page_cache_reservation,
+                page_cache_reservation: Mutex::new(page_cache_reservation),
+                page_cache_reclaimer: Mutex::new(None),
                 checkpoint_offset: AtomicU64::new(replay_offset),
                 // A checkpoint-less startup has just paid the full rebuild cost.  Historical
                 // bytes must not make the very next tiny commit immediately serialize the
@@ -1175,6 +1333,17 @@ impl GlacierBackend {
                 checkpoint_scheduled: AtomicBool::new(false),
             }),
         };
+        if let Some(governor) = backend.inner.memory_governor.as_ref() {
+            let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(GlacierPageCacheReclaimer {
+                inner: Arc::downgrade(&backend.inner),
+            });
+            governor.register_reclaimer(MemoryClass::PageCache, &reclaimer);
+            *backend
+                .inner
+                .page_cache_reclaimer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reclaimer);
+        }
         backend.refresh_resident_memory_observation();
         Ok(backend)
     }
@@ -1190,10 +1359,11 @@ impl GlacierBackend {
     }
     #[must_use]
     pub fn resident_memory(&self) -> GlacierResidentMemorySnapshot {
-        let resident = self
+        let mut resident = self
             .state_read()
             .map(|state| resident_memory_snapshot(&state))
             .unwrap_or_default();
+        add_segment_catalog_memory(&mut resident, &self.inner.segment_catalog);
         if let Some(governor) = self.inner.memory_governor.as_ref() {
             governor.set_observed_bytes(
                 MemoryClass::Indexing,
@@ -2319,6 +2489,8 @@ impl StorageRead for GlacierSnapshot {
             collection,
             self.generation,
             fields,
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             visitor,
         )
@@ -2349,6 +2521,8 @@ impl StorageRead for GlacierSnapshot {
             self.generation,
             fields,
             fields.len(),
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             &mut gate,
             &mut |_id, _version, values| visitor(values),
@@ -2387,6 +2561,8 @@ impl StorageRead for GlacierSnapshot {
             collection,
             self.generation,
             fields,
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             visitor,
         )
@@ -2418,6 +2594,8 @@ impl StorageRead for GlacierSnapshot {
             collection,
             self.generation,
             fields,
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             &mut |_id, _version, values| visitor(values),
         )
@@ -2450,6 +2628,8 @@ impl StorageRead for GlacierSnapshot {
             self.generation,
             fields,
             gate_field_count,
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             gate,
             &mut |_id, _version, values| visitor(values),
@@ -2493,6 +2673,8 @@ impl StorageRead for GlacierSnapshot {
             self.generation,
             fields,
             gate_field_count,
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             gate,
             visitor,
@@ -2525,6 +2707,8 @@ impl StorageRead for GlacierSnapshot {
             self.generation,
             fields,
             fields.len(),
+            &self.backend.inner.segment_catalog,
+            &self.backend.inner.read_mmap,
             &self.backend.inner.read_metrics,
             gate,
             &mut |_id, _version, _values| Ok(true),
@@ -3627,12 +3811,522 @@ fn append_committed_data_records( path: &Path, generation: u64, records: Vec<Dat
 
 fn checksum64_pair(first: &[u8], second: &[u8]) -> u64 { checksum64_continue(checksum64_continue(0xcbf2_9ce4_8422_2325, first), second) }
 
+#[derive(Debug)]
+struct SegmentCatalogEntry {
+    start: u64,
+    generation: u64,
+    record_count: u32,
+    directory_len: u32,
+    metadata_len: u32,
+    records_len: u32,
+    directory_checksum: u64,
+    records_checksum: u64,
+    directory_verified: AtomicBool,
+    records_verified: AtomicBool,
+    insert_collection: OnceLock<Option<Arc<str>>>,
+    physical_sets_only: OnceLock<bool>,
+}
+
+impl SegmentCatalogEntry {
+    fn new(
+        start: u64,
+        generation: u64,
+        record_count: u32,
+        directory_len: u32,
+        metadata_len: u32,
+        records_len: u32,
+        directory_checksum: u64,
+        records_checksum: u64,
+        directory_verified: bool,
+        insert_collection: Option<Option<Arc<str>>>,
+    ) -> Self {
+        let entry = Self {
+            start,
+            generation,
+            record_count,
+            directory_len,
+            metadata_len,
+            records_len,
+            directory_checksum,
+            records_checksum,
+            directory_verified: AtomicBool::new(directory_verified),
+            records_verified: AtomicBool::new(false),
+            insert_collection: OnceLock::new(),
+            physical_sets_only: OnceLock::new(),
+        };
+        if let Some(value) = insert_collection {
+            let _ = entry.insert_collection.set(value);
+        }
+        entry
+    }
+
+    fn clone_cached(&self) -> Self {
+        let entry = Self::new(
+            self.start,
+            self.generation,
+            self.record_count,
+            self.directory_len,
+            self.metadata_len,
+            self.records_len,
+            self.directory_checksum,
+            self.records_checksum,
+            self.directory_verified.load(Ordering::Acquire),
+            self.insert_collection.get().cloned(),
+        );
+        entry.records_verified.store(
+            self.records_verified.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+        if let Some(value) = self.physical_sets_only.get().copied() {
+            let _ = entry.physical_sets_only.set(value);
+        }
+        entry
+    }
+
+    #[inline]
+    fn record_count(&self) -> usize { self.record_count as usize }
+    #[inline]
+    fn directory_len(&self) -> usize { self.directory_len as usize }
+    #[inline]
+    fn metadata_len(&self) -> usize { self.metadata_len as usize }
+    #[inline]
+    fn records_len(&self) -> usize { self.records_len as usize }
+
+    fn end(&self) -> StorageResult<u64> {
+        self.start
+            .checked_add(SEGMENT_HEADER_BYTES as u64)
+            .and_then(|value| value.checked_add(self.directory_len as u64))
+            .and_then(|value| value.checked_add(self.metadata_len as u64))
+            .and_then(|value| value.checked_add(self.records_len as u64))
+            .ok_or_else(|| StorageError::backend("GlacierStorage catalog segment overflow"))
+    }
+
+    #[inline]
+    fn known_insert_collection(&self) -> Option<&str> {
+        self.insert_collection
+            .get()
+            .and_then(|value| value.as_deref())
+    }
+
+    fn proves_target_inserts(
+        &self,
+        metadata: &[u8],
+        collection: &CollectionId,
+    ) -> StorageResult<bool> {
+        if self.insert_collection.get().is_none() {
+            let delta: SegmentMetadataDelta = rmp_serde::from_slice(metadata).map_err(|error| {
+                StorageError::backend(format!(
+                    "cannot decode GlacierStorage segment metadata for catalog: {error}"
+                ))
+            })?;
+            let proof = segment_insert_collection_from_delta(&delta, self.record_count())
+                .map(Arc::<str>::from);
+            let _ = self.insert_collection.set(proof);
+        }
+        Ok(self.known_insert_collection() == Some(collection.as_str()))
+    }
+
+    fn verify_directory_checksum(&self, directory: &[u8], metadata: &[u8]) -> StorageResult<bool> {
+        if self.directory_verified.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if checksum64_pair(directory, metadata) != self.directory_checksum {
+            return Err(StorageError::backend(
+                "GlacierStorage segment directory checksum mismatch",
+            ));
+        }
+        self.directory_verified.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    fn verify_records_checksum(&self, records: &[u8]) -> StorageResult<bool> {
+        if self.records_verified.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        if checksum64(records) != self.records_checksum {
+            return Err(StorageError::backend(
+                "GlacierStorage segment records checksum mismatch",
+            ));
+        }
+        self.records_verified.store(true, Ordering::Release);
+        Ok(true)
+    }
+
+    fn proves_physical_sets(&self, records: &[u8]) -> StorageResult<bool> {
+        if let Some(value) = self.physical_sets_only.get().copied() {
+            return Ok(value);
+        }
+        let value = records_are_all_physical_sets(records, self.record_count())?;
+        let _ = self.physical_sets_only.set(value);
+        Ok(value)
+    }
+}
+
+#[derive(Debug)]
+struct SegmentCatalogSnapshot {
+    file_len: u64,
+    segments: Arc<[SegmentCatalogEntry]>,
+}
+
+fn segment_insert_collection_from_delta(
+    delta: &SegmentMetadataDelta,
+    record_count: usize,
+) -> Option<&str> {
+    if delta.clear || delta.collections.len() != 1 {
+        return None;
+    }
+    let (collection, collection_delta) = delta.collections.iter().next()?;
+    let expected = i64::try_from(record_count).ok()?;
+    (collection_delta.documents == expected).then_some(collection.as_str())
+}
+
+fn catalog_entry_from_header(
+    start: u64,
+    header: &[u8; SEGMENT_HEADER_BYTES],
+    directory_verified: bool,
+    insert_collection: Option<Option<Arc<str>>>,
+) -> StorageResult<SegmentCatalogEntry> {
+    if header[0..8] != SEGMENT_MAGIC {
+        return Err(StorageError::backend(
+            "invalid GlacierStorage segment magic while building catalog",
+        ));
+    }
+    let generation = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let record_count = u32::from_be_bytes(header[16..20].try_into().unwrap());
+    let directory_len = u32::from_be_bytes(header[20..24].try_into().unwrap());
+    let metadata_len = u32::from_be_bytes(header[24..28].try_into().unwrap());
+    let records_len = u32::from_be_bytes(header[28..32].try_into().unwrap());
+    validate_segment_lengths(
+        record_count as usize,
+        directory_len as usize,
+        metadata_len as usize,
+        records_len as usize,
+    )?;
+    Ok(SegmentCatalogEntry::new(
+        start,
+        generation,
+        record_count,
+        directory_len,
+        metadata_len,
+        records_len,
+        u64::from_be_bytes(header[32..40].try_into().unwrap()),
+        u64::from_be_bytes(header[40..48].try_into().unwrap()),
+        directory_verified,
+        insert_collection,
+    ))
+}
+
+fn read_segment_catalog_headers(
+    path: &Path,
+    start: u64,
+    end: u64,
+    mut expected_generation: u64,
+) -> StorageResult<Vec<SegmentCatalogEntry>> {
+    if start > end || start < GLACIER_SUPERBLOCK_BYTES as u64 {
+        return Err(StorageError::backend(
+            "GlacierStorage catalog range is outside the data file",
+        ));
+    }
+    let mut file = File::open(path).map_err(io_error("open segment catalog", path))?;
+    let mut cursor = start;
+    let mut entries = Vec::new();
+    while cursor < end {
+        if end - cursor < SEGMENT_HEADER_BYTES as u64 {
+            return Err(StorageError::backend(
+                "GlacierStorage catalog encountered a truncated segment header",
+            ));
+        }
+        file.seek(SeekFrom::Start(cursor))
+            .map_err(io_error("seek segment catalog", path))?;
+        let mut header = [0u8; SEGMENT_HEADER_BYTES];
+        file.read_exact(&mut header)
+            .map_err(io_error("read segment catalog header", path))?;
+        let entry = catalog_entry_from_header(cursor, &header, false, None)?;
+        if entry.generation != expected_generation {
+            return Err(StorageError::backend(format!(
+                "GlacierStorage catalog generation gap: expected {expected_generation}, got {}",
+                entry.generation
+            )));
+        }
+        expected_generation = expected_generation.saturating_add(1);
+        let next = entry.end()?;
+        if next > end {
+            return Err(StorageError::backend(
+                "GlacierStorage catalog segment extends beyond snapshot",
+            ));
+        }
+        entries.push(entry);
+        cursor = next;
+    }
+    if cursor != end {
+        return Err(StorageError::backend(
+            "GlacierStorage catalog snapshot is not segment aligned",
+        ));
+    }
+    Ok(entries)
+}
+
+fn prepare_segment_catalog(
+    path: &Path,
+    file_len: u64,
+    cache: &Mutex<Arc<SegmentCatalogSnapshot>>,
+    metrics: &GlacierReadMetrics,
+) -> StorageResult<Arc<SegmentCatalogSnapshot>> {
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.file_len == file_len {
+        metrics.segment_catalog_hits.fetch_add(1, Ordering::Relaxed);
+        return Ok(Arc::clone(&guard));
+    }
+
+    let started = Instant::now();
+    let snapshot = if guard.file_len < file_len {
+        let mut entries = guard
+            .segments
+            .iter()
+            .map(SegmentCatalogEntry::clone_cached)
+            .collect::<Vec<_>>();
+        let expected_generation = guard
+            .segments
+            .last()
+            .map(|entry| entry.generation.saturating_add(1))
+            .unwrap_or(1);
+        entries.extend(read_segment_catalog_headers(
+            path,
+            guard.file_len,
+            file_len,
+            expected_generation,
+        )?);
+        metrics
+            .segment_catalog_refreshes
+            .fetch_add(1, Ordering::Relaxed);
+        Arc::new(SegmentCatalogSnapshot {
+            file_len,
+            segments: Arc::from(entries),
+        })
+    } else {
+        let entries = read_segment_catalog_headers(
+            path,
+            GLACIER_SUPERBLOCK_BYTES as u64,
+            file_len,
+            1,
+        )?;
+        metrics
+            .segment_catalog_rebuilds
+            .fetch_add(1, Ordering::Relaxed);
+        Arc::new(SegmentCatalogSnapshot {
+            file_len,
+            segments: Arc::from(entries),
+        })
+    };
+    metrics
+        .segment_catalog_refresh_us
+        .fetch_add(elapsed_micros(started), Ordering::Relaxed);
+    *guard = Arc::clone(&snapshot);
+    Ok(snapshot)
+}
+
 fn checksum64_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     for byte in bytes {
         hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
     }
     hash
+}
+
+// Tiny segments are cheaper to copy through the existing buffered path than to
+// route through the mmap snapshot machinery. Larger immutable payloads avoid
+// the directory/metadata/records Vec allocations and their page-cache-to-userspace
+// copy. The threshold is deliberately architecture-neutral and easy to tune
+// from read metrics after benchmarking.
+const MIN_MMAP_SEGMENT_PAYLOAD_BYTES: usize = 64 * 1024;
+
+enum SegmentPayload<'a> {
+    Mapped {
+        payload: &'a [u8],
+        directory_len: usize,
+        metadata_len: usize,
+    },
+    Buffered {
+        directory: Vec<u8>,
+        metadata: Vec<u8>,
+        records: Vec<u8>,
+    },
+}
+
+impl SegmentPayload<'_> {
+    #[inline]
+    fn directory(&self) -> &[u8] {
+        match self {
+            Self::Mapped {
+                payload,
+                directory_len,
+                ..
+            } => &payload[..*directory_len],
+            Self::Buffered { directory, .. } => directory,
+        }
+    }
+
+    #[inline]
+    fn metadata(&self) -> &[u8] {
+        match self {
+            Self::Mapped {
+                payload,
+                directory_len,
+                metadata_len,
+            } => {
+                let start = *directory_len;
+                &payload[start..start + *metadata_len]
+            }
+            Self::Buffered { metadata, .. } => metadata,
+        }
+    }
+
+    #[inline]
+    fn records(&self) -> &[u8] {
+        match self {
+            Self::Mapped {
+                payload,
+                directory_len,
+                metadata_len,
+            } => &payload[*directory_len + *metadata_len..],
+            Self::Buffered { records, .. } => records,
+        }
+    }
+}
+
+/// Returns the persistent read-only mapping for the current Glacier file snapshot.
+///
+/// Reusing the same mapping across scans is essential: recreating a VMA for each
+/// analytical scan forces Linux to rebuild page-table entries and pay minor-fault
+/// cost again even when the file is already hot in the kernel page cache. The
+/// cache is refreshed lazily when append-only writes grow the file. In-flight
+/// scans keep their previous `Arc`, so remapping never invalidates borrowed bytes.
+///
+/// Mapping remains disabled on non-64-bit targets. Mapping failure is non-fatal:
+/// eligible segments transparently use the buffered path instead.
+fn prepare_scan_mmap(
+    path: &Path,
+    file_len: u64,
+    cache: &Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
+    metrics: &GlacierReadMetrics,
+) -> Option<Arc<GlacierReadOnlyMap>> {
+    if file_len < MIN_MMAP_SEGMENT_PAYLOAD_BYTES as u64 || !GlacierReadOnlyMap::supported() {
+        return None;
+    }
+
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_len, mapped)) = guard.as_ref() {
+            if *cached_len == file_len {
+                metrics.mmap_reuses.fetch_add(1, Ordering::Relaxed);
+                return Some(Arc::clone(mapped));
+            }
+        }
+    }
+
+    let mmap_started = Instant::now();
+    let mapped = GlacierReadOnlyMap::map(path, file_len).ok().map(Arc::new);
+    metrics
+        .mmap_us
+        .fetch_add(elapsed_micros(mmap_started), Ordering::Relaxed);
+
+    let Some(mapped) = mapped else {
+        return None;
+    };
+
+    if let Ok(mut guard) = cache.lock() {
+        if let Some((cached_len, cached)) = guard.as_ref() {
+            if *cached_len == file_len {
+                metrics.mmap_reuses.fetch_add(1, Ordering::Relaxed);
+                return Some(Arc::clone(cached));
+            }
+        }
+
+        if guard.is_some() {
+            metrics.mmap_remaps.fetch_add(1, Ordering::Relaxed);
+        } else {
+            metrics.mmap_map_creates.fetch_add(1, Ordering::Relaxed);
+        }
+        *guard = Some((file_len, Arc::clone(&mapped)));
+    } else {
+        metrics.mmap_map_creates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    Some(mapped)
+}
+
+fn read_segment_payload<'a>(
+    file: &mut File,
+    path: &Path,
+    segment_start: u64,
+    file_len: u64,
+    directory_len: usize,
+    metadata_len: usize,
+    records_len: usize,
+    mmap: Option<&'a GlacierReadOnlyMap>,
+    metrics: &GlacierReadMetrics,
+) -> StorageResult<SegmentPayload<'a>> {
+    let payload_len = directory_len
+        .checked_add(metadata_len)
+        .and_then(|value| value.checked_add(records_len))
+        .ok_or_else(|| StorageError::backend("GlacierStorage segment payload overflow"))?;
+    let payload_offset = segment_start
+        .checked_add(SEGMENT_HEADER_BYTES as u64)
+        .ok_or_else(|| StorageError::backend("GlacierStorage segment payload offset overflow"))?;
+    let payload_end = payload_offset
+        .checked_add(payload_len as u64)
+        .ok_or_else(|| StorageError::backend("GlacierStorage segment payload end overflow"))?;
+    if payload_end > file_len {
+        return Err(StorageError::backend(
+            "GlacierStorage segment payload extends beyond the scan file snapshot",
+        ));
+    }
+
+    if payload_len >= MIN_MMAP_SEGMENT_PAYLOAD_BYTES {
+        if let Some(mmap) = mmap {
+            if let Ok(payload) = mmap.slice(payload_offset, payload_len) {
+                metrics.mmap_segments.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .mmap_bytes
+                    .fetch_add(usize_to_u64_saturating(payload_len), Ordering::Relaxed);
+                return Ok(SegmentPayload::Mapped {
+                    payload,
+                    directory_len,
+                    metadata_len,
+                });
+            }
+        }
+        metrics
+            .mmap_fallback_segments
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics
+            .mmap_bypass_segments
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    let mut directory = vec![0u8; directory_len];
+    let mut metadata = vec![0u8; metadata_len];
+    let mut records = vec![0u8; records_len];
+    let io_started = Instant::now();
+    file.seek(SeekFrom::Start(payload_offset))
+        .map_err(io_error("seek Glacier segment payload", path))?;
+    file.read_exact(&mut directory)
+        .map_err(io_error("read Glacier segment directory", path))?;
+    file.read_exact(&mut metadata)
+        .map_err(io_error("read Glacier segment metadata", path))?;
+    file.read_exact(&mut records)
+        .map_err(io_error("read Glacier segment records", path))?;
+    metrics
+        .io_us
+        .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
+
+    Ok(SegmentPayload::Buffered {
+        directory,
+        metadata,
+        records,
+    })
 }
 
 fn read_stored_document_profiled( path: &Path, pointer: RecordPointer, metrics: &GlacierReadMetrics, ) -> StorageResult<StoredDocument> {
@@ -3734,6 +4428,8 @@ fn scan_collection_sequential(
     collection: &CollectionId,
     generation: u64,
     fields: &[FieldPath],
+    catalog_cache: &Mutex<Arc<SegmentCatalogSnapshot>>,
+    mmap_cache: &Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
     metrics: &GlacierReadMetrics,
     visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>,
 ) -> StorageResult<()> {
@@ -3763,66 +4459,52 @@ fn scan_collection_sequential(
     metrics
         .io_us
         .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-    let mut segment_start = GLACIER_SUPERBLOCK_BYTES as u64;
+    let mmap = prepare_scan_mmap(path, length, mmap_cache, metrics);
+    let catalog = prepare_segment_catalog(path, length, catalog_cache, metrics)?;
     let mut emitted = 0usize;
     // Reused for every physical record. Only the Value payloads themselves are
     // replaced; the projection container allocation is paid once per scan.
 
-    while segment_start < length && emitted < expected {
-        let io_started = Instant::now();
-        file.seek(SeekFrom::Start(segment_start))
-            .map_err(io_error("seek sequential segment", path))?;
-
-        let mut header = [0u8; SEGMENT_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(io_error("read sequential segment header", path))?;
-        metrics
-            .io_us
-            .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
+    for segment in catalog.segments.iter() {
+        if emitted >= expected || segment.generation > generation {
+            break;
+        }
+        if let Some(other_collection) = segment.known_insert_collection() {
+            if other_collection != collection.as_str() {
+                metrics
+                    .segment_catalog_skipped_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let segment_start = segment.start;
+        let record_count = segment.record_count();
+        let directory_len = segment.directory_len();
+        let metadata_len = segment.metadata_len();
+        let records_len = segment.records_len();
         scan_metrics.segments = scan_metrics.segments.saturating_add(1);
-        if header[0..8] != SEGMENT_MAGIC {
-            return Err(StorageError::backend(
-                "invalid GlacierStorage segment magic during scan",
-            ));
-        }
 
-        let record_count = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-        let directory_len = u32::from_be_bytes(header[20..24].try_into().unwrap()) as usize;
-        let metadata_len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let records_len = u32::from_be_bytes(header[28..32].try_into().unwrap()) as usize;
-        let expected_directory_checksum = u64::from_be_bytes(header[32..40].try_into().unwrap());
-        let expected_records_checksum = u64::from_be_bytes(header[40..48].try_into().unwrap());
+        let payload = read_segment_payload(
+            &mut file,
+            path,
+            segment_start,
+            length,
+            directory_len,
+            metadata_len,
+            records_len,
+            mmap.as_deref(),
+            metrics,
+        )?;
+        let directory = payload.directory();
+        let metadata = payload.metadata();
+        let records = payload.records();
 
-        validate_segment_lengths(record_count, directory_len, metadata_len, records_len)?;
-
-        let mut directory = vec![0u8; directory_len];
-        let mut metadata = vec![0u8; metadata_len];
-        let mut records = vec![0u8; records_len];
-        let io_started = Instant::now();
-        file.read_exact(&mut directory)
-            .map_err(io_error("read sequential segment directory", path))?;
-        file.read_exact(&mut metadata)
-            .map_err(io_error("read sequential segment metadata", path))?;
-        file.read_exact(&mut records)
-            .map_err(io_error("read sequential segment records", path))?;
-        metrics
-            .io_us
-            .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-
-        if checksum64_pair(&directory, &metadata) != expected_directory_checksum {
-            return Err(StorageError::backend(
-                "GlacierStorage segment directory checksum mismatch",
-            ));
-        }
-        if checksum64(&records) != expected_records_checksum {
-            return Err(StorageError::backend(
-                "GlacierStorage segment records checksum mismatch",
-            ));
-        }
+        let _ = segment.verify_directory_checksum(directory, metadata)?;
+        let _ = segment.verify_records_checksum(records)?;
 
         let decode_started = Instant::now();
         let entries: Vec<SegmentIndexEntry> =
-            rmp_serde::from_slice(&directory).map_err(|error| {
+            rmp_serde::from_slice(directory).map_err(|error| {
                 StorageError::backend(format!(
                     "cannot decode GlacierStorage segment directory: {error}"
                 ))
@@ -3937,12 +4619,6 @@ fn scan_collection_sequential(
             }
         }
 
-        segment_start = segment_start
-            .checked_add(SEGMENT_HEADER_BYTES as u64)
-            .and_then(|value| value.checked_add(directory_len as u64))
-            .and_then(|value| value.checked_add(metadata_len as u64))
-            .and_then(|value| value.checked_add(records_len as u64))
-            .ok_or_else(|| StorageError::backend("GlacierStorage scan segment overflow"))?;
     }
 
     if emitted != expected {
@@ -4487,23 +5163,6 @@ fn trusted_physical_set_prefix(bytes: &[u8]) -> StorageResult<Option<(PhysicalSe
 #[inline]
 fn physical_set_record_len(bytes: &[u8]) -> StorageResult<Option<usize>> { trusted_physical_set_prefix(bytes).map(|record| record.map(|(_, len)| len)) }
 
-fn segment_metadata_proves_target_inserts( metadata: &[u8], collection: &CollectionId, record_count: usize, ) -> StorageResult<bool> {
-    let delta: SegmentMetadataDelta = rmp_serde::from_slice(metadata).map_err(|error| {
-        StorageError::backend(format!(
-            "cannot decode GlacierStorage segment metadata for projected scan: {error}"
-        ))
-    })?;
-    if delta.clear || delta.collections.len() != 1 {
-        return Ok(false);
-    }
-    let Some(collection_delta) = delta.collections.get(collection.as_str()) else {
-        return Ok(false);
-    };
-    let expected = i64::try_from(record_count)
-        .map_err(|_| StorageError::backend("GlacierStorage segment record count overflow"))?;
-    Ok(collection_delta.documents == expected)
-}
-
 fn records_are_all_physical_sets(records: &[u8], record_count: usize) -> StorageResult<bool> {
     let mut cursor = 0usize;
     for _ in 0..record_count {
@@ -4549,6 +5208,8 @@ fn scan_collection_sequential_value_refs(
     collection: &CollectionId,
     generation: u64,
     fields: &[FieldPath],
+    catalog_cache: &Mutex<Arc<SegmentCatalogSnapshot>>,
+    mmap_cache: &Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
     metrics: &GlacierReadMetrics,
     visitor: &mut dyn for<'a> FnMut(
         DocumentId,
@@ -4592,7 +5253,8 @@ fn scan_collection_sequential_value_refs(
     metrics
         .io_us
         .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-    let mut segment_start = GLACIER_SUPERBLOCK_BYTES as u64;
+    let mmap = prepare_scan_mmap(path, length, mmap_cache, metrics);
+    let catalog = prepare_segment_catalog(path, length, catalog_cache, metrics)?;
     let mut emitted = 0usize;
     let mut borrowed_values = 0u64;
     let mut borrowed_strings = 0u64;
@@ -4603,62 +5265,54 @@ fn scan_collection_sequential_value_refs(
     let mut layout = PhysicalProjectionLayout::default();
     layout.prepare(fields);
 
-    while segment_start < length && emitted < expected {
-        let io_started = Instant::now();
-        file.seek(SeekFrom::Start(segment_start))
-            .map_err(io_error("seek borrowed projected segment", path))?;
-        let mut header = [0u8; SEGMENT_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(io_error("read borrowed projected segment header", path))?;
-        metrics
-            .io_us
-            .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-        scan_metrics.segments = scan_metrics.segments.saturating_add(1);
-        if header[0..8] != SEGMENT_MAGIC {
-            return Err(StorageError::backend(
-                "invalid GlacierStorage segment magic during borrowed projected scan",
-            ));
+    for segment in catalog.segments.iter() {
+        if emitted >= expected || segment.generation > generation {
+            break;
         }
-        let record_count = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-        let directory_len = u32::from_be_bytes(header[20..24].try_into().unwrap()) as usize;
-        let metadata_len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let records_len = u32::from_be_bytes(header[28..32].try_into().unwrap()) as usize;
-        let expected_directory_checksum = u64::from_be_bytes(header[32..40].try_into().unwrap());
-        validate_segment_lengths(record_count, directory_len, metadata_len, records_len)?;
+        if let Some(other_collection) = segment.known_insert_collection() {
+            if other_collection != collection.as_str() {
+                metrics
+                    .segment_catalog_skipped_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let segment_start = segment.start;
+        let record_count = segment.record_count();
+        let directory_len = segment.directory_len();
+        let metadata_len = segment.metadata_len();
+        let records_len = segment.records_len();
+        scan_metrics.segments = scan_metrics.segments.saturating_add(1);
 
-        let mut directory = vec![0u8; directory_len];
-        let mut metadata = vec![0u8; metadata_len];
-        let mut records = vec![0u8; records_len];
-        let io_started = Instant::now();
-        file.read_exact(&mut directory)
-            .map_err(io_error("read borrowed projected directory", path))?;
-        file.read_exact(&mut metadata)
-            .map_err(io_error("read borrowed projected metadata", path))?;
-        file.read_exact(&mut records)
-            .map_err(io_error("read borrowed projected records", path))?;
-        metrics
-            .io_us
-            .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-        let checksum_started = Instant::now();
-        let directory_checksum_matches =
-            checksum64_pair(&directory, &metadata) == expected_directory_checksum;
-        metrics
-            .checksum_us
-            .fetch_add(elapsed_micros(checksum_started), Ordering::Relaxed);
-        if !directory_checksum_matches {
-            return Err(StorageError::backend(
-                "GlacierStorage borrowed projected segment directory checksum mismatch",
-            ));
+        let payload = read_segment_payload(
+            &mut file,
+            path,
+            segment_start,
+            length,
+            directory_len,
+            metadata_len,
+            records_len,
+            mmap.as_deref(),
+            metrics,
+        )?;
+        let directory = payload.directory();
+        let metadata = payload.metadata();
+        let records = payload.records();
+        if !segment.directory_verified.load(Ordering::Acquire) {
+            let checksum_started = Instant::now();
+            let _ = segment.verify_directory_checksum(directory, metadata)?;
+            metrics
+                .checksum_us
+                .fetch_add(elapsed_micros(checksum_started), Ordering::Relaxed);
         }
 
         let bypass_directory = if append_only_visible {
             let metadata_decode_started = Instant::now();
-            let metadata_matches =
-                segment_metadata_proves_target_inserts(&metadata, collection, record_count)?;
+            let metadata_matches = segment.proves_target_inserts(metadata, collection)?;
             metrics
                 .decode_us
                 .fetch_add(elapsed_micros(metadata_decode_started), Ordering::Relaxed);
-            metadata_matches && records_are_all_physical_sets(&records, record_count)?
+            metadata_matches && segment.proves_physical_sets(records)?
         } else {
             false
         };
@@ -4752,7 +5406,7 @@ fn scan_collection_sequential_value_refs(
                 .fetch_add(1, Ordering::Relaxed);
             let decode_started = Instant::now();
             let entries: Vec<SegmentIndexEntry> =
-                rmp_serde::from_slice(&directory).map_err(|error| {
+                rmp_serde::from_slice(directory).map_err(|error| {
                     StorageError::backend(format!(
                         "cannot decode GlacierStorage segment directory: {error}"
                     ))
@@ -4881,15 +5535,6 @@ fn scan_collection_sequential_value_refs(
                 .record_loop_us
                 .fetch_add(elapsed_micros(record_loop_started), Ordering::Relaxed);
         }
-
-        segment_start = segment_start
-            .checked_add(SEGMENT_HEADER_BYTES as u64)
-            .and_then(|v| v.checked_add(directory_len as u64))
-            .and_then(|v| v.checked_add(metadata_len as u64))
-            .and_then(|v| v.checked_add(records_len as u64))
-            .ok_or_else(|| {
-                StorageError::backend("GlacierStorage borrowed projected segment overflow")
-            })?;
     }
 
     metrics
@@ -4934,6 +5579,8 @@ fn scan_collection_sequential_values(
     generation: u64,
     fields: &[FieldPath],
     gate_field_count: usize,
+    catalog_cache: &Mutex<Arc<SegmentCatalogSnapshot>>,
+    mmap_cache: &Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
     metrics: &GlacierReadMetrics,
     gate: &mut dyn FnMut(&[Option<Value>]) -> StorageResult<bool>,
     visitor: &mut dyn FnMut(
@@ -4987,71 +5634,63 @@ fn scan_collection_sequential_values(
     metrics
         .io_us
         .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-    let mut segment_start = GLACIER_SUPERBLOCK_BYTES as u64;
+    let mmap = prepare_scan_mmap(path, length, mmap_cache, metrics);
+    let catalog = prepare_segment_catalog(path, length, catalog_cache, metrics)?;
     let mut emitted = 0usize;
 
-    while segment_start < length && emitted < expected {
-        let io_started = Instant::now();
-        file.seek(SeekFrom::Start(segment_start))
-            .map_err(io_error("seek direct projected segment", path))?;
-        let mut header = [0u8; SEGMENT_HEADER_BYTES];
-        file.read_exact(&mut header)
-            .map_err(io_error("read direct projected segment header", path))?;
-        metrics
-            .io_us
-            .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
-        scan_metrics.segments = scan_metrics.segments.saturating_add(1);
-        if header[0..8] != SEGMENT_MAGIC {
-            return Err(StorageError::backend(
-                "invalid GlacierStorage segment magic during direct projected scan",
-            ));
+    for segment in catalog.segments.iter() {
+        if emitted >= expected || segment.generation > generation {
+            break;
         }
-        let record_count = u32::from_be_bytes(header[16..20].try_into().unwrap()) as usize;
-        let directory_len = u32::from_be_bytes(header[20..24].try_into().unwrap()) as usize;
-        let metadata_len = u32::from_be_bytes(header[24..28].try_into().unwrap()) as usize;
-        let records_len = u32::from_be_bytes(header[28..32].try_into().unwrap()) as usize;
-        let expected_directory_checksum = u64::from_be_bytes(header[32..40].try_into().unwrap());
-        let _expected_records_checksum = u64::from_be_bytes(header[40..48].try_into().unwrap());
-        validate_segment_lengths(record_count, directory_len, metadata_len, records_len)?;
+        if let Some(other_collection) = segment.known_insert_collection() {
+            if other_collection != collection.as_str() {
+                metrics
+                    .segment_catalog_skipped_segments
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let segment_start = segment.start;
+        let record_count = segment.record_count();
+        let directory_len = segment.directory_len();
+        let metadata_len = segment.metadata_len();
+        let records_len = segment.records_len();
+        scan_metrics.segments = scan_metrics.segments.saturating_add(1);
 
-        let mut directory = vec![0u8; directory_len];
-        let mut metadata = vec![0u8; metadata_len];
-        let mut records = vec![0u8; records_len];
-        let io_started = Instant::now();
-        file.read_exact(&mut directory)
-            .map_err(io_error("read direct projected directory", path))?;
-        file.read_exact(&mut metadata)
-            .map_err(io_error("read direct projected metadata", path))?;
-        file.read_exact(&mut records)
-            .map_err(io_error("read direct projected records", path))?;
-        metrics
-            .io_us
-            .fetch_add(elapsed_micros(io_started), Ordering::Relaxed);
+        let payload = read_segment_payload(
+            &mut file,
+            path,
+            segment_start,
+            length,
+            directory_len,
+            metadata_len,
+            records_len,
+            mmap.as_deref(),
+            metrics,
+        )?;
+        let directory = payload.directory();
+        let metadata = payload.metadata();
+        let records = payload.records();
         // Analytical projected scans trust the physical OGDOC001 record checksum
         // validated by `parse_physical_set_header`. Re-hashing the complete
         // records area here would hash the entire store a second time on every
         // analytical query. Directory + metadata remain protected at segment level.
-        let checksum_started = Instant::now();
-        let directory_checksum_matches =
-            checksum64_pair(&directory, &metadata) == expected_directory_checksum;
-        metrics
-            .checksum_us
-            .fetch_add(elapsed_micros(checksum_started), Ordering::Relaxed);
-        if !directory_checksum_matches {
-            return Err(StorageError::backend(
-                "GlacierStorage direct projected segment directory checksum mismatch",
-            ));
+        if !segment.directory_verified.load(Ordering::Acquire) {
+            let checksum_started = Instant::now();
+            let _ = segment.verify_directory_checksum(directory, metadata)?;
+            metrics
+                .checksum_us
+                .fetch_add(elapsed_micros(checksum_started), Ordering::Relaxed);
         }
 
         let bypass_directory = if append_only_visible {
             let metadata_decode_started = Instant::now();
-            let metadata_matches =
-                segment_metadata_proves_target_inserts(&metadata, collection, record_count)?;
+            let metadata_matches = segment.proves_target_inserts(metadata, collection)?;
             let metadata_decode_us = elapsed_micros(metadata_decode_started);
             metrics
                 .decode_us
                 .fetch_add(metadata_decode_us, Ordering::Relaxed);
-            metadata_matches && records_are_all_physical_sets(&records, record_count)?
+            metadata_matches && segment.proves_physical_sets(records)?
         } else {
             false
         };
@@ -5147,14 +5786,6 @@ fn scan_collection_sequential_values(
             metrics
                 .record_loop_us
                 .fetch_add(elapsed_micros(record_loop_started), Ordering::Relaxed);
-            segment_start = segment_start
-                .checked_add(SEGMENT_HEADER_BYTES as u64)
-                .and_then(|v| v.checked_add(directory_len as u64))
-                .and_then(|v| v.checked_add(metadata_len as u64))
-                .and_then(|v| v.checked_add(records_len as u64))
-                .ok_or_else(|| {
-                    StorageError::backend("GlacierStorage direct projected segment overflow")
-                })?;
             continue;
         }
 
@@ -5163,7 +5794,7 @@ fn scan_collection_sequential_values(
             .fetch_add(1, Ordering::Relaxed);
         let decode_started = Instant::now();
         let entries: Vec<SegmentIndexEntry> =
-            rmp_serde::from_slice(&directory).map_err(|error| {
+            rmp_serde::from_slice(directory).map_err(|error| {
                 StorageError::backend(format!(
                     "cannot decode GlacierStorage segment directory: {error}"
                 ))
@@ -5327,14 +5958,6 @@ fn scan_collection_sequential_values(
         metrics
             .record_loop_us
             .fetch_add(elapsed_micros(record_loop_started), Ordering::Relaxed);
-        segment_start = segment_start
-            .checked_add(SEGMENT_HEADER_BYTES as u64)
-            .and_then(|v| v.checked_add(directory_len as u64))
-            .and_then(|v| v.checked_add(metadata_len as u64))
-            .and_then(|v| v.checked_add(records_len as u64))
-            .ok_or_else(|| {
-                StorageError::backend("GlacierStorage direct projected segment overflow")
-            })?;
     }
     if emitted != expected {
         return Err(StorageError::backend(format!(
@@ -5693,6 +6316,7 @@ impl<'de> DeserializeSeed<'de> for CheckpointDocumentsSeed<'_> {
 
                 let mut collection = CollectionIndex {
                     primary: Vec::with_capacity(preload),
+                    reclaimable_primary: preload,
                     disk_primary: None,
                     exceptions: HashMap::new(),
                     count_history: vec![(self.seed.generation, self.seed.expected_count)],
@@ -6000,7 +6624,7 @@ fn load_checkpoint( path: &Path, format: GlacierFormatInfo, data_file_len: u64, 
         return Ok(None);
     }
 
-    let (cache_entries, cache_reservation) =
+    let (cache_entries, mut cache_reservation) =
         opportunistic_primary_cache_reservation(memory_governor);
     let mut reader = BufReader::with_capacity(CHECKPOINT_READ_BUFFER_BYTES, file);
     let mut deserializer = rmp_serde::Deserializer::new(&mut reader);
@@ -6015,6 +6639,23 @@ fn load_checkpoint( path: &Path, format: GlacierFormatInfo, data_file_len: u64, 
         Ok(value) => value,
         Err(_) => return Ok(None),
     };
+
+    // Reservation is a cache ceiling, not guaranteed resident usage. If the
+    // checkpoint contains fewer primary entries than the opportunistic budget,
+    // return the unused portion immediately so it cannot starve query memory.
+    if let Some(reservation) = cache_reservation.as_mut() {
+        let entry_bytes = std::mem::size_of::<CompactPrimaryEntry>().max(1);
+        let resident_cache_bytes = state.collections.values().fold(0usize, |bytes, collection| {
+            bytes.saturating_add(
+                collection
+                    .reclaimable_primary
+                    .min(collection.primary.len())
+                    .saturating_mul(entry_bytes),
+            )
+        });
+        let unused = reservation.bytes().saturating_sub(resident_cache_bytes);
+        let _ = reservation.shrink_by(unused);
+    }
 
     if checkpoint_data_len < data_file_len {
         if data_file_len - checkpoint_data_len < SEGMENT_HEADER_BYTES as u64 {
@@ -6129,10 +6770,11 @@ fn enforce_cold_primary_budget( store_path: &Path, state: &mut GlacierState, gen
         )?;
         collection.disk_primary = Some(disk);
         collection.primary = Vec::new();
+        collection.reclaimable_primary = 0;
     }
 }
 
-fn scan_data_file( path: &Path, metrics: &GlacierStartupMetrics, mut state: GlacierState, replay_offset: u64, memory_governor: Option<&MemoryGovernor>, ) -> StorageResult<GlacierState> {
+fn scan_data_file( path: &Path, metrics: &GlacierStartupMetrics, mut state: GlacierState, replay_offset: u64, memory_governor: Option<&MemoryGovernor>, ) -> StorageResult<(GlacierState, Vec<SegmentCatalogEntry>)> {
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -6145,6 +6787,8 @@ fn scan_data_file( path: &Path, metrics: &GlacierStartupMetrics, mut state: Glac
         ));
     }
     let mut segment_start = replay_offset;
+    let mut replay_catalog = Vec::new();
+    let mut catalog_collections = HashMap::<String, Arc<str>>::new();
 
     while segment_start < length {
         if length - segment_start < SEGMENT_HEADER_BYTES as u64 {
@@ -6235,6 +6879,28 @@ fn scan_data_file( path: &Path, metrics: &GlacierStartupMetrics, mut state: Glac
                     "cannot decode GlacierStorage startup metadata: {error}"
                 ))
             })?;
+        let insert_collection = segment_insert_collection_from_delta(&metadata_delta, record_count)
+            .map(|name| {
+                if let Some(existing) = catalog_collections.get(name) {
+                    Arc::clone(existing)
+                } else {
+                    let interned = Arc::<str>::from(name);
+                    catalog_collections.insert(name.to_owned(), Arc::clone(&interned));
+                    interned
+                }
+            });
+        replay_catalog.push(SegmentCatalogEntry::new(
+            segment_start,
+            generation,
+            record_count as u32,
+            directory_len as u32,
+            metadata_len as u32,
+            records_len as u32,
+            expected_directory_checksum,
+            u64::from_be_bytes(header[40..48].try_into().unwrap()),
+            true,
+            Some(insert_collection),
+        ));
         reserve_index_from_metadata_delta(&mut state, &metadata_delta)?;
         metrics
             .metadata_rebuild_us
@@ -6280,7 +6946,7 @@ fn scan_data_file( path: &Path, metrics: &GlacierStartupMetrics, mut state: Glac
             .map_err(io_error("skip Glacier segment records", path))?;
     }
 
-    Ok(state)
+    Ok((state, replay_catalog))
 }
 
 fn validate_segment_lengths( record_count: usize, directory_len: usize, metadata_len: usize, records_len: usize, ) -> StorageResult<()> {
@@ -6840,1026 +7506,37 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn projected_scalar_string_reuses_owned_arc() {
-        let bytes = rmp_serde::to_vec(&ImageValue::String("12-2025".to_owned())).unwrap();
-        let mut cache = None;
-        let (first, first_kind) =
-            decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap();
-        let (second, second_kind) =
-            decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap();
-        let (Value::String(first), Value::String(second)) = (first, second) else {
-            panic!("projected scalar decoder did not return strings");
-        };
-        assert!(matches!(first_kind, ProjectedValueKind::StringMiss));
-        assert!(matches!(second_kind, ProjectedValueKind::StringHit));
-        assert!(Arc::ptr_eq(&first, &second));
-    }
-
-    #[test]
-    fn creates_and_reopens_page_backed_store() {
-        let path = temp_path("create");
-        let first = GlacierBackend::open(&path).unwrap();
-        assert_eq!(first.format_info().version(), 5);
-        let second = GlacierBackend::open(&path).unwrap();
-        assert_eq!(
-            second.format_info().store_id(),
-            first.format_info().store_id()
-        );
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn crud_persists_without_memory_documents() {
-        let path = temp_path("crud");
-        let users = CollectionId::parse("users").unwrap();
-        let id = UuidV7Generator::new().next_id();
-
-        {
-            let storage = GlacierBackend::open(&path).unwrap();
-            let mut doc = Document::new();
-            doc.insert("name", Value::string("Alice"));
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(id.clone(), Arc::new(doc))],
-                )
-                .unwrap();
-            assert_eq!(storage.document_count().unwrap(), 1);
-        }
-
-        {
-            let storage = GlacierBackend::open(&path).unwrap();
-            let read = storage.read().unwrap();
-            let stored = read.get(&users, &id).unwrap().unwrap();
-            assert_eq!(stored.document().get("name"), Some(&Value::string("Alice")));
-            assert_eq!(read.count(&users).unwrap(), 1);
-        }
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn snapshot_remains_generation_stable() {
-        let path = temp_path("snapshot");
-        let users = CollectionId::parse("users").unwrap();
-        let storage = GlacierBackend::open(&path).unwrap();
-        let id1 = UuidV7Generator::new().next_id();
-        let id2 = UuidV7Generator::new().next_id();
-
-        storage
-            .apply_batch_atomic_summary(
-                &users,
-                vec![StorageMutation::insert(id1, Arc::new(Document::new()))],
-            )
-            .unwrap();
-        let snapshot = storage.read().unwrap();
-
-        storage
-            .apply_batch_atomic_summary(
-                &users,
-                vec![StorageMutation::insert(id2, Arc::new(Document::new()))],
-            )
-            .unwrap();
-
-        assert_eq!(snapshot.count(&users).unwrap(), 1);
-        assert_eq!(storage.read().unwrap().count(&users).unwrap(), 2);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn batch_coalesces_count_history_per_generation() {
-        let path = temp_path("count-history-coalesced");
-        let users = CollectionId::parse("users").unwrap();
-        let storage = GlacierBackend::open(&path).unwrap();
-        let generator = UuidV7Generator::new();
-        let mutations = (0..3)
-            .map(|_| StorageMutation::insert(generator.next_id(), Arc::new(Document::new())))
-            .collect::<Vec<_>>();
-
-        storage
-            .apply_batch_atomic_summary(&users, mutations)
-            .unwrap();
-
-        let state = storage.state_read().unwrap();
-        let collection = state.collections.get(&users).unwrap();
-        assert_eq!(collection.count_history.len(), 1);
-        assert_eq!(visible_count(collection, state.generation), 3);
-        drop(state);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn startup_metrics_describe_rebuilt_segments_and_records() {
-        let path = temp_path("startup-metrics");
-        let users = CollectionId::parse("users").unwrap();
-        let id = UuidV7Generator::new().next_id();
-
-        {
-            let storage = GlacierBackend::open(&path).unwrap();
-            let mut doc = Document::new();
-            doc.insert("name", Value::string("Alice"));
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(id, Arc::new(doc))],
-                )
-                .unwrap();
-        }
-
-        let reopened = GlacierBackend::open(&path).unwrap();
-        let metrics = reopened.startup_metrics();
-        assert_eq!(metrics.segments, 1);
-        assert_eq!(metrics.records, 1);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn projected_scan_metrics_count_physical_read_work() {
-        let path = temp_path("read-metrics");
-        let users = CollectionId::parse("users").unwrap();
-        let id = UuidV7Generator::new().next_id();
-        let storage = GlacierBackend::open(&path).unwrap();
-        let mut doc = Document::new();
-        doc.insert("name", Value::string("Alice"));
-        doc.insert("city", Value::string("Paris"));
-        storage
-            .apply_batch_atomic_summary(&users, vec![StorageMutation::insert(id, Arc::new(doc))])
-            .unwrap();
-
-        let read = storage.read().unwrap();
-        let fields = [FieldPath::parse("name").unwrap()];
-        let mut visited = 0u64;
-        read.scan_projected_unordered_each(&users, ScanOptions::default(), &fields, &mut |_| {
-            visited += 1;
-            Ok(true)
-        })
-        .unwrap();
-
-        let metrics = storage.read_metrics();
-        assert_eq!(visited, 1);
-        assert_eq!(metrics.scans, 1);
-        assert_eq!(metrics.segments, 1);
-        assert_eq!(metrics.records, 1);
-        assert_eq!(metrics.projected_records, 1);
-        assert_eq!(metrics.decoded_fields, 1);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn physical_projection_skips_unrequested_field_payload_decode() {
-        let name = rmp_serde::to_vec(&ImageValue::String("Alice".to_owned())).unwrap();
-        let ignored = rmp_serde::to_vec(&ImageValue::String("Paris".to_owned())).unwrap();
-        let document = ImageDocument {
-            id: [7u8; 16],
-            version: 3,
-            fields: vec![
-                ImageField {
-                    name: "name".to_owned(),
-                    value: name,
-                },
-                ImageField {
-                    name: "city".to_owned(),
-                    value: ignored,
-                },
-            ],
-        };
-        let mut bytes = encode_physical_set_record(9, &document).unwrap();
-        assert_eq!(&bytes[..8], &PHYSICAL_SET_MAGIC);
-        let header = parse_physical_set_header(&bytes).unwrap().unwrap();
-        let city = physical_field_entries(&bytes, header)
-            .unwrap()
-            .into_iter()
-            .find(|entry| entry.name == "city")
-            .map(|entry| (entry.offset, entry.length))
-            .unwrap();
-        let payload_base = PHYSICAL_SET_HEADER_BYTES + header.directory_len;
-        bytes[payload_base + city.0] = 0xc1;
-        let directory = &bytes[PHYSICAL_SET_HEADER_BYTES..payload_base];
-        let payloads = &bytes[payload_base..];
-        let checksum = checksum64_pair(directory, payloads);
-        bytes[56..64].copy_from_slice(&checksum.to_be_bytes());
-
-        let fields = [FieldPath::parse("name").unwrap()];
-        let requested = fields
-            .iter()
-            .map(|path| path.first().as_str())
-            .collect::<BTreeSet<_>>();
-        let (projected, decoded_fields) = decode_projected_physical_set(
-            &bytes,
-            parse_physical_set_header(&bytes).unwrap().unwrap(),
-            &fields,
-            Some(&requested),
-        )
-        .unwrap();
-        assert_eq!(decoded_fields, 1);
-        assert!(projected.get("name").is_some());
-        assert!(decode_physical_set_document(
-            &bytes,
-            parse_physical_set_header(&bytes).unwrap().unwrap(),
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn projected_values_append_only_uses_trusted_compiled_path() {
-        let path = temp_path("projected-values-trusted");
-        let users = CollectionId::parse("users").unwrap();
-        let storage = GlacierBackend::open(&path).unwrap();
-        let ids = UuidV7Generator::new().reserve(2);
-
-        for (id, name) in ids.into_iter().zip(["Alice", "Bob"]) {
-            let mut document = Document::new();
-            document.insert("name", Value::string(name));
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(id, Arc::new(document))],
-                )
-                .unwrap();
-        }
-
-        let fields = [FieldPath::parse("name").unwrap()];
-        let read = storage.read().unwrap();
-        let mut projected = Vec::new();
-        read.scan_projected_values_unordered_each(
-            &users,
-            ScanOptions::default(),
-            &fields,
-            &mut |values| {
-                projected.push(values[0].clone());
-                Ok(true)
-            },
-        )
-        .unwrap();
-
-        assert_eq!(projected.len(), 2);
-        assert!(projected.contains(&Some(Value::string("Alice"))));
-        assert!(projected.contains(&Some(Value::string("Bob"))));
-
-        let metrics = storage.read_metrics();
-        assert_eq!(metrics.visibility_fast_scans, 1);
-        assert_eq!(metrics.visibility_fallback_scans, 0);
-        assert_eq!(metrics.trusted_header_records, 2);
-        assert_eq!(metrics.verified_header_records, 0);
-        assert_eq!(metrics.projection_layout_misses, 1);
-        assert_eq!(metrics.projection_layout_hits, 1);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn projected_values_fallback_after_replace_preserves_result() {
-        let path = temp_path("projected-values-replace-fallback");
-        let users = CollectionId::parse("users").unwrap();
-        let id = UuidV7Generator::new().next_id();
-        let storage = GlacierBackend::open(&path).unwrap();
-
-        let mut original = Document::new();
-        original.insert("name", Value::string("Alice"));
-        storage
-            .apply_batch_atomic_summary(
-                &users,
-                vec![StorageMutation::insert(id, Arc::new(original))],
-            )
-            .unwrap();
-
-        let mut replacement = Document::new();
-        replacement.insert("name", Value::string("Bob"));
-        storage
-            .apply_batch_atomic_summary(
-                &users,
-                vec![StorageMutation::replace(
-                    id,
-                    Arc::new(replacement),
-                    VersionPrecondition::Any,
-                )],
-            )
-            .unwrap();
-
-        let fields = [FieldPath::parse("name").unwrap()];
-        let read = storage.read().unwrap();
-        let mut projected = Vec::new();
-        read.scan_projected_values_unordered_each(
-            &users,
-            ScanOptions::default(),
-            &fields,
-            &mut |values| {
-                projected.push(values[0].clone());
-                Ok(true)
-            },
-        )
-        .unwrap();
-
-        assert_eq!(projected, vec![Some(Value::string("Bob"))]);
-        let metrics = storage.read_metrics();
-        assert_eq!(metrics.visibility_fast_scans, 0);
-        assert_eq!(metrics.visibility_fallback_scans, 1);
-        assert!(metrics.visibility_checks > 0);
-        assert!(metrics.verified_header_records > 0);
-        assert_eq!(metrics.trusted_header_records, 0);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn compiled_projection_layout_relearns_when_field_order_changes() {
-        let generator = UuidV7Generator::new();
-        let fields = [FieldPath::parse("name").unwrap()];
-        let mut values: Vec<Option<Value>> = vec![None];
-        let mut layout = PhysicalProjectionLayout::default();
-
-        let first = ImageDocument {
-            id: *generator.next_id().as_bytes(),
-            version: 1,
-            fields: vec![
-                ImageField {
-                    name: "name".to_owned(),
-                    value: rmp_serde::to_vec(&ImageValue::String("Alice".to_owned())).unwrap(),
-                },
-                ImageField {
-                    name: "city".to_owned(),
-                    value: rmp_serde::to_vec(&ImageValue::String("Paris".to_owned())).unwrap(),
-                },
-            ],
-        };
-        let first_bytes = encode_physical_set_record(1, &first).unwrap();
-        let first_header = parse_physical_set_header(&first_bytes).unwrap().unwrap();
-        assert_eq!(
-            decode_physical_projected_values_into(
-                &first_bytes,
-                first_header,
-                &fields,
-                &mut values,
-                &mut layout,
-                None,
-                None,
-            )
-            .unwrap(),
-            (1, false)
-        );
-        assert_eq!(values[0], Some(Value::string("Alice")));
-
-        let second = ImageDocument {
-            id: *generator.next_id().as_bytes(),
-            version: 1,
-            fields: vec![
-                ImageField {
-                    name: "city".to_owned(),
-                    value: rmp_serde::to_vec(&ImageValue::String("Lyon".to_owned())).unwrap(),
-                },
-                ImageField {
-                    name: "name".to_owned(),
-                    value: rmp_serde::to_vec(&ImageValue::String("Bob".to_owned())).unwrap(),
-                },
-            ],
-        };
-        let second_bytes = encode_physical_set_record(2, &second).unwrap();
-        let second_header = parse_physical_set_header(&second_bytes).unwrap().unwrap();
-        assert_eq!(first_header.field_count, second_header.field_count);
-        assert_eq!(first_header.directory_len, second_header.directory_len);
-        assert_eq!(
-            decode_physical_projected_values_into(
-                &second_bytes,
-                second_header,
-                &fields,
-                &mut values,
-                &mut layout,
-                None,
-                None,
-            )
-            .unwrap(),
-            (1, false)
-        );
-        assert_eq!(values[0], Some(Value::string("Bob")));
-    }
-
-    #[test]
-    fn trusted_physical_header_skips_only_record_checksum() {
-        let id = UuidV7Generator::new().next_id();
-        let stored = StoredDocument::new(
-            id,
-            DocumentVersion::INITIAL,
-            Arc::new({
-                let mut document = Document::new();
-                document.insert("name", Value::string("Alice"));
-                document
-            }),
-        )
-        .unwrap();
-        let image = image_document(&stored).unwrap();
-        let mut bytes = encode_physical_set_record(7, &image).unwrap();
-
-        // Corrupt only the stored checksum. Framing, directory and payload remain valid.
-        bytes[56] ^= 0x01;
-
-        assert!(parse_physical_set_header(&bytes).is_err());
-        let trusted = parse_trusted_physical_set_header(&bytes)
-            .unwrap()
-            .expect("trusted analytical parser accepts valid framing");
-        assert_eq!(trusted.id, *id.as_bytes());
-        assert_eq!(trusted.version, DocumentVersion::INITIAL.get());
-
-        // Trusted parsing still rejects malformed framing.
-        let truncated = &bytes[..bytes.len() - 1];
-        assert!(parse_trusted_physical_set_header(truncated).is_err());
-    }
-
-    #[test]
-    fn persisted_set_records_use_physical_field_directory() {
-        let path = temp_path("physical-directory");
-        let users = CollectionId::parse("users").unwrap();
-        let id = UuidV7Generator::new().next_id();
-        let storage = GlacierBackend::open(&path).unwrap();
-        let mut doc = Document::new();
-        doc.insert("name", Value::string("Alice"));
-        doc.insert("city", Value::string("Paris"));
-        storage
-            .apply_batch_atomic_summary(&users, vec![StorageMutation::insert(id, Arc::new(doc))])
-            .unwrap();
-
-        let pointer = {
-            let state = storage.state_read().unwrap();
-            visible_version(&state, state.generation, &users, &id)
-                .unwrap()
-                .pointer
-                .unwrap()
-        };
-        let mut file = File::open(&path).unwrap();
-        file.seek(SeekFrom::Start(pointer.offset)).unwrap();
-        let mut magic = [0u8; 8];
-        file.read_exact(&mut magic).unwrap();
-        assert_eq!(magic, PHYSICAL_SET_MAGIC);
-
-        let stored = storage.read().unwrap().get(&users, &id).unwrap().unwrap();
-        assert_eq!(stored.document().len(), 2);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn primary_head_tracks_smallest_ids_without_requiring_insert_order() {
-        let generator = UuidV7Generator::new();
-        let mut ids = generator.reserve(6).collect::<Vec<_>>();
-        let expected = ids[..3].to_vec();
-        ids.reverse();
-
-        let mut collection = CollectionIndex::default();
-        for (ordinal, id) in ids.into_iter().enumerate() {
-            primary_head_insert(
-                &mut collection,
-                id,
-                RecordPointer {
-                    offset: 100 + ordinal as u64,
-                    length: 10,
-                },
-            );
-        }
-
-        let head = primary_head_entries(&collection, 3).unwrap();
-        assert_eq!(head.iter().map(|(id, _)| *id).collect::<Vec<_>>(), expected);
-    }
-
-    #[test]
-    fn invalid_primary_head_forces_bounded_fallback() {
-        let mut collection = CollectionIndex::default();
-        collection.primary_head_valid = false;
-        assert!(primary_head_entries(&collection, 1).is_none());
-    }
-
-    #[test]
-    fn primary_batch_append_updates_tail_and_count_once() {
-        let path = temp_path("primary-batch-append");
-        let collection = CollectionId::parse("users").unwrap();
-        let target = primary_index_path(&path, &collection);
-        let mut file = File::create(&target).unwrap();
-        file.write_all(PRIMARY_INDEX_MAGIC.as_slice()).unwrap();
-        file.write_all(&GLACIER_FORMAT_VERSION.to_be_bytes())
-            .unwrap();
-        file.write_all(&0u16.to_be_bytes()).unwrap();
-        file.write_all(&0u32.to_be_bytes()).unwrap();
-        file.write_all(&0u64.to_be_bytes()).unwrap();
-        drop(file);
-
-        let ids = UuidV7Generator::new().reserve(3).collect::<Vec<_>>();
-        let mut index = DiskPrimaryIndex {
-            path: target.clone(),
-            count: 0,
-            last_id: None,
-        };
-        let mut entries = ids
-            .iter()
-            .enumerate()
-            .map(|(ordinal, id)| CompactPrimaryEntry {
-                id: *id,
-                generation: 1,
-                version: DocumentVersion::INITIAL,
-                pointer: RecordPointer {
-                    offset: 100 + ordinal as u64,
-                    length: 10,
-                },
-            })
-            .collect::<Vec<_>>();
-
-        assert!(disk_primary_append_batch(&mut index, &mut entries).unwrap());
-        assert_eq!(index.count, 3);
-        assert_eq!(index.last_id, ids.last().copied());
-
-        let _ = fs::remove_file(&target);
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn page_backed_primary_rejects_ids_beyond_tail_without_disk_lookup() {
-        let collection = CollectionId::parse("users").unwrap();
-        let ids = UuidV7Generator::new().reserve(2).collect::<Vec<_>>();
-        let mut index = CollectionIndex::default();
-        index.disk_primary = Some(DiskPrimaryIndex {
-            path: PathBuf::from("/definitely/not/read"),
-            count: 1,
-            last_id: Some(ids[0]),
-        });
-        let state = GlacierState {
-            generation: 7,
-            ..GlacierState::default()
-        };
-
-        assert!(ids[1] > ids[0]);
-        assert!(index.visible_version(&state, 7, &ids[1]).is_none());
-        let _ = collection;
-    }
-
-    #[test]
-    fn page_backed_primary_lookup_works_without_resident_primary_entries() {
-        let path = temp_path("primary-sidecar");
-        let collection = CollectionId::parse("users").unwrap();
-        let ids = UuidV7Generator::new().reserve(3).collect::<Vec<_>>();
-        let documents = ids
-            .iter()
-            .enumerate()
-            .map(|(ordinal, id)| CheckpointDocument {
-                id: id.into_bytes(),
-                version: 1,
-                offset: 100 + ordinal as u64 * 20,
-                length: 10,
-            })
-            .collect::<Vec<_>>();
-
-        let disk = rebuild_disk_primary_documents(&path, &collection, 7, &documents).unwrap();
-        let mut index = CollectionIndex::default();
-        index.disk_primary = Some(disk);
-        assert!(index.primary.is_empty());
-
-        let mut state = GlacierState::default();
-        state.generation = 7;
-        let found = index.visible_version(&state, 7, &ids[1]).unwrap();
-        assert_eq!(found.pointer.unwrap().offset, 120);
-
-        if let Some(disk) = index.disk_primary {
-            let _ = fs::remove_file(disk.path);
-        }
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn streaming_checkpoint_loader_does_not_materialize_primary_documents() {
-        let path = temp_path("streaming-checkpoint");
-        let format = initialize_file(&path).unwrap();
-        let data_len = GLACIER_SUPERBLOCK_BYTES as u64 + 1024;
-        OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_len(data_len)
-            .unwrap();
-
-        let ids = UuidV7Generator::new().reserve(3).collect::<Vec<_>>();
-        let checkpoint = PersistentCheckpoint {
-            format_version: format.version(),
-            store_id: format.store_id(),
-            generation: 7,
-            data_len,
-            collections: vec![CheckpointCollection {
-                name: "users".to_owned(),
-                count: 3,
-                documents: ids
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, id)| CheckpointDocument {
-                        id: id.into_bytes(),
-                        version: 1,
-                        offset: GLACIER_SUPERBLOCK_BYTES as u64 + 100 + ordinal as u64 * 10,
-                        length: 5,
-                    })
-                    .collect(),
-            }],
-            metadata: FieldCatalog::default(),
-        };
-        let bytes = rmp_serde::to_vec(&checkpoint).unwrap();
-        let mut de = rmp_serde::Deserializer::new(bytes.as_slice());
-        let (state, decoded_data_len, generation) = StreamingCheckpointSeed {
-            store_path: &path,
-            format,
-            data_file_len: data_len,
-            cache_entries: 2,
-        }
-        .deserialize(&mut de)
-        .unwrap();
-
-        assert_eq!(decoded_data_len, data_len);
-        assert_eq!(generation, 7);
-        let users = CollectionId::parse("users").unwrap();
-        let collection = state.collections.get(&users).unwrap();
-        assert_eq!(collection.primary.len(), 2);
-        assert_eq!(collection.disk_primary.as_ref().unwrap().count, 3);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(primary_index_path(&path, &users));
-    }
-
-    #[test]
-    fn primary_cache_reservation_is_opportunistic_and_bounded() {
-        let governor = MemoryGovernor::with_process_limit(256 * 1024 * 1024);
-        let (entries, reservation) = opportunistic_primary_cache_reservation(Some(&governor));
-        assert!(entries > 0);
-        assert!(reservation.is_some());
-        assert!(
-            governor
-                .snapshot()
-                .classes
-                .iter()
-                .find(|class| class.class == MemoryClass::PageCache)
-                .unwrap()
-                .current_bytes
-                <= governor.profile().managed_budget_bytes.unwrap()
-                    / PRIMARY_CACHE_FRACTION_DENOMINATOR
-        );
-    }
-
-    #[test]
-    fn compact_primary_keeps_ordered_ids_inline_and_spills_only_exceptions() {
-        let generator = UuidV7Generator::new();
-        let ids = generator.reserve(4).collect::<Vec<_>>();
-        let mut index = CollectionIndex::default();
-
-        for (ordinal, id) in ids.iter().copied().enumerate() {
-            index.insert_new(
-                id,
-                IndexVersion {
-                    generation: 1,
-                    version: DocumentVersion::INITIAL,
-                    pointer: Some(RecordPointer {
-                        offset: 100 + ordinal as u64,
-                        length: 10,
-                    }),
-                },
-            );
-        }
-
-        assert_eq!(index.primary.len(), 4);
-        assert!(index.exceptions.is_empty());
-
-        let replacement = IndexVersion {
-            generation: 2,
-            version: DocumentVersion::new(2),
-            pointer: Some(RecordPointer {
-                offset: 999,
-                length: 11,
-            }),
-        };
-        index.push_existing(ids[1], replacement);
-        assert_eq!(index.primary.len(), 4);
-        assert_eq!(index.exceptions.len(), 1);
-
-        let mut state = GlacierState::default();
-        state.generation = 2;
-        let visible = index.visible_version(&state, 2, &ids[1]).unwrap();
-        assert_eq!(visible.generation, 2);
-        assert_eq!(visible.pointer.unwrap().offset, 999);
-    }
-
-    #[test]
-    fn inline_index_versions_allocate_history_only_after_second_version() {
-        let first = IndexVersion {
-            generation: 1,
-            version: DocumentVersion::INITIAL,
-            pointer: Some(RecordPointer {
-                offset: 100,
-                length: 10,
-            }),
-        };
-        let second = IndexVersion {
-            generation: 2,
-            version: DocumentVersion::new(2),
-            pointer: Some(RecordPointer {
-                offset: 200,
-                length: 11,
-            }),
-        };
-
-        let mut versions = InlineIndexVersions::new(first);
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions.heap_capacity(), 0);
-        assert_eq!(versions.iter_rev().next().copied().unwrap().generation, 1);
-
-        versions.push(second);
-        assert_eq!(versions.len(), 2);
-        assert!(versions.heap_capacity() >= 2);
-        let replayed = versions
-            .iter_rev()
-            .map(|version| version.generation)
-            .collect::<Vec<_>>();
-        assert_eq!(replayed, vec![2, 1]);
-    }
-
-    #[test]
-    fn bounded_limit_selection_preserves_primary_id_order() {
-        let mut state = GlacierState::default();
-        state.generation = 1;
-        let collection = CollectionId::parse("users").unwrap();
-        let mut index = CollectionIndex::default();
-
-        let mut ids = UuidV7Generator::new().reserve(5).collect::<Vec<_>>();
-        ids.reverse();
-        for (ordinal, id) in ids.into_iter().enumerate() {
-            index.insert_new(
-                id,
-                IndexVersion {
-                    generation: 1,
-                    version: DocumentVersion::INITIAL,
-                    pointer: Some(RecordPointer {
-                        offset: 100 + ordinal as u64,
-                        length: 10,
-                    }),
-                },
-            );
-        }
-        index.count_history.push((1, 5));
-        state.collections.insert(collection.clone(), index);
-        let index = state.collections.get(&collection).unwrap();
-
-        let forward = select_visible_entries_bounded(&state, index, 1, ScanDirection::Forward, 2);
-        assert_eq!(forward.len(), 2);
-        assert!(forward[0].0 < forward[1].0);
-
-        let reverse = select_visible_entries_bounded(&state, index, 1, ScanDirection::Reverse, 2);
-        assert_eq!(reverse.len(), 2);
-        assert!(reverse[0].0 > reverse[1].0);
-        assert!(reverse[0].0 > forward[1].0);
-    }
-
-    #[test]
-    fn checkpointless_open_does_not_make_historical_bytes_immediately_due() {
-        let replay_offset = GLACIER_SUPERBLOCK_BYTES as u64;
-        let data_len = 6 * 1024 * 1024 * 1024u64;
-        let next = next_checkpoint_offset_after_open(false, replay_offset, data_len);
-        assert_eq!(next, data_len.saturating_mul(2));
-        assert!(next > data_len.saturating_add(1));
-    }
-
-    #[test]
-    fn checkpointed_open_keeps_growth_relative_to_checkpoint_boundary() {
-        let replay_offset = 512 * 1024 * 1024u64;
-        let data_len = replay_offset + 64 * 1024 * 1024u64;
-        let next = next_checkpoint_offset_after_open(true, replay_offset, data_len);
-        assert_eq!(next, replay_offset.saturating_mul(2));
-    }
-
-    #[test]
-    fn automatic_checkpoint_interval_grows_geometrically() {
-        assert_eq!(
-            automatic_checkpoint_interval(0),
-            MIN_CHECKPOINT_INTERVAL_BYTES
-        );
-        assert_eq!(
-            automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES / 2),
-            MIN_CHECKPOINT_INTERVAL_BYTES
-        );
-        assert_eq!(
-            automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES),
-            MIN_CHECKPOINT_INTERVAL_BYTES
-        );
-        assert_eq!(
-            automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES * 4),
-            MIN_CHECKPOINT_INTERVAL_BYTES * 4
-        );
-    }
-
-    #[test]
-    fn failed_automatic_checkpoint_is_deferred_past_current_store_size() {
-        let checkpoint_offset = MIN_CHECKPOINT_INTERVAL_BYTES * 4;
-        let data_len = checkpoint_offset * 2;
-        let next = checkpoint_retry_offset_after_failure(data_len, checkpoint_offset);
-        assert_eq!(
-            next,
-            data_len + checkpoint_offset * CHECKPOINT_FAILURE_BACKOFF_MULTIPLIER
-        );
-        assert!(next > data_len);
-    }
-
-    #[test]
-    fn checkpoint_restores_index_and_replays_only_tail() {
-        let path = temp_path("checkpoint-tail");
-        let users = CollectionId::parse("users").unwrap();
-        let generator = UuidV7Generator::new();
-        let mut ids = generator.reserve(2);
-        let first_id = ids.next().unwrap();
-        let second_id = ids.next().unwrap();
-
-        {
-            let storage = GlacierBackend::open(&path).unwrap();
-            let mut first = Document::new();
-            first.insert("name", Value::string("Alice"));
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(first_id, Arc::new(first))],
-                )
-                .unwrap();
-            assert_eq!(
-                storage
-                    .collection_metadata(&users)
-                    .unwrap()
-                    .unwrap()
-                    .documents(),
-                1
-            );
-            storage.checkpoint().unwrap();
-            let checkpoint_metrics = storage.write_metrics();
-            assert_eq!(checkpoint_metrics.checkpoint_runs, 1);
-            assert_eq!(checkpoint_metrics.checkpoint_failures, 0);
-            assert_eq!(checkpoint_metrics.checkpoint_documents, 1);
-            assert!(checkpoint_metrics.checkpoint_bytes > CHECKPOINT_HEADER_BYTES as u64);
-            assert!(
-                checkpoint_metrics.checkpoint_total_us >= checkpoint_metrics.checkpoint_build_us
-            );
-            assert!(
-                checkpoint_metrics.checkpoint_write_us >= checkpoint_metrics.checkpoint_encode_us
-            );
-
-            let mut second = Document::new();
-            second.insert("name", Value::string("Bob"));
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(second_id, Arc::new(second))],
-                )
-                .unwrap();
-        }
-
-        let reopened = GlacierBackend::open(&path).unwrap();
-        let metrics = reopened.startup_metrics();
-        assert_eq!(metrics.checkpoint_loaded, 1);
-        assert_eq!(metrics.checkpoint_generation, 1);
-        assert!(metrics.checkpoint_bytes > CHECKPOINT_HEADER_BYTES as u64);
-        assert_eq!(metrics.segments, 1);
-        assert_eq!(metrics.records, 1);
-        assert_eq!(reopened.generation().unwrap(), 2);
-        assert_eq!(reopened.document_count().unwrap(), 2);
-        assert_eq!(
-            reopened
-                .collection_metadata(&users)
-                .unwrap()
-                .unwrap()
-                .documents(),
-            2
-        );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
-
-    #[test]
-    fn corrupt_checkpoint_falls_back_to_full_segment_replay() {
-        let path = temp_path("checkpoint-corrupt");
-        let users = CollectionId::parse("users").unwrap();
-        let id = UuidV7Generator::new().next_id();
-
-        {
-            let storage = GlacierBackend::open(&path).unwrap();
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(id, Arc::new(Document::new()))],
-                )
-                .unwrap();
-            storage.checkpoint().unwrap();
-        }
-
-        let checkpoint = checkpoint_path(&path);
-        let mut bytes = fs::read(&checkpoint).unwrap();
-        bytes[0] ^= 0xff;
-        fs::write(&checkpoint, bytes).unwrap();
-
-        let reopened = GlacierBackend::open(&path).unwrap();
-        let metrics = reopened.startup_metrics();
-        assert_eq!(metrics.checkpoint_loaded, 0);
-        assert_eq!(metrics.segments, 1);
-        assert_eq!(metrics.records, 1);
-        assert_eq!(reopened.document_count().unwrap(), 1);
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint);
-    }
-    #[test]
-    fn append_only_visibility_fast_path_requires_current_single_versions() {
-        let path = temp_path("append-only-visibility");
-        let users = CollectionId::parse("users").unwrap();
-        let storage = GlacierBackend::open(&path).unwrap();
-        let ids = UuidV7Generator::new().reserve(2);
-        for id in ids {
-            storage
-                .apply_batch_atomic_summary(
-                    &users,
-                    vec![StorageMutation::insert(id, Arc::new(Document::new()))],
-                )
-                .unwrap();
-        }
-
-        {
-            let state = storage.state_read().unwrap();
-            let collection = state.collections.get(&users).unwrap();
-            assert!(append_only_visibility_is_trivial(
-                &state,
-                collection,
-                state.generation
-            ));
-            assert!(!append_only_visibility_is_trivial(
-                &state,
-                collection,
-                state.generation.saturating_sub(1)
-            ));
-        }
-
-        let id = storage
-            .read()
-            .unwrap()
-            .scan(&users, ScanOptions::default())
-            .unwrap()[0]
-            .id()
-            .clone();
-        storage
-            .apply_batch_atomic_summary(
-                &users,
-                vec![StorageMutation::replace(
-                    id,
-                    Arc::new(Document::new()),
-                    VersionPrecondition::Any,
-                )],
-            )
-            .unwrap();
-        {
-            let state = storage.state_read().unwrap();
-            let collection = state.collections.get(&users).unwrap();
-            assert!(!append_only_visibility_is_trivial(
-                &state,
-                collection,
-                state.generation
-            ));
-        }
-
-        {
-            let mut transaction = storage.begin().unwrap();
-            transaction
-                .delete(&users, &id, VersionPrecondition::Any)
-                .unwrap();
-            transaction.commit().unwrap();
-        }
-        {
-            let state = storage.state_read().unwrap();
-            let collection = state.collections.get(&users).unwrap();
-            assert!(!append_only_visibility_is_trivial(
-                &state,
-                collection,
-                state.generation
-            ));
-        }
-
-        storage.clear().unwrap();
-        {
-            let state = storage.state_read().unwrap();
-            let collection = state.collections.get(&users).unwrap();
-            assert!(!append_only_visibility_is_trivial(
-                &state,
-                collection,
-                state.generation
-            ));
-        }
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(checkpoint_path(&path));
-    }
+    #[test] fn projected_scalar_string_reuses_owned_arc() { let bytes = rmp_serde::to_vec(&ImageValue::String("12-2025".to_owned())).unwrap(); let mut cache = None; let (first, first_kind) = decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap(); let (second, second_kind) = decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap(); let (Value::String(first), Value::String(second)) = (first, second) else { panic!("projected scalar decoder did not return strings"); }; assert!(matches!(first_kind, ProjectedValueKind::StringMiss)); assert!(matches!(second_kind, ProjectedValueKind::StringHit)); assert!(Arc::ptr_eq(&first, &second)); }
+    #[test] fn creates_and_reopens_page_backed_store() { let path = temp_path("create"); let first = GlacierBackend::open(&path).unwrap(); assert_eq!(first.format_info().version(), 5); let second = GlacierBackend::open(&path).unwrap(); assert_eq!( second.format_info().store_id(), first.format_info().store_id() ); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn crud_persists_without_memory_documents() { let path = temp_path("crud"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id.clone(), Arc::new(doc))], ) .unwrap(); assert_eq!(storage.document_count().unwrap(), 1); } { let storage = GlacierBackend::open(&path).unwrap(); let read = storage.read().unwrap(); let stored = read.get(&users, &id).unwrap().unwrap(); assert_eq!(stored.document().get("name"), Some(&Value::string("Alice"))); assert_eq!(read.count(&users).unwrap(), 1); } let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn snapshot_remains_generation_stable() { let path = temp_path("snapshot"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let id1 = UuidV7Generator::new().next_id(); let id2 = UuidV7Generator::new().next_id(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id1, Arc::new(Document::new()))], ) .unwrap(); let snapshot = storage.read().unwrap(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id2, Arc::new(Document::new()))], ) .unwrap(); assert_eq!(snapshot.count(&users).unwrap(), 1); assert_eq!(storage.read().unwrap().count(&users).unwrap(), 2); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn batch_coalesces_count_history_per_generation() { let path = temp_path("count-history-coalesced"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let generator = UuidV7Generator::new(); let mutations = (0..3) .map(|_| StorageMutation::insert(generator.next_id(), Arc::new(Document::new()))) .collect::<Vec<_>>(); storage .apply_batch_atomic_summary(&users, mutations) .unwrap(); let state = storage.state_read().unwrap(); let collection = state.collections.get(&users).unwrap(); assert_eq!(collection.count_history.len(), 1); assert_eq!(visible_count(collection, state.generation), 3); drop(state); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn startup_metrics_describe_rebuilt_segments_and_records() { let path = temp_path("startup-metrics"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let metrics = reopened.startup_metrics(); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn projected_scan_metrics_count_physical_read_work() { let path = temp_path("read-metrics"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); doc.insert("city", Value::string("Paris")); storage .apply_batch_atomic_summary(&users, vec![StorageMutation::insert(id, Arc::new(doc))]) .unwrap(); let read = storage.read().unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let mut visited = 0u64; read.scan_projected_unordered_each(&users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }) .unwrap(); let metrics = storage.read_metrics(); assert_eq!(visited, 1); assert_eq!(metrics.scans, 1); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); assert_eq!(metrics.projected_records, 1); assert_eq!(metrics.decoded_fields, 1); assert_eq!(metrics.mmap_segments, 0); assert_eq!(metrics.mmap_bypass_segments, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
+    #[test] fn projected_scan_reuses_mmap_and_refreshes_after_append() { let path = temp_path("read-mmap"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let first_id = UuidV7Generator::new().next_id(); let mut first = Document::new(); first.insert("name", Value::string("Alice")); first.insert( "payload", Value::string("x".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(first_id, Arc::new(first))], ) .unwrap(); let read = storage.read().unwrap(); for _ in 0..2 { let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 1); } let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 0); assert_eq!(metrics.segment_catalog_refreshes, 1); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 2); assert!(metrics.mmap_bytes >= (MIN_MMAP_SEGMENT_PAYLOAD_BYTES as u64) * 2); assert_eq!(metrics.mmap_fallback_segments, 0); let second_id = UuidV7Generator::new().next_id(); let mut second = Document::new(); second.insert("name", Value::string("Bob")); second.insert( "payload", Value::string("y".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(second_id, Arc::new(second))], ) .unwrap(); let read = storage.read().unwrap(); let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 2); let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 1); assert_eq!(metrics.segment_catalog_refreshes, 2); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 4); assert_eq!(metrics.mmap_fallback_segments, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn startup_replay_seeds_segment_catalog_validation() { let path = temp_path("segment-catalog-startup"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let startup = reopened.startup_metrics(); assert_eq!(startup.segment_catalog_segments, 1); let catalog = reopened .inner .segment_catalog .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()); assert_eq!(catalog.segments.len(), 1); let entry = &catalog.segments[0]; assert!(entry.directory_verified.load(Ordering::Acquire)); assert_eq!(entry.known_insert_collection(), Some("users")); drop(catalog); let resident = reopened.resident_memory(); assert_eq!(resident.segment_catalog_entries, 1); assert!(resident.segment_catalog_estimated_bytes > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn physical_projection_skips_unrequested_field_payload_decode() { let name = rmp_serde::to_vec(&ImageValue::String("Alice".to_owned())).unwrap(); let ignored = rmp_serde::to_vec(&ImageValue::String("Paris".to_owned())).unwrap(); let document = ImageDocument { id: [7u8; 16], version: 3, fields: vec![ ImageField { name: "name".to_owned(), value: name, }, ImageField { name: "city".to_owned(), value: ignored, }, ], }; let mut bytes = encode_physical_set_record(9, &document).unwrap(); assert_eq!(&bytes[..8], &PHYSICAL_SET_MAGIC); let header = parse_physical_set_header(&bytes).unwrap().unwrap(); let city = physical_field_entries(&bytes, header) .unwrap() .into_iter() .find(|entry| entry.name == "city") .map(|entry| (entry.offset, entry.length)) .unwrap(); let payload_base = PHYSICAL_SET_HEADER_BYTES + header.directory_len; bytes[payload_base + city.0] = 0xc1; let directory = &bytes[PHYSICAL_SET_HEADER_BYTES..payload_base]; let payloads = &bytes[payload_base..]; let checksum = checksum64_pair(directory, payloads); bytes[56..64].copy_from_slice(&checksum.to_be_bytes()); let fields = [FieldPath::parse("name").unwrap()]; let requested = fields .iter() .map(|path| path.first().as_str()) .collect::<BTreeSet<_>>(); let (projected, decoded_fields) = decode_projected_physical_set( &bytes, parse_physical_set_header(&bytes).unwrap().unwrap(), &fields, Some(&requested), ) .unwrap(); assert_eq!(decoded_fields, 1); assert!(projected.get("name").is_some()); assert!(decode_physical_set_document( &bytes, parse_physical_set_header(&bytes).unwrap().unwrap(), ) .is_err()); }
+    #[test] fn projected_values_append_only_uses_trusted_compiled_path() { let path = temp_path("projected-values-trusted"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let ids = UuidV7Generator::new().reserve(2); for (id, name) in ids.into_iter().zip(["Alice", "Bob"]) { let mut document = Document::new(); document.insert("name", Value::string(name)); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(document))], ) .unwrap(); } let fields = [FieldPath::parse("name").unwrap()]; let read = storage.read().unwrap(); let mut projected = Vec::new(); read.scan_projected_values_unordered_each( &users, ScanOptions::default(), &fields, &mut |values| { projected.push(values[0].clone()); Ok(true) }, ) .unwrap(); assert_eq!(projected.len(), 2); assert!(projected.contains(&Some(Value::string("Alice")))); assert!(projected.contains(&Some(Value::string("Bob")))); let metrics = storage.read_metrics(); assert_eq!(metrics.visibility_fast_scans, 1); assert_eq!(metrics.visibility_fallback_scans, 0); assert_eq!(metrics.trusted_header_records, 2); assert_eq!(metrics.verified_header_records, 0); assert_eq!(metrics.projection_layout_misses, 1); assert_eq!(metrics.projection_layout_hits, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn projected_values_fallback_after_replace_preserves_result() { let path = temp_path("projected-values-replace-fallback"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut original = Document::new(); original.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(original))], ) .unwrap(); let mut replacement = Document::new(); replacement.insert("name", Value::string("Bob")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::replace( id, Arc::new(replacement), VersionPrecondition::Any, )], ) .unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let read = storage.read().unwrap(); let mut projected = Vec::new(); read.scan_projected_values_unordered_each( &users, ScanOptions::default(), &fields, &mut |values| { projected.push(values[0].clone()); Ok(true) }, ) .unwrap(); assert_eq!(projected, vec![Some(Value::string("Bob"))]); let metrics = storage.read_metrics(); assert_eq!(metrics.visibility_fast_scans, 0); assert_eq!(metrics.visibility_fallback_scans, 1); assert!(metrics.visibility_checks > 0); assert!(metrics.verified_header_records > 0); assert_eq!(metrics.trusted_header_records, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn compiled_projection_layout_relearns_when_field_order_changes() { let generator = UuidV7Generator::new(); let fields = [FieldPath::parse("name").unwrap()]; let mut values: Vec<Option<Value>> = vec![None]; let mut layout = PhysicalProjectionLayout::default(); let first = ImageDocument { id: *generator.next_id().as_bytes(), version: 1, fields: vec![ ImageField { name: "name".to_owned(), value: rmp_serde::to_vec(&ImageValue::String("Alice".to_owned())).unwrap(), }, ImageField { name: "city".to_owned(), value: rmp_serde::to_vec(&ImageValue::String("Paris".to_owned())).unwrap(), }, ], }; let first_bytes = encode_physical_set_record(1, &first).unwrap(); let first_header = parse_physical_set_header(&first_bytes).unwrap().unwrap(); assert_eq!( decode_physical_projected_values_into( &first_bytes, first_header, &fields, &mut values, &mut layout, None, None, ) .unwrap(), (1, false) ); assert_eq!(values[0], Some(Value::string("Alice"))); let second = ImageDocument { id: *generator.next_id().as_bytes(), version: 1, fields: vec![ ImageField { name: "city".to_owned(), value: rmp_serde::to_vec(&ImageValue::String("Lyon".to_owned())).unwrap(), }, ImageField { name: "name".to_owned(), value: rmp_serde::to_vec(&ImageValue::String("Bob".to_owned())).unwrap(), }, ], }; let second_bytes = encode_physical_set_record(2, &second).unwrap(); let second_header = parse_physical_set_header(&second_bytes).unwrap().unwrap(); assert_eq!(first_header.field_count, second_header.field_count); assert_eq!(first_header.directory_len, second_header.directory_len); assert_eq!( decode_physical_projected_values_into( &second_bytes, second_header, &fields, &mut values, &mut layout, None, None, ) .unwrap(), (1, false) ); assert_eq!(values[0], Some(Value::string("Bob"))); }
+    #[test] fn trusted_physical_header_skips_only_record_checksum() { let id = UuidV7Generator::new().next_id(); let stored = StoredDocument::new( id, DocumentVersion::INITIAL, Arc::new({ let mut document = Document::new(); document.insert("name", Value::string("Alice")); document }), ) .unwrap(); let image = image_document(&stored).unwrap(); let mut bytes = encode_physical_set_record(7, &image).unwrap(); bytes[56] ^= 0x01; assert!(parse_physical_set_header(&bytes).is_err()); let trusted = parse_trusted_physical_set_header(&bytes) .unwrap() .expect("trusted analytical parser accepts valid framing"); assert_eq!(trusted.id, *id.as_bytes()); assert_eq!(trusted.version, DocumentVersion::INITIAL.get()); let truncated = &bytes[..bytes.len() - 1]; assert!(parse_trusted_physical_set_header(truncated).is_err()); }
+    #[test] fn persisted_set_records_use_physical_field_directory() { let path = temp_path("physical-directory"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); doc.insert("city", Value::string("Paris")); storage .apply_batch_atomic_summary(&users, vec![StorageMutation::insert(id, Arc::new(doc))]) .unwrap(); let pointer = { let state = storage.state_read().unwrap(); visible_version(&state, state.generation, &users, &id) .unwrap() .pointer .unwrap() }; let mut file = File::open(&path).unwrap(); file.seek(SeekFrom::Start(pointer.offset)).unwrap(); let mut magic = [0u8; 8]; file.read_exact(&mut magic).unwrap(); assert_eq!(magic, PHYSICAL_SET_MAGIC); let stored = storage.read().unwrap().get(&users, &id).unwrap().unwrap(); assert_eq!(stored.document().len(), 2); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn primary_head_tracks_smallest_ids_without_requiring_insert_order() { let generator = UuidV7Generator::new(); let mut ids = generator.reserve(6).collect::<Vec<_>>(); let expected = ids[..3].to_vec(); ids.reverse(); let mut collection = CollectionIndex::default(); for (ordinal, id) in ids.into_iter().enumerate() { primary_head_insert( &mut collection, id, RecordPointer { offset: 100 + ordinal as u64, length: 10, }, ); } let head = primary_head_entries(&collection, 3).unwrap(); assert_eq!(head.iter().map(|(id, _)| *id).collect::<Vec<_>>(), expected); }
+    #[test] fn invalid_primary_head_forces_bounded_fallback() { let mut collection = CollectionIndex::default(); collection.primary_head_valid = false; assert!(primary_head_entries(&collection, 1).is_none()); }
+    #[test] fn primary_batch_append_updates_tail_and_count_once() { let path = temp_path("primary-batch-append"); let collection = CollectionId::parse("users").unwrap(); let target = primary_index_path(&path, &collection); let mut file = File::create(&target).unwrap(); file.write_all(PRIMARY_INDEX_MAGIC.as_slice()).unwrap(); file.write_all(&GLACIER_FORMAT_VERSION.to_be_bytes()) .unwrap(); file.write_all(&0u16.to_be_bytes()).unwrap(); file.write_all(&0u32.to_be_bytes()).unwrap(); file.write_all(&0u64.to_be_bytes()).unwrap(); drop(file); let ids = UuidV7Generator::new().reserve(3).collect::<Vec<_>>(); let mut index = DiskPrimaryIndex { path: target.clone(), count: 0, last_id: None, }; let mut entries = ids .iter() .enumerate() .map(|(ordinal, id)| CompactPrimaryEntry { id: *id, generation: 1, version: DocumentVersion::INITIAL, pointer: RecordPointer { offset: 100 + ordinal as u64, length: 10, }, }) .collect::<Vec<_>>(); assert!(disk_primary_append_batch(&mut index, &mut entries).unwrap()); assert_eq!(index.count, 3); assert_eq!(index.last_id, ids.last().copied()); let _ = fs::remove_file(&target); let _ = fs::remove_file(&path); }
+    #[test] fn page_backed_primary_rejects_ids_beyond_tail_without_disk_lookup() { let collection = CollectionId::parse("users").unwrap(); let ids = UuidV7Generator::new().reserve(2).collect::<Vec<_>>(); let mut index = CollectionIndex::default(); index.disk_primary = Some(DiskPrimaryIndex { path: PathBuf::from("/definitely/not/read"), count: 1, last_id: Some(ids[0]), }); let state = GlacierState { generation: 7, ..GlacierState::default() }; assert!(ids[1] > ids[0]); assert!(index.visible_version(&state, 7, &ids[1]).is_none()); let _ = collection; }
+    #[test] fn page_backed_primary_lookup_works_without_resident_primary_entries() { let path = temp_path("primary-sidecar"); let collection = CollectionId::parse("users").unwrap(); let ids = UuidV7Generator::new().reserve(3).collect::<Vec<_>>(); let documents = ids .iter() .enumerate() .map(|(ordinal, id)| CheckpointDocument { id: id.into_bytes(), version: 1, offset: 100 + ordinal as u64 * 20, length: 10, }) .collect::<Vec<_>>(); let disk = rebuild_disk_primary_documents(&path, &collection, 7, &documents).unwrap(); let mut index = CollectionIndex::default(); index.disk_primary = Some(disk); assert!(index.primary.is_empty()); let mut state = GlacierState::default(); state.generation = 7; let found = index.visible_version(&state, 7, &ids[1]).unwrap(); assert_eq!(found.pointer.unwrap().offset, 120); if let Some(disk) = index.disk_primary { let _ = fs::remove_file(disk.path); } let _ = fs::remove_file(path); }
+    #[test] fn streaming_checkpoint_loader_does_not_materialize_primary_documents() { let path = temp_path("streaming-checkpoint"); let format = initialize_file(&path).unwrap(); let data_len = GLACIER_SUPERBLOCK_BYTES as u64 + 1024; OpenOptions::new() .write(true) .open(&path) .unwrap() .set_len(data_len) .unwrap(); let ids = UuidV7Generator::new().reserve(3).collect::<Vec<_>>(); let checkpoint = PersistentCheckpoint { format_version: format.version(), store_id: format.store_id(), generation: 7, data_len, collections: vec![CheckpointCollection { name: "users".to_owned(), count: 3, documents: ids .iter() .enumerate() .map(|(ordinal, id)| CheckpointDocument { id: id.into_bytes(), version: 1, offset: GLACIER_SUPERBLOCK_BYTES as u64 + 100 + ordinal as u64 * 10, length: 5, }) .collect(), }], metadata: FieldCatalog::default(), }; let bytes = rmp_serde::to_vec(&checkpoint).unwrap(); let mut de = rmp_serde::Deserializer::new(bytes.as_slice()); let (state, decoded_data_len, generation) = StreamingCheckpointSeed { store_path: &path, format, data_file_len: data_len, cache_entries: 2, } .deserialize(&mut de) .unwrap(); assert_eq!(decoded_data_len, data_len); assert_eq!(generation, 7); let users = CollectionId::parse("users").unwrap(); let collection = state.collections.get(&users).unwrap(); assert_eq!(collection.primary.len(), 2); assert_eq!(collection.disk_primary.as_ref().unwrap().count, 3); let _ = fs::remove_file(&path); let _ = fs::remove_file(primary_index_path(&path, &users)); }
+    #[test] fn primary_cache_reservation_is_opportunistic_and_bounded() { let governor = MemoryGovernor::with_process_limit(256 * 1024 * 1024); let (entries, reservation) = opportunistic_primary_cache_reservation(Some(&governor)); assert!(entries > 0); assert!(reservation.is_some()); assert!( governor .snapshot() .classes .iter() .find(|class| class.class == MemoryClass::PageCache) .unwrap() .current_bytes <= governor.profile().managed_budget_bytes.unwrap() / PRIMARY_CACHE_FRACTION_DENOMINATOR ); }
+    #[test] fn compact_primary_keeps_ordered_ids_inline_and_spills_only_exceptions() { let generator = UuidV7Generator::new(); let ids = generator.reserve(4).collect::<Vec<_>>(); let mut index = CollectionIndex::default(); for (ordinal, id) in ids.iter().copied().enumerate() { index.insert_new( id, IndexVersion { generation: 1, version: DocumentVersion::INITIAL, pointer: Some(RecordPointer { offset: 100 + ordinal as u64, length: 10, }), }, ); } assert_eq!(index.primary.len(), 4); assert!(index.exceptions.is_empty()); let replacement = IndexVersion { generation: 2, version: DocumentVersion::new(2), pointer: Some(RecordPointer { offset: 999, length: 11, }), }; index.push_existing(ids[1], replacement); assert_eq!(index.primary.len(), 4); assert_eq!(index.exceptions.len(), 1); let mut state = GlacierState::default(); state.generation = 2; let visible = index.visible_version(&state, 2, &ids[1]).unwrap(); assert_eq!(visible.generation, 2); assert_eq!(visible.pointer.unwrap().offset, 999); }
+    #[test] fn inline_index_versions_allocate_history_only_after_second_version() { let first = IndexVersion { generation: 1, version: DocumentVersion::INITIAL, pointer: Some(RecordPointer { offset: 100, length: 10, }), }; let second = IndexVersion { generation: 2, version: DocumentVersion::new(2), pointer: Some(RecordPointer { offset: 200, length: 11, }), }; let mut versions = InlineIndexVersions::new(first); assert_eq!(versions.len(), 1); assert_eq!(versions.heap_capacity(), 0); assert_eq!(versions.iter_rev().next().copied().unwrap().generation, 1); versions.push(second); assert_eq!(versions.len(), 2); assert!(versions.heap_capacity() >= 2); let replayed = versions .iter_rev() .map(|version| version.generation) .collect::<Vec<_>>(); assert_eq!(replayed, vec![2, 1]); }
+    #[test] fn bounded_limit_selection_preserves_primary_id_order() { let mut state = GlacierState::default(); state.generation = 1; let collection = CollectionId::parse("users").unwrap(); let mut index = CollectionIndex::default(); let mut ids = UuidV7Generator::new().reserve(5).collect::<Vec<_>>(); ids.reverse(); for (ordinal, id) in ids.into_iter().enumerate() { index.insert_new( id, IndexVersion { generation: 1, version: DocumentVersion::INITIAL, pointer: Some(RecordPointer { offset: 100 + ordinal as u64, length: 10, }), }, ); } index.count_history.push((1, 5)); state.collections.insert(collection.clone(), index); let index = state.collections.get(&collection).unwrap(); let forward = select_visible_entries_bounded(&state, index, 1, ScanDirection::Forward, 2); assert_eq!(forward.len(), 2); assert!(forward[0].0 < forward[1].0); let reverse = select_visible_entries_bounded(&state, index, 1, ScanDirection::Reverse, 2); assert_eq!(reverse.len(), 2); assert!(reverse[0].0 > reverse[1].0); assert!(reverse[0].0 > forward[1].0); }
+    #[test] fn checkpointless_open_does_not_make_historical_bytes_immediately_due() { let replay_offset = GLACIER_SUPERBLOCK_BYTES as u64; let data_len = 6 * 1024 * 1024 * 1024u64; let next = next_checkpoint_offset_after_open(false, replay_offset, data_len); assert_eq!(next, data_len.saturating_mul(2)); assert!(next > data_len.saturating_add(1)); }
+    #[test] fn checkpointed_open_keeps_growth_relative_to_checkpoint_boundary() { let replay_offset = 512 * 1024 * 1024u64; let data_len = replay_offset + 64 * 1024 * 1024u64; let next = next_checkpoint_offset_after_open(true, replay_offset, data_len); assert_eq!(next, replay_offset.saturating_mul(2)); }
+    #[test] fn automatic_checkpoint_interval_grows_geometrically() { assert_eq!( automatic_checkpoint_interval(0), MIN_CHECKPOINT_INTERVAL_BYTES ); assert_eq!( automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES / 2), MIN_CHECKPOINT_INTERVAL_BYTES ); assert_eq!( automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES), MIN_CHECKPOINT_INTERVAL_BYTES ); assert_eq!( automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES * 4), MIN_CHECKPOINT_INTERVAL_BYTES * 4 ); }
+    #[test] fn failed_automatic_checkpoint_is_deferred_past_current_store_size() { let checkpoint_offset = MIN_CHECKPOINT_INTERVAL_BYTES * 4; let data_len = checkpoint_offset * 2; let next = checkpoint_retry_offset_after_failure(data_len, checkpoint_offset); assert_eq!( next, data_len + checkpoint_offset * CHECKPOINT_FAILURE_BACKOFF_MULTIPLIER ); assert!(next > data_len); }
+    #[test] fn checkpoint_restores_index_and_replays_only_tail() { let path = temp_path("checkpoint-tail"); let users = CollectionId::parse("users").unwrap(); let generator = UuidV7Generator::new(); let mut ids = generator.reserve(2); let first_id = ids.next().unwrap(); let second_id = ids.next().unwrap(); { let storage = GlacierBackend::open(&path).unwrap(); let mut first = Document::new(); first.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(first_id, Arc::new(first))], ) .unwrap(); assert_eq!( storage .collection_metadata(&users) .unwrap() .unwrap() .documents(), 1 ); storage.checkpoint().unwrap(); let checkpoint_metrics = storage.write_metrics(); assert_eq!(checkpoint_metrics.checkpoint_runs, 1); assert_eq!(checkpoint_metrics.checkpoint_failures, 0); assert_eq!(checkpoint_metrics.checkpoint_documents, 1); assert!(checkpoint_metrics.checkpoint_bytes > CHECKPOINT_HEADER_BYTES as u64); assert!( checkpoint_metrics.checkpoint_total_us >= checkpoint_metrics.checkpoint_build_us ); assert!( checkpoint_metrics.checkpoint_write_us >= checkpoint_metrics.checkpoint_encode_us ); let mut second = Document::new(); second.insert("name", Value::string("Bob")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(second_id, Arc::new(second))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let metrics = reopened.startup_metrics(); assert_eq!(metrics.checkpoint_loaded, 1); assert_eq!(metrics.checkpoint_generation, 1); assert!(metrics.checkpoint_bytes > CHECKPOINT_HEADER_BYTES as u64); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); assert_eq!(reopened.generation().unwrap(), 2); assert_eq!(reopened.document_count().unwrap(), 2); assert_eq!( reopened .collection_metadata(&users) .unwrap() .unwrap() .documents(), 2 ); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn corrupt_checkpoint_falls_back_to_full_segment_replay() { let path = temp_path("checkpoint-corrupt"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(Document::new()))], ) .unwrap(); storage.checkpoint().unwrap(); } let checkpoint = checkpoint_path(&path); let mut bytes = fs::read(&checkpoint).unwrap(); bytes[0] ^= 0xff; fs::write(&checkpoint, bytes).unwrap(); let reopened = GlacierBackend::open(&path).unwrap(); let metrics = reopened.startup_metrics(); assert_eq!(metrics.checkpoint_loaded, 0); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); assert_eq!(reopened.document_count().unwrap(), 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint); }
+    #[test] fn append_only_visibility_fast_path_requires_current_single_versions() { let path = temp_path("append-only-visibility"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let ids = UuidV7Generator::new().reserve(2); for id in ids { storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(Document::new()))], ) .unwrap(); } { let state = storage.state_read().unwrap(); let collection = state.collections.get(&users).unwrap(); assert!(append_only_visibility_is_trivial( &state, collection, state.generation )); assert!(!append_only_visibility_is_trivial( &state, collection, state.generation.saturating_sub(1) )); } let id = storage .read() .unwrap() .scan(&users, ScanOptions::default()) .unwrap()[0] .id() .clone(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::replace( id, Arc::new(Document::new()), VersionPrecondition::Any, )], ) .unwrap(); { let state = storage.state_read().unwrap(); let collection = state.collections.get(&users).unwrap(); assert!(!append_only_visibility_is_trivial( &state, collection, state.generation )); } { let mut transaction = storage.begin().unwrap(); transaction .delete(&users, &id, VersionPrecondition::Any) .unwrap(); transaction.commit().unwrap(); } { let state = storage.state_read().unwrap(); let collection = state.collections.get(&users).unwrap(); assert!(!append_only_visibility_is_trivial( &state, collection, state.generation )); } storage.clear().unwrap(); { let state = storage.state_read().unwrap(); let collection = state.collections.get(&users).unwrap(); assert!(!append_only_visibility_is_trivial( &state, collection, state.generation )); } let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
 }

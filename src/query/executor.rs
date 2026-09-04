@@ -395,6 +395,27 @@ pub trait ExecutionRuntime: Send + Sync {
         ))
     }
 
+    /// Reports whether the runtime can compare rows represented only by sort-key values.
+    ///
+    /// This optional capability lets blocking sort operators remain on the standard
+    /// projected-value access vector and hydrate documents only after ordering.
+    fn supports_projected_sort(&self) -> bool {
+        false
+    }
+
+    /// Compares two rows whose values are aligned one-for-one with `keys`.
+    ///
+    /// Returning `None` asks the engine to preserve the full-document path.
+    fn compare_projected_values(
+        &self,
+        keys: &[SortKey],
+        left: &[Option<Value>],
+        right: &[Option<Value>],
+    ) -> ExecutionResult<Option<Ordering>> {
+        let _ = (keys, left, right);
+        Ok(None)
+    }
+
     /// Projects a document to the requested fields.
     fn apply_select(
         &self,
@@ -423,6 +444,48 @@ pub trait ExecutionRuntime: Send + Sync {
             "distinct",
             "distinct-key extraction has no runtime implementation",
         ))
+    }
+
+    /// Reports whether the runtime can encode ordinary distinct keys into a
+    /// reusable caller-owned buffer. This avoids one heap allocation per source
+    /// row while preserving the runtime as owner of canonical key semantics.
+    fn supports_buffered_distinct(&self) -> bool {
+        false
+    }
+
+    /// Encodes the same key as `distinct_key` into `key` and returns `true` when
+    /// the capability is available. Returning `false` preserves the Arc-returning
+    /// compatibility path.
+    fn write_distinct_key(
+        &self,
+        fields: &[ExpressionFieldPath],
+        document: &Document,
+        key: &mut Vec<u8>,
+    ) -> ExecutionResult<bool> {
+        let _ = (fields, document, key);
+        Ok(false)
+    }
+
+    /// Reports whether the runtime can encode explicit-field distinct keys directly
+    /// from the standard projected-value access vector.
+    fn supports_projected_distinct(&self) -> bool {
+        false
+    }
+
+    /// Encodes an explicit-field distinct key from storage-borrowed projected values.
+    ///
+    /// `indexes` maps `fields` into `values`. Implementations write into the reusable
+    /// caller-owned `key` buffer and return `true`; returning `false` selects the
+    /// established full-document fallback.
+    fn write_projected_distinct_key(
+        &self,
+        fields: &[ExpressionFieldPath],
+        values: &[Option<ProjectedValueRef<'_>>],
+        indexes: &[usize],
+        key: &mut Vec<u8>,
+    ) -> ExecutionResult<bool> {
+        let _ = (fields, values, indexes, key);
+        Ok(false)
     }
 
     /// Creates the single result document emitted by `count`.
@@ -1091,6 +1154,178 @@ impl ExecutionRow {
         self.document = Arc::new(document);
         self.changed |= mark_changed;
     }
+}
+
+/// Backend-independent locator retained while a row stays on the projected-value
+/// access vector. It is intentionally sufficient to hydrate the committed row
+/// later without retaining a `Document`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct ProjectedRowLocator {
+    id: DocumentId,
+    version: DocumentVersion,
+}
+
+impl ProjectedRowLocator {
+    #[must_use]
+    pub(crate) const fn new(id: DocumentId, version: DocumentVersion) -> Self {
+        Self { id, version }
+    }
+
+    #[must_use]
+    pub(crate) const fn id(self) -> DocumentId {
+        self.id
+    }
+
+    #[must_use]
+    pub(crate) const fn version(self) -> DocumentVersion {
+        self.version
+    }
+}
+
+/// Dense owned projected rows used by blocking operators. Values are stored in
+/// one flat buffer rather than allocating one `Vec` per source row. Consumers
+/// keep only the fields they actually need plus a locator for late hydration.
+#[derive(Debug)]
+pub(crate) struct ProjectedRowSet {
+    width: usize,
+    locators: Vec<ProjectedRowLocator>,
+    values: Vec<Option<Value>>,
+}
+
+impl ProjectedRowSet {
+    #[must_use]
+    pub(crate) fn new(width: usize) -> Self {
+        Self {
+            width,
+            locators: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.locators.len()
+    }
+
+    pub(crate) fn push_refs(
+        &mut self,
+        id: DocumentId,
+        version: DocumentVersion,
+        source: &[Option<ProjectedValueRef<'_>>],
+        slots: &[usize],
+    ) -> ExecutionResult<()> {
+        if slots.len() != self.width || slots.iter().any(|slot| *slot >= source.len()) {
+            return Err(ExecutionError::evaluation(
+                "projected row slots do not match the blocking-consumer layout",
+            ));
+        }
+        self.locators.push(ProjectedRowLocator::new(id, version));
+        self.values.extend(slots.iter().map(|slot| {
+            source
+                .get(*slot)
+                .and_then(Option::as_ref)
+                .map(ProjectedValueRef::to_value)
+        }));
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn locator(&self, index: usize) -> Option<ProjectedRowLocator> {
+        self.locators.get(index).copied()
+    }
+
+    #[must_use]
+    pub(crate) fn row(&self, index: usize) -> Option<&[Option<Value>]> {
+        let start = index.checked_mul(self.width)?;
+        let end = start.checked_add(self.width)?;
+        self.values.get(start..end)
+    }
+}
+
+/// Conservative working-set estimate for one projected blocking row, including
+/// locator storage, flattened value capacity and stable-sort index workspace.
+/// It deliberately overcharges small scalar rows so the governor remains the
+/// authority even when `Vec` capacities temporarily grow geometrically.
+pub(crate) fn projected_row_working_bytes_refs(
+    values: &[Option<ProjectedValueRef<'_>>],
+    slots: &[usize],
+) -> usize {
+    let payload = slots.iter().fold(0usize, |bytes, slot| {
+        let value = values.get(*slot).and_then(Option::as_ref);
+        bytes.saturating_add(projected_ref_payload_bytes(value))
+    });
+    192usize
+        .saturating_add(slots.len().saturating_mul(96))
+        .saturating_add(payload.saturating_mul(2))
+}
+
+fn projected_ref_payload_bytes(value: Option<&ProjectedValueRef<'_>>) -> usize {
+    match value {
+        None
+        | Some(ProjectedValueRef::Null)
+        | Some(ProjectedValueRef::Bool(_))
+        | Some(ProjectedValueRef::Signed(_))
+        | Some(ProjectedValueRef::Unsigned(_))
+        | Some(ProjectedValueRef::Float(_)) => 0,
+        Some(ProjectedValueRef::String(value)) => value.len(),
+        Some(ProjectedValueRef::Owned(value)) => spill_value_encoded_len(value),
+    }
+}
+
+/// Builds the stable output permutation for projected sort rows. The runtime
+/// remains the owner of value-comparison semantics; the identifier tie-break
+/// reconstructs the deterministic collection-scan source order because the
+/// storage cursor itself is allowed to be physically unordered.
+pub(crate) fn stable_projected_order(
+    runtime: &dyn ExecutionRuntime,
+    keys: &[SortKey],
+    rows: &ProjectedRowSet,
+    direction: crate::storage::ScanDirection,
+) -> ExecutionResult<Vec<usize>> {
+    let mut order = (0..rows.len()).collect::<Vec<_>>();
+    let mut failure = None;
+    order.sort_by(|left_index, right_index| {
+        if failure.is_some() {
+            return Ordering::Equal;
+        }
+        let left = rows
+            .row(*left_index)
+            .expect("projected sort index must reference an existing row");
+        let right = rows
+            .row(*right_index)
+            .expect("projected sort index must reference an existing row");
+        let ordering = match runtime.compare_projected_values(keys, left, right) {
+            Ok(Some(ordering)) => ordering,
+            Ok(None) => {
+                failure = Some(ExecutionError::unsupported_operator(
+                    "sort",
+                    "projected sort comparison runtime is not configured",
+                ));
+                Ordering::Equal
+            }
+            Err(error) => {
+                failure = Some(error);
+                Ordering::Equal
+            }
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+
+        let left_id = rows
+            .locator(*left_index)
+            .expect("projected sort index must reference a locator")
+            .id();
+        let right_id = rows
+            .locator(*right_index)
+            .expect("projected sort index must reference a locator")
+            .id();
+        match direction {
+            crate::storage::ScanDirection::Forward => left_id.cmp(&right_id),
+            crate::storage::ScanDirection::Reverse => right_id.cmp(&left_id),
+        }
+    });
+    failure.map_or(Ok(order), Err)
 }
 
 /// Physical execution strategy selected at runtime.
@@ -2483,11 +2718,13 @@ fn execute_top_n(
     state.add_filtered(original_len.saturating_sub(state.rows.len()))
 }
 
-pub(crate) fn execution_row_working_bytes(row: &ExecutionRow) -> ExecutionResult<usize> {
+pub(crate) fn execution_row_encoded_len(row: &ExecutionRow) -> usize {
     const ROW_HEADER_BYTES: usize = 16 + 8 + 1 + 1;
-    Ok(ROW_HEADER_BYTES
-        .saturating_add(spill_document_encoded_len(row.document()))
-        .saturating_add(64))
+    ROW_HEADER_BYTES.saturating_add(spill_document_encoded_len(row.document()))
+}
+
+pub(crate) fn execution_row_working_bytes(row: &ExecutionRow) -> ExecutionResult<usize> {
+    Ok(execution_row_encoded_len(row).saturating_add(64))
 }
 
 fn spill_document_encoded_len(document: &Document) -> usize {
@@ -2559,10 +2796,10 @@ fn external_sort(
         )?;
         stable_sort(runtime, keys, &mut chunk)?;
         let mut writer = spill.create_run().map_err(spill_execution_error)?;
+        let mut encoded = Vec::new();
         for row in &chunk {
-            writer
-                .append(&encode_execution_row(row)?)
-                .map_err(spill_execution_error)?;
+            encode_execution_row_into(row, &mut encoded)?;
+            writer.append(&encoded).map_err(spill_execution_error)?;
         }
         runs.push(writer.finish().map_err(spill_execution_error)?);
     }
@@ -2618,8 +2855,11 @@ fn read_next_spilled_row(reader: &mut SpillRunReader) -> ExecutionResult<Option<
         .transpose()
 }
 
-pub(crate) fn encode_execution_row(row: &ExecutionRow) -> ExecutionResult<Vec<u8>> {
-    let mut output = Vec::new();
+pub(crate) fn encode_execution_row_into(
+    row: &ExecutionRow,
+    output: &mut Vec<u8>,
+) -> ExecutionResult<()> {
+    output.clear();
     output.extend_from_slice(row.id().as_bytes());
     output.extend_from_slice(&row.version().get().to_le_bytes());
     output.push(u8::from(row.changed()));
@@ -2628,8 +2868,7 @@ pub(crate) fn encode_execution_row(row: &ExecutionRow) -> ExecutionResult<Vec<u8
         ExecutionRowOrigin::Union => 1,
         ExecutionRowOrigin::Synthetic => 2,
     });
-    encode_spill_document(&mut output, row.document())?;
-    Ok(output)
+    encode_spill_document(output, row.document())
 }
 
 pub(crate) fn decode_execution_row(bytes: &[u8]) -> ExecutionResult<ExecutionRow> {

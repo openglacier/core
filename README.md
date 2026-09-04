@@ -8,12 +8,12 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-0.60.6-blue)
+![Version](https://img.shields.io/badge/version-0.70.1-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
 
-![Architectures](https://img.shields.io/badge/release_targets-18-informational)
+![Architectures](https://img.shields.io/badge/release_targets-19-informational)
 
 <details>
 <summary><strong>Supported release targets</strong></summary>
@@ -21,6 +21,7 @@
 ### Linux GNU
 
 - `x86_64-unknown-linux-gnu`
+- `x86_64v3-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 - `armv7-unknown-linux-gnueabihf`
 - `arm-unknown-linux-gnueabihf`

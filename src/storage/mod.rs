@@ -25,7 +25,7 @@ use std::{
     },
 };
 
-use crate::model::{Document, FieldPath, Value};
+use crate::model::{Document, FieldPath, FieldPathSegment, Value};
 
 /// Result returned by storage operations.
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
@@ -825,57 +825,35 @@ fn project_document(document: &Document, fields: &[FieldPath]) -> Document {
     let mut projected = Document::new();
 
     for path in fields {
-        let segments = (0..path.len())
-            .filter_map(|index| path.get(index))
-            .map(|segment| segment.as_str())
-            .collect::<Vec<_>>();
-
-        if let Some(value) = value_at_path(document, &segments) {
-            insert_projected_path(&mut projected, &segments, value.clone());
+        if let Some(value) = path.resolve_value(document) {
+            insert_projected_path(&mut projected, path.as_segments(), value.clone());
         }
     }
 
     projected
 }
 
+#[inline]
 fn value_at_field_path<'a>(document: &'a Document, path: &FieldPath) -> Option<&'a Value> {
-    let segments = (0..path.len())
-        .filter_map(|index| path.get(index))
-        .map(|segment| segment.as_str())
-        .collect::<Vec<_>>();
-    value_at_path(document, &segments)
+    path.resolve_value(document)
 }
 
-fn value_at_path<'a>(document: &'a Document, segments: &[&str]) -> Option<&'a Value> {
-    let (first, rest) = segments.split_first()?;
-    let mut value = document.get(first)?;
-
-    for segment in rest {
-        let Value::Object(object) = value else {
-            return None;
-        };
-        value = object.get(segment)?;
-    }
-
-    Some(value)
-}
-
-fn insert_projected_path(document: &mut Document, segments: &[&str], value: Value) {
+fn insert_projected_path(document: &mut Document, segments: &[FieldPathSegment], value: Value) {
     let Some((first, rest)) = segments.split_first() else {
         return;
     };
 
     if rest.is_empty() {
-        document.insert(*first, value);
+        document.insert(first.as_str(), value);
         return;
     }
 
-    let mut object = match document.remove(first) {
+    let mut object = match document.remove(first.as_str()) {
         Some(Value::Object(object)) => (*object).clone(),
         _ => Document::new(),
     };
     insert_projected_path(&mut object, rest, value);
-    document.insert(*first, Value::Object(Arc::new(object)));
+    document.insert(first.as_str(), Value::Object(Arc::new(object)));
 }
 
 /// One storage mutation in an ordered batch.
