@@ -59,6 +59,30 @@ pub enum ProjectedAccess {
     Consumer,
 }
 
+/// Whether an operator semantically requires a fully materialized document.
+///
+/// `Deferred` means the operator can preserve or consume a projected row
+/// representation even when the current executor has not yet implemented that
+/// physical path for every composition. Keeping this separate from
+/// [`ProjectedAccess`] lets planning grow capabilities without encoding stage
+/// identities in storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Materialization {
+    Required,
+    Deferred,
+}
+
+/// Whether source projections consumed by this operator are safe to reuse.
+///
+/// Reuse applies to immutable source values, never to an operator's derived
+/// result. A filter can therefore consume a reusable projection even when its
+/// predicate itself is evaluated at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProjectionReuse {
+    None,
+    Reusable,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fields<'a> {
     Unknown,
@@ -77,12 +101,24 @@ pub struct ExecutionProperties<'a> {
     pub scope: Scope,
     pub effect: Effect,
     pub projected_access: ProjectedAccess,
+    pub materialization: Materialization,
+    pub projection_reuse: ProjectionReuse,
 }
 
 impl ExecutionProperties<'_> {
     #[must_use]
     pub const fn writes(self) -> bool {
         matches!(self.effect, Effect::Write)
+    }
+
+    #[must_use]
+    pub const fn defers_materialization(self) -> bool {
+        matches!(self.materialization, Materialization::Deferred)
+    }
+
+    #[must_use]
+    pub const fn reuses_projection(self) -> bool {
+        matches!(self.projection_reuse, ProjectionReuse::Reusable)
     }
 
     #[must_use]

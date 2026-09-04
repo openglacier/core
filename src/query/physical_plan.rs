@@ -5,8 +5,8 @@ use std::{error::Error as StdError, fmt, sync::Arc};
 use crate::storage::{CollectionId, DocumentId, ScanDirection, ScanOptions};
 
 use super::execution_properties::{
-    Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Order, ProjectedAccess,
-    Shape,
+    Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Materialization, Order,
+    ProjectedAccess, ProjectionReuse, Shape,
 };
 use super::{AccessVector, Expression, ExpressionFieldPath, SetAssignment, SortKey, StageName};
 
@@ -25,6 +25,7 @@ pub struct PhysicalPlan {
     changes_cardinality: bool,
     source_access_vector: AccessVector,
     projected_prefix_len: usize,
+    source_projection_reuse: ProjectionReuse,
 }
 
 impl PhysicalPlan {
@@ -48,6 +49,7 @@ impl PhysicalPlan {
 
         let (source_access_vector, projected_prefix_len) =
             negotiate_source_access_vector(&operators);
+        let source_projection_reuse = negotiate_source_projection_reuse(&operators);
         let (mode, memory_mode, changes_cardinality) = summarize_execution(&operators);
         Ok(Self {
             source,
@@ -57,6 +59,7 @@ impl PhysicalPlan {
             operators: Arc::from(operators),
             source_access_vector,
             projected_prefix_len,
+            source_projection_reuse,
         })
     }
 
@@ -86,15 +89,24 @@ impl PhysicalPlan {
         self.projected_prefix_len
     }
 
+    /// Whether the negotiated projected source representation is immutable and
+    /// reusable across executions. Storage remains free to decline caching.
+    #[must_use]
+    pub const fn source_projection_reuse(&self) -> ProjectionReuse {
+        self.source_projection_reuse
+    }
+
     /// Carries a source-vector negotiation from a parent physical plan into a
     /// source-facing subplan built by the executor.
     pub(crate) const fn with_source_access_negotiation(
         mut self,
         vector: AccessVector,
         projected_prefix_len: usize,
+        projection_reuse: ProjectionReuse,
     ) -> Self {
         self.source_access_vector = vector;
         self.projected_prefix_len = projected_prefix_len;
+        self.source_projection_reuse = projection_reuse;
         self
     }
 
@@ -701,100 +713,241 @@ impl PhysicalOperator {
         use Effect::{ReadOnly as R, Write as W};
         use Fields::{Preserved as SameFields, Projected, Unknown as UnknownFields};
         use Flow::{GovernedBlocking as B, Specialized as X, Streaming as S};
+        use Materialization::{Deferred as Defer, Required as Materialize};
         use Order::{Ordered, Preserved, Unknown as NoOrder};
         use ProjectedAccess::{Consumer as PvConsumer, None as NoPv, Stage as PvStage};
+        use ProjectionReuse::{None as NoReuse, Reusable as Reuse};
         use Shape::{Linear as L, Matrix as M, Scalar as C};
 
-        let (flow, cardinality, bound, order, fields, shape, scope, effect, projected_access) =
-            match self {
-                Self::Filter { .. } => (S, Reduce, U, Preserved, SameFields, L, Row, R, PvStage),
-                Self::Set { .. } | Self::StreamingLoad { .. } => {
-                    (X, Preserve, U, Preserved, UnknownFields, L, Row, W, NoPv)
-                }
-                Self::Lookup { .. } => (B, Preserve, U, Preserved, UnknownFields, L, Row, R, NoPv),
-                Self::Load { .. } => (B, Preserve, U, Preserved, UnknownFields, L, Row, W, NoPv),
-                Self::Union { .. } => (B, Expand, U, NoOrder, UnknownFields, L, Set, R, NoPv),
-                Self::Limit { count } => (
-                    S,
-                    Reduce,
-                    AtMost(*count),
-                    Preserved,
-                    SameFields,
-                    L,
-                    Set,
-                    R,
-                    NoPv,
-                ),
-                Self::Skip { .. } => (S, Reduce, U, Preserved, SameFields, L, Set, R, NoPv),
-                Self::Distinct { fields } if !fields.is_empty() => {
-                    (B, Reduce, U, NoOrder, UnknownFields, L, Set, R, PvConsumer)
-                }
-                Self::Distinct { .. } => (B, Reduce, U, NoOrder, UnknownFields, L, Set, R, NoPv),
-                Self::Group { .. } => (B, Reduce, U, NoOrder, UnknownFields, L, Set, R, PvConsumer),
-                Self::Sort { keys } => (
-                    B,
-                    Preserve,
-                    U,
-                    Ordered(keys),
-                    SameFields,
-                    L,
-                    Set,
-                    R,
-                    PvConsumer,
-                ),
-                Self::Select { fields } => (
-                    S,
-                    Preserve,
-                    U,
-                    Preserved,
-                    Projected(fields),
-                    L,
-                    Row,
-                    R,
-                    PvStage,
-                ),
-                Self::Count { .. } => (
-                    S,
-                    Unknown,
-                    Exact(1),
-                    NoOrder,
-                    UnknownFields,
-                    C,
-                    Set,
-                    R,
-                    PvConsumer,
-                ),
-                Self::Delete => (X, Reduce, U, NoOrder, UnknownFields, L, Row, W, NoPv),
-                Self::Insert { .. } => {
-                    (X, Expand, Exact(1), NoOrder, UnknownFields, L, Row, W, NoPv)
-                }
-                Self::Pivot { .. } => (B, Unknown, U, NoOrder, UnknownFields, M, Set, R, NoPv),
-                Self::Custom {
-                    writes,
-                    changes_cardinality,
-                    ..
-                } => (
-                    if *writes {
-                        X
-                    } else if *changes_cardinality {
-                        B
-                    } else {
-                        S
-                    },
-                    if *changes_cardinality {
-                        Unknown
-                    } else {
-                        Preserve
-                    },
-                    U,
-                    NoOrder,
-                    UnknownFields,
-                    L,
-                    Row,
-                    if *writes { W } else { R },
-                    NoPv,
-                ),
-            };
+        let (
+            flow,
+            cardinality,
+            bound,
+            order,
+            fields,
+            shape,
+            scope,
+            effect,
+            projected_access,
+            materialization,
+            projection_reuse,
+        ) = match self {
+            Self::Filter { .. } => (
+                S, Reduce, U, Preserved, SameFields, L, Row, R, PvStage, Defer, Reuse,
+            ),
+            Self::Set { .. } | Self::StreamingLoad { .. } => (
+                X,
+                Preserve,
+                U,
+                Preserved,
+                UnknownFields,
+                L,
+                Row,
+                W,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Lookup { .. } => (
+                B,
+                Preserve,
+                U,
+                Preserved,
+                UnknownFields,
+                L,
+                Row,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Load { .. } => (
+                B,
+                Preserve,
+                U,
+                Preserved,
+                UnknownFields,
+                L,
+                Row,
+                W,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Union { .. } => (
+                B,
+                Expand,
+                U,
+                NoOrder,
+                UnknownFields,
+                L,
+                Set,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Limit { count } => (
+                S,
+                Reduce,
+                AtMost(*count),
+                Preserved,
+                SameFields,
+                L,
+                Set,
+                R,
+                NoPv,
+                Defer,
+                Reuse,
+            ),
+            Self::Skip { .. } => (
+                S, Reduce, U, Preserved, SameFields, L, Set, R, NoPv, Defer, Reuse,
+            ),
+            Self::Distinct { fields } if !fields.is_empty() => (
+                B,
+                Reduce,
+                U,
+                NoOrder,
+                UnknownFields,
+                L,
+                Set,
+                R,
+                PvConsumer,
+                Defer,
+                Reuse,
+            ),
+            Self::Distinct { .. } => (
+                B,
+                Reduce,
+                U,
+                NoOrder,
+                UnknownFields,
+                L,
+                Set,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Group { .. } => (
+                B,
+                Reduce,
+                U,
+                NoOrder,
+                UnknownFields,
+                L,
+                Set,
+                R,
+                PvConsumer,
+                Defer,
+                Reuse,
+            ),
+            Self::Sort { keys } => (
+                B,
+                Preserve,
+                U,
+                Ordered(keys),
+                SameFields,
+                L,
+                Set,
+                R,
+                PvConsumer,
+                Defer,
+                Reuse,
+            ),
+            Self::Select { fields } => (
+                S,
+                Preserve,
+                U,
+                Preserved,
+                Projected(fields),
+                L,
+                Row,
+                R,
+                PvStage,
+                Defer,
+                Reuse,
+            ),
+            Self::Count { .. } => (
+                S,
+                Unknown,
+                Exact(1),
+                NoOrder,
+                UnknownFields,
+                C,
+                Set,
+                R,
+                PvConsumer,
+                Defer,
+                Reuse,
+            ),
+            Self::Delete => (
+                X,
+                Reduce,
+                U,
+                NoOrder,
+                UnknownFields,
+                L,
+                Row,
+                W,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Insert { .. } => (
+                X,
+                Expand,
+                Exact(1),
+                NoOrder,
+                UnknownFields,
+                L,
+                Row,
+                W,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Pivot { .. } => (
+                B,
+                Unknown,
+                U,
+                NoOrder,
+                UnknownFields,
+                M,
+                Set,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Custom {
+                writes,
+                changes_cardinality,
+                ..
+            } => (
+                if *writes {
+                    X
+                } else if *changes_cardinality {
+                    B
+                } else {
+                    S
+                },
+                if *changes_cardinality {
+                    Unknown
+                } else {
+                    Preserve
+                },
+                U,
+                NoOrder,
+                UnknownFields,
+                L,
+                Row,
+                if *writes { W } else { R },
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+        };
         ExecutionProperties {
             flow,
             cardinality,
@@ -805,6 +958,8 @@ impl PhysicalOperator {
             scope,
             effect,
             projected_access,
+            materialization,
+            projection_reuse,
         }
     }
 
@@ -1727,6 +1882,26 @@ fn negotiate_source_access_vector(operators: &[PhysicalOperator]) -> (AccessVect
     (AccessVector::Document, 0)
 }
 
+fn negotiate_source_projection_reuse(operators: &[PhysicalOperator]) -> ProjectionReuse {
+    let mut saw_projected_stage = false;
+    for operator in operators {
+        let properties = operator.execution_properties();
+        if !properties.reuses_projection() {
+            return ProjectionReuse::None;
+        }
+        match properties.projected_access {
+            ProjectedAccess::Stage => saw_projected_stage = true,
+            ProjectedAccess::Consumer => return ProjectionReuse::Reusable,
+            ProjectedAccess::None => return ProjectionReuse::None,
+        }
+    }
+    if saw_projected_stage {
+        ProjectionReuse::Reusable
+    } else {
+        ProjectionReuse::None
+    }
+}
+
 fn summarize_execution(
     operators: &[PhysicalOperator],
 ) -> (ExecutionMode, MemoryExecutionMode, bool) {
@@ -1805,6 +1980,57 @@ mod tests {
             }]),
             (AccessVector::Document, 0)
         );
+    }
+
+    #[test]
+    fn reusable_projection_is_negotiated_from_stage_properties() {
+        let predicate = crate::query::parse_expression(r#"active == true"#).unwrap();
+        let field = ExpressionFieldPath::new(["score"]).unwrap();
+        let operators = vec![
+            PhysicalOperator::Filter { predicate },
+            PhysicalOperator::Sort {
+                keys: Arc::from([SortKey::ascending(field)]),
+            },
+        ];
+        assert_eq!(
+            negotiate_source_projection_reuse(&operators),
+            ProjectionReuse::Reusable
+        );
+        assert!(operators
+            .iter()
+            .all(|operator| operator.execution_properties().defers_materialization()));
+        assert!(operators
+            .iter()
+            .all(|operator| operator.execution_properties().reuses_projection()));
+    }
+
+    #[test]
+    fn materializing_or_unsupported_stage_blocks_projection_reuse() {
+        let field = ExpressionFieldPath::new(["score"]).unwrap();
+        let with_skip = vec![
+            PhysicalOperator::Skip { count: 1 },
+            PhysicalOperator::Sort {
+                keys: Arc::from([SortKey::ascending(field.clone())]),
+            },
+        ];
+        assert_eq!(
+            negotiate_source_projection_reuse(&with_skip),
+            ProjectionReuse::None
+        );
+
+        let document_distinct = [PhysicalOperator::Distinct {
+            fields: Arc::from([]),
+        }];
+        assert_eq!(
+            negotiate_source_projection_reuse(&document_distinct),
+            ProjectionReuse::None
+        );
+        assert!(!document_distinct[0]
+            .execution_properties()
+            .defers_materialization());
+        assert!(!document_distinct[0]
+            .execution_properties()
+            .reuses_projection());
     }
 
     #[test]

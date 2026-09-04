@@ -774,7 +774,12 @@ define_atomic_metrics! {
         segment_catalog_hits, segment_catalog_refreshes, segment_catalog_rebuilds, segment_catalog_refresh_us, segment_catalog_skipped_segments,
         directory_decode_us, directory_bypass_segments, directory_fallback_segments,
         checksum_us, trusted_header_records, verified_header_records,
-        projection_layout_hits, projection_layout_misses, visitor_us, record_loop_us,
+        projection_layout_hits, projection_layout_misses,
+        hot_projection_cache_hits, hot_projection_cache_misses, hot_projection_cache_superset_hits,
+        hot_projection_cache_builds, hot_projection_cache_finalize_us, hot_projection_cache_admission_skips,
+        hot_projection_cache_evictions, hot_projection_cache_reused_rows,
+        hot_projection_cache_resident_bytes, hot_projection_cache_peak_bytes,
+        visitor_us, record_loop_us,
         generic_scan_each_calls, generic_scan_each_rows, generic_scan_each_prepare_us,
         generic_scan_each_pointer_loop_us, pointer_loads, pointer_payload_bytes,
         pointer_open_us, pointer_seek_us, pointer_alloc_us, pointer_read_us,
@@ -1094,6 +1099,454 @@ impl Drop for GlacierReadScanGuard<'_> {
 }
 
 
+const HOT_PROJECTION_CACHE_DEFAULT_BYTES: usize = 256 * 1024 * 1024;
+const HOT_PROJECTION_CACHE_FRACTION_DENOMINATOR: usize = 8;
+const HOT_PROJECTION_SIGNATURE_LIMIT: usize = 64;
+
+struct HotProjectionSignature {
+    collection: CollectionId,
+    fields: Arc<[FieldPath]>,
+}
+
+struct HotProjectionData {
+    collection: CollectionId,
+    fields: Arc<[FieldPath]>,
+    ids: Arc<[DocumentId]>,
+    versions: Arc<[DocumentVersion]>,
+    values: Arc<[Option<Value>]>,
+    bytes: usize,
+    _reservation: MemoryReservation,
+}
+
+impl HotProjectionData {
+    #[inline]
+    fn row_count(&self) -> usize { self.ids.len() }
+
+    fn requested_slots(&self, collection: &CollectionId, fields: &[FieldPath]) -> Option<Vec<usize>> {
+        if &self.collection != collection || self.fields.len() < fields.len() {
+            return None;
+        }
+        let mut slots = Vec::with_capacity(fields.len());
+        for field in fields {
+            slots.push(self.fields.iter().position(|candidate| candidate == field)?);
+        }
+        Some(slots)
+    }
+}
+
+struct HotProjectionCache {
+    capacity_bytes: usize,
+    resident_bytes: usize,
+    segments: BTreeMap<u64, Vec<Arc<HotProjectionData>>>,
+    signatures: Vec<HotProjectionSignature>,
+}
+
+impl HotProjectionCache {
+    fn new(capacity_bytes: usize) -> Self {
+        Self {
+            capacity_bytes,
+            resident_bytes: 0,
+            segments: BTreeMap::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn enabled(&self) -> bool { self.capacity_bytes > 0 }
+
+    /// Returns true from the second observation onward. The first scan only
+    /// records demand, preventing one-shot analytical projections from filling
+    /// PageCache memory.
+    fn observe_signature(&mut self, collection: &CollectionId, fields: &[FieldPath]) -> bool {
+        if !self.enabled() || fields.is_empty() {
+            return false;
+        }
+        if self.signatures.iter().any(|signature| {
+            &signature.collection == collection && signature.fields.as_ref() == fields
+        }) {
+            return true;
+        }
+        if self.signatures.len() >= HOT_PROJECTION_SIGNATURE_LIMIT {
+            self.signatures.remove(0);
+        }
+        self.signatures.push(HotProjectionSignature {
+            collection: collection.clone(),
+            fields: Arc::from(fields.to_vec()),
+        });
+        false
+    }
+
+    fn lookup(
+        &self,
+        segment_start: u64,
+        collection: &CollectionId,
+        fields: &[FieldPath],
+    ) -> Option<(Arc<HotProjectionData>, Vec<usize>, bool)> {
+        let entries = self.segments.get(&segment_start)?;
+        let mut best: Option<(Arc<HotProjectionData>, Vec<usize>)> = None;
+        for entry in entries {
+            let Some(slots) = entry.requested_slots(collection, fields) else { continue; };
+            if best
+                .as_ref()
+                .is_some_and(|(current, _)| current.fields.len() <= entry.fields.len())
+            {
+                continue;
+            }
+            best = Some((Arc::clone(entry), slots));
+        }
+        best.map(|(entry, slots)| {
+            let superset = entry.fields.as_ref() != fields;
+            (entry, slots, superset)
+        })
+    }
+
+    fn has_covering_entry(
+        &self,
+        segment_start: u64,
+        collection: &CollectionId,
+        fields: &[FieldPath],
+    ) -> bool {
+        self.lookup(segment_start, collection, fields).is_some()
+    }
+
+    fn can_reserve(&self, bytes: usize) -> bool {
+        self.enabled()
+            && bytes <= self.capacity_bytes.saturating_sub(self.resident_bytes)
+    }
+
+    fn insert(&mut self, segment_start: u64, data: Arc<HotProjectionData>) -> bool {
+        if self.has_covering_entry(segment_start, &data.collection, &data.fields)
+            || !self.can_reserve(data.bytes)
+        {
+            return false;
+        }
+        self.resident_bytes = self.resident_bytes.saturating_add(data.bytes);
+        self.segments.entry(segment_start).or_default().push(data);
+        true
+    }
+
+    /// Evicts only entries not currently borrowed by a scan. The reservation
+    /// lives inside `HotProjectionData`, so a removed entry releases PageCache
+    /// bytes exactly when its last reader is gone.
+    fn reclaim(&mut self, target_bytes: usize) -> (usize, u64) {
+        if target_bytes == 0 || self.resident_bytes == 0 {
+            return (0, 0);
+        }
+        let keys = self.segments.keys().copied().rev().collect::<Vec<_>>();
+        let mut freed = 0usize;
+        let mut evicted = 0u64;
+        for key in keys {
+            let mut remove_segment = false;
+            if let Some(entries) = self.segments.get_mut(&key) {
+                let mut index = entries.len();
+                while index > 0 && freed < target_bytes {
+                    index -= 1;
+                    if Arc::strong_count(&entries[index]) != 1 {
+                        continue;
+                    }
+                    let data = entries.remove(index);
+                    freed = freed.saturating_add(data.bytes);
+                    self.resident_bytes = self.resident_bytes.saturating_sub(data.bytes);
+                    evicted = evicted.saturating_add(1);
+                    drop(data);
+                }
+                remove_segment = entries.is_empty();
+            }
+            if remove_segment {
+                self.segments.remove(&key);
+            }
+            if freed >= target_bytes {
+                break;
+            }
+        }
+        (freed, evicted)
+    }
+}
+
+struct HotProjectionBuilder {
+    collection: CollectionId,
+    fields: Arc<[FieldPath]>,
+    ids: Vec<DocumentId>,
+    versions: Vec<DocumentVersion>,
+    values: Vec<Option<Value>>,
+    cacheable: bool,
+    reservation: MemoryReservation,
+}
+
+impl HotProjectionBuilder {
+    fn new(
+        collection: &CollectionId,
+        fields: &[FieldPath],
+        record_count: usize,
+        reservation: MemoryReservation,
+    ) -> Self {
+        Self {
+            collection: collection.clone(),
+            fields: Arc::from(fields.to_vec()),
+            ids: Vec::with_capacity(record_count),
+            versions: Vec::with_capacity(record_count),
+            values: Vec::with_capacity(record_count.saturating_mul(fields.len())),
+            cacheable: true,
+            reservation,
+        }
+    }
+
+    fn disable(&mut self) {
+        self.cacheable = false;
+        self.ids.clear();
+        self.versions.clear();
+        self.values.clear();
+    }
+
+    fn push_refs(
+        &mut self,
+        id: DocumentId,
+        version: DocumentVersion,
+        values: &[Option<ProjectedValueRef<'_>>],
+    ) {
+        if !self.cacheable {
+            return;
+        }
+        if values.len() != self.fields.len() {
+            self.disable();
+            return;
+        }
+        let base = self.values.len();
+        self.ids.push(id);
+        self.versions.push(version);
+        for value in values {
+            let owned = match value {
+                None => None,
+                Some(ProjectedValueRef::Null) => Some(Value::Null),
+                Some(ProjectedValueRef::Bool(value)) => Some(Value::Bool(*value)),
+                Some(ProjectedValueRef::Signed(value)) => Some(Value::signed(*value)),
+                Some(ProjectedValueRef::Unsigned(value)) => Some(Value::unsigned(*value)),
+                Some(ProjectedValueRef::Float(value)) => match Value::float(*value) {
+                    Ok(value) => Some(value),
+                    Err(_) => { self.disable(); return; }
+                },
+                Some(ProjectedValueRef::String(value)) => Some(Value::string(*value)),
+                Some(ProjectedValueRef::Owned(Value::Array(_) | Value::Object(_))) => {
+                    self.disable();
+                    return;
+                }
+                Some(ProjectedValueRef::Owned(value)) => Some(value.clone()),
+            };
+            self.values.push(owned);
+        }
+        if self.values.len() != base.saturating_add(self.fields.len()) {
+            self.disable();
+        }
+    }
+
+    fn push_values(
+        &mut self,
+        id: DocumentId,
+        version: DocumentVersion,
+        values: &[Option<Value>],
+    ) {
+        if !self.cacheable {
+            return;
+        }
+        if values.len() != self.fields.len()
+            || values.iter().flatten().any(|value| matches!(value, Value::Array(_) | Value::Object(_)))
+        {
+            self.disable();
+            return;
+        }
+        self.ids.push(id);
+        self.versions.push(version);
+        self.values.extend(values.iter().cloned());
+    }
+
+    fn finish(mut self, expected_rows: usize) -> Option<Arc<HotProjectionData>> {
+        if !self.cacheable
+            || self.ids.len() != expected_rows
+            || self.versions.len() != expected_rows
+            || self.values.len() != expected_rows.saturating_mul(self.fields.len())
+        {
+            return None;
+        }
+        let string_bytes = self
+            .values
+            .iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::len)
+            .sum::<usize>();
+        let string_count = self
+            .values
+            .iter()
+            .flatten()
+            .filter(|value| value.is_string())
+            .count();
+        let bytes = std::mem::size_of::<HotProjectionData>()
+            .saturating_add(256)
+            .saturating_add(self.fields.len().saturating_mul(std::mem::size_of::<FieldPath>()))
+            .saturating_add(self.ids.len().saturating_mul(std::mem::size_of::<DocumentId>()))
+            .saturating_add(self.versions.len().saturating_mul(std::mem::size_of::<DocumentVersion>()))
+            .saturating_add(self.values.len().saturating_mul(std::mem::size_of::<Option<Value>>()))
+            .saturating_add(string_bytes)
+            .saturating_add(string_count.saturating_mul(4 * std::mem::size_of::<usize>()));
+        if bytes > self.reservation.bytes() {
+            return None;
+        }
+        let excess = self.reservation.bytes().saturating_sub(bytes);
+        let _ = self.reservation.shrink_by(excess);
+        Some(Arc::new(HotProjectionData {
+            collection: self.collection,
+            fields: self.fields,
+            ids: Arc::from(self.ids),
+            versions: Arc::from(self.versions),
+            values: Arc::from(self.values),
+            bytes,
+            _reservation: self.reservation,
+        }))
+    }
+}
+
+
+fn visit_hot_projection_refs(
+    data: &HotProjectionData,
+    slots: &[usize],
+    visitor: &mut dyn for<'a> FnMut(
+        DocumentId,
+        DocumentVersion,
+        &[Option<ProjectedValueRef<'a>>],
+    ) -> StorageResult<bool>,
+) -> StorageResult<(usize, bool)> {
+    let source_width = data.fields.len();
+    if source_width == 0 || data.values.len() != data.row_count().saturating_mul(source_width) {
+        return Ok((0, true));
+    }
+    let mut projected = (0..slots.len()).map(|_| None).collect::<Vec<_>>();
+    for row in 0..data.row_count() {
+        let base = row.saturating_mul(source_width);
+        for (target, source) in projected.iter_mut().zip(slots.iter().copied()) {
+            *target = data.values[base + source].as_ref().map(projected_value_ref);
+        }
+        if !visitor(data.ids[row], data.versions[row], &projected)? {
+            return Ok((row.saturating_add(1), false));
+        }
+    }
+    Ok((data.row_count(), true))
+}
+
+fn visit_hot_projection_values(
+    data: &HotProjectionData,
+    slots: &[usize],
+    gate_field_count: usize,
+    gate: &mut dyn FnMut(&[Option<Value>]) -> StorageResult<bool>,
+    visitor: &mut dyn FnMut(DocumentId, DocumentVersion, &[Option<Value>]) -> StorageResult<bool>,
+) -> StorageResult<(usize, bool)> {
+    let source_width = data.fields.len();
+    if source_width == 0 || data.values.len() != data.row_count().saturating_mul(source_width) {
+        return Ok((0, true));
+    }
+    let gate_field_count = gate_field_count.min(slots.len());
+    let mut projected = vec![None; slots.len()];
+    for row in 0..data.row_count() {
+        let base = row.saturating_mul(source_width);
+        for (target, source) in projected[..gate_field_count]
+            .iter_mut()
+            .zip(slots[..gate_field_count].iter().copied())
+        {
+            *target = data.values[base + source].clone();
+        }
+        for target in &mut projected[gate_field_count..] {
+            *target = None;
+        }
+        if !gate(&projected)? {
+            continue;
+        }
+        for (target, source) in projected[gate_field_count..]
+            .iter_mut()
+            .zip(slots[gate_field_count..].iter().copied())
+        {
+            *target = data.values[base + source].clone();
+        }
+        if !visitor(data.ids[row], data.versions[row], &projected)? {
+            return Ok((row.saturating_add(1), false));
+        }
+    }
+    Ok((data.row_count(), true))
+}
+
+fn hot_projection_cache_capacity(governor: Option<&MemoryGovernor>) -> usize {
+    let Some(governor) = governor else { return 0; };
+    governor
+        .profile()
+        .managed_budget_bytes
+        .map(|managed| managed / HOT_PROJECTION_CACHE_FRACTION_DENOMINATOR)
+        .unwrap_or(HOT_PROJECTION_CACHE_DEFAULT_BYTES)
+        .min(HOT_PROJECTION_CACHE_DEFAULT_BYTES)
+}
+
+fn hot_projection_reservation_upper_bound(
+    record_count: usize,
+    field_count: usize,
+    records_len: usize,
+) -> usize {
+    let slots = record_count.saturating_mul(field_count);
+    std::mem::size_of::<HotProjectionData>()
+        .saturating_add(256)
+        .saturating_add(field_count.saturating_mul(std::mem::size_of::<FieldPath>()))
+        .saturating_add(record_count.saturating_mul(std::mem::size_of::<DocumentId>()))
+        .saturating_add(record_count.saturating_mul(std::mem::size_of::<DocumentVersion>()))
+        .saturating_add(slots.saturating_mul(std::mem::size_of::<Option<Value>>()))
+        .saturating_add(records_len)
+        // Conservative room for Arc/string allocation overhead beyond the
+        // encoded payload. Admission is allowed to over-reserve, then shrink.
+        .saturating_add(slots.saturating_mul(4 * std::mem::size_of::<usize>()))
+}
+
+fn begin_hot_projection_build(
+    governor: Option<&MemoryGovernor>,
+    cache: &Mutex<HotProjectionCache>,
+    collection: &CollectionId,
+    fields: &[FieldPath],
+    record_count: usize,
+    records_len: usize,
+    metrics: &GlacierReadMetrics,
+) -> Option<HotProjectionBuilder> {
+    let governor = governor?;
+    let upper = hot_projection_reservation_upper_bound(record_count, fields.len(), records_len);
+    let can_reserve = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .can_reserve(upper);
+    if !can_reserve {
+        metrics.hot_projection_cache_admission_skips.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let Ok(reservation) = governor.reserve(MemoryClass::PageCache, upper) else {
+        metrics.hot_projection_cache_admission_skips.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    Some(HotProjectionBuilder::new(collection, fields, record_count, reservation))
+}
+
+fn install_hot_projection(
+    segment_start: u64,
+    data: Arc<HotProjectionData>,
+    cache: &Mutex<HotProjectionCache>,
+    metrics: &GlacierReadMetrics,
+) {
+    let inserted = {
+        let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inserted = cache.insert(segment_start, data);
+        if inserted {
+            let resident = usize_to_u64_saturating(cache.resident_bytes);
+            metrics.hot_projection_cache_resident_bytes.store(resident, Ordering::Relaxed);
+            metrics.hot_projection_cache_peak_bytes.fetch_max(resident, Ordering::Relaxed);
+        }
+        inserted
+    };
+    if inserted {
+        metrics.hot_projection_cache_builds.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 struct GlacierPageCacheReclaimer {
     inner: Weak<GlacierInner>,
 }
@@ -1113,10 +1566,37 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
             return 0;
         };
 
+        // Hot projections are the cheapest cache to rebuild and are reclaimed
+        // before checkpoint-primary entries. Active readers retain their Arc and
+        // are skipped so reported reclaimed bytes always correspond to released
+        // PageCache reservations.
+        let (hot_freed, hot_evicted) = {
+            let mut cache = inner
+                .hot_projection_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let result = cache.reclaim(target_bytes);
+            inner.read_metrics.hot_projection_cache_resident_bytes.store(
+                usize_to_u64_saturating(cache.resident_bytes),
+                Ordering::Relaxed,
+            );
+            result
+        };
+        if hot_evicted > 0 {
+            inner
+                .read_metrics
+                .hot_projection_cache_evictions
+                .fetch_add(hot_evicted, Ordering::Relaxed);
+        }
+        if hot_freed >= target_bytes {
+            return hot_freed;
+        }
+
         // `reclaimable_primary` tracks only checkpoint entries duplicated by
         // the ordered disk sidecar. Removing that prefix never touches entries
         // created by later writes and therefore cannot change write semantics.
         let entry_bytes = std::mem::size_of::<CompactPrimaryEntry>().max(1);
+        let primary_target = target_bytes.saturating_sub(hot_freed);
         let freed = {
             let mut state = inner
                 .state
@@ -1130,7 +1610,7 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
                 if reclaimable == 0 || collection.disk_primary.is_none() {
                     continue;
                 }
-                let remaining = target_bytes.saturating_sub(freed);
+                let remaining = primary_target.saturating_sub(freed);
                 let requested_entries = remaining
                     .saturating_add(entry_bytes.saturating_sub(1))
                     / entry_bytes;
@@ -1141,7 +1621,7 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
                 collection.reclaimable_primary =
                     collection.reclaimable_primary.saturating_sub(evict);
                 freed = freed.saturating_add(evict.saturating_mul(entry_bytes));
-                if freed >= target_bytes {
+                if freed >= primary_target {
                     break;
                 }
             }
@@ -1149,7 +1629,7 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
         };
 
         if freed == 0 {
-            return 0;
+            return hot_freed;
         }
         let released = {
             let mut reservation = inner
@@ -1173,7 +1653,7 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
                 u64_to_usize_saturating(resident.state_estimated_bytes),
             );
         }
-        released
+        hot_freed.saturating_add(released)
     }
 }
 
@@ -1187,6 +1667,7 @@ struct GlacierInner {
     read_metrics: GlacierReadMetrics,
     read_mmap: Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
     segment_catalog: Mutex<Arc<SegmentCatalogSnapshot>>,
+    hot_projection_cache: Mutex<HotProjectionCache>,
     memory_governor: Option<MemoryGovernor>,
     page_cache_reservation: Mutex<Option<MemoryReservation>>,
     page_cache_reclaimer: Mutex<Option<Arc<dyn MemoryReclaimer>>>,
@@ -1303,6 +1784,7 @@ impl GlacierBackend {
         startup_metrics
             .total_us
             .store(elapsed_micros(startup_started), Ordering::Relaxed);
+        let hot_projection_capacity = hot_projection_cache_capacity(memory_governor.as_ref());
 
         let backend = Self {
             inner: Arc::new(GlacierInner {
@@ -1315,6 +1797,7 @@ impl GlacierBackend {
                 read_metrics: GlacierReadMetrics::default(),
                 read_mmap: Mutex::new(None),
                 segment_catalog: Mutex::new(segment_catalog),
+                hot_projection_cache: Mutex::new(HotProjectionCache::new(hot_projection_capacity)),
                 memory_governor,
                 page_cache_reservation: Mutex::new(page_cache_reservation),
                 page_cache_reclaimer: Mutex::new(None),
@@ -2523,6 +3006,9 @@ impl StorageRead for GlacierSnapshot {
             fields.len(),
             &self.backend.inner.segment_catalog,
             &self.backend.inner.read_mmap,
+            options.reusable_projection(),
+            &self.backend.inner.hot_projection_cache,
+            self.backend.inner.memory_governor.as_ref(),
             &self.backend.inner.read_metrics,
             &mut gate,
             &mut |_id, _version, values| visitor(values),
@@ -2563,6 +3049,9 @@ impl StorageRead for GlacierSnapshot {
             fields,
             &self.backend.inner.segment_catalog,
             &self.backend.inner.read_mmap,
+            options.reusable_projection(),
+            &self.backend.inner.hot_projection_cache,
+            self.backend.inner.memory_governor.as_ref(),
             &self.backend.inner.read_metrics,
             visitor,
         )
@@ -2596,6 +3085,9 @@ impl StorageRead for GlacierSnapshot {
             fields,
             &self.backend.inner.segment_catalog,
             &self.backend.inner.read_mmap,
+            options.reusable_projection(),
+            &self.backend.inner.hot_projection_cache,
+            self.backend.inner.memory_governor.as_ref(),
             &self.backend.inner.read_metrics,
             &mut |_id, _version, values| visitor(values),
         )
@@ -2630,6 +3122,9 @@ impl StorageRead for GlacierSnapshot {
             gate_field_count,
             &self.backend.inner.segment_catalog,
             &self.backend.inner.read_mmap,
+            options.reusable_projection(),
+            &self.backend.inner.hot_projection_cache,
+            self.backend.inner.memory_governor.as_ref(),
             &self.backend.inner.read_metrics,
             gate,
             &mut |_id, _version, values| visitor(values),
@@ -2675,6 +3170,9 @@ impl StorageRead for GlacierSnapshot {
             gate_field_count,
             &self.backend.inner.segment_catalog,
             &self.backend.inner.read_mmap,
+            options.reusable_projection(),
+            &self.backend.inner.hot_projection_cache,
+            self.backend.inner.memory_governor.as_ref(),
             &self.backend.inner.read_metrics,
             gate,
             visitor,
@@ -2709,6 +3207,9 @@ impl StorageRead for GlacierSnapshot {
             fields.len(),
             &self.backend.inner.segment_catalog,
             &self.backend.inner.read_mmap,
+            options.reusable_projection(),
+            &self.backend.inner.hot_projection_cache,
+            self.backend.inner.memory_governor.as_ref(),
             &self.backend.inner.read_metrics,
             gate,
             &mut |_id, _version, _values| Ok(true),
@@ -3906,6 +4407,11 @@ impl SegmentCatalogEntry {
         self.insert_collection
             .get()
             .and_then(|value| value.as_deref())
+    }
+
+    #[inline]
+    fn known_physical_sets(&self) -> Option<bool> {
+        self.physical_sets_only.get().copied()
     }
 
     fn proves_target_inserts(
@@ -5210,6 +5716,9 @@ fn scan_collection_sequential_value_refs(
     fields: &[FieldPath],
     catalog_cache: &Mutex<Arc<SegmentCatalogSnapshot>>,
     mmap_cache: &Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
+    reusable_projection: bool,
+    hot_projection_cache: &Mutex<HotProjectionCache>,
+    memory_governor: Option<&MemoryGovernor>,
     metrics: &GlacierReadMetrics,
     visitor: &mut dyn for<'a> FnMut(
         DocumentId,
@@ -5243,6 +5752,13 @@ fn scan_collection_sequential_value_refs(
             .visibility_fallback_scans
             .fetch_add(1, Ordering::Relaxed);
     }
+    let projection_hot = reusable_projection
+        && append_only_visible
+        && memory_governor.is_some()
+        && hot_projection_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_signature(collection, fields);
 
     let io_started = Instant::now();
     let mut file = File::open(path).map_err(io_error("open borrowed projected scan", path))?;
@@ -5284,6 +5800,42 @@ fn scan_collection_sequential_value_refs(
         let records_len = segment.records_len();
         scan_metrics.segments = scan_metrics.segments.saturating_add(1);
 
+        if reusable_projection
+            && append_only_visible
+            && segment.known_insert_collection() == Some(collection.as_str())
+            && segment.known_physical_sets() == Some(true)
+        {
+            let cached = hot_projection_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .lookup(segment_start, collection, fields);
+            if let Some((data, slots, superset)) = cached
+                .filter(|(data, _, _)| data.row_count() == record_count)
+            {
+                metrics.hot_projection_cache_hits.fetch_add(1, Ordering::Relaxed);
+                if superset {
+                    metrics
+                        .hot_projection_cache_superset_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let (visited, continued) = visit_hot_projection_refs(&data, &slots, visitor)?;
+                scan_metrics.records = scan_metrics.records.saturating_add(visited as u64);
+                scan_metrics.projected_records =
+                    scan_metrics.projected_records.saturating_add(visited as u64);
+                emitted = emitted.saturating_add(visited);
+                metrics
+                    .hot_projection_cache_reused_rows
+                    .fetch_add(visited as u64, Ordering::Relaxed);
+                if !continued {
+                    return Ok(());
+                }
+                continue;
+            }
+            if memory_governor.is_some() {
+                metrics.hot_projection_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
         let payload = read_segment_payload(
             &mut file,
             path,
@@ -5319,6 +5871,19 @@ fn scan_collection_sequential_value_refs(
 
         let mut values: Vec<Option<ProjectedValueRef<'_>>> =
             (0..fields.len()).map(|_| None).collect();
+        let mut cache_builder = if bypass_directory && projection_hot {
+            begin_hot_projection_build(
+                memory_governor,
+                hot_projection_cache,
+                collection,
+                fields,
+                record_count,
+                records_len,
+                metrics,
+            )
+        } else {
+            None
+        };
 
         if bypass_directory {
             metrics
@@ -5376,12 +5941,13 @@ fn scan_collection_sequential_value_refs(
                     scan_metrics.decoded_fields.saturating_add(decoded_fields);
                 scan_metrics.projected_records = scan_metrics.projected_records.saturating_add(1);
                 emitted = emitted.saturating_add(1);
+                let id = DocumentId::from_bytes(physical_header.id);
+                let version = DocumentVersion::new(physical_header.version);
+                if let Some(builder) = cache_builder.as_mut() {
+                    builder.push_refs(id, version, &values);
+                }
                 let visitor_started = scan_metrics.sampled_timer();
-                let result = visitor(
-                    DocumentId::from_bytes(physical_header.id),
-                    DocumentVersion::new(physical_header.version),
-                    &values,
-                );
+                let result = visitor(id, version, &values);
                 scan_metrics.record_sampled_visitor(visitor_started);
                 if !result? {
                     metrics
@@ -5396,6 +5962,15 @@ fn scan_collection_sequential_value_refs(
                     return Ok(());
                 }
                 cursor = end;
+            }
+            if let Some(builder) = cache_builder {
+                let build_started = Instant::now();
+                if let Some(data) = builder.finish(record_count) {
+                    install_hot_projection(segment_start, data, hot_projection_cache, metrics);
+                }
+                metrics
+                    .hot_projection_cache_finalize_us
+                    .fetch_add(elapsed_micros(build_started), Ordering::Relaxed);
             }
             metrics
                 .record_loop_us
@@ -5581,6 +6156,9 @@ fn scan_collection_sequential_values(
     gate_field_count: usize,
     catalog_cache: &Mutex<Arc<SegmentCatalogSnapshot>>,
     mmap_cache: &Mutex<Option<(u64, Arc<GlacierReadOnlyMap>)>>,
+    reusable_projection: bool,
+    hot_projection_cache: &Mutex<HotProjectionCache>,
+    memory_governor: Option<&MemoryGovernor>,
     metrics: &GlacierReadMetrics,
     gate: &mut dyn FnMut(&[Option<Value>]) -> StorageResult<bool>,
     visitor: &mut dyn FnMut(
@@ -5624,6 +6202,17 @@ fn scan_collection_sequential_values(
             .visibility_fallback_scans
             .fetch_add(1, Ordering::Relaxed);
     }
+    // Building a complete cache entry is safe when every requested field is
+    // decoded before the gate. Existing entries can serve any gate shape.
+    let projection_hot = reusable_projection
+        && append_only_visible
+        && full_visitor.is_none()
+        && gate_field_count == fields.len()
+        && memory_governor.is_some()
+        && hot_projection_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .observe_signature(collection, fields);
 
     let io_started = Instant::now();
     let mut file = File::open(path).map_err(io_error("open direct projected scan", path))?;
@@ -5656,6 +6245,49 @@ fn scan_collection_sequential_values(
         let metadata_len = segment.metadata_len();
         let records_len = segment.records_len();
         scan_metrics.segments = scan_metrics.segments.saturating_add(1);
+
+        if reusable_projection
+            && full_visitor.is_none()
+            && append_only_visible
+            && segment.known_insert_collection() == Some(collection.as_str())
+            && segment.known_physical_sets() == Some(true)
+        {
+            let cached = hot_projection_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .lookup(segment_start, collection, fields);
+            if let Some((data, slots, superset)) = cached
+                .filter(|(data, _, _)| data.row_count() == record_count)
+            {
+                metrics.hot_projection_cache_hits.fetch_add(1, Ordering::Relaxed);
+                if superset {
+                    metrics
+                        .hot_projection_cache_superset_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let (visited, continued) = visit_hot_projection_values(
+                    &data,
+                    &slots,
+                    gate_field_count,
+                    gate,
+                    visitor,
+                )?;
+                scan_metrics.records = scan_metrics.records.saturating_add(visited as u64);
+                scan_metrics.projected_records =
+                    scan_metrics.projected_records.saturating_add(visited as u64);
+                emitted = emitted.saturating_add(visited);
+                metrics
+                    .hot_projection_cache_reused_rows
+                    .fetch_add(visited as u64, Ordering::Relaxed);
+                if !continued {
+                    return Ok(());
+                }
+                continue;
+            }
+            if memory_governor.is_some() {
+                metrics.hot_projection_cache_misses.fetch_add(1, Ordering::Relaxed);
+            }
+        }
 
         let payload = read_segment_payload(
             &mut file,
@@ -5693,6 +6325,20 @@ fn scan_collection_sequential_values(
             metadata_matches && segment.proves_physical_sets(records)?
         } else {
             false
+        };
+
+        let mut cache_builder = if bypass_directory && projection_hot {
+            begin_hot_projection_build(
+                memory_governor,
+                hot_projection_cache,
+                collection,
+                fields,
+                record_count,
+                records_len,
+                metrics,
+            )
+        } else {
+            None
         };
 
         if bypass_directory {
@@ -5766,11 +6412,14 @@ fn scan_collection_sequential_values(
                     scan_metrics.decoded_fields.saturating_add(decoded_fields);
                 scan_metrics.projected_records = scan_metrics.projected_records.saturating_add(1);
                 emitted += 1;
+                let id = DocumentId::from_bytes(header.id);
+                let version = DocumentVersion::new(header.version);
+                if let Some(builder) = cache_builder.as_mut() {
+                    builder.push_values(id, version, &projected_values);
+                }
 
                 if accepted {
                     let visitor_started = scan_metrics.sampled_timer();
-                    let id = DocumentId::from_bytes(header.id);
-                    let version = DocumentVersion::new(header.version);
                     let result = if let Some(full_visitor) = full_visitor.as_deref_mut() {
                         full_visitor(decode_full_stored_record(record_bytes, id, version)?)
                     } else {
@@ -5782,6 +6431,15 @@ fn scan_collection_sequential_values(
                     }
                 }
                 cursor = end;
+            }
+            if let Some(builder) = cache_builder {
+                let build_started = Instant::now();
+                if let Some(data) = builder.finish(record_count) {
+                    install_hot_projection(segment_start, data, hot_projection_cache, metrics);
+                }
+                metrics
+                    .hot_projection_cache_finalize_us
+                    .fetch_add(elapsed_micros(build_started), Ordering::Relaxed);
             }
             metrics
                 .record_loop_us
@@ -7516,6 +8174,245 @@ mod tests {
     #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
     #[test] fn projected_scan_reuses_mmap_and_refreshes_after_append() { let path = temp_path("read-mmap"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let first_id = UuidV7Generator::new().next_id(); let mut first = Document::new(); first.insert("name", Value::string("Alice")); first.insert( "payload", Value::string("x".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(first_id, Arc::new(first))], ) .unwrap(); let read = storage.read().unwrap(); for _ in 0..2 { let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 1); } let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 0); assert_eq!(metrics.segment_catalog_refreshes, 1); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 2); assert!(metrics.mmap_bytes >= (MIN_MMAP_SEGMENT_PAYLOAD_BYTES as u64) * 2); assert_eq!(metrics.mmap_fallback_segments, 0); let second_id = UuidV7Generator::new().next_id(); let mut second = Document::new(); second.insert("name", Value::string("Bob")); second.insert( "payload", Value::string("y".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(second_id, Arc::new(second))], ) .unwrap(); let read = storage.read().unwrap(); let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 2); let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 1); assert_eq!(metrics.segment_catalog_refreshes, 2); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 4); assert_eq!(metrics.mmap_fallback_segments, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn startup_replay_seeds_segment_catalog_validation() { let path = temp_path("segment-catalog-startup"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let startup = reopened.startup_metrics(); assert_eq!(startup.segment_catalog_segments, 1); let catalog = reopened .inner .segment_catalog .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()); assert_eq!(catalog.segments.len(), 1); let entry = &catalog.segments[0]; assert!(entry.directory_verified.load(Ordering::Acquire)); assert_eq!(entry.known_insert_collection(), Some("users")); drop(catalog); let resident = reopened.resident_memory(); assert_eq!(resident.segment_catalog_entries, 1); assert!(resident.segment_catalog_estimated_bytes > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test]
+    fn governed_hot_projection_cache_is_two_touch_and_reuses_rows() {
+        let path = temp_path("hot-projection-two-touch");
+        let users = CollectionId::parse("users").unwrap();
+        let governor = MemoryGovernor::unlimited();
+        let storage = GlacierBackend::open_governed(&path, governor).unwrap();
+        let ids = UuidV7Generator::new().reserve(2);
+        let mut mutations = Vec::new();
+        for (id, (name, score)) in ids.into_iter().zip([("Alice", 7_i64), ("Bob", 9_i64)]) {
+            let mut document = Document::new();
+            document.insert("name", Value::string(name));
+            document.insert("score", Value::signed(score));
+            mutations.push(StorageMutation::insert(id, Arc::new(document)));
+        }
+        storage.apply_batch_atomic_summary(&users, mutations).unwrap();
+        let fields = [FieldPath::parse("name").unwrap()];
+        let options = ScanOptions::default().with_reusable_projection();
+
+        for pass in 0..3 {
+            let read = storage.read().unwrap();
+            let mut rows = 0usize;
+            read.scan_projected_value_refs_unordered_each(
+                &users,
+                options,
+                &fields,
+                &mut |values| {
+                    assert!(matches!(&values[0], Some(ProjectedValueRef::String(_))));
+                    rows += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(rows, 2);
+            let metrics = storage.read_metrics();
+            match pass {
+                0 => {
+                    assert_eq!(metrics.hot_projection_cache_builds, 0);
+                    assert_eq!(metrics.hot_projection_cache_hits, 0);
+                }
+                1 => {
+                    assert_eq!(metrics.hot_projection_cache_builds, 1);
+                    assert_eq!(metrics.hot_projection_cache_hits, 0);
+                    assert!(metrics.hot_projection_cache_resident_bytes > 0);
+                }
+                2 => {
+                    assert_eq!(metrics.hot_projection_cache_builds, 1);
+                    assert_eq!(metrics.hot_projection_cache_hits, 1);
+                    assert_eq!(metrics.hot_projection_cache_reused_rows, 2);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(checkpoint_path(&path));
+    }
+
+    #[test]
+    fn hot_projection_cache_reuses_covering_superset() {
+        let path = temp_path("hot-projection-superset");
+        let users = CollectionId::parse("users").unwrap();
+        let storage = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap();
+        let id = UuidV7Generator::new().next_id();
+        let mut document = Document::new();
+        document.insert("name", Value::string("Alice"));
+        document.insert("score", Value::signed(7));
+        storage
+            .apply_batch_atomic_summary(
+                &users,
+                vec![StorageMutation::insert(id, Arc::new(document))],
+            )
+            .unwrap();
+
+        let wide = [
+            FieldPath::parse("name").unwrap(),
+            FieldPath::parse("score").unwrap(),
+        ];
+        let options = ScanOptions::default().with_reusable_projection();
+        for _ in 0..2 {
+            storage
+                .read()
+                .unwrap()
+                .scan_projected_value_refs_unordered_each(
+                    &users,
+                    options,
+                    &wide,
+                    &mut |_values| Ok(true),
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.read_metrics().hot_projection_cache_builds, 1);
+
+        let narrow = [FieldPath::parse("name").unwrap()];
+        let mut rows = 0usize;
+        storage
+            .read()
+            .unwrap()
+            .scan_projected_value_refs_unordered_each(
+                &users,
+                options,
+                &narrow,
+                &mut |values| {
+                    assert!(matches!(&values[0], Some(ProjectedValueRef::String("Alice"))));
+                    rows += 1;
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+        let metrics = storage.read_metrics();
+        assert_eq!(metrics.hot_projection_cache_hits, 1);
+        assert_eq!(metrics.hot_projection_cache_superset_hits, 1);
+        assert_eq!(metrics.hot_projection_cache_builds, 1);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(checkpoint_path(&path));
+    }
+
+    #[test]
+    fn hot_projection_cache_crosses_borrowed_and_gated_value_consumers() {
+        let path = temp_path("hot-projection-cross-consumer");
+        let users = CollectionId::parse("users").unwrap();
+        let storage = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap();
+        let ids = UuidV7Generator::new().reserve(2);
+        let mut mutations = Vec::new();
+        for (id, (active, score)) in ids.into_iter().zip([(true, 7_i64), (false, 9_i64)]) {
+            let mut document = Document::new();
+            document.insert("active", Value::Bool(active));
+            document.insert("score", Value::signed(score));
+            mutations.push(StorageMutation::insert(id, Arc::new(document)));
+        }
+        storage.apply_batch_atomic_summary(&users, mutations).unwrap();
+        let fields = [
+            FieldPath::parse("active").unwrap(),
+            FieldPath::parse("score").unwrap(),
+        ];
+        let options = ScanOptions::default().with_reusable_projection();
+        for _ in 0..2 {
+            storage
+                .read()
+                .unwrap()
+                .scan_projected_value_refs_unordered_each(
+                    &users,
+                    options,
+                    &fields,
+                    &mut |_values| Ok(true),
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.read_metrics().hot_projection_cache_builds, 1);
+
+        let mut accepted_scores = Vec::new();
+        storage
+            .read()
+            .unwrap()
+            .scan_projected_values_gated_unordered_each(
+                &users,
+                options,
+                &fields,
+                1,
+                &mut |values| Ok(values[0] == Some(Value::Bool(true))),
+                &mut |values| {
+                    accepted_scores.push(values[1].clone());
+                    Ok(true)
+                },
+            )
+            .unwrap();
+        assert_eq!(accepted_scores, vec![Some(Value::signed(7))]);
+        assert_eq!(storage.read_metrics().hot_projection_cache_hits, 1);
+        assert_eq!(storage.read_metrics().hot_projection_cache_reused_rows, 2);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(checkpoint_path(&path));
+    }
+
+    #[test]
+    fn hot_projection_cache_requires_governor_and_is_revocable() {
+        let path = temp_path("hot-projection-governed");
+        let users = CollectionId::parse("users").unwrap();
+        let id = UuidV7Generator::new().next_id();
+        {
+            let storage = GlacierBackend::open(&path).unwrap();
+            let mut document = Document::new();
+            document.insert("name", Value::string("Alice"));
+            storage
+                .apply_batch_atomic_summary(
+                    &users,
+                    vec![StorageMutation::insert(id, Arc::new(document))],
+                )
+                .unwrap();
+            let fields = [FieldPath::parse("name").unwrap()];
+            for _ in 0..3 {
+                storage
+                    .read()
+                    .unwrap()
+                    .scan_projected_value_refs_unordered_each(
+                        &users,
+                        ScanOptions::default().with_reusable_projection(),
+                        &fields,
+                        &mut |_values| Ok(true),
+                    )
+                    .unwrap();
+            }
+            let metrics = storage.read_metrics();
+            assert_eq!(metrics.hot_projection_cache_builds, 0);
+            assert_eq!(metrics.hot_projection_cache_resident_bytes, 0);
+        }
+
+        let governed = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap();
+        let fields = [FieldPath::parse("name").unwrap()];
+        for _ in 0..2 {
+            governed
+                .read()
+                .unwrap()
+                .scan_projected_value_refs_unordered_each(
+                    &users,
+                    ScanOptions::default().with_reusable_projection(),
+                    &fields,
+                    &mut |_values| Ok(true),
+                )
+                .unwrap();
+        }
+        assert!(governed.read_metrics().hot_projection_cache_resident_bytes > 0);
+        let reclaimer = governed
+            .inner
+            .page_cache_reclaimer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert!(reclaimer.reclaim(1) > 0);
+        assert_eq!(governed.read_metrics().hot_projection_cache_resident_bytes, 0);
+        assert!(governed.read_metrics().hot_projection_cache_evictions > 0);
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(checkpoint_path(&path));
+    }
+
     #[test] fn physical_projection_skips_unrequested_field_payload_decode() { let name = rmp_serde::to_vec(&ImageValue::String("Alice".to_owned())).unwrap(); let ignored = rmp_serde::to_vec(&ImageValue::String("Paris".to_owned())).unwrap(); let document = ImageDocument { id: [7u8; 16], version: 3, fields: vec![ ImageField { name: "name".to_owned(), value: name, }, ImageField { name: "city".to_owned(), value: ignored, }, ], }; let mut bytes = encode_physical_set_record(9, &document).unwrap(); assert_eq!(&bytes[..8], &PHYSICAL_SET_MAGIC); let header = parse_physical_set_header(&bytes).unwrap().unwrap(); let city = physical_field_entries(&bytes, header) .unwrap() .into_iter() .find(|entry| entry.name == "city") .map(|entry| (entry.offset, entry.length)) .unwrap(); let payload_base = PHYSICAL_SET_HEADER_BYTES + header.directory_len; bytes[payload_base + city.0] = 0xc1; let directory = &bytes[PHYSICAL_SET_HEADER_BYTES..payload_base]; let payloads = &bytes[payload_base..]; let checksum = checksum64_pair(directory, payloads); bytes[56..64].copy_from_slice(&checksum.to_be_bytes()); let fields = [FieldPath::parse("name").unwrap()]; let requested = fields .iter() .map(|path| path.first().as_str()) .collect::<BTreeSet<_>>(); let (projected, decoded_fields) = decode_projected_physical_set( &bytes, parse_physical_set_header(&bytes).unwrap().unwrap(), &fields, Some(&requested), ) .unwrap(); assert_eq!(decoded_fields, 1); assert!(projected.get("name").is_some()); assert!(decode_physical_set_document( &bytes, parse_physical_set_header(&bytes).unwrap().unwrap(), ) .is_err()); }
     #[test] fn projected_values_append_only_uses_trusted_compiled_path() { let path = temp_path("projected-values-trusted"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let ids = UuidV7Generator::new().reserve(2); for (id, name) in ids.into_iter().zip(["Alice", "Bob"]) { let mut document = Document::new(); document.insert("name", Value::string(name)); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(document))], ) .unwrap(); } let fields = [FieldPath::parse("name").unwrap()]; let read = storage.read().unwrap(); let mut projected = Vec::new(); read.scan_projected_values_unordered_each( &users, ScanOptions::default(), &fields, &mut |values| { projected.push(values[0].clone()); Ok(true) }, ) .unwrap(); assert_eq!(projected.len(), 2); assert!(projected.contains(&Some(Value::string("Alice")))); assert!(projected.contains(&Some(Value::string("Bob")))); let metrics = storage.read_metrics(); assert_eq!(metrics.visibility_fast_scans, 1); assert_eq!(metrics.visibility_fallback_scans, 0); assert_eq!(metrics.trusted_header_records, 2); assert_eq!(metrics.verified_header_records, 0); assert_eq!(metrics.projection_layout_misses, 1); assert_eq!(metrics.projection_layout_hits, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn projected_values_fallback_after_replace_preserves_result() { let path = temp_path("projected-values-replace-fallback"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut original = Document::new(); original.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(original))], ) .unwrap(); let mut replacement = Document::new(); replacement.insert("name", Value::string("Bob")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::replace( id, Arc::new(replacement), VersionPrecondition::Any, )], ) .unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let read = storage.read().unwrap(); let mut projected = Vec::new(); read.scan_projected_values_unordered_each( &users, ScanOptions::default(), &fields, &mut |values| { projected.push(values[0].clone()); Ok(true) }, ) .unwrap(); assert_eq!(projected, vec![Some(Value::string("Bob"))]); let metrics = storage.read_metrics(); assert_eq!(metrics.visibility_fast_scans, 0); assert_eq!(metrics.visibility_fallback_scans, 1); assert!(metrics.visibility_checks > 0); assert!(metrics.verified_header_records > 0); assert_eq!(metrics.trusted_header_records, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }

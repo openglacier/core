@@ -8,12 +8,12 @@ use crate::{
     storage::ProjectedValueRef,
 };
 
-use super::Fields;
 use super::{
     BinaryOperator, ExecutionError, ExecutionResult, Expression, ExpressionFieldPath,
     ExpressionFieldResolver, ExpressionView, Literal, PhysicalOperator, SemanticValue,
     UnaryOperator,
 };
+use super::{Fields, ProjectionReuse};
 
 /// Row representation used by stages that can consume projected field values
 /// without materializing a full document.
@@ -73,8 +73,8 @@ impl ProjectedValueLayout {
         &self.storage_fields
     }
 
-    /// Returns whether every requested field can use Glacier's current native
-    /// top-level projected-value cursor.
+    /// Returns whether every requested field is compatible with the storage
+    /// top-level projected-value cursor contract.
     #[must_use]
     pub fn is_top_level(&self) -> bool {
         self.storage_fields.iter().all(|field| field.len() == 1)
@@ -127,6 +127,7 @@ pub struct ProjectedValuePipeline {
     stages: Arc<[ProjectedValueStage]>,
     gate_field_count: usize,
     hydration_projection: Option<Arc<[ExpressionFieldPath]>>,
+    projection_reuse: ProjectionReuse,
 }
 
 impl ProjectedValuePipeline {
@@ -142,6 +143,14 @@ impl ProjectedValuePipeline {
     {
         let downstream_fields = downstream_fields.into_iter().collect::<Vec<_>>();
         let mut required = downstream_fields.clone();
+        let projection_reuse = if operators
+            .iter()
+            .all(|operator| operator.execution_properties().reuses_projection())
+        {
+            ProjectionReuse::Reusable
+        } else {
+            ProjectionReuse::None
+        };
 
         // Walk backwards to validate Select visibility without turning Select
         // into a demand for every field it exposes. Only fields actually used
@@ -216,6 +225,7 @@ impl ProjectedValuePipeline {
             stages: Arc::from(stages),
             gate_field_count,
             hydration_projection,
+            projection_reuse,
         }))
     }
 
@@ -229,6 +239,13 @@ impl ProjectedValuePipeline {
     #[must_use]
     pub const fn gate_field_count(&self) -> usize {
         self.gate_field_count
+    }
+
+    /// Whether every source-facing stage declares immutable source
+    /// projections reusable across executions.
+    #[must_use]
+    pub const fn projection_reuse(&self) -> ProjectionReuse {
+        self.projection_reuse
     }
 
     /// Projection that must be re-applied after late hydration, when a projected
@@ -675,6 +692,7 @@ mod tests {
         // predicate dependencies before downstream-only values.
         assert_eq!(pipeline.layout().slot(&period), Some(0));
         assert_eq!(pipeline.layout().slot(&revenue), Some(1));
+        assert_eq!(pipeline.projection_reuse(), ProjectionReuse::Reusable);
     }
 
     #[test]

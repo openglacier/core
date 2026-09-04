@@ -345,6 +345,7 @@ impl VersionPrecondition {
 pub struct ScanOptions {
     limit: Option<usize>,
     direction: ScanDirection,
+    reusable_projection: bool,
 }
 
 impl ScanOptions {
@@ -355,6 +356,7 @@ impl ScanOptions {
         Self {
             limit: None,
             direction: ScanDirection::Forward,
+            reusable_projection: false,
         }
     }
 
@@ -383,6 +385,23 @@ impl ScanOptions {
     #[inline]
     pub const fn direction(self) -> ScanDirection {
         self.direction
+    }
+
+    /// Marks an immutable projected source representation as reusable across
+    /// executions. Storage backends may use this as an admission hint for
+    /// governed caches, but must preserve identical semantics when ignored.
+    #[must_use]
+    pub const fn with_reusable_projection(mut self) -> Self {
+        self.reusable_projection = true;
+        self
+    }
+
+    /// Returns whether the caller proved the projected source representation
+    /// reusable. This is a semantic hint, never a requirement to cache.
+    #[must_use]
+    #[inline]
+    pub const fn reusable_projection(self) -> bool {
+        self.reusable_projection
     }
 }
 

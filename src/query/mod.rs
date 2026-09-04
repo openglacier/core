@@ -66,8 +66,8 @@ pub use planner::{
 mod execution_properties;
 
 pub use execution_properties::{
-    Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Order, ProjectedAccess,
-    Scope, Shape,
+    Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Materialization, Order,
+    ProjectedAccess, ProjectionReuse, Scope, Shape,
 };
 
 mod physical_plan;

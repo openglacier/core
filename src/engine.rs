@@ -91,6 +91,24 @@ use crate::{
 };
 
 #[inline]
+fn reusable_projected_scan_options(
+    options: ScanOptions,
+    plan: &PhysicalPlan,
+    projected: &ProjectedValuePipeline,
+) -> ScanOptions {
+    if matches!(
+        (plan.source_projection_reuse(), projected.projection_reuse()),
+        (
+            crate::query::ProjectionReuse::Reusable,
+            crate::query::ProjectionReuse::Reusable,
+        )
+    ) {
+        options.with_reusable_projection()
+    } else {
+        options
+    }
+}
+
 fn storage_engine_error(error: StorageError) -> EngineError {
     EngineError::execution(ExecutionError::storage(error))
 }
@@ -399,7 +417,7 @@ impl Engine {
                     let mut projected_filtered = 0u64;
                     read.scan_projected_values_gated_unordered_each(
                         physical.source().collection(),
-                        *options,
+                        reusable_projected_scan_options(*options, physical, &value_pipeline),
                         value_pipeline.layout().storage_fields(),
                         value_pipeline.gate_field_count(),
                         &mut |values| {
@@ -499,7 +517,7 @@ impl Engine {
             crate::query::PhysicalAccess::CollectionScan { options } => {
                 // Push a simple terminal LIMIT into the storage scan. This is
                 // semantically safe because there is no filter/skip/cardinality
-                // changing operator before it, and it lets Glacier use its
+                // changing operator before it, and it lets storage use its
                 // sequential short-scan path instead of materializing/sorting a
                 // multi-million-entry lazy primary index just to return N rows.
                 let requested_window = match physical.operators().get(..data_operator_len) {
@@ -520,7 +538,7 @@ impl Engine {
                     });
 
                 // Standard projected-value streaming path for pipelines made only
-                // of Filter/Select stages and ending in Select. Glacier can read
+                // of Filter/Select stages and ending in Select. Native storage can read
                 // the required top-level values directly from physical records,
                 // evaluate filters without materializing full documents, and build
                 // the selected output from those slots. Unsupported shapes keep
@@ -560,7 +578,7 @@ impl Engine {
 
                         read.scan_projected_row_values_gated_unordered_each(
                             physical.source().collection(),
-                            storage_options,
+                            reusable_projected_scan_options(storage_options, physical, &value_pipeline),
                             value_pipeline.layout().storage_fields(),
                             value_pipeline.gate_field_count(),
                             &mut |values| {
@@ -1238,7 +1256,7 @@ impl Engine {
         let mut returned = 0u64;
         read.scan_projected_row_refs_unordered_each(
             prefix.source().collection(),
-            options,
+            reusable_projected_scan_options(options, prefix, projected),
             projected.layout().storage_fields(),
             &mut |id, version, values| {
                 scanned = scanned.saturating_add(1);
@@ -1761,7 +1779,7 @@ impl Engine {
                         .collect::<Vec<_>>();
                     read.scan_projected_value_refs_unordered_each(
                         prefix.source().collection(),
-                        *options,
+                        reusable_projected_scan_options(*options, prefix, &value_pipeline),
                         layout.storage_fields(),
                         &mut |values| {
                             if exceeded.get() {
@@ -1876,7 +1894,7 @@ impl Engine {
                 } else {
                     read.scan_projected_values_gated_unordered_each(
                         prefix.source().collection(),
-                        *options,
+                        reusable_projected_scan_options(*options, prefix, &value_pipeline),
                         layout.storage_fields(),
                         value_pipeline.gate_field_count(),
                         &mut |values| {
@@ -2110,7 +2128,7 @@ impl Engine {
                 .collect::<Vec<_>>();
             read.scan_projected_value_refs_unordered_each(
                 prefix.source().collection(),
-                *options,
+                reusable_projected_scan_options(*options, prefix, &value_pipeline),
                 layout.storage_fields(),
                 &mut |values| {
                     scanned = scanned.saturating_add(1);
@@ -2165,7 +2183,7 @@ impl Engine {
         } else {
             read.scan_projected_values_gated_unordered_each(
                 prefix.source().collection(),
-                *options,
+                reusable_projected_scan_options(*options, prefix, &value_pipeline),
                 layout.storage_fields(),
                 value_pipeline.gate_field_count(),
                 &mut |values| {
@@ -2301,6 +2319,7 @@ impl Engine {
         .with_source_access_negotiation(
             physical.source_access_vector(),
             physical.projected_prefix_len().min(blocking_index),
+            physical.source_projection_reuse(),
         );
         let source_strategy = match physical.source().access() {
             crate::query::PhysicalAccess::CollectionScan { .. } => {
