@@ -313,6 +313,8 @@ fn lower_operator(operator: &LogicalOperator, depth: usize) -> LoweringResult<Ph
         } => match stage.as_str() {
             "lookup" => lower_lookup(arguments.as_ref(), depth + 1),
             "union" => lower_union(arguments.as_ref(), depth + 1),
+            "sample" => PhysicalOperator::custom(stage.clone(), arguments.as_ref(), false, true)
+                .map_err(|error| LoweringError::physical(None, error)),
 
             _ => PhysicalOperator::custom(stage.clone(), arguments.as_ref(), *mutating, false)
                 .map_err(|error| LoweringError::physical(None, error)),

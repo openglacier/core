@@ -80,7 +80,7 @@ use crate::{
         ExecutionStrategy, Executor, LogicalPlan, LookupDocuments, Order, PhysicalOperator,
         PhysicalPlan, PhysicalPlanError, PhysicalPlanner, PhysicalSubPipeline, Planner,
         PlannerCache, PlannerCacheStats, PlannerError, PlannerPipeline, ProjectedRowLocator,
-        ProjectedRowSet, ProjectedValueLayout, ProjectedValuePipeline, SortKey, vcollections,
+        ProjectedRowSet, ProjectedValueLayout, ProjectedValuePipeline, NearSpec, SortDirection, SortKey, vcollections,
     },
     spill::{SpillEngine, SpillRun, SpillRunReader},
     storage::{
@@ -1314,6 +1314,169 @@ impl Engine {
             row.replace_document(document, false);
         }
         Ok(Some(row))
+    }
+
+    /// Executes the native `near -> sort _distance -> limit` shape from projected
+    /// values and hydrates only retained winners. The query vector is parsed once
+    /// for the scan instead of once per source document.
+    fn try_projected_near_top_n(
+        &self,
+        prefix: &PhysicalPlan,
+        keys: &[crate::query::SortKey],
+        limit: usize,
+    ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
+        if limit == 0
+            || keys.len() != 1
+            || keys[0].field().to_string() != "_distance"
+            || keys[0].direction() != SortDirection::Ascending
+        {
+            return Ok(None);
+        }
+
+        let Some((near, filter_operators)) = prefix.operators().split_last() else {
+            return Ok(None);
+        };
+        let PhysicalOperator::Custom {
+            name,
+            arguments,
+            writes: false,
+            changes_cardinality: false,
+        } = near
+        else {
+            return Ok(None);
+        };
+        if name.as_str() != "near"
+            || filter_operators
+                .iter()
+                .any(|operator| !matches!(operator, PhysicalOperator::Filter { .. }))
+        {
+            return Ok(None);
+        }
+
+        // Invalid specs keep the established document-path semantics, including
+        // the fact that an empty source never evaluates a row-local stage.
+        let Ok(spec) = NearSpec::parse(arguments) else {
+            return Ok(None);
+        };
+        let filter_prefix = PhysicalPlan::new(
+            prefix.source().clone(),
+            filter_operators.iter().cloned(),
+        )
+        .map_err(EngineError::physical_planning)?;
+        let Some((options, projected)) = self.projected_collection_pipeline(
+            &filter_prefix,
+            std::iter::once(spec.field().clone()),
+        )? else {
+            return Ok(None);
+        };
+        let Some(embedding_slot) = projected.layout().slot(spec.field()) else {
+            return Ok(None);
+        };
+
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let mut top = BoundedProjectedTopN::new(limit);
+        let distance_slot = [0usize];
+        let prefix_stats = if projected.gate_field_count() > 0
+            && read
+                .support(StorageReadCapability::ProjectedValuesGatedUnordered)
+                .available()
+        {
+            let mut scanned = 0u64;
+            let mut filtered = 0u64;
+            let mut accepted = 0u64;
+            read.scan_projected_row_values_gated_unordered_each(
+                filter_prefix.source().collection(),
+                reusable_projected_scan_options(options, &filter_prefix, &projected),
+                projected.layout().storage_fields(),
+                projected.gate_field_count(),
+                &mut |values| {
+                    scanned = scanned.saturating_add(1);
+                    let keep = projected
+                        .accepts_with(values, |expression, resolver| {
+                            self.runtime.evaluate_resolved_predicate(expression, resolver)
+                        })
+                        .map_err(backend_storage_error)?;
+                    if !keep {
+                        filtered = filtered.saturating_add(1);
+                    }
+                    Ok(keep)
+                },
+                &mut |id, version, values| {
+                    accepted = accepted.saturating_add(1);
+                    let Some(value) = values.get(embedding_slot).and_then(Option::as_ref) else {
+                        return Ok(true);
+                    };
+                    let distance = spec.distance_value(value).map_err(backend_storage_error)?;
+                    let distance_values = [Some(ProjectedValueRef::Float(distance))];
+                    top.push_refs(keys, &distance_slot, id, version, &distance_values)
+                        .map_err(backend_storage_error)?;
+                    Ok(true)
+                },
+            )
+            .map_err(storage_engine_error)?;
+            ExecutionStatistics::streamed_pipeline(
+                scanned,
+                filtered,
+                accepted,
+                ExecutionStrategy::CollectionScan,
+            )
+        } else {
+            self.scan_projected_prefix_refs(
+                read.as_ref(),
+                &filter_prefix,
+                options,
+                &projected,
+                &mut |id, version, values| {
+                    let Some(value) = values.get(embedding_slot).and_then(Option::as_ref) else {
+                        return Ok(true);
+                    };
+                    let distance = spec
+                        .distance_projected(value)
+                        .map_err(EngineError::execution)?;
+                    let distance_values = [Some(ProjectedValueRef::Float(distance))];
+                    top.push_refs(keys, &distance_slot, id, version, &distance_values)
+                        .map_err(EngineError::execution)?;
+                    Ok(true)
+                },
+            )?
+        };
+
+        let winners = top
+            .into_sorted_winners(keys)
+            .map_err(EngineError::execution)?;
+        let mut hydrated = Vec::with_capacity(winners.len());
+        for winner in winners {
+            let Some(distance) = winner.value(0).cloned() else {
+                continue;
+            };
+            let locator = ProjectedRowLocator::new(*winner.id(), winner.version());
+            if let Some(mut row) = self.hydrate_projected_locator(
+                read.as_ref(),
+                prefix.source().collection(),
+                locator,
+                &projected,
+            )? {
+                let mut document = row.document().clone();
+                document.insert("_distance", distance);
+                row.replace_document(Arc::new(document), false);
+                hydrated.push(row);
+            }
+        }
+
+        let returned = hydrated.len() as u64;
+        Ok(Some((
+            hydrated,
+            ExecutionStatistics::streamed_with_strategies(
+                prefix_stats.scanned(),
+                prefix_stats
+                    .filtered()
+                    .saturating_add(prefix_stats.returned().saturating_sub(returned)),
+                returned,
+                ExecutionStrategies::default()
+                    .with(ExecutionStrategy::CollectionScan)
+                    .with(ExecutionStrategy::TopN),
+            ),
+        )))
     }
 
     /// Executes Top-N from the shared projected-value access vector and
@@ -2954,6 +3117,14 @@ impl Engine {
         match &physical.operators()[blocking_index] {
             PhysicalOperator::Sort { keys } if output_limit.is_some() => {
                 let limit = output_limit.expect("checked Top-N limit");
+                if let Some((rows, statistics)) =
+                    self.try_projected_near_top_n(&prefix, keys, limit)?
+                {
+                    for row in rows {
+                        visitor(row)?;
+                    }
+                    return Ok(Some(statistics));
+                }
                 if let Some((rows, statistics)) = self.try_projected_top_n(&prefix, keys, limit)? {
                     for row in rows {
                         visitor(row)?;

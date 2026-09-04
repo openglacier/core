@@ -398,6 +398,9 @@ impl Planner {
     ) -> PlanningResult<LogicalOperator> {
         match stage.name().as_str() {
             "where" => self.compile_where(location, stage),
+            "near" => self.compile_near(location, stage),
+            "root" => self.compile_root(location, stage),
+            "sample" => self.compile_sample(location, stage),
             "set" => self.compile_set(location, stage),
             "derive" => self.compile_derive(location, stage),
             "lookup" | "join" => self.compile_lookup(location, stage),
@@ -452,6 +455,47 @@ impl Planner {
         let arguments = self.required_arguments(location, stage)?;
         let predicate = self.parse_stage_expression(location, stage, arguments)?;
         Ok(LogicalOperator::filter(predicate))
+    }
+
+    fn compile_near(
+        &self,
+        location: StageLocation,
+        stage: &PlannerStage,
+    ) -> PlanningResult<LogicalOperator> {
+        self.require_simple(location, stage)?;
+        let arguments = self.required_arguments(location, stage)?;
+        let name = StageName::parse("near").expect("native stage name 'near' must always be valid");
+        Ok(LogicalOperator::custom(name, arguments, false))
+    }
+
+    fn compile_root(
+        &self,
+        location: StageLocation,
+        stage: &PlannerStage,
+    ) -> PlanningResult<LogicalOperator> {
+        self.require_simple(location, stage)?;
+        let arguments = self.required_arguments(location, stage)?;
+        parse_field_path(arguments)
+            .map_err(|message| self.invalid_syntax(location, stage, message))?;
+        Ok(LogicalOperator::custom(
+            StageName::parse("root").unwrap(),
+            arguments,
+            false,
+        ))
+    }
+
+    fn compile_sample(
+        &self,
+        location: StageLocation,
+        stage: &PlannerStage,
+    ) -> PlanningResult<LogicalOperator> {
+        self.require_simple(location, stage)?;
+        let count = self.parse_non_negative_integer(location, stage)?;
+        Ok(LogicalOperator::custom(
+            StageName::parse("sample").unwrap(),
+            count.to_string(),
+            false,
+        ))
     }
 
     fn compile_derive(
@@ -2368,6 +2412,33 @@ mod tests {
     #[test]
     fn plans_all_simple_native_stages() {
         assert!(plan_one("where", "age >= 18").has_filter());
+        let near = plan_one("near", "embedding, [1.0, 0.0]");
+        assert!(matches!(
+            near.operator(0),
+            Some(LogicalOperator::Custom {
+                stage,
+                arguments,
+                mutating: false,
+            }) if stage.as_str() == "near" && arguments.as_ref() == "embedding, [1.0, 0.0]"
+        ));
+        let root = plan_one("root", "payload");
+        assert!(matches!(
+            root.operator(0),
+            Some(LogicalOperator::Custom {
+                stage,
+                arguments,
+                mutating: false,
+            }) if stage.as_str() == "root" && arguments.as_ref() == "payload"
+        ));
+        let sample = plan_one("sample", "5");
+        assert!(matches!(
+            sample.operator(0),
+            Some(LogicalOperator::Custom {
+                stage,
+                arguments,
+                mutating: false,
+            }) if stage.as_str() == "sample" && arguments.as_ref() == "5"
+        ));
         assert!(plan_one("set", "enabled=true").has_set());
         assert!(plan_one("load", "profile").has_load());
         assert!(plan_one("limit", "10").has_limit());
@@ -3077,7 +3148,8 @@ mod tests {
     #[test]
     fn validates_native_stage_arguments() {
         for name in [
-            "where", "set", "load", "limit", "skip", "sort", "select", "insert", "group",
+            "where", "near", "root", "sample", "set", "load", "limit", "skip", "sort", "select",
+            "insert", "group",
         ] {
             let error = Planner::new()
                 .plan(&PlannerPipeline::new("users", [stage(name, "")]))
@@ -3104,6 +3176,8 @@ mod tests {
             ("limit", "-1"),
             ("limit", "1 2"),
             ("skip", "one"),
+            ("sample", "-1"),
+            ("sample", "one"),
             ("sort", "age sideways"),
             ("count", "total"),
             ("count", "as total extra"),

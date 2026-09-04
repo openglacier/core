@@ -941,7 +941,7 @@ impl PhysicalOperator {
                 NoOrder,
                 UnknownFields,
                 L,
-                Row,
+                if *changes_cardinality { Set } else { Row },
                 if *writes { W } else { R },
                 NoPv,
                 Materialize,
@@ -2378,6 +2378,22 @@ mod tests {
         assert!(!matches!(
             operator.execution_properties().flow,
             Flow::GovernedBlocking
+        ));
+    }
+
+    #[test]
+    fn cardinality_changing_custom_operator_is_set_level() {
+        let operator =
+            PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true)
+                .unwrap();
+
+        assert!(matches!(
+            operator.execution_properties().flow,
+            Flow::GovernedBlocking
+        ));
+        assert!(matches!(
+            operator.execution_properties().scope,
+            super::super::execution_properties::Scope::Set
         ));
     }
 

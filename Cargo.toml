@@ -1,6 +1,6 @@
 [package]
 name = "og-core"
-version = "0.70.2"
+version = "0.70.4"
 edition = "2021"
 description = "Event-first, schema-less document database kernel"
 license = "MIT"

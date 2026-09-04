@@ -144,9 +144,11 @@ Every stage has a single responsibility.
 |--------|---------|--------|-------|---------|
 | on | Select source collection | :white_check_mark: | :white_check_mark: | Alias : from |
 | where | Filter documents | :white_check_mark: | :white_check_mark: | |
+| near | Vector nearby lookup | :white_check_mark: | :white_check_mark: | |
 | derive | Compute new fields | :white_check_mark: | :white_check_mark: | |
 | join | Load related documents | :white_check_mark: | :white_check_mark: | Alias : lookup |
 | unwind | Expand arrays | :white_check_mark: | | |
+| root | Change root to specified field | :white_check_mark: | :white_check_mark: | |
 | group | Build groups | :white_check_mark: | | |
 | set | Update documents or chunks | :white_check_mark: | | |
 | insert | Create one or more documents | :white_check_mark: | | |
@@ -161,6 +163,7 @@ Every stage has a single responsibility.
 | skip | Skip documents | :white_check_mark: | | Alias : offset |
 | limit | Limit result size | :white_check_mark: | | |
 | first | Return first document | :white_check_mark: | | |
+| sample | Provide a random set of n document(s) | :white_check_mark: | :white_check_mark: | |
 | single | Return exactly one document | :white_check_mark: | | |
 | count | Count results | :white_check_mark: | | |
 | .collections | Show a list of collections | :white_check_mark: | | Option : stats for more infos |

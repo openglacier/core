@@ -1,5 +1,6 @@
 //! Physical query plan execution.
 
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp::Ordering, error::Error as StdError, fmt, io, mem::size_of, sync::Arc};
 
 use crate::{
@@ -2119,6 +2120,18 @@ fn execute_set_level_operator(
         }
 
         PhysicalOperator::Custom {
+            name, arguments, ..
+        } if name.as_str() == "sample" => {
+            let count = arguments.parse::<usize>().map_err(|_| {
+                ExecutionError::evaluation(format!("invalid sample size {arguments:?}"))
+            })?;
+            let removed = sample_rows(&mut state.rows, count);
+            if removed > 0 {
+                state.add_filtered(removed)?;
+            }
+        }
+
+        PhysicalOperator::Custom {
             name,
             arguments,
             writes,
@@ -2173,6 +2186,33 @@ fn execute_set_level_operator(
     }
 
     Ok(())
+}
+
+fn sample_rows(rows: &mut Vec<ExecutionRow>, count: usize) -> usize {
+    let original_len = rows.len();
+    let keep = count.min(original_len);
+    let mut random = sample_seed();
+
+    for index in 0..keep {
+        random = random
+            .wrapping_add(0x9e37_79b9_7f4a_7c15)
+            .rotate_left(27)
+            .wrapping_mul(0x94d0_49bb_1331_11eb);
+        let remaining = original_len - index;
+        let chosen = index + (random as usize % remaining);
+        rows.swap(index, chosen);
+    }
+
+    rows.truncate(keep);
+    original_len - keep
+}
+
+fn sample_seed() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    (nanos as u64) ^ ((nanos >> 64) as u64) ^ u64::from(std::process::id())
 }
 
 fn execute_distinct(
@@ -2411,6 +2451,11 @@ impl ProjectedTopNWinner {
     #[must_use]
     pub(crate) const fn version(&self) -> DocumentVersion {
         self.version
+    }
+
+    #[must_use]
+    pub(crate) fn value(&self, index: usize) -> Option<&Value> {
+        self.values.get(index).and_then(Option::as_ref)
     }
 }
 

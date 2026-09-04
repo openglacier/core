@@ -5313,13 +5313,14 @@ fn decode_cached_physical_projection( bytes: &[u8], header: PhysicalSetHeader, f
             profile.meta_ns = profile.meta_ns.saturating_add(elapsed_nanos(started));
         }
         let value_started = profile.as_ref().map(|_| Instant::now());
-        let (value, kind) = decode_projected_image_value_reusing_string(
+        let (value, decoded_kind) = decode_projected_image_value_reusing_string_known_kind(
             &bytes[start..end],
+            kind,
             &mut layout.string_cache[field_index],
         )?;
         values[field_index] = Some(value);
         if let Some(counters) = counters.as_deref_mut() {
-            counters.record(kind);
+            counters.record(decoded_kind);
         }
         if let (Some(started), Some(profile)) = (value_started, profile.as_deref_mut()) {
             profile.value_ns = profile.value_ns.saturating_add(elapsed_nanos(started));
@@ -5419,13 +5420,14 @@ fn decode_physical_projected_values_into( bytes: &[u8], header: PhysicalSetHeade
             }
             let start = payload_base + offset;
             let end = start + length;
-            let (value, kind) = decode_projected_image_value_reusing_string(
+            let (value, decoded_kind) = decode_projected_image_value_reusing_string_known_kind(
                 &bytes[start..end],
+                kind,
                 &mut layout.string_cache[field_index],
             )?;
             values[field_index] = Some(value);
             if let Some(counters) = counters.as_deref_mut() {
-                counters.record(kind);
+                counters.record(decoded_kind);
             }
             layout.entry_offsets[field_index] = Some(entry_start);
             decoded_fields = decoded_fields.saturating_add(1);
@@ -5446,6 +5448,30 @@ fn decode_physical_projected_values_into( bytes: &[u8], header: PhysicalSetHeade
     }
 
     Ok((decoded_fields, false))
+}
+
+fn decode_projected_image_value_ref_known_kind<'a>(
+    bytes: &'a [u8],
+    kind: u8,
+) -> StorageResult<(ProjectedValueRef<'a>, ProjectedValueKind)> {
+    // The physical field directory already tells us when the payload is an
+    // array/object. Avoid first traversing a large embedding as `IgnoredAny`
+    // only to deserialize the same payload again into the owned fallback.
+    if matches!(kind, 6 | 7) {
+        let value: ImageValue = rmp_serde::from_slice(bytes).map_err(|error| {
+            StorageError::backend(format!(
+                "cannot decode GlacierStorage projected complex field: {error}"
+            ))
+        })?;
+        if !matches!((&value, kind), (ImageValue::Array(_), 6) | (ImageValue::Object(_), 7)) {
+            return Err(StorageError::backend(
+                "GlacierStorage projected field kind does not match its payload",
+            ));
+        }
+        return image_to_value(value)
+            .map(|value| (ProjectedValueRef::Owned(value), ProjectedValueKind::Complex));
+    }
+    decode_projected_image_value_ref(bytes)
 }
 
 fn decode_projected_image_value_ref<'a>( bytes: &'a [u8], ) -> StorageResult<(ProjectedValueRef<'a>, ProjectedValueKind)> {
@@ -5534,7 +5560,8 @@ fn decode_cached_physical_projection_refs<'a>( bytes: &'a [u8], header: Physical
         }
         let start = payload_base + offset;
         let end = start + length;
-        let (value, kind) = decode_projected_image_value_ref(&bytes[start..end])?;
+        let (value, kind) =
+            decode_projected_image_value_ref_known_kind(&bytes[start..end], entry.kind)?;
         counters.record(kind);
         values[field_index] = Some(value);
         decoded_fields = decoded_fields.saturating_add(1);
@@ -5601,7 +5628,9 @@ fn decode_physical_projected_refs_into<'a>( bytes: &'a [u8], header: PhysicalSet
             }
             let start = payload_base + offset;
             let end = start + length;
-            let (value, kind) = decode_projected_image_value_ref(&bytes[start..end])?;
+            let field_kind = directory[entry_start + 2];
+            let (value, kind) =
+                decode_projected_image_value_ref_known_kind(&bytes[start..end], field_kind)?;
             counters.record(kind);
             values[field_index] = Some(value);
             layout.entry_offsets[field_index] = Some(entry_start);
@@ -8040,6 +8069,27 @@ fn value_to_image(value: &Value) -> ImageValue {
     }
 }
 
+fn decode_projected_image_value_reusing_string_known_kind(
+    bytes: &[u8],
+    kind: u8,
+    string_cache: &mut Option<Arc<str>>,
+) -> StorageResult<(Value, ProjectedValueKind)> {
+    if matches!(kind, 6 | 7) {
+        let value: ImageValue = rmp_serde::from_slice(bytes).map_err(|error| {
+            StorageError::backend(format!(
+                "cannot decode GlacierStorage projected complex field: {error}"
+            ))
+        })?;
+        if !matches!((&value, kind), (ImageValue::Array(_), 6) | (ImageValue::Object(_), 7)) {
+            return Err(StorageError::backend(
+                "GlacierStorage projected field kind does not match its payload",
+            ));
+        }
+        return image_to_value(value).map(|value| (value, ProjectedValueKind::Complex));
+    }
+    decode_projected_image_value_reusing_string(bytes, string_cache)
+}
+
 fn decode_projected_image_value_reusing_string( bytes: &[u8], string_cache: &mut Option<Arc<str>>, ) -> StorageResult<(Value, ProjectedValueKind)> {
     let value: BorrowedProjectedImageValue<'_> = rmp_serde::from_slice(bytes).map_err(|error| {
         StorageError::backend(format!(
@@ -8165,6 +8215,7 @@ mod tests {
     }
 
     #[test] fn projected_scalar_string_reuses_owned_arc() { let bytes = rmp_serde::to_vec(&ImageValue::String("12-2025".to_owned())).unwrap(); let mut cache = None; let (first, first_kind) = decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap(); let (second, second_kind) = decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap(); let (Value::String(first), Value::String(second)) = (first, second) else { panic!("projected scalar decoder did not return strings"); }; assert!(matches!(first_kind, ProjectedValueKind::StringMiss)); assert!(matches!(second_kind, ProjectedValueKind::StringHit)); assert!(Arc::ptr_eq(&first, &second)); }
+    #[test] fn projected_known_array_kind_uses_complex_decoder() { let bytes = rmp_serde::to_vec(&ImageValue::Array(vec![ImageValue::Float(1.0), ImageValue::Float(2.0)])).unwrap(); let (borrowed, borrowed_kind) = decode_projected_image_value_ref_known_kind(&bytes, 6).unwrap(); assert!(matches!(borrowed_kind, ProjectedValueKind::Complex)); assert!(matches!(borrowed, ProjectedValueRef::Owned(Value::Array(_)))); let mut cache = None; let (owned, owned_kind) = decode_projected_image_value_reusing_string_known_kind(&bytes, 6, &mut cache).unwrap(); assert!(matches!(owned_kind, ProjectedValueKind::Complex)); assert!(matches!(owned, Value::Array(_))); }
     #[test] fn creates_and_reopens_page_backed_store() { let path = temp_path("create"); let first = GlacierBackend::open(&path).unwrap(); assert_eq!(first.format_info().version(), 5); let second = GlacierBackend::open(&path).unwrap(); assert_eq!( second.format_info().store_id(), first.format_info().store_id() ); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn crud_persists_without_memory_documents() { let path = temp_path("crud"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id.clone(), Arc::new(doc))], ) .unwrap(); assert_eq!(storage.document_count().unwrap(), 1); } { let storage = GlacierBackend::open(&path).unwrap(); let read = storage.read().unwrap(); let stored = read.get(&users, &id).unwrap().unwrap(); assert_eq!(stored.document().get("name"), Some(&Value::string("Alice"))); assert_eq!(read.count(&users).unwrap(), 1); } let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn snapshot_remains_generation_stable() { let path = temp_path("snapshot"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let id1 = UuidV7Generator::new().next_id(); let id2 = UuidV7Generator::new().next_id(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id1, Arc::new(Document::new()))], ) .unwrap(); let snapshot = storage.read().unwrap(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id2, Arc::new(Document::new()))], ) .unwrap(); assert_eq!(snapshot.count(&users).unwrap(), 1); assert_eq!(storage.read().unwrap().count(&users).unwrap(), 2); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }

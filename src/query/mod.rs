@@ -116,7 +116,7 @@ pub use projected_values::{
 
 mod runtime_materializer;
 
-pub(crate) use runtime_materializer::group_field_layout;
+pub(crate) use runtime_materializer::{group_field_layout, NearSpec};
 pub use runtime_materializer::{QueryRuntimeMaterializationExt, RuntimeMaterializer};
 
 mod evaluator;

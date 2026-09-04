@@ -13,7 +13,10 @@ use crate::{
     model::Document,
     model::Number,
     model::Value,
-    storage::{CollectionId, DocumentId, StorageRead, UuidV7Generator, VersionPrecondition},
+    storage::{
+        CollectionId, DocumentId, ProjectedValueRef, StorageRead, UuidV7Generator,
+        VersionPrecondition,
+    },
     ValueCapabilities,
 };
 
@@ -24,6 +27,113 @@ use super::{
     PivotSpecification, PivotValue, QueryRuntime, SortDirection, SortKey, StreamingLoadMutation,
     SyntheticDocument, UnaryOperator,
 };
+
+/// Parsed native `near` stage shared by the document fallback and projected Top-N path.
+#[derive(Clone, Debug)]
+pub(crate) struct NearSpec {
+    field: ExpressionFieldPath,
+    query: Arc<[f64]>,
+    query_norm: f64,
+}
+
+impl NearSpec {
+    pub(crate) fn parse(arguments: &str) -> ExecutionResult<Self> {
+        let (field, vector) = arguments
+            .split_once(',')
+            .ok_or_else(|| ExecutionError::evaluation("near expects <field>, <vector>"))?;
+        let field = ExpressionFieldPath::new(field.trim().split('.'))
+            .map_err(|error| ExecutionError::evaluation(error.to_string()))?;
+        let query = serde_json::from_str::<Vec<f64>>(vector.trim())
+            .map_err(|error| ExecutionError::evaluation(format!("invalid near vector: {error}")))?;
+        if query.is_empty() {
+            return Err(ExecutionError::evaluation("near vector must not be empty"));
+        }
+        let query_norm = query.iter().map(|value| *value * *value).sum::<f64>();
+        if !query_norm.is_finite() {
+            return Err(ExecutionError::evaluation(
+                "near vector norm must be finite",
+            ));
+        }
+        Ok(Self {
+            field,
+            query: Arc::from(query),
+            query_norm,
+        })
+    }
+
+    #[must_use]
+    pub(crate) const fn field(&self) -> &ExpressionFieldPath {
+        &self.field
+    }
+
+    pub(crate) fn distance_value(&self, value: &Value) -> ExecutionResult<f64> {
+        let values = value.as_array().ok_or_else(|| {
+            ExecutionError::evaluation(format!(
+                "near field {} must be an array of numbers",
+                self.field
+            ))
+        })?;
+        self.distance_values(values)
+    }
+
+    pub(crate) fn distance_projected(&self, value: &ProjectedValueRef<'_>) -> ExecutionResult<f64> {
+        match value {
+            ProjectedValueRef::Owned(value) => self.distance_value(value),
+            _ => Err(ExecutionError::evaluation(format!(
+                "near field {} must be an array of numbers",
+                self.field
+            ))),
+        }
+    }
+
+    fn distance_values(&self, values: &[Value]) -> ExecutionResult<f64> {
+        if values.len() != self.query.len() {
+            return Err(ExecutionError::evaluation(format!(
+                "near dimension mismatch for {}: document has {}, query has {}",
+                self.field,
+                values.len(),
+                self.query.len()
+            )));
+        }
+
+        let mut dot = 0.0_f64;
+        let mut document_norm = 0.0_f64;
+        for (value, query_value) in values.iter().zip(self.query.iter()) {
+            let number = value.as_number().ok_or_else(|| {
+                ExecutionError::evaluation(format!(
+                    "near field {} must contain only numbers",
+                    self.field
+                ))
+            })?;
+            let value = match *number {
+                Number::Signed(value) => value as f64,
+                Number::Unsigned(value) => value as f64,
+                Number::Float(value) => value,
+            };
+            dot += value * *query_value;
+            document_norm += value * value;
+        }
+        if document_norm == 0.0 || self.query_norm == 0.0 {
+            return Err(ExecutionError::evaluation(
+                "near cosine distance requires non-zero vectors",
+            ));
+        }
+        if !dot.is_finite() || !document_norm.is_finite() {
+            return Err(ExecutionError::evaluation(
+                "near cosine distance overflowed",
+            ));
+        }
+
+        let similarity = (dot / (document_norm.sqrt() * self.query_norm.sqrt())).clamp(-1.0, 1.0);
+        let distance = 1.0 - similarity;
+        if !distance.is_finite() {
+            return Err(ExecutionError::evaluation(
+                "near cosine distance is not finite",
+            ));
+        }
+        Ok(distance)
+    }
+}
 
 /// Materializes lookup arrays and pivot result documents for the default daemon.
 #[derive(Clone, Copy, Debug, Default)]
@@ -290,10 +400,50 @@ impl RuntimeMaterializer {
             "rename" => self.materialize_rename(arguments, document),
             "drop" => self.materialize_drop(arguments, document),
             "derive" => self.materialize_derive(arguments, document),
+            "near" => self.materialize_near(arguments, document),
+            "root" => self.materialize_root(arguments, document),
             "first" | "single" => self.materialize_scalar_projection(arguments, document),
             "unwind" => self.materialize_unwind(arguments, document),
             _ => Ok(CustomOperatorResult::Keep),
         }
+    }
+
+    fn materialize_near(
+        &self,
+        arguments: &str,
+        document: &Document,
+    ) -> ExecutionResult<CustomOperatorResult> {
+        let spec = NearSpec::parse(arguments)?;
+        let Some(value) = path_value(document, spec.field()) else {
+            return Ok(CustomOperatorResult::Discard);
+        };
+        let distance = spec.distance_value(value)?;
+        let mut result = document.clone();
+        result.insert(
+            "_distance",
+            Value::float(distance).map_err(|error| {
+                ExecutionError::evaluation(format!("invalid near distance: {error}"))
+            })?,
+        );
+        Ok(CustomOperatorResult::Replace(Arc::new(result)))
+    }
+
+    fn materialize_root(
+        &self,
+        arguments: &str,
+        document: &Document,
+    ) -> ExecutionResult<CustomOperatorResult> {
+        let path = ExpressionFieldPath::new(arguments.trim().split('.'))
+            .map_err(|error| ExecutionError::evaluation(error.to_string()))?;
+        let value = path_value(document, &path).ok_or_else(|| {
+            ExecutionError::evaluation(format!("root field {arguments:?} is missing"))
+        })?;
+        let Value::Object(root) = value else {
+            return Err(ExecutionError::evaluation(format!(
+                "root field {arguments:?} must be an object"
+            )));
+        };
+        Ok(CustomOperatorResult::Replace(Arc::clone(root)))
     }
 
     fn materialize_scalar_projection(
@@ -2118,6 +2268,84 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("division by zero in derive"));
+    }
+
+    #[test]
+    fn root_replaces_with_nested_object() {
+        let mut nested = Document::new();
+        nested.insert("answer", Value::unsigned(42));
+        let mut wrapper = Document::new();
+        wrapper.insert("nested", Value::object(nested));
+        let mut document = Document::new();
+        document.insert("payload", Value::object(wrapper));
+
+        let result = RuntimeMaterializer::new()
+            .materialize_custom("root", "payload.nested", &document)
+            .unwrap();
+
+        let CustomOperatorResult::Replace(result) = result else {
+            panic!("root should replace the result document");
+        };
+        assert_eq!(result.get("answer"), Some(&Value::unsigned(42)));
+    }
+
+    #[test]
+    fn root_rejects_missing_or_non_object_fields() {
+        let materializer = RuntimeMaterializer::new();
+        let missing = materializer
+            .materialize_custom("root", "payload", &Document::new())
+            .unwrap_err();
+        assert!(missing.to_string().contains("is missing"));
+
+        let mut document = Document::new();
+        document.insert("payload", "not an object");
+        let scalar = materializer
+            .materialize_custom("root", "payload", &document)
+            .unwrap_err();
+        assert!(scalar.to_string().contains("must be an object"));
+    }
+
+    #[test]
+    fn near_adds_cosine_distance_without_mutating_the_source_document() {
+        let mut document = Document::new();
+        document.insert(
+            "embedding",
+            Value::array([Value::float(1.0).unwrap(), Value::float(0.0).unwrap()]),
+        );
+
+        let result = RuntimeMaterializer::new()
+            .materialize_custom("near", "embedding, [1.0, 0.0]", &document)
+            .unwrap();
+
+        let CustomOperatorResult::Replace(result) = result else {
+            panic!("near should replace the result document");
+        };
+        assert_eq!(result.get("_distance"), Some(&Value::float(0.0).unwrap()));
+        assert_eq!(document.get("_distance"), None);
+    }
+
+    #[test]
+    fn near_discards_documents_without_the_vector_field() {
+        let result = RuntimeMaterializer::new()
+            .materialize_custom("near", "embedding, [1.0, 0.0]", &Document::new())
+            .unwrap();
+
+        assert!(matches!(result, CustomOperatorResult::Discard));
+    }
+
+    #[test]
+    fn near_rejects_dimension_mismatches() {
+        let mut document = Document::new();
+        document.insert(
+            "embedding",
+            Value::array([Value::float(1.0).unwrap(), Value::float(0.0).unwrap()]),
+        );
+
+        let error = RuntimeMaterializer::new()
+            .materialize_custom("near", "embedding, [1.0]", &document)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("near dimension mismatch"));
     }
 
     #[test]
