@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Local filesystem synchronization model.
 //!
 //! Sync is a device-local materialization of existing app-scoped Files trees.
@@ -336,52 +337,11 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn selections_are_stable_and_id_based() {
-        let mut config = FileSyncConfig::new(PathBuf::from("OpenGlacier"));
-        config.set_selection(
-            "place-1",
-            "files-main",
-            FileSyncSelectionMode::Selected,
-            vec!["folder-b".into(), "folder-a".into(), "folder-a".into()],
-        );
-        let selection = config
-            .selection("place-1", "files-main")
-            .expect("selection");
-        assert_eq!(selection.mode, FileSyncSelectionMode::Selected);
-        assert_eq!(selection.folder_ids, ["folder-a", "folder-b"]);
-    }
+    #[test] fn selections_are_stable_and_id_based() { let mut config = FileSyncConfig::new(PathBuf::from("OpenGlacier")); config.set_selection( "place-1", "files-main", FileSyncSelectionMode::Selected, vec!["folder-b".into(), "folder-a".into(), "folder-a".into()], ); let selection = config .selection("place-1", "files-main") .expect("selection"); assert_eq!(selection.mode, FileSyncSelectionMode::Selected); assert_eq!(selection.folder_ids, ["folder-a", "folder-b"]); }
 
-    #[test]
-    fn all_selection_does_not_persist_redundant_folder_ids() {
-        let mut config = FileSyncConfig::new(PathBuf::from("OpenGlacier"));
-        config.set_selection(
-            "place-1",
-            "files-main",
-            FileSyncSelectionMode::All,
-            vec!["folder-a".into()],
-        );
-        let selection = config
-            .selection("place-1", "files-main")
-            .expect("selection");
-        assert_eq!(selection.mode, FileSyncSelectionMode::All);
-        assert!(selection.folder_ids.is_empty());
-    }
+    #[test] fn all_selection_does_not_persist_redundant_folder_ids() { let mut config = FileSyncConfig::new(PathBuf::from("OpenGlacier")); config.set_selection( "place-1", "files-main", FileSyncSelectionMode::All, vec!["folder-a".into()], ); let selection = config .selection("place-1", "files-main") .expect("selection"); assert_eq!(selection.mode, FileSyncSelectionMode::All); assert!(selection.folder_ids.is_empty()); }
 
-    #[test]
-    fn reserved_projection_names_are_explicit() {
-        assert_eq!(APP_FILES_DIRECTORY, "Apps");
-        assert_eq!(PRIMARY_APPS_COLLISION_NAME, "Apps (Files)");
-    }
+    #[test] fn reserved_projection_names_are_explicit() { assert_eq!(APP_FILES_DIRECTORY, "Apps"); assert_eq!(PRIMARY_APPS_COLLISION_NAME, "Apps (Files)"); }
 
-    #[test]
-    fn projection_components_are_portable() {
-        assert_eq!(
-            file_sync_projection_component(" Maison ", "Place"),
-            "Maison"
-        );
-        assert_eq!(file_sync_projection_component("A/B:C*", "Place"), "A_B_C_");
-        assert_eq!(file_sync_projection_component("CON", "Place"), "CON_");
-        assert_eq!(file_sync_projection_component("..", "Place"), "Place");
-    }
+    #[test] fn projection_components_are_portable() { assert_eq!( file_sync_projection_component(" Maison ", "Place"), "Maison" ); assert_eq!(file_sync_projection_component("A/B:C*", "Place"), "A_B_C_"); assert_eq!(file_sync_projection_component("CON", "Place"), "CON_"); assert_eq!(file_sync_projection_component("..", "Place"), "Place"); }
 }

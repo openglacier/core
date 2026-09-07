@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Generic non-streaming operation response.
 
 use serde::{Deserialize, Serialize};
@@ -33,13 +34,5 @@ impl OperationResponse {
 mod tests {
     use super::*;
 
-    #[test]
-    fn operation_response_uses_the_common_response_kind() {
-        let response = OperationResponse::new(1, serde_json::json!({"ok": true}));
-        let bytes = rmp_serde::to_vec_named(&response).unwrap();
-        let value: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
-        assert_eq!(value["kind"], "response");
-        assert_eq!(value["status"], "ok");
-        assert_eq!(value["id"], 1);
-    }
+    #[test] fn operation_response_uses_the_common_response_kind() { let response = OperationResponse::new(1, serde_json::json!({"ok": true})); let bytes = rmp_serde::to_vec_named(&response).unwrap(); let value: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap(); assert_eq!(value["kind"], "response"); assert_eq!(value["status"], "ok"); assert_eq!(value["id"], 1); }
 }

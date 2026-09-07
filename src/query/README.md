@@ -155,7 +155,7 @@ Every stage has a single responsibility.
 | load | Load documents or chunks | :white_check_mark: | | working but slow |
 | pivot | Pivot data | :white_check_mark: | | Expect rows, columns, values and aggregate function |
 | aggregate | Compute aggregates | not working | | |
-| select | Project fields | :white_check_mark: | | |
+| select | Project fields | :white_check_mark: | | Alias : project |
 | rename | Rename fields | :white_check_mark: | | |
 | drop | Remove fields | :white_check_mark: | | |
 | distinct | Remove duplicates | :white_check_mark: | | |

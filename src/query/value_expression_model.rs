@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Value expression model types.
 
 use std::sync::Arc;
@@ -258,74 +259,11 @@ mod tests {
     use super::*;
     use crate::query::parse_expression;
 
-    #[test]
-    fn equality_predicate_filters_values() {
-        let evaluator = value_expression_model().unwrap().into_evaluator();
-        let expression = parse_expression("a == 2").unwrap();
+    #[test] fn equality_predicate_filters_values() { let evaluator = value_expression_model().unwrap().into_evaluator(); let expression = parse_expression("a == 2").unwrap(); let mut matching = Document::new(); matching.insert("a", Value::signed(2)); let mut different = Document::new(); different.insert("a", Value::signed(3)); assert!(evaluator .evaluate_predicate(&expression, &matching) .unwrap()); assert!(!evaluator .evaluate_predicate(&expression, &different) .unwrap()); }
 
-        let mut matching = Document::new();
-        matching.insert("a", Value::signed(2));
-        let mut different = Document::new();
-        different.insert("a", Value::signed(3));
+    #[test] fn nested_field_predicate_is_resolved() { let evaluator = value_expression_model().unwrap().into_evaluator(); let expression = parse_expression("user.age >= 18").unwrap(); let mut user = Document::new(); user.insert("age", Value::signed(20)); let mut document = Document::new(); document.insert("user", Value::object(user)); assert!(evaluator .evaluate_predicate(&expression, &document) .unwrap()); }
 
-        assert!(evaluator
-            .evaluate_predicate(&expression, &matching)
-            .unwrap());
-        assert!(!evaluator
-            .evaluate_predicate(&expression, &different)
-            .unwrap());
-    }
+    #[test] fn resolved_predicate_uses_native_semantics_without_document_materialization() { struct Resolver; impl super::super::ExpressionFieldResolver<Value> for Resolver { fn resolve_field( &self, field: &super::super::ExpressionFieldPath, ) -> SemanticValue<Value> { match field.to_string().as_str() { "a" => SemanticValue::Present(Value::signed(2)), "b" => SemanticValue::Present(Value::signed(3)), _ => SemanticValue::Missing, } } } let runtime = value_expression_runtime().unwrap(); let expression = parse_expression("a == 2 and b > 1").unwrap(); assert!(super::super::ExecutionRuntime::evaluate_resolved_predicate( &runtime, &expression, &Resolver, ) .unwrap()); }
 
-    #[test]
-    fn nested_field_predicate_is_resolved() {
-        let evaluator = value_expression_model().unwrap().into_evaluator();
-        let expression = parse_expression("user.age >= 18").unwrap();
-        let mut user = Document::new();
-        user.insert("age", Value::signed(20));
-        let mut document = Document::new();
-        document.insert("user", Value::object(user));
-
-        assert!(evaluator
-            .evaluate_predicate(&expression, &document)
-            .unwrap());
-    }
-
-    #[test]
-    fn resolved_predicate_uses_native_semantics_without_document_materialization() {
-        struct Resolver;
-
-        impl super::super::ExpressionFieldResolver<Value> for Resolver {
-            fn resolve_field(
-                &self,
-                field: &super::super::ExpressionFieldPath,
-            ) -> SemanticValue<Value> {
-                match field.to_string().as_str() {
-                    "a" => SemanticValue::Present(Value::signed(2)),
-                    "b" => SemanticValue::Present(Value::signed(3)),
-                    _ => SemanticValue::Missing,
-                }
-            }
-        }
-
-        let runtime = value_expression_runtime().unwrap();
-        let expression = parse_expression("a == 2 and b > 1").unwrap();
-        assert!(super::super::ExecutionRuntime::evaluate_resolved_predicate(
-            &runtime,
-            &expression,
-            &Resolver,
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn non_boolean_predicate_is_rejected() {
-        let evaluator = value_expression_model().unwrap().into_evaluator();
-        let expression = parse_expression("a").unwrap();
-        let mut document = Document::new();
-        document.insert("a", Value::signed(2));
-
-        assert!(evaluator
-            .evaluate_predicate(&expression, &document)
-            .is_err());
-    }
+    #[test] fn non_boolean_predicate_is_rejected() { let evaluator = value_expression_model().unwrap().into_evaluator(); let expression = parse_expression("a").unwrap(); let mut document = Document::new(); document.insert("a", Value::signed(2)); assert!(evaluator .evaluate_predicate(&expression, &document) .is_err()); }
 }

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Lightweight developer diagnostics controlled by `OGD_DEBUG`.
 
 use std::{
@@ -221,21 +222,7 @@ fn is_secret_key(key: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn topics_have_stable_names() {
-        assert_eq!(DebugTopic::Auth.as_str(), "auth");
-        assert_eq!(DebugTopic::Events.as_str(), "events");
-    }
+    #[test] fn topics_have_stable_names() { assert_eq!(DebugTopic::Auth.as_str(), "auth"); assert_eq!(DebugTopic::Events.as_str(), "events"); }
 
-    #[test]
-    fn redaction_hides_nested_secrets() {
-        let value = serde_json::json!({
-            "data": {"signature": "secret", "identityId": "alice"},
-            "token": "bootstrap"
-        });
-        let redacted = redact_json(value);
-        assert_eq!(redacted["data"]["signature"], "<redacted>");
-        assert_eq!(redacted["token"], "<redacted>");
-        assert_eq!(redacted["data"]["identityId"], "alice");
-    }
+    #[test] fn redaction_hides_nested_secrets() { let value = serde_json::json!({ "data": {"signature": "secret", "identityId": "alice"}, "token": "bootstrap" }); let redacted = redact_json(value); assert_eq!(redacted["data"]["signature"], "<redacted>"); assert_eq!(redacted["token"], "<redacted>"); assert_eq!(redacted["data"]["identityId"], "alice"); }
 }

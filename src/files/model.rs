@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! App-scoped file metadata persisted in `_files`.
 
 use std::{error::Error as StdError, fmt};
@@ -261,32 +262,5 @@ fn optional_u64(document: &Document, field: &'static str) -> Result<Option<u64>,
 mod tests {
     use super::*;
 
-    #[test]
-    fn file_entry_round_trips_through_app_scoped_document() {
-        let entry = FileEntry {
-            file_id: FileId::from("file-1"),
-            store_id: StoreId::from("native-main"),
-            remote_id: "opaque/provider/id".to_owned(),
-            parent_id: Some(FileId::from("parent-1")),
-            name: "report.pdf".to_owned(),
-            kind: FileKind::File,
-            metadata: FileMetadata {
-                size: Some(42),
-                content_type: Some("application/pdf".to_owned()),
-                etag: Some("etag-1".to_owned()),
-                created_at: Some(10),
-                modified_at: Some(20),
-            },
-            place_id: "place-a".to_owned(),
-            app_instance_id: "files-main".to_owned(),
-        };
-
-        let document = entry.to_document();
-        assert_eq!(document.get("_place"), Some(&Value::from("place-a")));
-        assert_eq!(
-            document.get("_app_instance"),
-            Some(&Value::from("files-main"))
-        );
-        assert_eq!(FileEntry::from_document(&document), Ok(entry));
-    }
+    #[test] fn file_entry_round_trips_through_app_scoped_document() { let entry = FileEntry { file_id: FileId::from("file-1"), store_id: StoreId::from("native-main"), remote_id: "opaque/provider/id".to_owned(), parent_id: Some(FileId::from("parent-1")), name: "report.pdf".to_owned(), kind: FileKind::File, metadata: FileMetadata { size: Some(42), content_type: Some("application/pdf".to_owned()), etag: Some("etag-1".to_owned()), created_at: Some(10), modified_at: Some(20), }, place_id: "place-a".to_owned(), app_instance_id: "files-main".to_owned(), }; let document = entry.to_document(); assert_eq!(document.get("_place"), Some(&Value::from("place-a"))); assert_eq!( document.get("_app_instance"), Some(&Value::from("files-main")) ); assert_eq!(FileEntry::from_document(&document), Ok(entry)); }
 }

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Physical query plan representation.
 
 use std::{error::Error as StdError, fmt, sync::Arc};
@@ -1933,120 +1934,17 @@ fn summarize_execution(
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    fn negotiates_projected_values_for_filter_group_source_prefix() {
-        let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap();
-        let field = ExpressionFieldPath::new(["x"]).unwrap();
-        let operators = vec![
-            PhysicalOperator::Filter { predicate },
-            PhysicalOperator::Group {
-                keys: Arc::from([field]),
-            },
-        ];
-        assert_eq!(
-            negotiate_source_access_vector(&operators),
-            (AccessVector::ProjectedValues, 1)
-        );
-    }
+    #[test] fn negotiates_projected_values_for_filter_group_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Group { keys: Arc::from([field]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
 
-    #[test]
-    fn negotiates_projected_values_for_filter_sort_source_prefix() {
-        let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap();
-        let field = ExpressionFieldPath::new(["score"]).unwrap();
-        let operators = vec![
-            PhysicalOperator::Filter { predicate },
-            PhysicalOperator::Sort {
-                keys: Arc::from([SortKey::ascending(field)]),
-            },
-        ];
-        assert_eq!(
-            negotiate_source_access_vector(&operators),
-            (AccessVector::ProjectedValues, 1)
-        );
-    }
+    #[test] fn negotiates_projected_values_for_filter_sort_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["score"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field)]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
 
-    #[test]
-    fn explicit_distinct_negotiates_projected_values_but_document_distinct_does_not() {
-        let field = ExpressionFieldPath::new(["name"]).unwrap();
-        assert_eq!(
-            negotiate_source_access_vector(&[PhysicalOperator::Distinct {
-                fields: Arc::from([field]),
-            }]),
-            (AccessVector::ProjectedValues, 0)
-        );
-        assert_eq!(
-            negotiate_source_access_vector(&[PhysicalOperator::Distinct {
-                fields: Arc::from([]),
-            }]),
-            (AccessVector::Document, 0)
-        );
-    }
+    #[test] fn explicit_distinct_negotiates_projected_values_but_document_distinct_does_not() { let field = ExpressionFieldPath::new(["name"]).unwrap(); assert_eq!( negotiate_source_access_vector(&[PhysicalOperator::Distinct { fields: Arc::from([field]), }]), (AccessVector::ProjectedValues, 0) ); assert_eq!( negotiate_source_access_vector(&[PhysicalOperator::Distinct { fields: Arc::from([]), }]), (AccessVector::Document, 0) ); }
 
-    #[test]
-    fn reusable_projection_is_negotiated_from_stage_properties() {
-        let predicate = crate::query::parse_expression(r#"active == true"#).unwrap();
-        let field = ExpressionFieldPath::new(["score"]).unwrap();
-        let operators = vec![
-            PhysicalOperator::Filter { predicate },
-            PhysicalOperator::Sort {
-                keys: Arc::from([SortKey::ascending(field)]),
-            },
-        ];
-        assert_eq!(
-            negotiate_source_projection_reuse(&operators),
-            ProjectionReuse::Reusable
-        );
-        assert!(operators
-            .iter()
-            .all(|operator| operator.execution_properties().defers_materialization()));
-        assert!(operators
-            .iter()
-            .all(|operator| operator.execution_properties().reuses_projection()));
-    }
+    #[test] fn reusable_projection_is_negotiated_from_stage_properties() { let predicate = crate::query::parse_expression(r#"active == true"#).unwrap(); let field = ExpressionFieldPath::new(["score"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field)]), }, ]; assert_eq!( negotiate_source_projection_reuse(&operators), ProjectionReuse::Reusable ); assert!(operators .iter() .all(|operator| operator.execution_properties().defers_materialization())); assert!(operators .iter() .all(|operator| operator.execution_properties().reuses_projection())); }
 
-    #[test]
-    fn materializing_or_unsupported_stage_blocks_projection_reuse() {
-        let field = ExpressionFieldPath::new(["score"]).unwrap();
-        let with_skip = vec![
-            PhysicalOperator::Skip { count: 1 },
-            PhysicalOperator::Sort {
-                keys: Arc::from([SortKey::ascending(field.clone())]),
-            },
-        ];
-        assert_eq!(
-            negotiate_source_projection_reuse(&with_skip),
-            ProjectionReuse::None
-        );
+    #[test] fn materializing_or_unsupported_stage_blocks_projection_reuse() { let field = ExpressionFieldPath::new(["score"]).unwrap(); let with_skip = vec![ PhysicalOperator::Skip { count: 1 }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field.clone())]), }, ]; assert_eq!( negotiate_source_projection_reuse(&with_skip), ProjectionReuse::None ); let document_distinct = [PhysicalOperator::Distinct { fields: Arc::from([]), }]; assert_eq!( negotiate_source_projection_reuse(&document_distinct), ProjectionReuse::None ); assert!(!document_distinct[0] .execution_properties() .defers_materialization()); assert!(!document_distinct[0] .execution_properties() .reuses_projection()); }
 
-        let document_distinct = [PhysicalOperator::Distinct {
-            fields: Arc::from([]),
-        }];
-        assert_eq!(
-            negotiate_source_projection_reuse(&document_distinct),
-            ProjectionReuse::None
-        );
-        assert!(!document_distinct[0]
-            .execution_properties()
-            .defers_materialization());
-        assert!(!document_distinct[0]
-            .execution_properties()
-            .reuses_projection());
-    }
-
-    #[test]
-    fn incompatible_source_stage_forces_document_vector() {
-        let field = ExpressionFieldPath::new(["x"]).unwrap();
-        let operators = vec![
-            PhysicalOperator::Skip { count: 1 },
-            PhysicalOperator::Group {
-                keys: Arc::from([field]),
-            },
-        ];
-        assert_eq!(
-            negotiate_source_access_vector(&operators),
-            (AccessVector::Document, 0)
-        );
-    }
+    #[test] fn incompatible_source_stage_forces_document_vector() { let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Skip { count: 1 }, PhysicalOperator::Group { keys: Arc::from([field]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::Document, 0) ); }
 
     use super::*;
 
@@ -2094,346 +1992,39 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn source_defaults_to_forward_collection_scan() {
-        let collection = CollectionId::parse("users").unwrap();
-        let source = PhysicalSource::collection_scan(collection.clone());
+    #[test] fn source_defaults_to_forward_collection_scan() { let collection = CollectionId::parse("users").unwrap(); let source = PhysicalSource::collection_scan(collection.clone()); assert_eq!(source.collection(), &collection); assert_eq!(source.access().scan_options(), Some(ScanOptions::default())); }
 
-        assert_eq!(source.collection(), &collection);
-        assert_eq!(source.access().scan_options(), Some(ScanOptions::default()));
-    }
+    #[test] fn planner_applies_scan_direction() { let planner = PhysicalPlanner::with_options( PhysicalPlannerOptions::new().with_scan_direction(ScanDirection::Reverse), ); let plan = planner .plan_collection(CollectionId::parse("users").unwrap()) .finish() .unwrap(); assert_eq!( plan.source().access().scan_options().unwrap().direction(), ScanDirection::Reverse, ); }
 
-    #[test]
-    fn planner_applies_scan_direction() {
-        let planner = PhysicalPlanner::with_options(
-            PhysicalPlannerOptions::new().with_scan_direction(ScanDirection::Reverse),
-        );
+    #[test] fn supports_complete_read_pipeline() { let mut builder = PhysicalPlan::builder(source()); builder .filter(parse_expression("active == true").unwrap()) .unwrap() .sort([ SortKey::new(field(&["age"]), SortDirection::Descending), SortKey::new(field(&["name"]), SortDirection::Ascending), ]) .unwrap() .skip(10) .unwrap() .limit(20) .unwrap() .select([field(&["name"]), field(&["age"])]) .unwrap() .distinct([field(&["name"])]) .unwrap(); let plan = builder.finish().unwrap(); assert_eq!(plan.len(), 6); assert!(!plan.is_write()); assert!(plan.changes_cardinality()); assert_eq!(plan.mode(), ExecutionMode::ReadOnly); }
 
-        let plan = planner
-            .plan_collection(CollectionId::parse("users").unwrap())
-            .finish()
-            .unwrap();
+    #[test] fn load_requires_a_transaction_and_is_terminal() { let mut builder = PhysicalPlan::builder(source()); builder.load("profile").unwrap(); let error = builder.limit(1).unwrap_err(); assert!(matches!( error.kind(), PhysicalPlanErrorKind::OperatorAfterTerminal { .. } )); let plan = builder.finish().unwrap(); assert!(plan.is_write()); assert_eq!( plan.required_storage_access(), StorageAccessMode::Transaction ); }
 
-        assert_eq!(
-            plan.source().access().scan_options().unwrap().direction(),
-            ScanDirection::Reverse,
-        );
-    }
+    #[test] fn insert_preserves_typed_document() { let document = insert_document(); let operator = PhysicalOperator::insert(document.clone()); assert_eq!(operator.kind(), PhysicalOperatorKind::Insert); assert_eq!(operator.insert_document(), Some(&document)); assert!(operator.execution_properties().writes()); assert!(!matches!( operator.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(operator.execution_properties().closes_linear_pipeline()); }
 
-    #[test]
-    fn supports_complete_read_pipeline() {
-        let mut builder = PhysicalPlan::builder(source());
+    #[test] fn insert_requires_transaction_and_must_be_alone() { let mut builder = PhysicalPlan::builder(source()); builder.insert(insert_document()).unwrap(); let plan = builder.finish().unwrap(); assert!(plan.is_write()); assert_eq!( plan.required_storage_access(), StorageAccessMode::Transaction ); let mut invalid = PhysicalPlan::builder(source()); invalid .filter(parse_expression("active == true").unwrap()) .unwrap(); assert!(matches!( invalid.insert(insert_document()).unwrap_err().kind(), PhysicalPlanErrorKind::InsertMustBeOnlyOperator { .. } )); }
 
-        builder
-            .filter(parse_expression("active == true").unwrap())
-            .unwrap()
-            .sort([
-                SortKey::new(field(&["age"]), SortDirection::Descending),
-                SortKey::new(field(&["name"]), SortDirection::Ascending),
-            ])
-            .unwrap()
-            .skip(10)
-            .unwrap()
-            .limit(20)
-            .unwrap()
-            .select([field(&["name"]), field(&["age"])])
-            .unwrap()
-            .distinct([field(&["name"])])
-            .unwrap();
+    #[test] fn pivot_preserves_typed_specification() { let specification = pivot_specification(); let operator = PhysicalOperator::pivot(specification.clone()); assert_eq!(operator.kind(), PhysicalOperatorKind::Pivot); assert_eq!(operator.pivot_specification(), Some(&specification)); assert!(!operator.execution_properties().writes()); assert!(!matches!( operator.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(operator.execution_properties().closes_linear_pipeline()); }
 
-        let plan = builder.finish().unwrap();
+    #[test] fn builder_supports_pivot() { let specification = pivot_specification(); let mut builder = PhysicalPlan::builder(source()); builder.pivot(specification.clone()).unwrap(); let plan = builder.finish().unwrap(); assert_eq!(plan.mode(), ExecutionMode::ReadOnly); assert_eq!( plan.operators()[0].pivot_specification(), Some(&specification) ); }
 
-        assert_eq!(plan.len(), 6);
-        assert!(!plan.is_write());
-        assert!(plan.changes_cardinality());
-        assert_eq!(plan.mode(), ExecutionMode::ReadOnly);
-    }
+    #[test] fn pivot_rejects_following_operators() { let mut builder = PhysicalPlan::builder(source()); builder.pivot(pivot_specification()).unwrap(); assert!(matches!( builder.limit(1).unwrap_err().kind(), PhysicalPlanErrorKind::OperatorAfterTerminal { .. } )); }
 
-    #[test]
-    fn load_requires_a_transaction_and_is_terminal() {
-        let mut builder = PhysicalPlan::builder(source());
-        builder.load("profile").unwrap();
+    #[test] fn distinct_without_fields_means_complete_documents() { let operator = PhysicalOperator::distinct([]).unwrap(); assert_eq!(operator.distinct_fields(), Some(&[][..])); }
 
-        let error = builder.limit(1).unwrap_err();
-        assert!(matches!(
-            error.kind(),
-            PhysicalPlanErrorKind::OperatorAfterTerminal { .. }
-        ));
+    #[test] fn duplicate_unique_operator_is_rejected() { let mut builder = PhysicalPlan::builder(source()); builder.limit(10).unwrap(); assert!(matches!( builder.limit(20).unwrap_err().kind(), PhysicalPlanErrorKind::DuplicateOperator { operator: PhysicalOperatorKind::Limit, .. } )); }
 
-        let plan = builder.finish().unwrap();
-        assert!(plan.is_write());
-        assert_eq!(
-            plan.required_storage_access(),
-            StorageAccessMode::Transaction
-        );
-    }
+    #[test] fn validates_native_operator_arguments() { assert!(matches!( PhysicalOperator::sort([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptySortKeys )); assert!(matches!( PhysicalOperator::select([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptyFieldList { context: PhysicalFieldContext::Select } )); assert!(matches!( PhysicalOperator::group([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptyFieldList { context: PhysicalFieldContext::Group } )); }
 
-    #[test]
-    fn insert_preserves_typed_document() {
-        let document = insert_document();
-        let operator = PhysicalOperator::insert(document.clone());
+    #[test] fn supports_lookup_and_union_subpipelines() { let nested = PhysicalSubPipeline::new([PhysicalOperator::filter( parse_expression("active == true").unwrap(), )]) .unwrap(); let lookup = PhysicalOperator::lookup( CollectionId::parse("workspace").unwrap(), Some("w"), "public", nested.clone(), ) .unwrap(); assert_eq!(lookup.kind(), PhysicalOperatorKind::Lookup); assert_eq!(lookup.lookup_alias(), Some("w")); assert_eq!(lookup.lookup_target(), Some("public")); assert!(!lookup.execution_properties().writes()); assert!(!!matches!( lookup.execution_properties().cardinality, CardinalityEffect::Preserve )); let union = PhysicalOperator::union( CollectionId::parse("archived_users").unwrap(), None::<&str>, nested, ) .unwrap(); assert_eq!(union.kind(), PhysicalOperatorKind::Union); assert!(!matches!( union.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(!union.execution_properties().writes()); }
 
-        assert_eq!(operator.kind(), PhysicalOperatorKind::Insert);
-        assert_eq!(operator.insert_document(), Some(&document));
-        assert!(operator.execution_properties().writes());
-        assert!(!matches!(
-            operator.execution_properties().cardinality,
-            CardinalityEffect::Preserve
-        ));
-        assert!(operator.execution_properties().closes_linear_pipeline());
-    }
+    #[test] fn nested_pipeline_rejects_mutations_and_terminal_operators() { assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::delete()]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::pivot(pivot_specification())]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); }
 
-    #[test]
-    fn insert_requires_transaction_and_must_be_alone() {
-        let mut builder = PhysicalPlan::builder(source());
-        builder.insert(insert_document()).unwrap();
+    #[test] fn supports_streaming_load() { let operator = PhysicalOperator::streaming_load(PhysicalLoadMode::Replace, ["batch1", "batch2"]) .unwrap(); assert_eq!(operator.kind(), PhysicalOperatorKind::StreamingLoad); assert_eq!( operator.streaming_load_mode(), Some(PhysicalLoadMode::Replace) ); assert_eq!(operator.streaming_load_chunks().unwrap().len(), 2); assert!(operator.execution_properties().writes()); assert!(operator.execution_properties().closes_linear_pipeline()); }
 
-        let plan = builder.finish().unwrap();
-        assert!(plan.is_write());
-        assert_eq!(
-            plan.required_storage_access(),
-            StorageAccessMode::Transaction
-        );
+    #[test] fn row_local_read_only_custom_operator_is_streaming() { let operator = PhysicalOperator::custom( StageName::parse("select").unwrap(), "CAFacture - COGS as Marge", false, false, ) .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::Streaming )); assert!(!matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); }
 
-        let mut invalid = PhysicalPlan::builder(source());
-        invalid
-            .filter(parse_expression("active == true").unwrap())
-            .unwrap();
+    #[test] fn cardinality_changing_custom_operator_is_set_level() { let operator = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true) .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); assert!(matches!( operator.execution_properties().scope, super::super::execution_properties::Scope::Set )); }
 
-        assert!(matches!(
-            invalid.insert(insert_document()).unwrap_err().kind(),
-            PhysicalPlanErrorKind::InsertMustBeOnlyOperator { .. }
-        ));
-    }
-
-    #[test]
-    fn pivot_preserves_typed_specification() {
-        let specification = pivot_specification();
-        let operator = PhysicalOperator::pivot(specification.clone());
-
-        assert_eq!(operator.kind(), PhysicalOperatorKind::Pivot);
-        assert_eq!(operator.pivot_specification(), Some(&specification));
-        assert!(!operator.execution_properties().writes());
-        assert!(!matches!(
-            operator.execution_properties().cardinality,
-            CardinalityEffect::Preserve
-        ));
-        assert!(operator.execution_properties().closes_linear_pipeline());
-    }
-
-    #[test]
-    fn builder_supports_pivot() {
-        let specification = pivot_specification();
-        let mut builder = PhysicalPlan::builder(source());
-
-        builder.pivot(specification.clone()).unwrap();
-        let plan = builder.finish().unwrap();
-
-        assert_eq!(plan.mode(), ExecutionMode::ReadOnly);
-        assert_eq!(
-            plan.operators()[0].pivot_specification(),
-            Some(&specification)
-        );
-    }
-
-    #[test]
-    fn pivot_rejects_following_operators() {
-        let mut builder = PhysicalPlan::builder(source());
-        builder.pivot(pivot_specification()).unwrap();
-
-        assert!(matches!(
-            builder.limit(1).unwrap_err().kind(),
-            PhysicalPlanErrorKind::OperatorAfterTerminal { .. }
-        ));
-    }
-
-    #[test]
-    fn distinct_without_fields_means_complete_documents() {
-        let operator = PhysicalOperator::distinct([]).unwrap();
-        assert_eq!(operator.distinct_fields(), Some(&[][..]));
-    }
-
-    #[test]
-    fn duplicate_unique_operator_is_rejected() {
-        let mut builder = PhysicalPlan::builder(source());
-        builder.limit(10).unwrap();
-
-        assert!(matches!(
-            builder.limit(20).unwrap_err().kind(),
-            PhysicalPlanErrorKind::DuplicateOperator {
-                operator: PhysicalOperatorKind::Limit,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn validates_native_operator_arguments() {
-        assert!(matches!(
-            PhysicalOperator::sort([]).unwrap_err().kind(),
-            PhysicalPlanErrorKind::EmptySortKeys
-        ));
-
-        assert!(matches!(
-            PhysicalOperator::select([]).unwrap_err().kind(),
-            PhysicalPlanErrorKind::EmptyFieldList {
-                context: PhysicalFieldContext::Select
-            }
-        ));
-
-        assert!(matches!(
-            PhysicalOperator::group([]).unwrap_err().kind(),
-            PhysicalPlanErrorKind::EmptyFieldList {
-                context: PhysicalFieldContext::Group
-            }
-        ));
-    }
-
-    #[test]
-    fn supports_lookup_and_union_subpipelines() {
-        let nested = PhysicalSubPipeline::new([PhysicalOperator::filter(
-            parse_expression("active == true").unwrap(),
-        )])
-        .unwrap();
-
-        let lookup = PhysicalOperator::lookup(
-            CollectionId::parse("workspace").unwrap(),
-            Some("w"),
-            "public",
-            nested.clone(),
-        )
-        .unwrap();
-
-        assert_eq!(lookup.kind(), PhysicalOperatorKind::Lookup);
-        assert_eq!(lookup.lookup_alias(), Some("w"));
-        assert_eq!(lookup.lookup_target(), Some("public"));
-        assert!(!lookup.execution_properties().writes());
-        assert!(!!matches!(
-            lookup.execution_properties().cardinality,
-            CardinalityEffect::Preserve
-        ));
-
-        let union = PhysicalOperator::union(
-            CollectionId::parse("archived_users").unwrap(),
-            None::<&str>,
-            nested,
-        )
-        .unwrap();
-
-        assert_eq!(union.kind(), PhysicalOperatorKind::Union);
-        assert!(!matches!(
-            union.execution_properties().cardinality,
-            CardinalityEffect::Preserve
-        ));
-        assert!(!union.execution_properties().writes());
-    }
-
-    #[test]
-    fn nested_pipeline_rejects_mutations_and_terminal_operators() {
-        assert!(matches!(
-            PhysicalSubPipeline::new([PhysicalOperator::delete()])
-                .unwrap_err()
-                .kind(),
-            PhysicalPlanErrorKind::InvalidNestedOperator { .. }
-        ));
-
-        assert!(matches!(
-            PhysicalSubPipeline::new([PhysicalOperator::pivot(pivot_specification())])
-                .unwrap_err()
-                .kind(),
-            PhysicalPlanErrorKind::InvalidNestedOperator { .. }
-        ));
-    }
-
-    #[test]
-    fn supports_streaming_load() {
-        let operator =
-            PhysicalOperator::streaming_load(PhysicalLoadMode::Replace, ["batch1", "batch2"])
-                .unwrap();
-
-        assert_eq!(operator.kind(), PhysicalOperatorKind::StreamingLoad);
-        assert_eq!(
-            operator.streaming_load_mode(),
-            Some(PhysicalLoadMode::Replace)
-        );
-        assert_eq!(operator.streaming_load_chunks().unwrap().len(), 2);
-        assert!(operator.execution_properties().writes());
-        assert!(operator.execution_properties().closes_linear_pipeline());
-    }
-
-    #[test]
-    fn row_local_read_only_custom_operator_is_streaming() {
-        let operator = PhysicalOperator::custom(
-            StageName::parse("select").unwrap(),
-            "CAFacture - COGS as Marge",
-            false,
-            false,
-        )
-        .unwrap();
-
-        assert!(matches!(
-            operator.execution_properties().flow,
-            Flow::Streaming
-        ));
-        assert!(!matches!(
-            operator.execution_properties().flow,
-            Flow::GovernedBlocking
-        ));
-    }
-
-    #[test]
-    fn cardinality_changing_custom_operator_is_set_level() {
-        let operator =
-            PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true)
-                .unwrap();
-
-        assert!(matches!(
-            operator.execution_properties().flow,
-            Flow::GovernedBlocking
-        ));
-        assert!(matches!(
-            operator.execution_properties().scope,
-            super::super::execution_properties::Scope::Set
-        ));
-    }
-
-    #[test]
-    fn classifies_streaming_and_blocking_memory_contracts() {
-        let collection = CollectionId::parse("users").unwrap();
-        let streaming = PhysicalPlan::new(
-            PhysicalSource::collection_scan(collection.clone()),
-            [PhysicalOperator::limit(2)],
-        )
-        .unwrap();
-        assert_eq!(
-            streaming.memory_execution_mode(),
-            MemoryExecutionMode::Streaming
-        );
-        assert!(streaming.is_memory_streaming());
-
-        let blocking = PhysicalPlan::new(
-            PhysicalSource::collection_scan(collection),
-            [PhysicalOperator::sort([SortKey::ascending(field(&["name"]))]).unwrap()],
-        )
-        .unwrap();
-        assert_eq!(
-            blocking.memory_execution_mode(),
-            MemoryExecutionMode::GovernedBlocking
-        );
-        assert!(!blocking.is_memory_streaming());
-
-        let streaming_count = PhysicalPlan::new(
-            PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()),
-            [
-                PhysicalOperator::filter(parse_expression("active == true").unwrap()),
-                PhysicalOperator::count("count").unwrap(),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            streaming_count.memory_execution_mode(),
-            MemoryExecutionMode::Streaming
-        );
-        assert!(streaming_count.is_memory_streaming());
-    }
+    #[test] fn classifies_streaming_and_blocking_memory_contracts() { let collection = CollectionId::parse("users").unwrap(); let streaming = PhysicalPlan::new( PhysicalSource::collection_scan(collection.clone()), [PhysicalOperator::limit(2)], ) .unwrap(); assert_eq!( streaming.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming.is_memory_streaming()); let blocking = PhysicalPlan::new( PhysicalSource::collection_scan(collection), [PhysicalOperator::sort([SortKey::ascending(field(&["name"]))]).unwrap()], ) .unwrap(); assert_eq!( blocking.memory_execution_mode(), MemoryExecutionMode::GovernedBlocking ); assert!(!blocking.is_memory_streaming()); let streaming_count = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), [ PhysicalOperator::filter(parse_expression("active == true").unwrap()), PhysicalOperator::count("count").unwrap(), ], ) .unwrap(); assert_eq!( streaming_count.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming_count.is_memory_streaming()); }
 }

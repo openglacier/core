@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Source span tracking.
 
 use std::fmt;
@@ -193,158 +194,43 @@ const fn max(left: usize, right: usize) -> usize {
 mod tests {
     use super::*;
 
-    #[test]
-    fn creates_span() {
-        let span = Span::new(2, 8);
+    #[test] fn creates_span() { let span = Span::new(2, 8); assert_eq!(span.start(), 2); assert_eq!(span.end(), 8); assert_eq!(span.len(), 6); assert!(!span.is_empty()); }
 
-        assert_eq!(span.start(), 2);
-        assert_eq!(span.end(), 8);
-        assert_eq!(span.len(), 6);
-        assert!(!span.is_empty());
-    }
+    #[test] fn creates_empty_span_at_position() { let span = Span::at(4); assert_eq!(span, Span::new(4, 4)); assert_eq!(span.len(), 0); assert!(span.is_empty()); }
 
-    #[test]
-    fn creates_empty_span_at_position() {
-        let span = Span::at(4);
+    #[test] #[should_panic(expected = "span start must not exceed span end")] fn rejects_reversed_span() { let _ = Span::new(8, 2); }
 
-        assert_eq!(span, Span::new(4, 4));
-        assert_eq!(span.len(), 0);
-        assert!(span.is_empty());
-    }
+    #[test] fn contains_offset_with_exclusive_end() { let span = Span::new(2, 5); assert!(!span.contains(1)); assert!(span.contains(2)); assert!(span.contains(4)); assert!(!span.contains(5)); }
 
-    #[test]
-    #[should_panic(expected = "span start must not exceed span end")]
-    fn rejects_reversed_span() {
-        let _ = Span::new(8, 2);
-    }
+    #[test] fn empty_span_contains_no_offset() { let span = Span::at(3); assert!(!span.contains(3)); }
 
-    #[test]
-    fn contains_offset_with_exclusive_end() {
-        let span = Span::new(2, 5);
+    #[test] fn contains_nested_span() { let outer = Span::new(2, 10); assert!(outer.contains_span(Span::new(4, 8))); assert!(outer.contains_span(Span::at(10))); assert!(!outer.contains_span(Span::new(1, 8))); assert!(!outer.contains_span(Span::new(4, 11))); }
 
-        assert!(!span.contains(1));
-        assert!(span.contains(2));
-        assert!(span.contains(4));
-        assert!(!span.contains(5));
-    }
+    #[test] fn detects_overlap() { let left = Span::new(2, 6); assert!(left.overlaps(Span::new(4, 8))); assert!(left.overlaps(Span::new(1, 3))); assert!(!left.overlaps(Span::new(6, 8))); assert!(!left.overlaps(Span::new(0, 2))); assert!(!left.overlaps(Span::at(4))); }
 
-    #[test]
-    fn empty_span_contains_no_offset() {
-        let span = Span::at(3);
+    #[test] fn joins_disjoint_spans() { assert_eq!(Span::new(2, 5).join(Span::new(8, 10)), Span::new(2, 10),); }
 
-        assert!(!span.contains(3));
-    }
+    #[test] fn joins_spans_independently_of_order() { let left = Span::new(8, 10); let right = Span::new(2, 5); assert_eq!(left.join(right), Span::new(2, 10)); assert_eq!(right.join(left), Span::new(2, 10)); }
 
-    #[test]
-    fn contains_nested_span() {
-        let outer = Span::new(2, 10);
+    #[test] fn extends_end() { assert_eq!(Span::new(2, 5).with_end(8), Span::new(2, 8),); }
 
-        assert!(outer.contains_span(Span::new(4, 8)));
-        assert!(outer.contains_span(Span::at(10)));
-        assert!(!outer.contains_span(Span::new(1, 8)));
-        assert!(!outer.contains_span(Span::new(4, 11)));
-    }
+    #[test] fn offsets_span() { assert_eq!(Span::new(2, 5).offset(10), Span::new(12, 15),); }
 
-    #[test]
-    fn detects_overlap() {
-        let left = Span::new(2, 6);
+    #[test] fn converts_to_and_from_range() { let span = Span::from(2..5); let range: Range<usize> = span.into(); assert_eq!(span, Span::new(2, 5)); assert_eq!(range, 2..5); }
 
-        assert!(left.overlaps(Span::new(4, 8)));
-        assert!(left.overlaps(Span::new(1, 3)));
+    #[test] fn slices_ascii_source() { let source = "from users"; let span = Span::new(5, 10); assert_eq!(span.slice(source), Some("users")); }
 
-        assert!(!left.overlaps(Span::new(6, 8)));
-        assert!(!left.overlaps(Span::new(0, 2)));
-        assert!(!left.overlaps(Span::at(4)));
-    }
+    #[test] fn slices_utf8_source_using_byte_offsets() { let source = "où âge"; let start = source.find("âge").unwrap(); let end = start + "âge".len(); assert_eq!(Span::new(start, end).slice(source), Some("âge"),); }
 
-    #[test]
-    fn joins_disjoint_spans() {
-        assert_eq!(Span::new(2, 5).join(Span::new(8, 10)), Span::new(2, 10),);
-    }
+    #[test] fn invalid_utf8_boundary_returns_none() { let source = "é"; assert_eq!(Span::new(0, 1).slice(source), None); }
 
-    #[test]
-    fn joins_spans_independently_of_order() {
-        let left = Span::new(8, 10);
-        let right = Span::new(2, 5);
+    #[test] fn out_of_bounds_slice_returns_none() { assert_eq!(Span::new(0, 20).slice("from users"), None,); }
 
-        assert_eq!(left.join(right), Span::new(2, 10));
-        assert_eq!(right.join(left), Span::new(2, 10));
-    }
+    #[test] fn debug_and_display_are_compact() { let span = Span::new(2, 8); assert_eq!(format!("{span:?}"), "2..8"); assert_eq!(span.to_string(), "2..8"); }
 
-    #[test]
-    fn extends_end() {
-        assert_eq!(Span::new(2, 5).with_end(8), Span::new(2, 8),);
-    }
+    #[test] fn default_is_empty_start_span() { assert_eq!(Span::default(), Span::EMPTY); }
 
-    #[test]
-    fn offsets_span() {
-        assert_eq!(Span::new(2, 5).offset(10), Span::new(12, 15),);
-    }
+    #[test] fn span_remains_compact() { assert_eq!( std::mem::size_of::<Span>(), 2 * std::mem::size_of::<usize>(), ); }
 
-    #[test]
-    fn converts_to_and_from_range() {
-        let span = Span::from(2..5);
-        let range: Range<usize> = span.into();
-
-        assert_eq!(span, Span::new(2, 5));
-        assert_eq!(range, 2..5);
-    }
-
-    #[test]
-    fn slices_ascii_source() {
-        let source = "from users";
-        let span = Span::new(5, 10);
-
-        assert_eq!(span.slice(source), Some("users"));
-    }
-
-    #[test]
-    fn slices_utf8_source_using_byte_offsets() {
-        let source = "où âge";
-        let start = source.find("âge").unwrap();
-        let end = start + "âge".len();
-
-        assert_eq!(Span::new(start, end).slice(source), Some("âge"),);
-    }
-
-    #[test]
-    fn invalid_utf8_boundary_returns_none() {
-        let source = "é";
-
-        assert_eq!(Span::new(0, 1).slice(source), None);
-    }
-
-    #[test]
-    fn out_of_bounds_slice_returns_none() {
-        assert_eq!(Span::new(0, 20).slice("from users"), None,);
-    }
-
-    #[test]
-    fn debug_and_display_are_compact() {
-        let span = Span::new(2, 8);
-
-        assert_eq!(format!("{span:?}"), "2..8");
-        assert_eq!(span.to_string(), "2..8");
-    }
-
-    #[test]
-    fn default_is_empty_start_span() {
-        assert_eq!(Span::default(), Span::EMPTY);
-    }
-
-    #[test]
-    fn span_remains_compact() {
-        assert_eq!(
-            std::mem::size_of::<Span>(),
-            2 * std::mem::size_of::<usize>(),
-        );
-    }
-
-    #[test]
-    fn spans_overlap() {
-        assert!(Span::new(0, 5).overlaps(Span::new(4, 8)));
-        assert!(Span::new(4, 8).overlaps(Span::new(0, 5)));
-        assert!(!Span::new(0, 5).overlaps(Span::new(5, 8)));
-        assert!(!Span::new(0, 0).overlaps(Span::new(0, 5)));
-    }
+    #[test] fn spans_overlap() { assert!(Span::new(0, 5).overlaps(Span::new(4, 8))); assert!(Span::new(4, 8).overlaps(Span::new(0, 5))); assert!(!Span::new(0, 5).overlaps(Span::new(5, 8))); assert!(!Span::new(0, 0).overlaps(Span::new(0, 5))); }
 }

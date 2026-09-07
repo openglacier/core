@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Backend-independent, time-ordered document identifiers.
 
 use std::{
@@ -298,13 +299,5 @@ fn random_node() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn generated_ids_are_v7_unique_and_ordered() {
-        let g = UuidV7Generator::new();
-        let ids: Vec<_> = g.reserve(10_000).collect();
-        assert!(ids.windows(2).all(|w| w[0] < w[1]));
-        assert!(ids
-            .iter()
-            .all(|id| DocumentId::parse(id.to_string()).unwrap() == *id));
-    }
+    #[test] fn generated_ids_are_v7_unique_and_ordered() { let g = UuidV7Generator::new(); let ids: Vec<_> = g.reserve(10_000).collect(); assert!(ids.windows(2).all(|w| w[0] < w[1])); assert!(ids .iter() .all(|id| DocumentId::parse(id.to_string()).unwrap() == *id)); }
 }

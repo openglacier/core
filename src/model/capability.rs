@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Value capability definitions and capability checks.
 
 use std::fmt;
@@ -390,257 +391,49 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn capability_names_are_stable() {
-        assert_eq!(Capability::Comparable.as_str(), "comparable");
-        assert_eq!(Capability::Summable.as_str(), "summable");
-        assert_eq!(Capability::Temporal.as_str(), "temporal");
-        assert_eq!(Capability::Searchable.as_str(), "searchable");
-    }
+    #[test] fn capability_names_are_stable() { assert_eq!(Capability::Comparable.as_str(), "comparable"); assert_eq!(Capability::Summable.as_str(), "summable"); assert_eq!(Capability::Temporal.as_str(), "temporal"); assert_eq!(Capability::Searchable.as_str(), "searchable"); }
 
-    #[test]
-    fn empty_capability_set_contains_nothing() {
-        let capabilities = Capabilities::empty();
+    #[test] fn empty_capability_set_contains_nothing() { let capabilities = Capabilities::empty(); assert!(capabilities.is_empty()); assert_eq!(capabilities.len(), 0); assert!(!capabilities.contains(Capability::Comparable)); assert!(!capabilities.contains(Capability::Summable)); assert!(!capabilities.contains(Capability::Temporal)); assert!(!capabilities.contains(Capability::Searchable)); }
 
-        assert!(capabilities.is_empty());
-        assert_eq!(capabilities.len(), 0);
-        assert!(!capabilities.contains(Capability::Comparable));
-        assert!(!capabilities.contains(Capability::Summable));
-        assert!(!capabilities.contains(Capability::Temporal));
-        assert!(!capabilities.contains(Capability::Searchable));
-    }
+    #[test] fn capability_can_be_added() { let capabilities = Capabilities::empty() .with(Capability::Comparable) .with(Capability::Searchable); assert_eq!(capabilities.len(), 2); assert!(capabilities.contains(Capability::Comparable)); assert!(capabilities.contains(Capability::Searchable)); assert!(!capabilities.contains(Capability::Summable)); }
 
-    #[test]
-    fn capability_can_be_added() {
-        let capabilities = Capabilities::empty()
-            .with(Capability::Comparable)
-            .with(Capability::Searchable);
+    #[test] fn adding_a_capability_is_idempotent() { let capabilities = Capabilities::empty() .with(Capability::Comparable) .with(Capability::Comparable); assert_eq!(capabilities.len(), 1); }
 
-        assert_eq!(capabilities.len(), 2);
-        assert!(capabilities.contains(Capability::Comparable));
-        assert!(capabilities.contains(Capability::Searchable));
-        assert!(!capabilities.contains(Capability::Summable));
-    }
+    #[test] fn capability_can_be_removed() { let capabilities = Capabilities::ALL.without(Capability::Temporal); assert!(!capabilities.contains(Capability::Temporal)); assert!(capabilities.contains(Capability::Comparable)); assert!(capabilities.contains(Capability::Summable)); assert!(capabilities.contains(Capability::Searchable)); }
 
-    #[test]
-    fn adding_a_capability_is_idempotent() {
-        let capabilities = Capabilities::empty()
-            .with(Capability::Comparable)
-            .with(Capability::Comparable);
+    #[test] fn union_combines_capabilities() { let left = Capabilities::COMPARABLE; let right = Capabilities::SEARCHABLE; let union = left.union(right); assert!(union.contains(Capability::Comparable)); assert!(union.contains(Capability::Searchable)); assert_eq!(union.len(), 2); }
 
-        assert_eq!(capabilities.len(), 1);
-    }
+    #[test] fn intersection_keeps_shared_capabilities() { let left = Capabilities::COMPARABLE.union(Capabilities::SUMMABLE); let right = Capabilities::SUMMABLE.union(Capabilities::SEARCHABLE); let intersection = left.intersection(right); assert_eq!(intersection, Capabilities::SUMMABLE); }
 
-    #[test]
-    fn capability_can_be_removed() {
-        let capabilities = Capabilities::ALL.without(Capability::Temporal);
+    #[test] fn difference_removes_shared_capabilities() { let left = Capabilities::COMPARABLE .union(Capabilities::SUMMABLE) .union(Capabilities::SEARCHABLE); let difference = left.difference(Capabilities::SUMMABLE); assert!(difference.contains(Capability::Comparable)); assert!(!difference.contains(Capability::Summable)); assert!(difference.contains(Capability::Searchable)); }
 
-        assert!(!capabilities.contains(Capability::Temporal));
-        assert!(capabilities.contains(Capability::Comparable));
-        assert!(capabilities.contains(Capability::Summable));
-        assert!(capabilities.contains(Capability::Searchable));
-    }
+    #[test] fn contains_all_checks_a_required_set() { let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE); assert!(capabilities.contains_all(Capabilities::COMPARABLE)); assert!(capabilities.contains_all(Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE))); assert!(!capabilities.contains_all(Capabilities::SUMMABLE)); }
 
-    #[test]
-    fn union_combines_capabilities() {
-        let left = Capabilities::COMPARABLE;
-        let right = Capabilities::SEARCHABLE;
+    #[test] fn intersects_detects_any_shared_capability() { let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE); assert!(capabilities.intersects(Capabilities::SEARCHABLE)); assert!(!capabilities.intersects(Capabilities::SUMMABLE.union(Capabilities::TEMPORAL))); }
 
-        let union = left.union(right);
+    #[test] fn iteration_order_is_stable() { let capabilities = Capabilities::ALL; let values = capabilities.into_iter().collect::<Vec<_>>(); assert_eq!( values, vec![ Capability::Comparable, Capability::Summable, Capability::Temporal, Capability::Searchable, ] ); }
 
-        assert!(union.contains(Capability::Comparable));
-        assert!(union.contains(Capability::Searchable));
-        assert_eq!(union.len(), 2);
-    }
+    #[test] fn debug_format_lists_capabilities() { let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE); assert_eq!(format!("{capabilities:?}"), "{Comparable, Searchable}"); }
 
-    #[test]
-    fn intersection_keeps_shared_capabilities() {
-        let left = Capabilities::COMPARABLE.union(Capabilities::SUMMABLE);
-        let right = Capabilities::SUMMABLE.union(Capabilities::SEARCHABLE);
+    #[test] fn display_format_lists_stable_names() { let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE); assert_eq!(capabilities.to_string(), "comparable, searchable"); }
 
-        let intersection = left.intersection(right);
+    #[test] fn null_exposes_no_capability() { let value = Value::Null; assert_eq!(value.capabilities(), Capabilities::NONE); assert!(!value.is_comparable()); assert!(!value.is_summable()); assert!(!value.is_temporal()); assert!(!value.is_searchable()); }
 
-        assert_eq!(intersection, Capabilities::SUMMABLE);
-    }
+    #[test] fn bool_is_comparable_and_searchable() { let value = Value::from(true); assert_eq!( value.capabilities(), Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE) ); assert!(value.is_comparable()); assert!(value.is_searchable()); assert!(!value.is_summable()); assert!(!value.is_temporal()); }
 
-    #[test]
-    fn difference_removes_shared_capabilities() {
-        let left = Capabilities::COMPARABLE
-            .union(Capabilities::SUMMABLE)
-            .union(Capabilities::SEARCHABLE);
+    #[test] fn signed_number_is_comparable_summable_and_searchable() { let value = Value::from(-42_i64); assert_eq!( value.capabilities(), Capabilities::COMPARABLE .union(Capabilities::SUMMABLE) .union(Capabilities::SEARCHABLE) ); }
 
-        let difference = left.difference(Capabilities::SUMMABLE);
+    #[test] fn unsigned_number_is_comparable_summable_and_searchable() { let value = Value::from(42_u64); assert_eq!( value.capabilities(), Capabilities::COMPARABLE .union(Capabilities::SUMMABLE) .union(Capabilities::SEARCHABLE) ); }
 
-        assert!(difference.contains(Capability::Comparable));
-        assert!(!difference.contains(Capability::Summable));
-        assert!(difference.contains(Capability::Searchable));
-    }
+    #[test] fn float_is_comparable_summable_and_searchable() { let value = Value::float(42.5).expect("42.5 must be finite"); assert_eq!( value.capabilities(), Capabilities::COMPARABLE .union(Capabilities::SUMMABLE) .union(Capabilities::SEARCHABLE) ); }
 
-    #[test]
-    fn contains_all_checks_a_required_set() {
-        let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE);
+    #[test] fn string_is_comparable_and_searchable() { let value = Value::from("OG"); assert_eq!( value.capabilities(), Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE) ); }
 
-        assert!(capabilities.contains_all(Capabilities::COMPARABLE));
+    #[test] fn array_is_searchable_only() { let value = Value::array([Value::from(1_i64), Value::from(2_i64)]); assert_eq!(value.capabilities(), Capabilities::SEARCHABLE); assert!(!value.is_comparable()); assert!(!value.is_summable()); assert!(!value.is_temporal()); assert!(value.is_searchable()); }
 
-        assert!(capabilities.contains_all(Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE)));
+    #[test] fn object_is_searchable_only() { let value = Value::from(Document::from_fields([("name", Value::from("Tom"))])); assert_eq!(value.capabilities(), Capabilities::SEARCHABLE); }
 
-        assert!(!capabilities.contains_all(Capabilities::SUMMABLE));
-    }
+    #[test] fn no_current_value_is_temporal() { let values = [ Value::Null, Value::from(true), Value::from(42_i64), Value::from("2026-07-27"), Value::array([]), Value::from(Document::new()), ]; assert!(values.iter().all(|value| !value.is_temporal())); }
 
-    #[test]
-    fn intersects_detects_any_shared_capability() {
-        let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE);
-
-        assert!(capabilities.intersects(Capabilities::SEARCHABLE));
-
-        assert!(!capabilities.intersects(Capabilities::SUMMABLE.union(Capabilities::TEMPORAL)));
-    }
-
-    #[test]
-    fn iteration_order_is_stable() {
-        let capabilities = Capabilities::ALL;
-
-        let values = capabilities.into_iter().collect::<Vec<_>>();
-
-        assert_eq!(
-            values,
-            vec![
-                Capability::Comparable,
-                Capability::Summable,
-                Capability::Temporal,
-                Capability::Searchable,
-            ]
-        );
-    }
-
-    #[test]
-    fn debug_format_lists_capabilities() {
-        let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE);
-
-        assert_eq!(format!("{capabilities:?}"), "{Comparable, Searchable}");
-    }
-
-    #[test]
-    fn display_format_lists_stable_names() {
-        let capabilities = Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE);
-
-        assert_eq!(capabilities.to_string(), "comparable, searchable");
-    }
-
-    #[test]
-    fn null_exposes_no_capability() {
-        let value = Value::Null;
-
-        assert_eq!(value.capabilities(), Capabilities::NONE);
-        assert!(!value.is_comparable());
-        assert!(!value.is_summable());
-        assert!(!value.is_temporal());
-        assert!(!value.is_searchable());
-    }
-
-    #[test]
-    fn bool_is_comparable_and_searchable() {
-        let value = Value::from(true);
-
-        assert_eq!(
-            value.capabilities(),
-            Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE)
-        );
-
-        assert!(value.is_comparable());
-        assert!(value.is_searchable());
-        assert!(!value.is_summable());
-        assert!(!value.is_temporal());
-    }
-
-    #[test]
-    fn signed_number_is_comparable_summable_and_searchable() {
-        let value = Value::from(-42_i64);
-
-        assert_eq!(
-            value.capabilities(),
-            Capabilities::COMPARABLE
-                .union(Capabilities::SUMMABLE)
-                .union(Capabilities::SEARCHABLE)
-        );
-    }
-
-    #[test]
-    fn unsigned_number_is_comparable_summable_and_searchable() {
-        let value = Value::from(42_u64);
-
-        assert_eq!(
-            value.capabilities(),
-            Capabilities::COMPARABLE
-                .union(Capabilities::SUMMABLE)
-                .union(Capabilities::SEARCHABLE)
-        );
-    }
-
-    #[test]
-    fn float_is_comparable_summable_and_searchable() {
-        let value = Value::float(42.5).expect("42.5 must be finite");
-
-        assert_eq!(
-            value.capabilities(),
-            Capabilities::COMPARABLE
-                .union(Capabilities::SUMMABLE)
-                .union(Capabilities::SEARCHABLE)
-        );
-    }
-
-    #[test]
-    fn string_is_comparable_and_searchable() {
-        let value = Value::from("OG");
-
-        assert_eq!(
-            value.capabilities(),
-            Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE)
-        );
-    }
-
-    #[test]
-    fn array_is_searchable_only() {
-        let value = Value::array([Value::from(1_i64), Value::from(2_i64)]);
-
-        assert_eq!(value.capabilities(), Capabilities::SEARCHABLE);
-
-        assert!(!value.is_comparable());
-        assert!(!value.is_summable());
-        assert!(!value.is_temporal());
-        assert!(value.is_searchable());
-    }
-
-    #[test]
-    fn object_is_searchable_only() {
-        let value = Value::from(Document::from_fields([("name", Value::from("Tom"))]));
-
-        assert_eq!(value.capabilities(), Capabilities::SEARCHABLE);
-    }
-
-    #[test]
-    fn no_current_value_is_temporal() {
-        let values = [
-            Value::Null,
-            Value::from(true),
-            Value::from(42_i64),
-            Value::from("2026-07-27"),
-            Value::array([]),
-            Value::from(Document::new()),
-        ];
-
-        assert!(values.iter().all(|value| !value.is_temporal()));
-    }
-
-    #[test]
-    fn capability_set_can_be_collected() {
-        let capabilities = [Capability::Comparable, Capability::Searchable]
-            .into_iter()
-            .collect::<Capabilities>();
-
-        assert_eq!(
-            capabilities,
-            Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE)
-        );
-    }
+    #[test] fn capability_set_can_be_collected() { let capabilities = [Capability::Comparable, Capability::Searchable] .into_iter() .collect::<Capabilities>(); assert_eq!( capabilities, Capabilities::COMPARABLE.union(Capabilities::SEARCHABLE) ); }
 }

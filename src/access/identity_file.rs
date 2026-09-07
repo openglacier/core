@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Encrypted portable identity credentials.
 
 use std::{
@@ -340,48 +341,9 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), IdentityFileError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn encrypted_identity_round_trips() {
-        let identity = IdentityCredential::generate().unwrap();
-        let bytes = encrypt_bytes(&identity, b"correct horse battery staple").unwrap();
-        let decoded = decrypt_bytes(&bytes, b"correct horse battery staple").unwrap();
-        assert_eq!(decoded.identity_id, identity.identity_id);
-        assert_eq!(decoded.device_id, identity.device_id);
-        assert_eq!(decoded.public_key, identity.public_key);
-        assert_eq!(
-            decoded.sign_base64(b"challenge"),
-            identity.sign_base64(b"challenge")
-        );
-    }
+    #[test] fn encrypted_identity_round_trips() { let identity = IdentityCredential::generate().unwrap(); let bytes = encrypt_bytes(&identity, b"correct horse battery staple").unwrap(); let decoded = decrypt_bytes(&bytes, b"correct horse battery staple").unwrap(); assert_eq!(decoded.identity_id, identity.identity_id); assert_eq!(decoded.device_id, identity.device_id); assert_eq!(decoded.public_key, identity.public_key); assert_eq!( decoded.sign_base64(b"challenge"), identity.sign_base64(b"challenge") ); }
 
-    #[test]
-    fn encrypted_export_requires_correct_password() {
-        let identity = IdentityCredential::generate().unwrap();
-        let unique = UuidV7Generator::new().next_id().to_string();
-        let source = std::env::temp_dir().join(format!("og-{unique}.ogid"));
-        let destination = std::env::temp_dir().join(format!("og-{unique}-copy.ogid"));
-        save(&source, &identity, b"correct horse battery staple").unwrap();
+    #[test] fn encrypted_export_requires_correct_password() { let identity = IdentityCredential::generate().unwrap(); let unique = UuidV7Generator::new().next_id().to_string(); let source = std::env::temp_dir().join(format!("og-{unique}.ogid")); let destination = std::env::temp_dir().join(format!("og-{unique}-copy.ogid")); save(&source, &identity, b"correct horse battery staple").unwrap(); assert!(matches!( copy_encrypted(&source, &destination, b"wrong password"), Err(IdentityFileError::InvalidPassword) )); assert!(!destination.exists()); copy_encrypted(&source, &destination, b"correct horse battery staple").unwrap(); assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap()); let _ = fs::remove_file(source); let _ = fs::remove_file(destination); }
 
-        assert!(matches!(
-            copy_encrypted(&source, &destination, b"wrong password"),
-            Err(IdentityFileError::InvalidPassword)
-        ));
-        assert!(!destination.exists());
-
-        copy_encrypted(&source, &destination, b"correct horse battery staple").unwrap();
-        assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap());
-
-        let _ = fs::remove_file(source);
-        let _ = fs::remove_file(destination);
-    }
-
-    #[test]
-    fn wrong_password_is_rejected() {
-        let identity = IdentityCredential::generate().unwrap();
-        let bytes = encrypt_bytes(&identity, b"good password").unwrap();
-        assert!(matches!(
-            decrypt_bytes(&bytes, b"bad password"),
-            Err(IdentityFileError::InvalidPassword)
-        ));
-    }
+    #[test] fn wrong_password_is_rejected() { let identity = IdentityCredential::generate().unwrap(); let bytes = encrypt_bytes(&identity, b"good password").unwrap(); assert!(matches!( decrypt_bytes(&bytes, b"bad password"), Err(IdentityFileError::InvalidPassword) )); }
 }

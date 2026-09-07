@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Executable query expressions.
 
 use std::{fmt, sync::Arc};
@@ -1618,517 +1619,89 @@ pub enum ExpressionErrorKind {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parses_null_literal() {
-        let expression = parse_expression("null").unwrap();
-
-        assert_eq!(expression.kind(), &ExpressionKind::Literal(Literal::Null),);
-
-        assert_eq!(expression.span(), Span::new(0, 4));
-    }
-
-    #[test]
-    fn parses_boolean_literals() {
-        let true_expression = parse_expression("true").unwrap();
-
-        let false_expression = parse_expression("false").unwrap();
-
-        assert_eq!(true_expression.as_literal().unwrap().as_bool(), Some(true),);
-
-        assert_eq!(
-            false_expression.as_literal().unwrap().as_bool(),
-            Some(false),
-        );
-    }
-
-    #[test]
-    fn parses_integer_literal() {
-        let expression = parse_expression("123").unwrap();
-
-        assert_eq!(
-            expression.as_literal().unwrap().as_number_text(),
-            Some("123"),
-        );
-    }
+    #[test] fn parses_null_literal() { let expression = parse_expression("null").unwrap(); assert_eq!(expression.kind(), &ExpressionKind::Literal(Literal::Null),); assert_eq!(expression.span(), Span::new(0, 4)); }
 
-    #[test]
-    fn parses_decimal_literal() {
-        let expression = parse_expression("12.50").unwrap();
+    #[test] fn parses_boolean_literals() { let true_expression = parse_expression("true").unwrap(); let false_expression = parse_expression("false").unwrap(); assert_eq!(true_expression.as_literal().unwrap().as_bool(), Some(true),); assert_eq!( false_expression.as_literal().unwrap().as_bool(), Some(false), ); }
 
-        assert_eq!(
-            expression.as_literal().unwrap().as_number_text(),
-            Some("12.50"),
-        );
-    }
-
-    #[test]
-    fn parses_leading_decimal_point() {
-        let expression = parse_expression(".75").unwrap();
+    #[test] fn parses_integer_literal() { let expression = parse_expression("123").unwrap(); assert_eq!( expression.as_literal().unwrap().as_number_text(), Some("123"), ); }
 
-        assert_eq!(
-            expression.as_literal().unwrap().as_number_text(),
-            Some(".75"),
-        );
-    }
+    #[test] fn parses_decimal_literal() { let expression = parse_expression("12.50").unwrap(); assert_eq!( expression.as_literal().unwrap().as_number_text(), Some("12.50"), ); }
 
-    #[test]
-    fn parses_exponent_literal() {
-        let expression = parse_expression("1.5e-10").unwrap();
+    #[test] fn parses_leading_decimal_point() { let expression = parse_expression(".75").unwrap(); assert_eq!( expression.as_literal().unwrap().as_number_text(), Some(".75"), ); }
 
-        assert_eq!(
-            expression.as_literal().unwrap().as_number_text(),
-            Some("1.5e-10"),
-        );
-    }
-
-    #[test]
-    fn preserves_numeric_literal_spelling() {
-        let first = parse_expression("1").unwrap();
-        let second = parse_expression("1.0").unwrap();
+    #[test] fn parses_exponent_literal() { let expression = parse_expression("1.5e-10").unwrap(); assert_eq!( expression.as_literal().unwrap().as_number_text(), Some("1.5e-10"), ); }
 
-        assert_ne!(first.as_literal(), second.as_literal(),);
-    }
+    #[test] fn preserves_numeric_literal_spelling() { let first = parse_expression("1").unwrap(); let second = parse_expression("1.0").unwrap(); assert_ne!(first.as_literal(), second.as_literal(),); }
 
-    #[test]
-    fn parses_string_literal() {
-        let expression = parse_expression(r#""hello""#).unwrap();
+    #[test] fn parses_string_literal() { let expression = parse_expression(r#""hello""#).unwrap(); assert_eq!(expression.as_literal().unwrap().as_string(), Some("hello"),); }
 
-        assert_eq!(expression.as_literal().unwrap().as_string(), Some("hello"),);
-    }
-
-    #[test]
-    fn decodes_string_escapes() {
-        let expression = parse_expression(r#""hello\n\"OG\"""#).unwrap();
-
-        assert_eq!(
-            expression.as_literal().unwrap().as_string(),
-            Some("hello\n\"OG\""),
-        );
-    }
-
-    #[test]
-    fn parses_field_reference() {
-        let expression = parse_expression("country").unwrap();
+    #[test] fn decodes_string_escapes() { let expression = parse_expression(r#""hello\n\"OG\"""#).unwrap(); assert_eq!( expression.as_literal().unwrap().as_string(), Some("hello\n\"OG\""), ); }
 
-        let field = expression.as_field().unwrap();
-
-        assert_eq!(field.len(), 1);
-        assert_eq!(field.first(), "country");
-        assert_eq!(field.last(), "country");
-    }
-
-    #[test]
-    fn parses_nested_field_reference() {
-        let expression = parse_expression("user.address.city").unwrap();
-
-        let field = expression.as_field().unwrap();
+    #[test] fn parses_field_reference() { let expression = parse_expression("country").unwrap(); let field = expression.as_field().unwrap(); assert_eq!(field.len(), 1); assert_eq!(field.first(), "country"); assert_eq!(field.last(), "country"); }
 
-        assert_eq!(field.len(), 3);
-        assert_eq!(
-            field.iter().collect::<Vec<_>>(),
-            vec!["user", "address", "city"],
-        );
-
-        assert_eq!(field.to_string(), "user.address.city",);
-    }
-
-    #[test]
-    fn parses_unicode_field_reference() {
-        let expression = parse_expression("utilisateur.adresse.ville").unwrap();
-
-        let field = expression.as_field().unwrap();
-
-        assert_eq!(field.len(), 3);
-    }
-
-    #[test]
-    fn parses_unary_not() {
-        let expression = parse_expression("!active").unwrap();
-
-        let ExpressionKind::Unary { operator, operand } = expression.kind() else {
-            panic!("expected unary expression");
-        };
-
-        assert_eq!(*operator, UnaryOperator::Not);
-        assert_eq!(operand.as_field().unwrap().first(), "active",);
-    }
-
-    #[test]
-    fn parses_unary_negation() {
-        let expression = parse_expression("-18").unwrap();
-
-        let ExpressionKind::Unary { operator, operand } = expression.kind() else {
-            panic!("expected unary expression");
-        };
-
-        assert_eq!(*operator, UnaryOperator::Negate);
-
-        assert_eq!(operand.as_literal().unwrap().as_number_text(), Some("18"),);
-    }
-
-    #[test]
-    fn parses_comparison() {
-        let expression = parse_expression("age >= 18").unwrap();
-
-        let ExpressionKind::Binary {
-            left,
-            operator,
-            right,
-        } = expression.kind()
-        else {
-            panic!("expected binary expression");
-        };
-
-        assert_eq!(*operator, BinaryOperator::GreaterThanOrEqual,);
-
-        assert_eq!(left.as_field().unwrap().first(), "age",);
-
-        assert_eq!(right.as_literal().unwrap().as_number_text(), Some("18"),);
-    }
-
-    #[test]
-    fn multiplication_has_higher_precedence_than_addition() {
-        let expression = parse_expression("1 + 2 * 3").unwrap();
-
-        let ExpressionKind::Binary {
-            left,
-            operator,
-            right,
-        } = expression.kind()
-        else {
-            panic!("expected addition");
-        };
-
-        assert_eq!(*operator, BinaryOperator::Add);
-        assert!(left.is_literal());
-
-        let ExpressionKind::Binary { operator, .. } = right.kind() else {
-            panic!("expected multiplication");
-        };
-
-        assert_eq!(*operator, BinaryOperator::Multiply,);
-    }
-
-    #[test]
-    fn comparison_has_higher_precedence_than_and() {
-        let expression = parse_expression("age >= 18 && active == true").unwrap();
-
-        let ExpressionKind::Binary {
-            left,
-            operator,
-            right,
-        } = expression.kind()
-        else {
-            panic!("expected boolean expression");
-        };
-
-        assert_eq!(*operator, BinaryOperator::And);
-
-        assert!(matches!(
-            left.kind(),
-            ExpressionKind::Binary {
-                operator: BinaryOperator::GreaterThanOrEqual,
-                ..
-            },
-        ));
-
-        assert!(matches!(
-            right.kind(),
-            ExpressionKind::Binary {
-                operator: BinaryOperator::Equal,
-                ..
-            },
-        ));
-    }
-
-    #[test]
-    fn and_has_higher_precedence_than_or() {
-        let expression = parse_expression("a || b && c").unwrap();
-
-        let ExpressionKind::Binary {
-            operator, right, ..
-        } = expression.kind()
-        else {
-            panic!("expected binary expression");
-        };
-
-        assert_eq!(*operator, BinaryOperator::Or);
-
-        assert!(matches!(
-            right.kind(),
-            ExpressionKind::Binary {
-                operator: BinaryOperator::And,
-                ..
-            },
-        ));
-    }
-
-    #[test]
-    fn subtraction_is_left_associative() {
-        let expression = parse_expression("10 - 5 - 2").unwrap();
-
-        let ExpressionKind::Binary { left, operator, .. } = expression.kind() else {
-            panic!("expected subtraction");
-        };
-
-        assert_eq!(*operator, BinaryOperator::Subtract,);
-
-        assert!(matches!(
-            left.kind(),
-            ExpressionKind::Binary {
-                operator: BinaryOperator::Subtract,
-                ..
-            },
-        ));
-    }
-
-    #[test]
-    fn parentheses_override_precedence() {
-        let expression = parse_expression("(1 + 2) * 3").unwrap();
-
-        let ExpressionKind::Binary { left, operator, .. } = expression.kind() else {
-            panic!("expected multiplication");
-        };
-
-        assert_eq!(*operator, BinaryOperator::Multiply,);
-
-        assert!(matches!(left.kind(), ExpressionKind::Group(_),));
-    }
-
-    #[test]
-    fn preserves_group_span() {
-        let expression = parse_expression("(age >= 18)").unwrap();
-
-        assert_eq!(expression.span(), Span::new(0, 11),);
-
-        assert!(matches!(expression.kind(), ExpressionKind::Group(_),));
-    }
-
-    #[test]
-    fn ignores_outer_whitespace() {
-        let expression = parse_expression("  age >= 18  ").unwrap();
-
-        assert_eq!(expression.span(), Span::new(2, 11),);
-    }
-
-    #[test]
-    fn rejects_empty_expression() {
-        let error = parse_expression("   ").unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::EmptyExpression,);
-    }
-
-    #[test]
-    fn rejects_empty_group() {
-        let error = parse_expression("()").unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::EmptyGroup,);
-    }
-
-    #[test]
-    fn rejects_missing_right_operand() {
-        let error = parse_expression("age >").unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &ExpressionErrorKind::UnexpectedEnd {
-                expected: "expression",
-            },
-        );
-    }
-
-    #[test]
-    fn rejects_missing_closing_parenthesis() {
-        let error = parse_expression("(age > 18").unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &ExpressionErrorKind::UnexpectedToken {
-                found: Arc::from(""),
-                expected: "')'",
-            },
-        );
-    }
-
-    #[test]
-    fn rejects_single_equal() {
-        let error = parse_expression("age = 18").unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::SingleEqual,);
-    }
-
-    #[test]
-    fn rejects_single_ampersand() {
-        let error = parse_expression("a & b").unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::SingleAmpersand,);
-    }
-
-    #[test]
-    fn rejects_pipeline_pipe_inside_expression() {
-        let error = parse_expression("a | b").unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::SinglePipe,);
-    }
-
-    #[test]
-    fn rejects_unterminated_string() {
-        let error = parse_expression(r#""hello"#).unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::UnterminatedString,);
-    }
-
-    #[test]
-    fn rejects_invalid_string_escape() {
-        let error = parse_expression(r#""\q""#).unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &ExpressionErrorKind::InvalidStringEscape { character: 'q' },
-        );
-    }
-
-    #[test]
-    fn rejects_incomplete_exponent() {
-        let error = parse_expression("1e+").unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::InvalidNumber,);
-    }
-
-    #[test]
-    fn rejects_trailing_expression() {
-        let error = parse_expression("age 18").unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &ExpressionErrorKind::UnexpectedToken {
-                found: Arc::from("18"),
-                expected: "end of expression",
-            },
-        );
-    }
-
-    #[test]
-    fn creates_field_path_directly() {
-        let path = ExpressionFieldPath::new(["user", "address", "city"]).unwrap();
-
-        assert_eq!(path.to_string(), "user.address.city",);
-    }
-
-    #[test]
-    fn rejects_empty_direct_field_path() {
-        let segments: [&str; 0] = [];
-
-        let error = ExpressionFieldPath::new(segments).unwrap_err();
-
-        assert_eq!(error.kind(), &ExpressionErrorKind::EmptyFieldPath,);
-    }
-
-    #[test]
-    fn rejects_empty_direct_field_segment() {
-        let error = ExpressionFieldPath::new(["user", "", "name"]).unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &ExpressionErrorKind::EmptyFieldSegment { index: 1 },
-        );
-    }
-
-    #[test]
-    fn binary_operator_categories_are_correct() {
-        assert!(BinaryOperator::And.is_boolean());
-        assert!(BinaryOperator::Equal.is_comparison());
-        assert!(BinaryOperator::Add.is_arithmetic());
-
-        assert!(!BinaryOperator::And.is_arithmetic());
-        assert!(!BinaryOperator::Equal.is_boolean());
-        assert!(!BinaryOperator::Add.is_comparison());
-    }
-
-    #[test]
-    fn exposes_complete_structural_view() {
-        let expression = parse_expression("(age + 1) >= 18").unwrap();
-
-        let ExpressionView::Binary {
-            left,
-            operator,
-            right,
-        } = expression.view()
-        else {
-            panic!("expected binary view");
-        };
-
-        assert_eq!(operator, BinaryOperator::GreaterThanOrEqual);
-        assert!(left.is_group());
-        assert!(right.is_literal());
-
-        let ExpressionView::Binary { operator, .. } = left.ungrouped().view() else {
-            panic!("expected grouped addition");
-        };
-
-        assert_eq!(operator, BinaryOperator::Add);
-    }
-
-    #[test]
-    fn unary_and_binary_accessors_are_consistent() {
-        let unary = parse_expression("!active").unwrap();
-        let (operator, operand) = unary.as_unary().unwrap();
-
-        assert_eq!(operator, UnaryOperator::Not);
-        assert_eq!(operand.as_field().unwrap().first(), "active");
-
-        let binary = parse_expression("age >= 18").unwrap();
-        let (left, operator, right) = binary.as_binary().unwrap();
-
-        assert_eq!(operator, BinaryOperator::GreaterThanOrEqual);
-        assert!(left.is_field());
-        assert!(right.is_literal());
-    }
-
-    #[test]
-    fn group_accessors_preserve_and_remove_parentheses() {
-        let expression = parse_expression("((active))").unwrap();
-
-        assert!(expression.is_group());
-        assert!(expression.as_group().is_some());
-        assert!(expression.ungrouped().is_field());
-    }
-
-    #[test]
-    fn operator_categories_cover_unary_semantics() {
-        assert!(UnaryOperator::Not.is_boolean());
-        assert!(!UnaryOperator::Not.is_numeric());
-        assert!(UnaryOperator::Negate.is_numeric());
-        assert!(UnaryOperator::Positive.is_numeric());
-    }
-
-    #[test]
-    fn word_boolean_operators_follow_standard_precedence() {
-        let expression = parse_expression("a == 1 or b == 2 and not disabled").unwrap();
-        let ExpressionView::Binary {
-            operator, right, ..
-        } = expression.view()
-        else {
-            panic!("expected top-level binary expression");
-        };
-        assert_eq!(operator, BinaryOperator::Or);
-        let ExpressionView::Binary {
-            operator,
-            right: and_right,
-            ..
-        } = right.view()
-        else {
-            panic!("expected right-hand conjunction");
-        };
-        assert_eq!(operator, BinaryOperator::And);
-        assert!(matches!(
-            and_right.view(),
-            ExpressionView::Unary {
-                operator: UnaryOperator::Not,
-                ..
-            }
-        ));
-    }
+    #[test] fn parses_nested_field_reference() { let expression = parse_expression("user.address.city").unwrap(); let field = expression.as_field().unwrap(); assert_eq!(field.len(), 3); assert_eq!( field.iter().collect::<Vec<_>>(), vec!["user", "address", "city"], ); assert_eq!(field.to_string(), "user.address.city",); }
+
+    #[test] fn parses_unicode_field_reference() { let expression = parse_expression("utilisateur.adresse.ville").unwrap(); let field = expression.as_field().unwrap(); assert_eq!(field.len(), 3); }
+
+    #[test] fn parses_unary_not() { let expression = parse_expression("!active").unwrap(); let ExpressionKind::Unary { operator, operand } = expression.kind() else { panic!("expected unary expression"); }; assert_eq!(*operator, UnaryOperator::Not); assert_eq!(operand.as_field().unwrap().first(), "active",); }
+
+    #[test] fn parses_unary_negation() { let expression = parse_expression("-18").unwrap(); let ExpressionKind::Unary { operator, operand } = expression.kind() else { panic!("expected unary expression"); }; assert_eq!(*operator, UnaryOperator::Negate); assert_eq!(operand.as_literal().unwrap().as_number_text(), Some("18"),); }
+
+    #[test] fn parses_comparison() { let expression = parse_expression("age >= 18").unwrap(); let ExpressionKind::Binary { left, operator, right, } = expression.kind() else { panic!("expected binary expression"); }; assert_eq!(*operator, BinaryOperator::GreaterThanOrEqual,); assert_eq!(left.as_field().unwrap().first(), "age",); assert_eq!(right.as_literal().unwrap().as_number_text(), Some("18"),); }
+
+    #[test] fn multiplication_has_higher_precedence_than_addition() { let expression = parse_expression("1 + 2 * 3").unwrap(); let ExpressionKind::Binary { left, operator, right, } = expression.kind() else { panic!("expected addition"); }; assert_eq!(*operator, BinaryOperator::Add); assert!(left.is_literal()); let ExpressionKind::Binary { operator, .. } = right.kind() else { panic!("expected multiplication"); }; assert_eq!(*operator, BinaryOperator::Multiply,); }
+
+    #[test] fn comparison_has_higher_precedence_than_and() { let expression = parse_expression("age >= 18 && active == true").unwrap(); let ExpressionKind::Binary { left, operator, right, } = expression.kind() else { panic!("expected boolean expression"); }; assert_eq!(*operator, BinaryOperator::And); assert!(matches!( left.kind(), ExpressionKind::Binary { operator: BinaryOperator::GreaterThanOrEqual, .. }, )); assert!(matches!( right.kind(), ExpressionKind::Binary { operator: BinaryOperator::Equal, .. }, )); }
+
+    #[test] fn and_has_higher_precedence_than_or() { let expression = parse_expression("a || b && c").unwrap(); let ExpressionKind::Binary { operator, right, .. } = expression.kind() else { panic!("expected binary expression"); }; assert_eq!(*operator, BinaryOperator::Or); assert!(matches!( right.kind(), ExpressionKind::Binary { operator: BinaryOperator::And, .. }, )); }
+
+    #[test] fn subtraction_is_left_associative() { let expression = parse_expression("10 - 5 - 2").unwrap(); let ExpressionKind::Binary { left, operator, .. } = expression.kind() else { panic!("expected subtraction"); }; assert_eq!(*operator, BinaryOperator::Subtract,); assert!(matches!( left.kind(), ExpressionKind::Binary { operator: BinaryOperator::Subtract, .. }, )); }
+
+    #[test] fn parentheses_override_precedence() { let expression = parse_expression("(1 + 2) * 3").unwrap(); let ExpressionKind::Binary { left, operator, .. } = expression.kind() else { panic!("expected multiplication"); }; assert_eq!(*operator, BinaryOperator::Multiply,); assert!(matches!(left.kind(), ExpressionKind::Group(_),)); }
+
+    #[test] fn preserves_group_span() { let expression = parse_expression("(age >= 18)").unwrap(); assert_eq!(expression.span(), Span::new(0, 11),); assert!(matches!(expression.kind(), ExpressionKind::Group(_),)); }
+
+    #[test] fn ignores_outer_whitespace() { let expression = parse_expression("  age >= 18  ").unwrap(); assert_eq!(expression.span(), Span::new(2, 11),); }
+
+    #[test] fn rejects_empty_expression() { let error = parse_expression("   ").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::EmptyExpression,); }
+
+    #[test] fn rejects_empty_group() { let error = parse_expression("()").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::EmptyGroup,); }
+
+    #[test] fn rejects_missing_right_operand() { let error = parse_expression("age >").unwrap_err(); assert_eq!( error.kind(), &ExpressionErrorKind::UnexpectedEnd { expected: "expression", }, ); }
+
+    #[test] fn rejects_missing_closing_parenthesis() { let error = parse_expression("(age > 18").unwrap_err(); assert_eq!( error.kind(), &ExpressionErrorKind::UnexpectedToken { found: Arc::from(""), expected: "')'", }, ); }
+
+    #[test] fn rejects_single_equal() { let error = parse_expression("age = 18").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::SingleEqual,); }
+
+    #[test] fn rejects_single_ampersand() { let error = parse_expression("a & b").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::SingleAmpersand,); }
+
+    #[test] fn rejects_pipeline_pipe_inside_expression() { let error = parse_expression("a | b").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::SinglePipe,); }
+
+    #[test] fn rejects_unterminated_string() { let error = parse_expression(r#""hello"#).unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::UnterminatedString,); }
+
+    #[test] fn rejects_invalid_string_escape() { let error = parse_expression(r#""\q""#).unwrap_err(); assert_eq!( error.kind(), &ExpressionErrorKind::InvalidStringEscape { character: 'q' }, ); }
+
+    #[test] fn rejects_incomplete_exponent() { let error = parse_expression("1e+").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::InvalidNumber,); }
+
+    #[test] fn rejects_trailing_expression() { let error = parse_expression("age 18").unwrap_err(); assert_eq!( error.kind(), &ExpressionErrorKind::UnexpectedToken { found: Arc::from("18"), expected: "end of expression", }, ); }
+
+    #[test] fn creates_field_path_directly() { let path = ExpressionFieldPath::new(["user", "address", "city"]).unwrap(); assert_eq!(path.to_string(), "user.address.city",); }
+
+    #[test] fn rejects_empty_direct_field_path() { let segments: [&str; 0] = []; let error = ExpressionFieldPath::new(segments).unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::EmptyFieldPath,); }
+
+    #[test] fn rejects_empty_direct_field_segment() { let error = ExpressionFieldPath::new(["user", "", "name"]).unwrap_err(); assert_eq!( error.kind(), &ExpressionErrorKind::EmptyFieldSegment { index: 1 }, ); }
+
+    #[test] fn binary_operator_categories_are_correct() { assert!(BinaryOperator::And.is_boolean()); assert!(BinaryOperator::Equal.is_comparison()); assert!(BinaryOperator::Add.is_arithmetic()); assert!(!BinaryOperator::And.is_arithmetic()); assert!(!BinaryOperator::Equal.is_boolean()); assert!(!BinaryOperator::Add.is_comparison()); }
+
+    #[test] fn exposes_complete_structural_view() { let expression = parse_expression("(age + 1) >= 18").unwrap(); let ExpressionView::Binary { left, operator, right, } = expression.view() else { panic!("expected binary view"); }; assert_eq!(operator, BinaryOperator::GreaterThanOrEqual); assert!(left.is_group()); assert!(right.is_literal()); let ExpressionView::Binary { operator, .. } = left.ungrouped().view() else { panic!("expected grouped addition"); }; assert_eq!(operator, BinaryOperator::Add); }
+
+    #[test] fn unary_and_binary_accessors_are_consistent() { let unary = parse_expression("!active").unwrap(); let (operator, operand) = unary.as_unary().unwrap(); assert_eq!(operator, UnaryOperator::Not); assert_eq!(operand.as_field().unwrap().first(), "active"); let binary = parse_expression("age >= 18").unwrap(); let (left, operator, right) = binary.as_binary().unwrap(); assert_eq!(operator, BinaryOperator::GreaterThanOrEqual); assert!(left.is_field()); assert!(right.is_literal()); }
+
+    #[test] fn group_accessors_preserve_and_remove_parentheses() { let expression = parse_expression("((active))").unwrap(); assert!(expression.is_group()); assert!(expression.as_group().is_some()); assert!(expression.ungrouped().is_field()); }
+
+    #[test] fn operator_categories_cover_unary_semantics() { assert!(UnaryOperator::Not.is_boolean()); assert!(!UnaryOperator::Not.is_numeric()); assert!(UnaryOperator::Negate.is_numeric()); assert!(UnaryOperator::Positive.is_numeric()); }
+
+    #[test] fn word_boolean_operators_follow_standard_precedence() { let expression = parse_expression("a == 1 or b == 2 and not disabled").unwrap(); let ExpressionView::Binary { operator, right, .. } = expression.view() else { panic!("expected top-level binary expression"); }; assert_eq!(operator, BinaryOperator::Or); let ExpressionView::Binary { operator, right: and_right, .. } = right.view() else { panic!("expected right-hand conjunction"); }; assert_eq!(operator, BinaryOperator::And); assert!(matches!( and_right.view(), ExpressionView::Unary { operator: UnaryOperator::Not, .. } )); }
 
     fn assert_same_expression_structure(left: &Expression, right: &Expression) {
         match (left.view(), right.view()) {
@@ -2176,11 +1749,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn symbolic_and_word_boolean_operators_build_equivalent_trees() {
-        let words = parse_expression("a == 1 and (b == 2 or not disabled)").unwrap();
-        let symbols = parse_expression("a == 1 && (b == 2 || !disabled)").unwrap();
-
-        assert_same_expression_structure(&words, &symbols);
-    }
+    #[test] fn symbolic_and_word_boolean_operators_build_equivalent_trees() { let words = parse_expression("a == 1 and (b == 2 or not disabled)").unwrap(); let symbols = parse_expression("a == 1 && (b == 2 || !disabled)").unwrap(); assert_same_expression_structure(&words, &symbols); }
 }

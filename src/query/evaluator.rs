@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Expression evaluator contracts.
 
 use std::{error::Error as StdError, fmt, sync::Arc};
@@ -459,41 +460,9 @@ impl EvaluationBackend for FunctionEvaluationBackend {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_context_is_strict_and_atomic() {
-        let context = EvaluationContext::default();
+    #[test] fn default_context_is_strict_and_atomic() { let context = EvaluationContext::default(); assert_eq!(context.missing_policy(), MissingPolicy::Preserve); assert_eq!(context.boolean_policy(), BooleanPolicy::Strict); assert_eq!(context.assignment_policy(), AssignmentPolicy::Atomic); }
 
-        assert_eq!(context.missing_policy(), MissingPolicy::Preserve);
-        assert_eq!(context.boolean_policy(), BooleanPolicy::Strict);
-        assert_eq!(context.assignment_policy(), AssignmentPolicy::Atomic);
-    }
+    #[test] fn error_is_converted_to_execution_category() { let evaluation = EvaluationError::missing_field("address.city"); let execution = ExecutionError::from(evaluation); assert!(matches!( execution.kind(), super::super::ExecutionErrorKind::Evaluation { .. } )); let mutation = ExecutionError::from(EvaluationError::new(EvaluationErrorKind::EmptyAssignments)); assert!(matches!( mutation.kind(), super::super::ExecutionErrorKind::Mutation { .. } )); }
 
-    #[test]
-    fn error_is_converted_to_execution_category() {
-        let evaluation = EvaluationError::missing_field("address.city");
-        let execution = ExecutionError::from(evaluation);
-
-        assert!(matches!(
-            execution.kind(),
-            super::super::ExecutionErrorKind::Evaluation { .. }
-        ));
-
-        let mutation =
-            ExecutionError::from(EvaluationError::new(EvaluationErrorKind::EmptyAssignments));
-
-        assert!(matches!(
-            mutation.kind(),
-            super::super::ExecutionErrorKind::Mutation { .. }
-        ));
-    }
-
-    #[test]
-    fn evaluator_public_types_are_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        assert_send_and_sync::<Evaluator>();
-        assert_send_and_sync::<EvaluationContext>();
-        assert_send_and_sync::<EvaluationError>();
-        assert_send_and_sync::<FunctionEvaluationBackend>();
-    }
+    #[test] fn evaluator_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Evaluator>(); assert_send_and_sync::<EvaluationContext>(); assert_send_and_sync::<EvaluationError>(); assert_send_and_sync::<FunctionEvaluationBackend>(); }
 }

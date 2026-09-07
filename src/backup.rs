@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Streaming, backend-agnostic OG backup/restore format.
 
 use crate::storage::{
@@ -361,40 +362,5 @@ fn json_to_value(v: JsonValue) -> Result<Value, BackupError> {
 mod tests {
     use super::*;
     use crate::storage::MemoryStorage;
-    #[test]
-    fn round_trip() {
-        let storage = MemoryStorage::new();
-        let c = CollectionId::parse("users").unwrap();
-        let mut tx = storage.begin().unwrap();
-        let mut d = Document::new();
-        d.insert("name", Value::string("Alice"));
-        tx.insert(&c, DocumentId::from_test_label("a"), Arc::new(d))
-            .unwrap();
-        tx.commit().unwrap();
-        let p = std::env::temp_dir().join(format!("og-backup-{}.ogb", std::process::id()));
-        let s = create(
-            &storage,
-            &p,
-            BackupMetadata {
-                created_at: 42,
-                source: BackupSource {
-                    instance_id: "instance-test".into(),
-                    hostname: "test-host".into(),
-                    platform: "test-os".into(),
-                    arch: "test-arch".into(),
-                    core_version: "0.1.0".into(),
-                },
-            },
-        )
-        .unwrap();
-        assert_eq!(s.documents, 1);
-        let info = inspect(&p).unwrap();
-        assert_eq!(info.created_at, 42);
-        assert_eq!(info.size_bytes, std::fs::metadata(&p).unwrap().len());
-        assert_eq!(info.source.instance_id, "instance-test");
-        let restored = MemoryStorage::new();
-        restore(&restored, &p, false).unwrap();
-        assert_eq!(restored.read().unwrap().count(&c).unwrap(), 1);
-        let _ = std::fs::remove_file(p);
-    }
+    #[test] fn round_trip() { let storage = MemoryStorage::new(); let c = CollectionId::parse("users").unwrap(); let mut tx = storage.begin().unwrap(); let mut d = Document::new(); d.insert("name", Value::string("Alice")); tx.insert(&c, DocumentId::from_test_label("a"), Arc::new(d)) .unwrap(); tx.commit().unwrap(); let p = std::env::temp_dir().join(format!("og-backup-{}.ogb", std::process::id())); let s = create( &storage, &p, BackupMetadata { created_at: 42, source: BackupSource { instance_id: "instance-test".into(), hostname: "test-host".into(), platform: "test-os".into(), arch: "test-arch".into(), core_version: "0.1.0".into(), }, }, ) .unwrap(); assert_eq!(s.documents, 1); let info = inspect(&p).unwrap(); assert_eq!(info.created_at, 42); assert_eq!(info.size_bytes, std::fs::metadata(&p).unwrap().len()); assert_eq!(info.source.instance_id, "instance-test"); let restored = MemoryStorage::new(); restore(&restored, &p, false).unwrap(); assert_eq!(restored.read().unwrap().count(&c).unwrap(), 1); let _ = std::fs::remove_file(p); }
 }

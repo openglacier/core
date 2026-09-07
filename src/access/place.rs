@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Place roles and stable sharing permission tokens.
 //!
 //! A Place is a system-owned usage and security context. The Owner is stored on
@@ -139,38 +140,9 @@ pub fn parse_sharing_permission(value: &str) -> Option<(&str, PlaceRole)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn place_role_rights_are_monotonic() {
-        assert!(PlaceRole::Owner.can_manage());
-        assert!(PlaceRole::Owner.can_write());
-        assert!(!PlaceRole::Resident.can_manage());
-        assert!(PlaceRole::Resident.can_write());
-        assert!(!PlaceRole::Member.can_manage());
-        assert!(!PlaceRole::Member.can_write());
-    }
+    #[test] fn place_role_rights_are_monotonic() { assert!(PlaceRole::Owner.can_manage()); assert!(PlaceRole::Owner.can_write()); assert!(!PlaceRole::Resident.can_manage()); assert!(PlaceRole::Resident.can_write()); assert!(!PlaceRole::Member.can_manage()); assert!(!PlaceRole::Member.can_write()); }
 
-    #[test]
-    fn public_access_maps_to_place_capabilities() {
-        assert!(!PublicAccess::Readonly.can_write());
-        assert!(PublicAccess::Readwrite.can_write());
-        assert_eq!(PublicAccess::Readonly.place_role(), PlaceRole::Member);
-        assert_eq!(PublicAccess::Readwrite.place_role(), PlaceRole::Resident);
-    }
+    #[test] fn public_access_maps_to_place_capabilities() { assert!(!PublicAccess::Readonly.can_write()); assert!(PublicAccess::Readwrite.can_write()); assert_eq!(PublicAccess::Readonly.place_role(), PlaceRole::Member); assert_eq!(PublicAccess::Readwrite.place_role(), PlaceRole::Resident); }
 
-    #[test]
-    fn sharing_tokens_round_trip() {
-        let token = sharing_permission("workshop", PlaceRole::Resident);
-        assert_eq!(token, "place:workshop:resident");
-        assert_eq!(
-            parse_sharing_permission(&token),
-            Some(("workshop", PlaceRole::Resident))
-        );
-        let owner_token = sharing_permission("workshop", PlaceRole::Owner);
-        assert_eq!(owner_token, "place:workshop:owner");
-        assert_eq!(
-            parse_sharing_permission(&owner_token),
-            Some(("workshop", PlaceRole::Owner))
-        );
-        assert!(parse_sharing_permission("files.read").is_none());
-    }
+    #[test] fn sharing_tokens_round_trip() { let token = sharing_permission("workshop", PlaceRole::Resident); assert_eq!(token, "place:workshop:resident"); assert_eq!( parse_sharing_permission(&token), Some(("workshop", PlaceRole::Resident)) ); let owner_token = sharing_permission("workshop", PlaceRole::Owner); assert_eq!(owner_token, "place:workshop:owner"); assert_eq!( parse_sharing_permission(&owner_token), Some(("workshop", PlaceRole::Owner)) ); assert!(parse_sharing_permission("files.read").is_none()); }
 }

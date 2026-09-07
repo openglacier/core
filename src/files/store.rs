@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Provider-neutral file-store contract.
 
 use std::{error::Error as StdError, fmt, io::Read};
@@ -189,12 +190,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn contract_is_object_safe() {
-        let store: Box<dyn FileStore> = Box::new(ContractOnlyStore {
-            id: StoreId::from("test"),
-        });
-        assert_eq!(store.store_id().as_str(), "test");
-        assert!(store.list(None).expect("list root").is_empty());
-    }
+    #[test] fn contract_is_object_safe() { let store: Box<dyn FileStore> = Box::new(ContractOnlyStore { id: StoreId::from("test"), }); assert_eq!(store.store_id().as_str(), "test"); assert!(store.list(None).expect("list root").is_empty()); }
 }

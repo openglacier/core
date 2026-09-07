@@ -1,7 +1,9 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Compact per-connection authentication state.
 
 use std::{fs::File, io::Read, time::Duration};
 
+#[cfg(feature = "identity")]
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::Serialize;
 
@@ -265,10 +267,19 @@ pub struct AuthChallenge {
     pub expires_at: u64,
 }
 
+#[cfg(feature = "identity")]
 pub fn validate_ed25519_public_key(public_key: &str) -> Result<(), AuthError> {
     parse_ed25519_public_key(public_key).map(drop)
 }
 
+#[cfg(not(feature = "identity"))]
+pub fn validate_ed25519_public_key(_public_key: &str) -> Result<(), AuthError> {
+    Err(AuthError::UnsupportedAlgorithm(
+        "ed25519 support is not compiled into this build".to_owned(),
+    ))
+}
+
+#[cfg(feature = "identity")]
 fn parse_ed25519_public_key(public_key: &str) -> Result<VerifyingKey, AuthError> {
     let der = decode_base64(public_key).map_err(|_| AuthError::InvalidBase64)?;
     const PREFIX: &[u8] = &[
@@ -281,13 +292,25 @@ fn parse_ed25519_public_key(public_key: &str) -> Result<VerifyingKey, AuthError>
     VerifyingKey::from_bytes(&key_bytes).map_err(|_| AuthError::InvalidPublicKey)
 }
 
-fn verify_ed25519(public_key: &str, signature: &str, message: &[u8]) -> Result<(), AuthError> {
+#[cfg(feature = "identity")]
+pub fn verify_ed25519(public_key: &str, signature: &str, message: &[u8]) -> Result<(), AuthError> {
     let key = parse_ed25519_public_key(public_key)?;
     let signature_bytes = decode_base64(signature).map_err(|_| AuthError::InvalidBase64)?;
     let signature =
         Signature::from_slice(&signature_bytes).map_err(|_| AuthError::InvalidSignature)?;
     key.verify(message, &signature)
         .map_err(|_| AuthError::InvalidSignature)
+}
+
+#[cfg(not(feature = "identity"))]
+pub fn verify_ed25519(
+    _public_key: &str,
+    _signature: &str,
+    _message: &[u8],
+) -> Result<(), AuthError> {
+    Err(AuthError::UnsupportedAlgorithm(
+        "ed25519 support is not compiled into this build".to_owned(),
+    ))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -304,78 +327,13 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn base64_round_trip_is_stable() {
-        let input = b"openglacier authentication";
-        assert_eq!(decode_base64(&encode_base64(input)).unwrap(), input);
-    }
+    #[test] fn base64_round_trip_is_stable() { let input = b"openglacier authentication"; assert_eq!(decode_base64(&encode_base64(input)).unwrap(), input); }
 
-    #[test]
-    fn challenge_is_bound_to_identity_and_device() {
-        let credential = DeviceCredential {
-            identity_id: "identity-a".to_owned(),
-            device_id: "device-a".to_owned(),
-            public_key: "unused".to_owned(),
-            algorithm: "ed25519".to_owned(),
-            encoding: "spki-der".to_owned(),
-            active: true,
-        };
-        let mut auth = ConnectionAuth::default();
-        let challenge = auth.begin(&credential, Duration::from_secs(1)).unwrap();
-        assert!(!challenge.challenge_id.is_empty());
-        assert_eq!(decode_base64(&challenge.challenge).unwrap().len(), 32);
-        assert_eq!(auth.principal(), &Principal::Anonymous);
-    }
+    #[test] fn challenge_is_bound_to_identity_and_device() { let credential = DeviceCredential { identity_id: "identity-a".to_owned(), device_id: "device-a".to_owned(), public_key: "unused".to_owned(), algorithm: "ed25519".to_owned(), encoding: "spki-der".to_owned(), active: true, }; let mut auth = ConnectionAuth::default(); let challenge = auth.begin(&credential, Duration::from_secs(1)).unwrap(); assert!(!challenge.challenge_id.is_empty()); assert_eq!(decode_base64(&challenge.challenge).unwrap().len(), 32); assert_eq!(auth.principal(), &Principal::Anonymous); }
 
-    #[test]
-    fn enrollment_challenge_keeps_stateless_subject_until_completion() {
-        let mut auth = ConnectionAuth::default();
+    #[test] fn enrollment_challenge_keeps_stateless_subject_until_completion() { let mut auth = ConnectionAuth::default(); let challenge = auth .begin_enrollment( "identity-a".to_owned(), "shared-public-key".to_owned(), "device-a".to_owned(), "shared-public-key".to_owned(), Duration::from_secs(1), ) .unwrap(); assert!(!challenge.challenge_id.is_empty()); assert_eq!(auth.principal(), &Principal::Anonymous); }
 
-        let challenge = auth
-            .begin_enrollment(
-                "identity-a".to_owned(),
-                "shared-public-key".to_owned(),
-                "device-a".to_owned(),
-                "shared-public-key".to_owned(),
-                Duration::from_secs(1),
-            )
-            .unwrap();
+    #[test] fn challenge_expiration_is_messagepack_js_number() { let challenge = AuthChallenge { challenge_id: "challenge-a".to_owned(), challenge: "payload".to_owned(), expires_at: 1_785_680_802_608, }; let encoded = rmp_serde::to_vec_named(&challenge).unwrap(); let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap(); assert_eq!( decoded.get("expiresAt").and_then(serde_json::Value::as_f64), Some(1_785_680_802_608.0), ); assert!(decoded.get("expiresAt").unwrap().as_u64().is_none()); }
 
-        assert!(!challenge.challenge_id.is_empty());
-        assert_eq!(auth.principal(), &Principal::Anonymous);
-    }
-
-    #[test]
-    fn challenge_expiration_is_messagepack_js_number() {
-        let challenge = AuthChallenge {
-            challenge_id: "challenge-a".to_owned(),
-            challenge: "payload".to_owned(),
-            expires_at: 1_785_680_802_608,
-        };
-
-        let encoded = rmp_serde::to_vec_named(&challenge).unwrap();
-        let decoded: serde_json::Value = rmp_serde::from_slice(&encoded).unwrap();
-
-        assert_eq!(
-            decoded.get("expiresAt").and_then(serde_json::Value::as_f64),
-            Some(1_785_680_802_608.0),
-        );
-        assert!(decoded.get("expiresAt").unwrap().as_u64().is_none());
-    }
-
-    #[test]
-    fn inactive_device_cannot_start_authentication() {
-        let credential = DeviceCredential {
-            identity_id: "identity-a".to_owned(),
-            device_id: "device-a".to_owned(),
-            public_key: "unused".to_owned(),
-            algorithm: "ed25519".to_owned(),
-            encoding: "spki-der".to_owned(),
-            active: false,
-        };
-        let error = ConnectionAuth::default()
-            .begin(&credential, Duration::from_secs(1))
-            .unwrap_err();
-        assert_eq!(error, AuthError::DeviceMismatch);
-    }
+    #[test] fn inactive_device_cannot_start_authentication() { let credential = DeviceCredential { identity_id: "identity-a".to_owned(), device_id: "device-a".to_owned(), public_key: "unused".to_owned(), algorithm: "ed25519".to_owned(), encoding: "spki-der".to_owned(), active: false, }; let error = ConnectionAuth::default() .begin(&credential, Duration::from_secs(1)) .unwrap_err(); assert_eq!(error, AuthError::DeviceMismatch); }
 }

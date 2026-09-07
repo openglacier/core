@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Query tokenization.
 
 use std::fmt;
@@ -645,473 +646,69 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn lexes_empty_source() {
-        let stream = lex("").unwrap();
+    #[test] fn lexes_empty_source() { let stream = lex("").unwrap(); assert!(stream.is_empty()); assert_eq!(stream.len(), 1); assert_eq!(stream.tokens(), &[Token::end(0)]); }
 
-        assert!(stream.is_empty());
-        assert_eq!(stream.len(), 1);
-        assert_eq!(stream.tokens(), &[Token::end(0)]);
-    }
+    #[test] fn lexes_whitespace_only_source() { let stream = lex(" \n\t\r").unwrap(); assert!(stream.is_empty()); assert_eq!(stream.tokens(), &[Token::end(" \n\t\r".len())],); }
 
-    #[test]
-    fn lexes_whitespace_only_source() {
-        let stream = lex(" \n\t\r").unwrap();
+    #[test] fn lexes_minimal_from_query() { let source = "from users"; let stream = lex(source).unwrap(); assert_eq!( stream.tokens(), &[ Token::new(TokenKind::From, Span::new(0, 4)), Token::new(TokenKind::Identifier, Span::new(5, 10)), Token::end(10), ], ); assert_eq!( stream .significant_tokens() .map(|token| stream.lexeme(token).unwrap()) .collect::<Vec<_>>(), vec!["from", "users"], ); }
 
-        assert!(stream.is_empty());
-        assert_eq!(stream.tokens(), &[Token::end(" \n\t\r".len())],);
-    }
+    #[test] fn lexes_filter_pipeline() { assert_eq!( kinds("from users | where age > 18"), vec![ TokenKind::From, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::Greater, TokenKind::Number, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_minimal_from_query() {
-        let source = "from users";
-        let stream = lex(source).unwrap();
+    #[test] fn lexes_set_pipeline() { assert_eq!( kinds("from users | set active = true"), vec![ TokenKind::From, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Set, TokenKind::Identifier, TokenKind::Equal, TokenKind::True, TokenKind::End, ], ); }
 
-        assert_eq!(
-            stream.tokens(),
-            &[
-                Token::new(TokenKind::From, Span::new(0, 4)),
-                Token::new(TokenKind::Identifier, Span::new(5, 10)),
-                Token::end(10),
-            ],
-        );
+    #[test] fn lexes_load_pipeline() { assert_eq!( kinds("from users | load profile"), vec![ TokenKind::From, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Load, TokenKind::Identifier, TokenKind::End, ], ); }
 
-        assert_eq!(
-            stream
-                .significant_tokens()
-                .map(|token| stream.lexeme(token).unwrap())
-                .collect::<Vec<_>>(),
-            vec!["from", "users"],
-        );
-    }
+    #[test] fn lexes_join_as_compound_stage_keyword() { assert_eq!( kinds("on users | join workspace | into public | end"), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Join, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Into, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_filter_pipeline() {
-        assert_eq!(
-            kinds("from users | where age > 18"),
-            vec![
-                TokenKind::From,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Where,
-                TokenKind::Identifier,
-                TokenKind::Greater,
-                TokenKind::Number,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_set_pipeline() {
-        assert_eq!(
-            kinds("from users | set active = true"),
-            vec![
-                TokenKind::From,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Set,
-                TokenKind::Identifier,
-                TokenKind::Equal,
-                TokenKind::True,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_load_pipeline() {
-        assert_eq!(
-            kinds("from users | load profile"),
-            vec![
-                TokenKind::From,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Load,
-                TokenKind::Identifier,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_join_as_compound_stage_keyword() {
-        assert_eq!(
-            kinds("on users | join workspace | into public | end"),
-            vec![
-                TokenKind::On,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Join,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Into,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::EndKeyword,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_lookup_pipeline() {
-        assert_eq!(
-            kinds(
-                "on users as u \
+    #[test] fn lexes_lookup_pipeline() { assert_eq!( kinds( "on users as u \
                  | lookup workspace as w \
                  | where w.public == true \
                  | into public \
-                 | end"
-            ),
-            vec![
-                TokenKind::On,
-                TokenKind::Identifier,
-                TokenKind::As,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Lookup,
-                TokenKind::Identifier,
-                TokenKind::As,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Where,
-                TokenKind::Identifier,
-                TokenKind::Dot,
-                TokenKind::Identifier,
-                TokenKind::EqualEqual,
-                TokenKind::True,
-                TokenKind::Pipe,
-                TokenKind::Into,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::EndKeyword,
-                TokenKind::End,
-            ],
-        );
-    }
+                 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Lookup, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::Dot, TokenKind::Identifier, TokenKind::EqualEqual, TokenKind::True, TokenKind::Pipe, TokenKind::Into, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_union_pipeline() {
-        assert_eq!(
-            kinds(
-                "on users \
+    #[test] fn lexes_union_pipeline() { assert_eq!( kinds( "on users \
                  | union \
                  | on archived_users \
                  | where active == true \
-                 | end"
-            ),
-            vec![
-                TokenKind::On,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Union,
-                TokenKind::Pipe,
-                TokenKind::On,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Where,
-                TokenKind::Identifier,
-                TokenKind::EqualEqual,
-                TokenKind::True,
-                TokenKind::Pipe,
-                TokenKind::EndKeyword,
-                TokenKind::End,
-            ],
-        );
-    }
+                 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Union, TokenKind::Pipe, TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::EqualEqual, TokenKind::True, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_streaming_load_pipeline() {
-        assert_eq!(
-            kinds(
-                "on users \
+    #[test] fn lexes_streaming_load_pipeline() { assert_eq!( kinds( "on users \
                  | load \
                  | with replace \
                  | chunk batch1 \
                  | chunk batch2 \
-                 | end"
-            ),
-            vec![
-                TokenKind::On,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Load,
-                TokenKind::Pipe,
-                TokenKind::With,
-                TokenKind::Replace,
-                TokenKind::Pipe,
-                TokenKind::Chunk,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Chunk,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::EndKeyword,
-                TokenKind::End,
-            ],
-        );
-    }
+                 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Load, TokenKind::Pipe, TokenKind::With, TokenKind::Replace, TokenKind::Pipe, TokenKind::Chunk, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Chunk, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_compact_load_modes() {
-        assert_eq!(
-            kinds("load x with replace load y with update load z with merge"),
-            vec![
-                TokenKind::Load,
-                TokenKind::Identifier,
-                TokenKind::With,
-                TokenKind::Replace,
-                TokenKind::Load,
-                TokenKind::Identifier,
-                TokenKind::With,
-                TokenKind::Update,
-                TokenKind::Load,
-                TokenKind::Identifier,
-                TokenKind::With,
-                TokenKind::Merge,
-                TokenKind::End,
-            ],
-        );
-    }
+    #[test] fn lexes_compact_load_modes() { assert_eq!( kinds("load x with replace load y with update load z with merge"), vec![ TokenKind::Load, TokenKind::Identifier, TokenKind::With, TokenKind::Replace, TokenKind::Load, TokenKind::Identifier, TokenKind::With, TokenKind::Update, TokenKind::Load, TokenKind::Identifier, TokenKind::With, TokenKind::Merge, TokenKind::End, ], ); }
 
-    #[test]
-    fn distinguishes_end_keyword_from_end_of_input() {
-        let stream = lex("| end").unwrap();
+    #[test] fn distinguishes_end_keyword_from_end_of_input() { let stream = lex("| end").unwrap(); assert_eq!( stream.tokens(), &[ Token::new(TokenKind::Pipe, Span::new(0, 1)), Token::new(TokenKind::EndKeyword, Span::new(2, 5)), Token::end(5), ], ); assert!(stream.get(1).is_some_and(Token::is_end_keyword)); assert!(stream.get(2).is_some_and(Token::is_end)); }
 
-        assert_eq!(
-            stream.tokens(),
-            &[
-                Token::new(TokenKind::Pipe, Span::new(0, 1)),
-                Token::new(TokenKind::EndKeyword, Span::new(2, 5)),
-                Token::end(5),
-            ],
-        );
+    #[test] fn lexes_on_source() { assert_eq!( kinds("on users"), vec![TokenKind::On, TokenKind::Identifier, TokenKind::End], ); }
 
-        assert!(stream.get(1).is_some_and(Token::is_end_keyword));
-        assert!(stream.get(2).is_some_and(Token::is_end));
-    }
+    #[test] fn lexes_source_alias() { assert_eq!( kinds("on users as u"), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::End, ], ); assert_eq!(lexemes("on users as u"), vec!["on", "users", "as", "u"]); }
 
-    #[test]
-    fn lexes_on_source() {
-        assert_eq!(
-            kinds("on users"),
-            vec![TokenKind::On, TokenKind::Identifier, TokenKind::End],
-        );
-    }
+    #[test] fn lexes_all_reserved_words() { assert_eq!( kinds( "from on as where set lookup join union load into with chunk \
+                 replace update merge end true false null and or not" ), vec![ TokenKind::From, TokenKind::On, TokenKind::As, TokenKind::Where, TokenKind::Set, TokenKind::Lookup, TokenKind::Join, TokenKind::Union, TokenKind::Load, TokenKind::Into, TokenKind::With, TokenKind::Chunk, TokenKind::Replace, TokenKind::Update, TokenKind::Merge, TokenKind::EndKeyword, TokenKind::True, TokenKind::False, TokenKind::Null, TokenKind::And, TokenKind::Or, TokenKind::Not, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_source_alias() {
-        assert_eq!(
-            kinds("on users as u"),
-            vec![
-                TokenKind::On,
-                TokenKind::Identifier,
-                TokenKind::As,
-                TokenKind::Identifier,
-                TokenKind::End,
-            ],
-        );
+    #[test] fn keywords_are_case_sensitive() { assert_eq!( kinds("FROM From from"), vec![ TokenKind::Identifier, TokenKind::Identifier, TokenKind::From, TokenKind::End, ], ); }
 
-        assert_eq!(lexemes("on users as u"), vec!["on", "users", "as", "u"]);
-    }
+    #[test] fn lexes_ascii_identifiers() { assert_eq!( lexemes("users _private user2 first_name"), vec!["users", "_private", "user2", "first_name",], ); }
 
-    #[test]
-    fn lexes_all_reserved_words() {
-        assert_eq!(
-            kinds(
-                "from on as where set lookup join union load into with chunk \
-                 replace update merge end true false null and or not"
-            ),
-            vec![
-                TokenKind::From,
-                TokenKind::On,
-                TokenKind::As,
-                TokenKind::Where,
-                TokenKind::Set,
-                TokenKind::Lookup,
-                TokenKind::Join,
-                TokenKind::Union,
-                TokenKind::Load,
-                TokenKind::Into,
-                TokenKind::With,
-                TokenKind::Chunk,
-                TokenKind::Replace,
-                TokenKind::Update,
-                TokenKind::Merge,
-                TokenKind::EndKeyword,
-                TokenKind::True,
-                TokenKind::False,
-                TokenKind::Null,
-                TokenKind::And,
-                TokenKind::Or,
-                TokenKind::Not,
-                TokenKind::End,
-            ],
-        );
-    }
+    #[test] fn lexes_unicode_identifiers() { assert_eq!( lexemes("employés âge résumé"), vec!["employés", "âge", "résumé"], ); }
 
-    #[test]
-    fn keywords_are_case_sensitive() {
-        assert_eq!(
-            kinds("FROM From from"),
-            vec![
-                TokenKind::Identifier,
-                TokenKind::Identifier,
-                TokenKind::From,
-                TokenKind::End,
-            ],
-        );
-    }
+    #[test] fn lexes_field_paths() { assert_eq!( kinds("profile.address.city"), vec![ TokenKind::Identifier, TokenKind::Dot, TokenKind::Identifier, TokenKind::Dot, TokenKind::Identifier, TokenKind::End, ], ); assert_eq!( lexemes("profile.address.city"), vec!["profile", ".", "address", ".", "city"], ); }
 
-    #[test]
-    fn lexes_ascii_identifiers() {
-        assert_eq!(
-            lexemes("users _private user2 first_name"),
-            vec!["users", "_private", "user2", "first_name",],
-        );
-    }
+    #[test] fn lexes_punctuation() { assert_eq!( kinds("| . : , ( ) { } [ ]"), vec![ TokenKind::Pipe, TokenKind::Dot, TokenKind::Colon, TokenKind::Comma, TokenKind::LeftParen, TokenKind::RightParen, TokenKind::LeftBrace, TokenKind::RightBrace, TokenKind::LeftBracket, TokenKind::RightBracket, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_unicode_identifiers() {
-        assert_eq!(
-            lexemes("employés âge résumé"),
-            vec!["employés", "âge", "résumé"],
-        );
-    }
+    #[test] fn lexes_empty_object_and_array() { assert_eq!( kinds("{} []"), vec![ TokenKind::LeftBrace, TokenKind::RightBrace, TokenKind::LeftBracket, TokenKind::RightBracket, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_field_paths() {
-        assert_eq!(
-            kinds("profile.address.city"),
-            vec![
-                TokenKind::Identifier,
-                TokenKind::Dot,
-                TokenKind::Identifier,
-                TokenKind::Dot,
-                TokenKind::Identifier,
-                TokenKind::End,
-            ],
-        );
+    #[test] fn lexes_object_literal_shape() { let source = r#"{ _id: "u1", name: "John", age: 42, active: true }"#; assert_eq!( kinds(source), vec![ TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::Number, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::True, TokenKind::RightBrace, TokenKind::End, ], ); }
 
-        assert_eq!(
-            lexemes("profile.address.city"),
-            vec!["profile", ".", "address", ".", "city"],
-        );
-    }
+    #[test] fn lexes_quoted_object_keys() { let source = r#"{ "_id": "u1", "display-name": "John" }"#; assert_eq!( kinds(source), vec![ TokenKind::LeftBrace, TokenKind::String, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::Colon, TokenKind::String, TokenKind::RightBrace, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_punctuation() {
-        assert_eq!(
-            kinds("| . : , ( ) { } [ ]"),
-            vec![
-                TokenKind::Pipe,
-                TokenKind::Dot,
-                TokenKind::Colon,
-                TokenKind::Comma,
-                TokenKind::LeftParen,
-                TokenKind::RightParen,
-                TokenKind::LeftBrace,
-                TokenKind::RightBrace,
-                TokenKind::LeftBracket,
-                TokenKind::RightBracket,
-                TokenKind::End,
-            ],
-        );
-    }
+    #[test] fn lexes_array_literal_shape() { let source = r#"["rust", "database", 42, true, false, null]"#; assert_eq!( kinds(source), vec![ TokenKind::LeftBracket, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::Comma, TokenKind::Number, TokenKind::Comma, TokenKind::True, TokenKind::Comma, TokenKind::False, TokenKind::Comma, TokenKind::Null, TokenKind::RightBracket, TokenKind::End, ], ); }
 
-    #[test]
-    fn lexes_empty_object_and_array() {
-        assert_eq!(
-            kinds("{} []"),
-            vec![
-                TokenKind::LeftBrace,
-                TokenKind::RightBrace,
-                TokenKind::LeftBracket,
-                TokenKind::RightBracket,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_object_literal_shape() {
-        let source = r#"{ _id: "u1", name: "John", age: 42, active: true }"#;
-
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::LeftBrace,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::Number,
-                TokenKind::Comma,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::True,
-                TokenKind::RightBrace,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_quoted_object_keys() {
-        let source = r#"{ "_id": "u1", "display-name": "John" }"#;
-
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::LeftBrace,
-                TokenKind::String,
-                TokenKind::Colon,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::String,
-                TokenKind::Colon,
-                TokenKind::String,
-                TokenKind::RightBrace,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_array_literal_shape() {
-        let source = r#"["rust", "database", 42, true, false, null]"#;
-
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::LeftBracket,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::Number,
-                TokenKind::Comma,
-                TokenKind::True,
-                TokenKind::Comma,
-                TokenKind::False,
-                TokenKind::Comma,
-                TokenKind::Null,
-                TokenKind::RightBracket,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_nested_structured_values() {
-        let source = r#"
+    #[test] fn lexes_nested_structured_values() { let source = r#"
             {
                 user: {
                     name: "John",
@@ -1122,414 +719,72 @@ mod tests {
                 tags: ["rust", "database"],
                 scores: [1, 2.5, -3e2]
             }
-        "#;
+        "#; let stream = lex(source).unwrap(); assert_eq!( stream.kinds().collect::<Vec<_>>(), vec![ TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::RightBrace, TokenKind::RightBrace, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBracket, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::RightBracket, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBracket, TokenKind::Number, TokenKind::Comma, TokenKind::Number, TokenKind::Comma, TokenKind::Number, TokenKind::RightBracket, TokenKind::RightBrace, TokenKind::End, ], ); }
 
-        let stream = lex(source).unwrap();
-
-        assert_eq!(
-            stream.kinds().collect::<Vec<_>>(),
-            vec![
-                TokenKind::LeftBrace,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::LeftBrace,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::LeftBrace,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::String,
-                TokenKind::RightBrace,
-                TokenKind::RightBrace,
-                TokenKind::Comma,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::LeftBracket,
-                TokenKind::String,
-                TokenKind::Comma,
-                TokenKind::String,
-                TokenKind::RightBracket,
-                TokenKind::Comma,
-                TokenKind::Identifier,
-                TokenKind::Colon,
-                TokenKind::LeftBracket,
-                TokenKind::Number,
-                TokenKind::Comma,
-                TokenKind::Number,
-                TokenKind::Comma,
-                TokenKind::Number,
-                TokenKind::RightBracket,
-                TokenKind::RightBrace,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_insert_with_document_literal() {
-        let source = r#"
+    #[test] fn lexes_insert_with_document_literal() { let source = r#"
             from users
             | insert {
                 _id: "u1",
                 name: "John",
                 age: 42
             }
-        "#;
-
-        let stream = lex(source).unwrap();
-        let kinds = stream.kinds().collect::<Vec<_>>();
-
-        assert_eq!(kinds[0], TokenKind::From);
-        assert_eq!(kinds[1], TokenKind::Identifier);
-        assert_eq!(kinds[2], TokenKind::Pipe);
-        assert_eq!(kinds[3], TokenKind::Identifier);
-        assert_eq!(kinds[4], TokenKind::LeftBrace);
-        assert_eq!(kinds.last(), Some(&TokenKind::End));
-
-        assert!(kinds.contains(&TokenKind::Colon));
-        assert!(kinds.contains(&TokenKind::RightBrace));
-    }
-
-    #[test]
-    fn lexes_assignment_and_comparison_operators() {
-        assert_eq!(
-            kinds("= == != < <= > >="),
-            vec![
-                TokenKind::Equal,
-                TokenKind::EqualEqual,
-                TokenKind::NotEqual,
-                TokenKind::Less,
-                TokenKind::LessEqual,
-                TokenKind::Greater,
-                TokenKind::GreaterEqual,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_integer_numbers() {
-        assert_eq!(
-            lexemes("0 18 +18 -18 0018"),
-            vec!["0", "18", "+18", "-18", "0018"],
-        );
-    }
-
-    #[test]
-    fn lexes_decimal_numbers() {
-        assert_eq!(lexemes("18.5 -0.25 +42.0"), vec!["18.5", "-0.25", "+42.0"],);
-    }
-
-    #[test]
-    fn lexes_exponent_numbers() {
-        assert_eq!(
-            lexemes("1e3 1E3 -2.5e-4 +6E+8"),
-            vec!["1e3", "1E3", "-2.5e-4", "+6E+8"],
-        );
-    }
-
-    #[test]
-    fn dot_after_integer_is_separate_token_without_fraction_digits() {
-        assert_eq!(
-            kinds("18.field"),
-            vec![
-                TokenKind::Number,
-                TokenKind::Dot,
-                TokenKind::Identifier,
-                TokenKind::End,
-            ],
-        );
-
-        assert_eq!(lexemes("18.field"), vec!["18", ".", "field"],);
-    }
-
-    #[test]
-    fn rejects_number_followed_by_identifier_characters() {
-        let error = lex("18abc").unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::InvalidNumber);
-        assert_eq!(error.span(), Span::new(0, 5));
-    }
-
-    #[test]
-    fn rejects_exponent_without_digits() {
-        let error = lex("1e").unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::MissingExponentDigits,);
-        assert_eq!(error.span(), Span::new(0, 2));
-    }
-
-    #[test]
-    fn rejects_signed_exponent_without_digits() {
-        let error = lex("1e+").unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::MissingExponentDigits,);
-        assert_eq!(error.span(), Span::new(0, 3));
-    }
-
-    #[test]
-    fn standalone_plus_is_rejected() {
-        let error = lex("+").unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &LexErrorKind::UnexpectedCharacter { character: '+' },
-        );
-    }
-
-    #[test]
-    fn standalone_minus_is_rejected() {
-        let error = lex("-").unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &LexErrorKind::UnexpectedCharacter { character: '-' },
-        );
-    }
-
-    #[test]
-    fn lexes_strings() {
-        let source = r#""hello" "hello world" "a \"quote\"""#;
-
-        let stream = lex(source).unwrap();
-
-        assert_eq!(
-            stream.kinds().collect::<Vec<_>>(),
-            vec![
-                TokenKind::String,
-                TokenKind::String,
-                TokenKind::String,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_escaped_strings() {
-        let source = r#""line\nnext" "quote\"" "slash\\""#;
-
-        assert_eq!(
-            kinds(source),
-            vec![
-                TokenKind::String,
-                TokenKind::String,
-                TokenKind::String,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn lexes_unicode_strings() {
-        let source = r#""Paris" "été" "東京""#;
-
-        assert_eq!(lexemes(source), vec![r#""Paris""#, r#""été""#, r#""東京""#],);
-    }
-
-    #[test]
-    fn rejects_unterminated_string() {
-        let error = lex(r#""Paris"#).unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::UnterminatedString,);
-        assert_eq!(error.span(), Span::new(0, r#""Paris"#.len()),);
-    }
-
-    #[test]
-    fn rejects_multiline_string() {
-        let error = lex("\"first\nsecond\"").unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::UnterminatedString,);
-        assert_eq!(error.span(), Span::new(0, 6));
-    }
-
-    #[test]
-    fn rejects_invalid_escape() {
-        let error = lex(r#""invalid\q""#).unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &LexErrorKind::InvalidEscape { character: 'q' },
-        );
-        assert_eq!(error.span(), Span::new(8, 10));
-    }
-
-    #[test]
-    fn rejects_unterminated_escape() {
-        let error = lex("\"value\\").unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::UnterminatedEscape,);
-        assert_eq!(error.span(), Span::new(6, 7));
-    }
-
-    #[test]
-    fn rejects_bang_without_equals() {
-        let error = lex("!").unwrap_err();
-
-        assert_eq!(error.kind(), &LexErrorKind::ExpectedEqualsAfterBang,);
-        assert_eq!(error.span(), Span::new(0, 1));
-    }
-
-    #[test]
-    fn rejects_unknown_character() {
-        let error = lex("@").unwrap_err();
-
-        assert_eq!(
-            error.kind(),
-            &LexErrorKind::UnexpectedCharacter { character: '@' },
-        );
-        assert_eq!(error.span(), Span::new(0, 1));
-    }
-
-    #[test]
-    fn skips_all_standard_whitespace() {
-        assert_eq!(
-            kinds("from\tusers\n|\r\nwhere age > 18"),
-            vec![
-                TokenKind::From,
-                TokenKind::Identifier,
-                TokenKind::Pipe,
-                TokenKind::Where,
-                TokenKind::Identifier,
-                TokenKind::Greater,
-                TokenKind::Number,
-                TokenKind::End,
-            ],
-        );
-    }
-
-    #[test]
-    fn preserves_exact_spans_across_whitespace() {
-        let source = "  from   users  ";
-        let stream = lex(source).unwrap();
-
-        assert_eq!(
-            stream.tokens(),
-            &[
-                Token::new(TokenKind::From, Span::new(2, 6)),
-                Token::new(TokenKind::Identifier, Span::new(9, 14),),
-                Token::end(16),
-            ],
-        );
-    }
-
-    #[test]
-    fn iterator_emits_end_once() {
-        let mut lexer = Lexer::new("from");
-
-        assert_eq!(
-            lexer.next(),
-            Some(Ok(Token::new(TokenKind::From, Span::new(0, 4),))),
-        );
-
-        assert_eq!(lexer.next(), Some(Ok(Token::end(4))));
-        assert_eq!(lexer.next(), None);
-        assert_eq!(lexer.next(), None);
-    }
-
-    #[test]
-    fn token_stream_exposes_source_and_tokens() {
-        let source = "from users";
-        let stream = lex(source).unwrap();
-
-        assert_eq!(stream.source(), source);
-        assert_eq!(stream.len(), 3);
-        assert!(!stream.is_empty());
-
-        assert_eq!(
-            stream.get(0),
-            Some(Token::new(TokenKind::From, Span::new(0, 4),)),
-        );
-
-        assert_eq!(stream.get(99), None);
-    }
-
-    #[test]
-    fn token_stream_iteration_is_stable() {
-        let stream = lex("from users").unwrap();
-
-        let first = stream.iter().collect::<Vec<_>>();
-        let second = stream.iter().collect::<Vec<_>>();
-
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn identical_queries_produce_identical_tokens() {
-        let left = lex("from users | where age >= 18").unwrap();
-
-        let right = lex("from users | where age >= 18").unwrap();
-
-        assert_eq!(left, right);
-    }
-
-    #[test]
-    fn whitespace_changes_spans_but_not_token_kinds() {
-        let compact = lex("from users|where age>=18").unwrap();
-
-        let spaced = lex("from users | where age >= 18").unwrap();
-
-        assert_ne!(compact.tokens(), spaced.tokens());
-
-        assert_eq!(
-            compact.kinds().collect::<Vec<_>>(),
-            spaced.kinds().collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn different_literals_keep_same_lexical_shape() {
-        let first = lex("from users | where age >= 18").unwrap();
-
-        let second = lex("from users | where age >= 42").unwrap();
-
-        assert_eq!(
-            first.kinds().collect::<Vec<_>>(),
-            second.kinds().collect::<Vec<_>>(),
-        );
-
-        assert_ne!(
-            first
-                .significant_tokens()
-                .map(|token| first.lexeme(token).unwrap())
-                .collect::<Vec<_>>(),
-            second
-                .significant_tokens()
-                .map(|token| second.lexeme(token).unwrap())
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn different_identifiers_are_not_hidden_by_token_stream() {
-        let users = lex("from users | where age > 18").unwrap();
-
-        let orders = lex("from orders | where total > 18").unwrap();
-
-        assert_eq!(
-            users.kinds().collect::<Vec<_>>(),
-            orders.kinds().collect::<Vec<_>>(),
-        );
-
-        assert_ne!(
-            users
-                .significant_tokens()
-                .map(|token| users.lexeme(token).unwrap())
-                .collect::<Vec<_>>(),
-            orders
-                .significant_tokens()
-                .map(|token| orders.lexeme(token).unwrap())
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    #[test]
-    fn errors_are_displayed_with_spans() {
-        let error = lex("@").unwrap_err();
-
-        assert_eq!(error.to_string(), "unexpected character `@` at 0..1",);
-    }
+        "#; let stream = lex(source).unwrap(); let kinds = stream.kinds().collect::<Vec<_>>(); assert_eq!(kinds[0], TokenKind::From); assert_eq!(kinds[1], TokenKind::Identifier); assert_eq!(kinds[2], TokenKind::Pipe); assert_eq!(kinds[3], TokenKind::Identifier); assert_eq!(kinds[4], TokenKind::LeftBrace); assert_eq!(kinds.last(), Some(&TokenKind::End)); assert!(kinds.contains(&TokenKind::Colon)); assert!(kinds.contains(&TokenKind::RightBrace)); }
+
+    #[test] fn lexes_assignment_and_comparison_operators() { assert_eq!( kinds("= == != < <= > >="), vec![ TokenKind::Equal, TokenKind::EqualEqual, TokenKind::NotEqual, TokenKind::Less, TokenKind::LessEqual, TokenKind::Greater, TokenKind::GreaterEqual, TokenKind::End, ], ); }
+
+    #[test] fn lexes_integer_numbers() { assert_eq!( lexemes("0 18 +18 -18 0018"), vec!["0", "18", "+18", "-18", "0018"], ); }
+
+    #[test] fn lexes_decimal_numbers() { assert_eq!(lexemes("18.5 -0.25 +42.0"), vec!["18.5", "-0.25", "+42.0"],); }
+
+    #[test] fn lexes_exponent_numbers() { assert_eq!( lexemes("1e3 1E3 -2.5e-4 +6E+8"), vec!["1e3", "1E3", "-2.5e-4", "+6E+8"], ); }
+
+    #[test] fn dot_after_integer_is_separate_token_without_fraction_digits() { assert_eq!( kinds("18.field"), vec![ TokenKind::Number, TokenKind::Dot, TokenKind::Identifier, TokenKind::End, ], ); assert_eq!(lexemes("18.field"), vec!["18", ".", "field"],); }
+
+    #[test] fn rejects_number_followed_by_identifier_characters() { let error = lex("18abc").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::InvalidNumber); assert_eq!(error.span(), Span::new(0, 5)); }
+
+    #[test] fn rejects_exponent_without_digits() { let error = lex("1e").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::MissingExponentDigits,); assert_eq!(error.span(), Span::new(0, 2)); }
+
+    #[test] fn rejects_signed_exponent_without_digits() { let error = lex("1e+").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::MissingExponentDigits,); assert_eq!(error.span(), Span::new(0, 3)); }
+
+    #[test] fn standalone_plus_is_rejected() { let error = lex("+").unwrap_err(); assert_eq!( error.kind(), &LexErrorKind::UnexpectedCharacter { character: '+' }, ); }
+
+    #[test] fn standalone_minus_is_rejected() { let error = lex("-").unwrap_err(); assert_eq!( error.kind(), &LexErrorKind::UnexpectedCharacter { character: '-' }, ); }
+
+    #[test] fn lexes_strings() { let source = r#""hello" "hello world" "a \"quote\"""#; let stream = lex(source).unwrap(); assert_eq!( stream.kinds().collect::<Vec<_>>(), vec![ TokenKind::String, TokenKind::String, TokenKind::String, TokenKind::End, ], ); }
+
+    #[test] fn lexes_escaped_strings() { let source = r#""line\nnext" "quote\"" "slash\\""#; assert_eq!( kinds(source), vec![ TokenKind::String, TokenKind::String, TokenKind::String, TokenKind::End, ], ); }
+
+    #[test] fn lexes_unicode_strings() { let source = r#""Paris" "été" "東京""#; assert_eq!(lexemes(source), vec![r#""Paris""#, r#""été""#, r#""東京""#],); }
+
+    #[test] fn rejects_unterminated_string() { let error = lex(r#""Paris"#).unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnterminatedString,); assert_eq!(error.span(), Span::new(0, r#""Paris"#.len()),); }
+
+    #[test] fn rejects_multiline_string() { let error = lex("\"first\nsecond\"").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnterminatedString,); assert_eq!(error.span(), Span::new(0, 6)); }
+
+    #[test] fn rejects_invalid_escape() { let error = lex(r#""invalid\q""#).unwrap_err(); assert_eq!( error.kind(), &LexErrorKind::InvalidEscape { character: 'q' }, ); assert_eq!(error.span(), Span::new(8, 10)); }
+
+    #[test] fn rejects_unterminated_escape() { let error = lex("\"value\\").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnterminatedEscape,); assert_eq!(error.span(), Span::new(6, 7)); }
+
+    #[test] fn rejects_bang_without_equals() { let error = lex("!").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::ExpectedEqualsAfterBang,); assert_eq!(error.span(), Span::new(0, 1)); }
+
+    #[test] fn rejects_unknown_character() { let error = lex("@").unwrap_err(); assert_eq!( error.kind(), &LexErrorKind::UnexpectedCharacter { character: '@' }, ); assert_eq!(error.span(), Span::new(0, 1)); }
+
+    #[test] fn skips_all_standard_whitespace() { assert_eq!( kinds("from\tusers\n|\r\nwhere age > 18"), vec![ TokenKind::From, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::Greater, TokenKind::Number, TokenKind::End, ], ); }
+
+    #[test] fn preserves_exact_spans_across_whitespace() { let source = "  from   users  "; let stream = lex(source).unwrap(); assert_eq!( stream.tokens(), &[ Token::new(TokenKind::From, Span::new(2, 6)), Token::new(TokenKind::Identifier, Span::new(9, 14),), Token::end(16), ], ); }
+
+    #[test] fn iterator_emits_end_once() { let mut lexer = Lexer::new("from"); assert_eq!( lexer.next(), Some(Ok(Token::new(TokenKind::From, Span::new(0, 4),))), ); assert_eq!(lexer.next(), Some(Ok(Token::end(4)))); assert_eq!(lexer.next(), None); assert_eq!(lexer.next(), None); }
+
+    #[test] fn token_stream_exposes_source_and_tokens() { let source = "from users"; let stream = lex(source).unwrap(); assert_eq!(stream.source(), source); assert_eq!(stream.len(), 3); assert!(!stream.is_empty()); assert_eq!( stream.get(0), Some(Token::new(TokenKind::From, Span::new(0, 4),)), ); assert_eq!(stream.get(99), None); }
+
+    #[test] fn token_stream_iteration_is_stable() { let stream = lex("from users").unwrap(); let first = stream.iter().collect::<Vec<_>>(); let second = stream.iter().collect::<Vec<_>>(); assert_eq!(first, second); }
+
+    #[test] fn identical_queries_produce_identical_tokens() { let left = lex("from users | where age >= 18").unwrap(); let right = lex("from users | where age >= 18").unwrap(); assert_eq!(left, right); }
+
+    #[test] fn whitespace_changes_spans_but_not_token_kinds() { let compact = lex("from users|where age>=18").unwrap(); let spaced = lex("from users | where age >= 18").unwrap(); assert_ne!(compact.tokens(), spaced.tokens()); assert_eq!( compact.kinds().collect::<Vec<_>>(), spaced.kinds().collect::<Vec<_>>(), ); }
+
+    #[test] fn different_literals_keep_same_lexical_shape() { let first = lex("from users | where age >= 18").unwrap(); let second = lex("from users | where age >= 42").unwrap(); assert_eq!( first.kinds().collect::<Vec<_>>(), second.kinds().collect::<Vec<_>>(), ); assert_ne!( first .significant_tokens() .map(|token| first.lexeme(token).unwrap()) .collect::<Vec<_>>(), second .significant_tokens() .map(|token| second.lexeme(token).unwrap()) .collect::<Vec<_>>(), ); }
+
+    #[test] fn different_identifiers_are_not_hidden_by_token_stream() { let users = lex("from users | where age > 18").unwrap(); let orders = lex("from orders | where total > 18").unwrap(); assert_eq!( users.kinds().collect::<Vec<_>>(), orders.kinds().collect::<Vec<_>>(), ); assert_ne!( users .significant_tokens() .map(|token| users.lexeme(token).unwrap()) .collect::<Vec<_>>(), orders .significant_tokens() .map(|token| orders.lexeme(token).unwrap()) .collect::<Vec<_>>(), ); }
+
+    #[test] fn errors_are_displayed_with_spans() { let error = lex("@").unwrap_err(); assert_eq!(error.to_string(), "unexpected character `@` at 0..1",); }
 }

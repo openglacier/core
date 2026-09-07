@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Small helpers shared by the library and binaries.
 
 pub use crate::error::Base64DecodeError;
@@ -148,11 +149,9 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, Base64DecodeError> {
     for (index, chunk) in clean.chunks_exact(4).enumerate() {
         let last = index + 1 == chunk_count;
         let padding = usize::from(chunk[3] == b'=') + usize::from(chunk[2] == b'=');
-
         if (!last && padding != 0) || (chunk[2] == b'=' && chunk[3] != b'=') || padding > 2 {
             return Err(Base64DecodeError);
         }
-
         let a = value(chunk[0]).ok_or(Base64DecodeError)?;
         let b = value(chunk[1]).ok_or(Base64DecodeError)?;
         let c = if chunk[2] == b'=' {
@@ -165,12 +164,10 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, Base64DecodeError> {
         } else {
             value(chunk[3]).ok_or(Base64DecodeError)?
         };
-
         // Reject non-zero unused bits, matching canonical padded Base64.
         if (padding == 2 && (b & 0x0f) != 0) || (padding == 1 && (c & 0x03) != 0) {
             return Err(Base64DecodeError);
         }
-
         output.push((a << 2) | (b >> 4));
         if padding < 2 {
             output.push((b << 4) | (c >> 2));
@@ -186,25 +183,9 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, Base64DecodeError> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn base64_round_trip_is_stable() {
-        let input = b"openglacier authentication";
-        assert_eq!(decode_base64(&encode_base64(input)).unwrap(), input);
-    }
+    #[test] fn base64_round_trip_is_stable() { let input = b"openglacier authentication"; assert_eq!(decode_base64(&encode_base64(input)).unwrap(), input); }
 
-    #[test]
-    fn standard_vectors_are_stable() {
-        assert_eq!(encode_base64(b""), "");
-        assert_eq!(encode_base64(b"f"), "Zg==");
-        assert_eq!(encode_base64(b"fo"), "Zm8=");
-        assert_eq!(encode_base64(b"foo"), "Zm9v");
-        assert_eq!(decode_base64("Zm9v").unwrap(), b"foo");
-    }
+    #[test] fn standard_vectors_are_stable() { assert_eq!(encode_base64(b""), ""); assert_eq!(encode_base64(b"f"), "Zg=="); assert_eq!(encode_base64(b"fo"), "Zm8="); assert_eq!(encode_base64(b"foo"), "Zm9v"); assert_eq!(decode_base64("Zm9v").unwrap(), b"foo"); }
 
-    #[test]
-    fn malformed_padding_is_rejected() {
-        assert!(decode_base64("Zg=a").is_err());
-        assert!(decode_base64("Zg==AAAA").is_err());
-        assert!(decode_base64("Zh==").is_err());
-    }
+    #[test] fn malformed_padding_is_rejected() { assert!(decode_base64("Zg=a").is_err()); assert!(decode_base64("Zg==AAAA").is_err()); assert!(decode_base64("Zh==").is_err()); }
 }

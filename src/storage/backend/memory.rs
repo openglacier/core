@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Physical in-memory storage backend.
 
 use std::{
@@ -637,240 +638,31 @@ mod tests {
         DocumentId::from_test_label(value)
     }
 
-    #[test]
-    fn new_storage_is_empty() {
-        let storage = MemoryBackend::new();
+    #[test] fn new_storage_is_empty() { let storage = MemoryBackend::new(); assert_eq!(storage.generation().unwrap(), 0); assert_eq!(storage.collection_count().unwrap(), 0); assert_eq!(storage.document_count().unwrap(), 0); }
 
-        assert_eq!(storage.generation().unwrap(), 0);
-        assert_eq!(storage.collection_count().unwrap(), 0);
-        assert_eq!(storage.document_count().unwrap(), 0);
-    }
+    #[test] fn empty_snapshot_has_no_collections() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot.collections().unwrap().is_empty()); assert!(!snapshot.collection_exists(&collection("users")).unwrap()); }
 
-    #[test]
-    fn empty_snapshot_has_no_collections() {
-        let storage = MemoryBackend::new();
-        let snapshot = storage.read().unwrap();
+    #[test] fn missing_document_returns_none() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot .get(&collection("users"), &document_id("42")) .unwrap() .is_none()); }
 
-        assert!(snapshot.collections().unwrap().is_empty());
-        assert!(!snapshot.collection_exists(&collection("users")).unwrap());
-    }
+    #[test] fn missing_collection_scan_is_empty() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot .scan(&collection("users"), ScanOptions::default()) .unwrap() .is_empty()); }
 
-    #[test]
-    fn missing_document_returns_none() {
-        let storage = MemoryBackend::new();
-        let snapshot = storage.read().unwrap();
+    #[test] fn empty_commit_does_not_advance_generation() { let storage = MemoryBackend::new(); let transaction = storage.begin().unwrap(); let result = transaction.commit().unwrap(); assert!(result.is_empty()); assert_eq!(storage.generation().unwrap(), 0); }
 
-        assert!(snapshot
-            .get(&collection("users"), &document_id("42"))
-            .unwrap()
-            .is_none());
-    }
+    #[test] fn rollback_does_not_advance_generation() { let storage = MemoryBackend::new(); let transaction = storage.begin().unwrap(); transaction.rollback().unwrap(); assert_eq!(storage.generation().unwrap(), 0); }
 
-    #[test]
-    fn missing_collection_scan_is_empty() {
-        let storage = MemoryBackend::new();
-        let snapshot = storage.read().unwrap();
+    #[test] fn clear_on_empty_storage_is_a_no_op() { let storage = MemoryBackend::new(); storage.clear().unwrap(); assert_eq!(storage.generation().unwrap(), 0); }
 
-        assert!(snapshot
-            .scan(&collection("users"), ScanOptions::default())
-            .unwrap()
-            .is_empty());
-    }
+    #[test] fn helper_rejects_incorrect_version() { let error = ensure_version( &collection("users"), &document_id("42"), DocumentVersion::new(3), VersionPrecondition::Exact(DocumentVersion::new(2)), ) .unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::VersionConflict { .. } )); }
 
-    #[test]
-    fn empty_commit_does_not_advance_generation() {
-        let storage = MemoryBackend::new();
-        let transaction = storage.begin().unwrap();
+    #[test] fn memory_storage_is_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<MemoryBackend>(); }
 
-        let result = transaction.commit().unwrap();
+    #[test] fn memory_backend_implements_storage_backend() { fn accept_backend(_: &dyn StorageBackend) {} let backend = MemoryBackend::new(); accept_backend(&backend); }
+    #[test] fn atomic_batch_commits_one_generation() { let storage = MemoryBackend::new(); let users = collection("users"); let (stored, commit) = storage .apply_batch_atomic( &users, vec![ StorageMutation::insert(document_id("a"), Arc::new(Document::new())), StorageMutation::insert(document_id("b"), Arc::new(Document::new())), ], ) .unwrap(); assert_eq!(stored.len(), 2); assert_eq!(commit.inserted(), 2); assert_eq!(commit.replaced(), 0); assert_eq!(storage.generation().unwrap(), 1); assert_eq!(storage.document_count().unwrap(), 2); }
 
-        assert!(result.is_empty());
-        assert_eq!(storage.generation().unwrap(), 0);
-    }
+    #[test] fn atomic_batch_failure_leaves_storage_unchanged() { let storage = MemoryBackend::new(); let users = collection("users"); let duplicate = document_id("a"); let error = storage .apply_batch_atomic( &users, vec![ StorageMutation::insert(duplicate.clone(), Arc::new(Document::new())), StorageMutation::insert(duplicate, Arc::new(Document::new())), ], ) .unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::DocumentAlreadyExists { .. } )); assert_eq!(storage.generation().unwrap(), 0); assert_eq!(storage.collection_count().unwrap(), 0); assert_eq!(storage.document_count().unwrap(), 0); }
 
-    #[test]
-    fn rollback_does_not_advance_generation() {
-        let storage = MemoryBackend::new();
-        let transaction = storage.begin().unwrap();
+    #[test] fn atomic_batch_preserves_order_and_sequential_versions() { let storage = MemoryBackend::new(); let users = collection("users"); let id = document_id("a"); let (stored, commit) = storage .apply_batch_atomic( &users, vec![ StorageMutation::insert(id.clone(), Arc::new(Document::new())), StorageMutation::replace( id.clone(), Arc::new(Document::new()), VersionPrecondition::Exact(DocumentVersion::INITIAL), ), StorageMutation::replace( id.clone(), Arc::new(Document::new()), VersionPrecondition::Exact(DocumentVersion::new(2)), ), ], ) .unwrap(); assert_eq!( stored.iter().map(StoredDocument::id).collect::<Vec<_>>(), vec![&id, &id, &id] ); assert_eq!(stored[0].version(), DocumentVersion::INITIAL); assert_eq!(stored[1].version(), DocumentVersion::new(2)); assert_eq!(stored[2].version(), DocumentVersion::new(3)); assert_eq!(commit.inserted(), 1); assert_eq!(commit.replaced(), 2); }
 
-        transaction.rollback().unwrap();
-
-        assert_eq!(storage.generation().unwrap(), 0);
-    }
-
-    #[test]
-    fn clear_on_empty_storage_is_a_no_op() {
-        let storage = MemoryBackend::new();
-
-        storage.clear().unwrap();
-
-        assert_eq!(storage.generation().unwrap(), 0);
-    }
-
-    #[test]
-    fn helper_rejects_incorrect_version() {
-        let error = ensure_version(
-            &collection("users"),
-            &document_id("42"),
-            DocumentVersion::new(3),
-            VersionPrecondition::Exact(DocumentVersion::new(2)),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error.kind(),
-            StorageErrorKind::VersionConflict { .. }
-        ));
-    }
-
-    #[test]
-    fn memory_storage_is_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        assert_send_and_sync::<MemoryBackend>();
-    }
-
-    #[test]
-    fn memory_backend_implements_storage_backend() {
-        fn accept_backend(_: &dyn StorageBackend) {}
-
-        let backend = MemoryBackend::new();
-        accept_backend(&backend);
-    }
-    #[test]
-    fn atomic_batch_commits_one_generation() {
-        let storage = MemoryBackend::new();
-        let users = collection("users");
-
-        let (stored, commit) = storage
-            .apply_batch_atomic(
-                &users,
-                vec![
-                    StorageMutation::insert(document_id("a"), Arc::new(Document::new())),
-                    StorageMutation::insert(document_id("b"), Arc::new(Document::new())),
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(stored.len(), 2);
-        assert_eq!(commit.inserted(), 2);
-        assert_eq!(commit.replaced(), 0);
-        assert_eq!(storage.generation().unwrap(), 1);
-        assert_eq!(storage.document_count().unwrap(), 2);
-    }
-
-    #[test]
-    fn atomic_batch_failure_leaves_storage_unchanged() {
-        let storage = MemoryBackend::new();
-        let users = collection("users");
-        let duplicate = document_id("a");
-
-        let error = storage
-            .apply_batch_atomic(
-                &users,
-                vec![
-                    StorageMutation::insert(duplicate.clone(), Arc::new(Document::new())),
-                    StorageMutation::insert(duplicate, Arc::new(Document::new())),
-                ],
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            error.kind(),
-            StorageErrorKind::DocumentAlreadyExists { .. }
-        ));
-        assert_eq!(storage.generation().unwrap(), 0);
-        assert_eq!(storage.collection_count().unwrap(), 0);
-        assert_eq!(storage.document_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn atomic_batch_preserves_order_and_sequential_versions() {
-        let storage = MemoryBackend::new();
-        let users = collection("users");
-        let id = document_id("a");
-
-        let (stored, commit) = storage
-            .apply_batch_atomic(
-                &users,
-                vec![
-                    StorageMutation::insert(id.clone(), Arc::new(Document::new())),
-                    StorageMutation::replace(
-                        id.clone(),
-                        Arc::new(Document::new()),
-                        VersionPrecondition::Exact(DocumentVersion::INITIAL),
-                    ),
-                    StorageMutation::replace(
-                        id.clone(),
-                        Arc::new(Document::new()),
-                        VersionPrecondition::Exact(DocumentVersion::new(2)),
-                    ),
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(
-            stored.iter().map(StoredDocument::id).collect::<Vec<_>>(),
-            vec![&id, &id, &id]
-        );
-        assert_eq!(stored[0].version(), DocumentVersion::INITIAL);
-        assert_eq!(stored[1].version(), DocumentVersion::new(2));
-        assert_eq!(stored[2].version(), DocumentVersion::new(3));
-        assert_eq!(commit.inserted(), 1);
-        assert_eq!(commit.replaced(), 2);
-    }
-
-    #[test]
-    fn batch_applies_ordered_inserts_and_replacements() {
-        let storage = MemoryBackend::new();
-        let users = collection("users");
-        let first = document_id("a");
-        let second = document_id("b");
-        let mut transaction = storage.begin().unwrap();
-
-        let stored = transaction
-            .apply_batch(
-                &users,
-                vec![
-                    StorageMutation::insert(first.clone(), Arc::new(Document::new())),
-                    StorageMutation::insert(second.clone(), Arc::new(Document::new())),
-                    StorageMutation::replace(
-                        first.clone(),
-                        Arc::new(Document::new()),
-                        VersionPrecondition::Exact(DocumentVersion::INITIAL),
-                    ),
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(stored.len(), 3);
-        assert_eq!(stored[0].id(), &first);
-        assert_eq!(stored[1].id(), &second);
-        assert_eq!(stored[2].id(), &first);
-        assert_eq!(stored[2].version(), DocumentVersion::new(2));
-
-        let commit = transaction.commit().unwrap();
-        assert_eq!(commit.inserted(), 2);
-        assert_eq!(commit.replaced(), 1);
-    }
-    #[test]
-    fn compact_atomic_batch_returns_only_commit_summary() {
-        let storage = MemoryBackend::new();
-        let users = collection("users");
-
-        let commit = storage
-            .apply_batch_atomic_summary(
-                &users,
-                vec![
-                    StorageMutation::insert(document_id("a"), Arc::new(Document::new())),
-                    StorageMutation::insert(document_id("b"), Arc::new(Document::new())),
-                ],
-            )
-            .unwrap();
-
-        assert_eq!(commit.inserted(), 2);
-        assert_eq!(commit.replaced(), 0);
-        assert_eq!(storage.generation().unwrap(), 1);
-        assert_eq!(storage.document_count().unwrap(), 2);
-    }
+    #[test] fn batch_applies_ordered_inserts_and_replacements() { let storage = MemoryBackend::new(); let users = collection("users"); let first = document_id("a"); let second = document_id("b"); let mut transaction = storage.begin().unwrap(); let stored = transaction .apply_batch( &users, vec![ StorageMutation::insert(first.clone(), Arc::new(Document::new())), StorageMutation::insert(second.clone(), Arc::new(Document::new())), StorageMutation::replace( first.clone(), Arc::new(Document::new()), VersionPrecondition::Exact(DocumentVersion::INITIAL), ), ], ) .unwrap(); assert_eq!(stored.len(), 3); assert_eq!(stored[0].id(), &first); assert_eq!(stored[1].id(), &second); assert_eq!(stored[2].id(), &first); assert_eq!(stored[2].version(), DocumentVersion::new(2)); let commit = transaction.commit().unwrap(); assert_eq!(commit.inserted(), 2); assert_eq!(commit.replaced(), 1); }
+    #[test] fn compact_atomic_batch_returns_only_commit_summary() { let storage = MemoryBackend::new(); let users = collection("users"); let commit = storage .apply_batch_atomic_summary( &users, vec![ StorageMutation::insert(document_id("a"), Arc::new(Document::new())), StorageMutation::insert(document_id("b"), Arc::new(Document::new())), ], ) .unwrap(); assert_eq!(commit.inserted(), 2); assert_eq!(commit.replaced(), 0); assert_eq!(storage.generation().unwrap(), 1); assert_eq!(storage.document_count().unwrap(), 2); }
 }

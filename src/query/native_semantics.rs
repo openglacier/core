@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Default expression semantics.
 
 use std::{
@@ -421,65 +422,15 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
 mod tests {
     use super::*;
 
-    #[test]
-    fn options_have_safe_defaults() {
-        let options = NativeSemanticOptions::default();
+    #[test] fn options_have_safe_defaults() { let options = NativeSemanticOptions::default(); assert_eq!( options.max_assignments(), NativeSemanticOptions::DEFAULT_MAX_ASSIGNMENTS ); assert!(options.catches_panics()); }
 
-        assert_eq!(
-            options.max_assignments(),
-            NativeSemanticOptions::DEFAULT_MAX_ASSIGNMENTS
-        );
-        assert!(options.catches_panics());
-    }
+    #[test] fn zero_assignment_limit_is_normalized() { let options = NativeSemanticOptions::new().with_max_assignments(0); assert_eq!(options.max_assignments(), 1); }
 
-    #[test]
-    fn zero_assignment_limit_is_normalized() {
-        let options = NativeSemanticOptions::new().with_max_assignments(0);
+    #[test] fn builder_requires_predicate_first() { let error = NativeSemanticBuilder::new().build().unwrap_err(); assert_eq!(error, NativeSemanticBuildError::MissingPredicate); }
 
-        assert_eq!(options.max_assignments(), 1);
-    }
+    #[test] fn builder_requires_assignment() { let error = NativeSemanticBuilder::new() .predicate(|_, _, _| Ok(true)) .build() .unwrap_err(); assert_eq!(error, NativeSemanticBuildError::MissingAssignment); }
 
-    #[test]
-    fn builder_requires_predicate_first() {
-        let error = NativeSemanticBuilder::new().build().unwrap_err();
+    #[test] fn adapter_builds_native_runtime() { let runtime = NativeSemanticFunctions::new( |_, _, _| Ok(true), |_, _, document, _| Ok(document.clone()), ) .into_runtime(); assert!(!runtime.supports_load()); assert!(!runtime.supports_sort()); assert!(!runtime.supports_select()); assert!(!runtime.supports_distinct()); assert!(!runtime.supports_count()); assert!(!runtime.supports_group()); assert!(!runtime.supports_insert()); assert!(!runtime.supports_custom()); }
 
-        assert_eq!(error, NativeSemanticBuildError::MissingPredicate);
-    }
-
-    #[test]
-    fn builder_requires_assignment() {
-        let error = NativeSemanticBuilder::new()
-            .predicate(|_, _, _| Ok(true))
-            .build()
-            .unwrap_err();
-
-        assert_eq!(error, NativeSemanticBuildError::MissingAssignment);
-    }
-
-    #[test]
-    fn adapter_builds_native_runtime() {
-        let runtime = NativeSemanticFunctions::new(
-            |_, _, _| Ok(true),
-            |_, _, document, _| Ok(document.clone()),
-        )
-        .into_runtime();
-
-        assert!(!runtime.supports_load());
-        assert!(!runtime.supports_sort());
-        assert!(!runtime.supports_select());
-        assert!(!runtime.supports_distinct());
-        assert!(!runtime.supports_count());
-        assert!(!runtime.supports_group());
-        assert!(!runtime.supports_insert());
-        assert!(!runtime.supports_custom());
-    }
-
-    #[test]
-    fn builder_is_cloneable() {
-        let builder = NativeSemanticBuilder::new()
-            .predicate(|_, _, _| Ok(true))
-            .assignment(|_, _, document, _| Ok(document.clone()));
-
-        let _clone = builder.clone();
-    }
+    #[test] fn builder_is_cloneable() { let builder = NativeSemanticBuilder::new() .predicate(|_, _, _| Ok(true)) .assignment(|_, _, document, _| Ok(document.clone())); let _clone = builder.clone(); }
 }

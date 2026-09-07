@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Capability-aware value comparison.
 
 use super::{
@@ -263,379 +264,67 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn comparison_converts_from_and_to_ordering() {
-        assert_eq!(Comparison::from_ordering(Ordering::Less), Comparison::Less);
+    #[test] fn comparison_converts_from_and_to_ordering() { assert_eq!(Comparison::from_ordering(Ordering::Less), Comparison::Less); assert_eq!(Comparison::Equal.into_ordering(), Ordering::Equal); }
 
-        assert_eq!(Comparison::Equal.into_ordering(), Ordering::Equal);
-    }
+    #[test] fn null_equals_null() { assert_eq!( compare(&Value::Null, &Value::Null, CoercionPolicy::Strict,), Ok(Comparison::Equal) ); }
 
-    #[test]
-    fn null_equals_null() {
-        assert_eq!(
-            compare(&Value::Null, &Value::Null, CoercionPolicy::Strict,),
-            Ok(Comparison::Equal)
-        );
-    }
+    #[test] fn null_is_not_comparable_to_other_values() { assert_eq!( compare(&Value::Null, &Value::from(false), CoercionPolicy::Implicit,), Err(CompareFailure::IncompatibleValues) ); }
 
-    #[test]
-    fn null_is_not_comparable_to_other_values() {
-        assert_eq!(
-            compare(&Value::Null, &Value::from(false), CoercionPolicy::Implicit,),
-            Err(CompareFailure::IncompatibleValues)
-        );
-    }
+    #[test] fn null_is_not_equal_to_non_null_values() { assert_eq!( equals( &Value::Null, &Value::from("1.598-900.0"), CoercionPolicy::Implicit, ), Ok(false) ); assert_eq!( equals(&Value::Null, &Value::from(false), CoercionPolicy::Strict,), Ok(false) ); }
 
-    #[test]
-    fn null_is_not_equal_to_non_null_values() {
-        assert_eq!(
-            equals(
-                &Value::Null,
-                &Value::from("1.598-900.0"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(false)
-        );
-        assert_eq!(
-            equals(&Value::Null, &Value::from(false), CoercionPolicy::Strict,),
-            Ok(false)
-        );
-    }
+    #[test] fn null_is_different_from_non_null_values() { assert_eq!( not_equals( &Value::Null, &Value::from("1.598-900.0"), CoercionPolicy::Implicit, ), Ok(true) ); }
 
-    #[test]
-    fn null_is_different_from_non_null_values() {
-        assert_eq!(
-            not_equals(
-                &Value::Null,
-                &Value::from("1.598-900.0"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(true)
-        );
-    }
+    #[test] fn equality_is_total_across_incompatible_physical_kinds() { assert_eq!( equals( &Value::from(true), &Value::from("true"), CoercionPolicy::Implicit, ), Ok(false) ); }
 
-    #[test]
-    fn equality_is_total_across_incompatible_physical_kinds() {
-        assert_eq!(
-            equals(
-                &Value::from(true),
-                &Value::from("true"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(false)
-        );
-    }
+    #[test] fn booleans_are_ordered_false_before_true() { assert_eq!( compare( &Value::from(false), &Value::from(true), CoercionPolicy::Strict, ), Ok(Comparison::Less) ); }
 
-    #[test]
-    fn booleans_are_ordered_false_before_true() {
-        assert_eq!(
-            compare(
-                &Value::from(false),
-                &Value::from(true),
-                CoercionPolicy::Strict,
-            ),
-            Ok(Comparison::Less)
-        );
-    }
+    #[test] fn strings_are_compared_lexicographically() { assert_eq!( compare( &Value::from("alice"), &Value::from("bob"), CoercionPolicy::Strict, ), Ok(Comparison::Less) ); }
 
-    #[test]
-    fn strings_are_compared_lexicographically() {
-        assert_eq!(
-            compare(
-                &Value::from("alice"),
-                &Value::from("bob"),
-                CoercionPolicy::Strict,
-            ),
-            Ok(Comparison::Less)
-        );
-    }
+    #[test] fn identical_signed_numbers_are_equal() { assert_eq!( compare_numbers( Number::Signed(18), Number::Signed(18), CoercionPolicy::Strict, ), Ok(Comparison::Equal) ); }
 
-    #[test]
-    fn identical_signed_numbers_are_equal() {
-        assert_eq!(
-            compare_numbers(
-                Number::Signed(18),
-                Number::Signed(18),
-                CoercionPolicy::Strict,
-            ),
-            Ok(Comparison::Equal)
-        );
-    }
+    #[test] fn signed_numbers_are_ordered() { assert_eq!( compare_numbers( Number::Signed(-1), Number::Signed(18), CoercionPolicy::Strict, ), Ok(Comparison::Less) ); }
 
-    #[test]
-    fn signed_numbers_are_ordered() {
-        assert_eq!(
-            compare_numbers(
-                Number::Signed(-1),
-                Number::Signed(18),
-                CoercionPolicy::Strict,
-            ),
-            Ok(Comparison::Less)
-        );
-    }
+    #[test] fn unsigned_numbers_are_ordered() { assert_eq!( compare_numbers( Number::Unsigned(20), Number::Unsigned(18), CoercionPolicy::Strict, ), Ok(Comparison::Greater) ); }
 
-    #[test]
-    fn unsigned_numbers_are_ordered() {
-        assert_eq!(
-            compare_numbers(
-                Number::Unsigned(20),
-                Number::Unsigned(18),
-                CoercionPolicy::Strict,
-            ),
-            Ok(Comparison::Greater)
-        );
-    }
+    #[test] fn floats_are_ordered() { assert_eq!( compare_numbers( Number::Float(18.5), Number::Float(18.0), CoercionPolicy::Strict, ), Ok(Comparison::Greater) ); }
 
-    #[test]
-    fn floats_are_ordered() {
-        assert_eq!(
-            compare_numbers(
-                Number::Float(18.5),
-                Number::Float(18.0),
-                CoercionPolicy::Strict,
-            ),
-            Ok(Comparison::Greater)
-        );
-    }
+    #[test] fn strict_policy_preserves_numeric_representations() { assert_eq!( compare_numbers( Number::Signed(18), Number::Unsigned(18), CoercionPolicy::Strict, ), Err(CompareFailure::Coercion(CoercionFailure::ForbiddenByPolicy)) ); }
 
-    #[test]
-    fn strict_policy_preserves_numeric_representations() {
-        assert_eq!(
-            compare_numbers(
-                Number::Signed(18),
-                Number::Unsigned(18),
-                CoercionPolicy::Strict,
-            ),
-            Err(CompareFailure::Coercion(CoercionFailure::ForbiddenByPolicy))
-        );
-    }
+    #[test] fn numeric_policy_compares_signed_and_unsigned_values() { assert_eq!( compare_numbers( Number::Signed(18), Number::Unsigned(18), CoercionPolicy::Numeric, ), Ok(Comparison::Equal) ); }
 
-    #[test]
-    fn numeric_policy_compares_signed_and_unsigned_values() {
-        assert_eq!(
-            compare_numbers(
-                Number::Signed(18),
-                Number::Unsigned(18),
-                CoercionPolicy::Numeric,
-            ),
-            Ok(Comparison::Equal)
-        );
-    }
+    #[test] fn numeric_policy_compares_integer_and_float() { assert_eq!( compare_numbers( Number::Signed(18), Number::Float(18.5), CoercionPolicy::Numeric, ), Ok(Comparison::Less) ); }
 
-    #[test]
-    fn numeric_policy_compares_integer_and_float() {
-        assert_eq!(
-            compare_numbers(
-                Number::Signed(18),
-                Number::Float(18.5),
-                CoercionPolicy::Numeric,
-            ),
-            Ok(Comparison::Less)
-        );
-    }
+    #[test] fn precision_loss_is_propagated() { assert_eq!( compare_numbers( Number::Signed(9_007_199_254_740_993), Number::Float(1.0), CoercionPolicy::Numeric, ), Err(CompareFailure::Coercion(CoercionFailure::PrecisionLoss)) ); }
 
-    #[test]
-    fn precision_loss_is_propagated() {
-        assert_eq!(
-            compare_numbers(
-                Number::Signed(9_007_199_254_740_993),
-                Number::Float(1.0),
-                CoercionPolicy::Numeric,
-            ),
-            Err(CompareFailure::Coercion(CoercionFailure::PrecisionLoss))
-        );
-    }
+    #[test] fn implicit_policy_compares_number_and_numeric_string() { assert_eq!( compare( &Value::from(18_i64), &Value::from("18"), CoercionPolicy::Implicit, ), Ok(Comparison::Equal) ); }
 
-    #[test]
-    fn implicit_policy_compares_number_and_numeric_string() {
-        assert_eq!(
-            compare(
-                &Value::from(18_i64),
-                &Value::from("18"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(Comparison::Equal)
-        );
-    }
+    #[test] fn numeric_string_with_leading_zero_is_equal_to_number() { assert_eq!( equals( &Value::from("018"), &Value::from(18_i64), CoercionPolicy::Implicit, ), Ok(true) ); }
 
-    #[test]
-    fn numeric_string_with_leading_zero_is_equal_to_number() {
-        assert_eq!(
-            equals(
-                &Value::from("018"),
-                &Value::from(18_i64),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(true)
-        );
-    }
+    #[test] fn numeric_policy_rejects_string_to_number() { assert_eq!( compare( &Value::from(18_i64), &Value::from("18"), CoercionPolicy::Numeric, ), Err(CompareFailure::Coercion(CoercionFailure::ForbiddenByPolicy)) ); }
 
-    #[test]
-    fn numeric_policy_rejects_string_to_number() {
-        assert_eq!(
-            compare(
-                &Value::from(18_i64),
-                &Value::from("18"),
-                CoercionPolicy::Numeric,
-            ),
-            Err(CompareFailure::Coercion(CoercionFailure::ForbiddenByPolicy))
-        );
-    }
+    #[test] fn two_strings_remain_lexical_under_implicit_policy() { assert_eq!( compare( &Value::from("18"), &Value::from("2"), CoercionPolicy::Implicit, ), Ok(Comparison::Less) ); }
 
-    #[test]
-    fn two_strings_remain_lexical_under_implicit_policy() {
-        assert_eq!(
-            compare(
-                &Value::from("18"),
-                &Value::from("2"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(Comparison::Less)
-        );
-    }
+    #[test] fn non_numeric_string_is_incompatible_with_number() { assert_eq!( compare( &Value::from(18_i64), &Value::from("eighteen"), CoercionPolicy::Implicit, ), Err(CompareFailure::Coercion(CoercionFailure::IncompatibleValue)) ); }
 
-    #[test]
-    fn non_numeric_string_is_incompatible_with_number() {
-        assert_eq!(
-            compare(
-                &Value::from(18_i64),
-                &Value::from("eighteen"),
-                CoercionPolicy::Implicit,
-            ),
-            Err(CompareFailure::Coercion(CoercionFailure::IncompatibleValue))
-        );
-    }
+    #[test] fn physically_equal_arrays_are_equal() { let left = Value::array([Value::from(1_i64), Value::from(2_i64)]); let right = left.clone(); assert_eq!(equals(&left, &right, CoercionPolicy::Strict), Ok(true)); }
 
-    #[test]
-    fn physically_equal_arrays_are_equal() {
-        let left = Value::array([Value::from(1_i64), Value::from(2_i64)]);
+    #[test] fn distinct_arrays_are_not_equal_without_requiring_an_order() { let left = Value::array([Value::from(1_i64)]); let right = Value::array([Value::from(2_i64)]); assert_eq!(equals(&left, &right, CoercionPolicy::Strict), Ok(false)); }
 
-        let right = left.clone();
+    #[test] fn physically_equal_objects_are_equal() { let left = Value::from(Document::from_fields([("name", Value::from("Tom"))])); let right = left.clone(); assert_eq!(equals(&left, &right, CoercionPolicy::Strict), Ok(true)); }
 
-        assert_eq!(equals(&left, &right, CoercionPolicy::Strict), Ok(true));
-    }
+    #[test] fn incompatible_physical_kinds_are_rejected() { assert_eq!( compare( &Value::from(true), &Value::from("true"), CoercionPolicy::Implicit, ), Err(CompareFailure::IncompatibleValues) ); }
 
-    #[test]
-    fn distinct_arrays_are_not_equal_without_requiring_an_order() {
-        let left = Value::array([Value::from(1_i64)]);
-        let right = Value::array([Value::from(2_i64)]);
+    #[test] fn not_equals_negates_equality() { assert_eq!( not_equals( &Value::from(18_i64), &Value::from("18"), CoercionPolicy::Implicit, ), Ok(false) ); }
 
-        assert_eq!(equals(&left, &right, CoercionPolicy::Strict), Ok(false));
-    }
+    #[test] fn compare_failure_has_readable_messages() { assert_eq!( CompareFailure::IncompatibleValues.to_string(), "values are not comparable" ); assert_eq!( CompareFailure::Coercion(CoercionFailure::PrecisionLoss).to_string(), "value coercion failed: precision_loss" ); }
 
-    #[test]
-    fn physically_equal_objects_are_equal() {
-        let left = Value::from(Document::from_fields([("name", Value::from("Tom"))]));
+    #[test] fn comparison_predicates_cover_every_relation() { assert!(Comparison::Less.is_less()); assert!(Comparison::Less.is_less_or_equal()); assert!(!Comparison::Less.is_equal()); assert!(Comparison::Equal.is_equal()); assert!(Comparison::Equal.is_less_or_equal()); assert!(Comparison::Equal.is_greater_or_equal()); assert!(Comparison::Greater.is_greater()); assert!(Comparison::Greater.is_greater_or_equal()); assert!(!Comparison::Greater.is_equal()); }
 
-        let right = left.clone();
+    #[test] fn comparison_can_be_reversed() { assert_eq!(Comparison::Less.reverse(), Comparison::Greater); assert_eq!(Comparison::Equal.reverse(), Comparison::Equal); assert_eq!(Comparison::Greater.reverse(), Comparison::Less); }
 
-        assert_eq!(equals(&left, &right, CoercionPolicy::Strict), Ok(true));
-    }
+    #[test] fn relational_helpers_delegate_to_operational_comparison() { let left = Value::from(18_i64); let right = Value::from("20"); assert_eq!(less_than(&left, &right, CoercionPolicy::Implicit), Ok(true),); assert_eq!( less_than_or_equal(&left, &right, CoercionPolicy::Implicit), Ok(true), ); assert_eq!( greater_than(&left, &right, CoercionPolicy::Implicit), Ok(false), ); assert_eq!( greater_than_or_equal(&left, &right, CoercionPolicy::Implicit), Ok(false), ); }
 
-    #[test]
-    fn incompatible_physical_kinds_are_rejected() {
-        assert_eq!(
-            compare(
-                &Value::from(true),
-                &Value::from("true"),
-                CoercionPolicy::Implicit,
-            ),
-            Err(CompareFailure::IncompatibleValues)
-        );
-    }
+    #[test] fn physical_equality_never_applies_coercion() { assert!(!physically_equals(&Value::from(18_i64), &Value::from("18"),)); assert_eq!( equals( &Value::from(18_i64), &Value::from("18"), CoercionPolicy::Implicit, ), Ok(true), ); }
 
-    #[test]
-    fn not_equals_negates_equality() {
-        assert_eq!(
-            not_equals(
-                &Value::from(18_i64),
-                &Value::from("18"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(false)
-        );
-    }
-
-    #[test]
-    fn compare_failure_has_readable_messages() {
-        assert_eq!(
-            CompareFailure::IncompatibleValues.to_string(),
-            "values are not comparable"
-        );
-
-        assert_eq!(
-            CompareFailure::Coercion(CoercionFailure::PrecisionLoss).to_string(),
-            "value coercion failed: precision_loss"
-        );
-    }
-
-    #[test]
-    fn comparison_predicates_cover_every_relation() {
-        assert!(Comparison::Less.is_less());
-        assert!(Comparison::Less.is_less_or_equal());
-        assert!(!Comparison::Less.is_equal());
-
-        assert!(Comparison::Equal.is_equal());
-        assert!(Comparison::Equal.is_less_or_equal());
-        assert!(Comparison::Equal.is_greater_or_equal());
-
-        assert!(Comparison::Greater.is_greater());
-        assert!(Comparison::Greater.is_greater_or_equal());
-        assert!(!Comparison::Greater.is_equal());
-    }
-
-    #[test]
-    fn comparison_can_be_reversed() {
-        assert_eq!(Comparison::Less.reverse(), Comparison::Greater);
-        assert_eq!(Comparison::Equal.reverse(), Comparison::Equal);
-        assert_eq!(Comparison::Greater.reverse(), Comparison::Less);
-    }
-
-    #[test]
-    fn relational_helpers_delegate_to_operational_comparison() {
-        let left = Value::from(18_i64);
-        let right = Value::from("20");
-
-        assert_eq!(less_than(&left, &right, CoercionPolicy::Implicit), Ok(true),);
-        assert_eq!(
-            less_than_or_equal(&left, &right, CoercionPolicy::Implicit),
-            Ok(true),
-        );
-        assert_eq!(
-            greater_than(&left, &right, CoercionPolicy::Implicit),
-            Ok(false),
-        );
-        assert_eq!(
-            greater_than_or_equal(&left, &right, CoercionPolicy::Implicit),
-            Ok(false),
-        );
-    }
-
-    #[test]
-    fn physical_equality_never_applies_coercion() {
-        assert!(!physically_equals(&Value::from(18_i64), &Value::from("18"),));
-
-        assert_eq!(
-            equals(
-                &Value::from(18_i64),
-                &Value::from("18"),
-                CoercionPolicy::Implicit,
-            ),
-            Ok(true),
-        );
-    }
-
-    #[test]
-    fn compare_failure_exposes_its_category() {
-        let incompatible = CompareFailure::IncompatibleValues;
-        assert!(incompatible.is_incompatible_values());
-        assert_eq!(incompatible.coercion_failure(), None);
-
-        let coercion = CompareFailure::Coercion(CoercionFailure::PrecisionLoss);
-        assert!(!coercion.is_incompatible_values());
-        assert_eq!(
-            coercion.coercion_failure(),
-            Some(CoercionFailure::PrecisionLoss),
-        );
-    }
+    #[test] fn compare_failure_exposes_its_category() { let incompatible = CompareFailure::IncompatibleValues; assert!(incompatible.is_incompatible_values()); assert_eq!(incompatible.coercion_failure(), None); let coercion = CompareFailure::Coercion(CoercionFailure::PrecisionLoss); assert!(!coercion.is_incompatible_values()); assert_eq!( coercion.coercion_failure(), Some(CoercionFailure::PrecisionLoss), ); }
 }

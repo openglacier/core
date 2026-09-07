@@ -37,6 +37,7 @@ authorization_actions! {
     PermissionManage => "permission.manage",
     SharingManage => "sharing.manage",
     AppManage => "app.manage",
+    FabricManage => "fabric.manage",
     CollectionsList => "collections.list",
     StorageStats => "storage.stats",
     BackupManage => "backup.manage",
@@ -128,5 +129,6 @@ mod tests {
     #[test] fn anonymous_principal_cannot_build_permission_request() { let access = QueryAccess::analyze("on users").unwrap(); assert!(access.request_for(&Principal::Anonymous).is_none()); }
     #[test] fn authenticated_principal_builds_permission_request() { let access = QueryAccess::analyze("on users").unwrap(); let request = access .request_for(&Principal::Identity { identity_id: "identity-a".to_owned(), device_id: "device-a".to_owned(), }) .unwrap(); assert_eq!(request.identity_id, "identity-a"); assert_eq!(request.action, AuthorizationAction::QueryRead); assert_eq!(request.resource, "users"); }
     #[test] fn app_manage_action_is_stable() { assert_eq!(AuthorizationAction::AppManage.as_str(), "app.manage"); }
+    #[test] fn fabric_manage_action_is_stable() { assert_eq!(AuthorizationAction::FabricManage.as_str(), "fabric.manage"); }
     #[test] fn query_string_escaping_is_stable() { assert_eq!(quote_query_string("a\"b\\c"), "\"a\\\"b\\\\c\""); }
 }

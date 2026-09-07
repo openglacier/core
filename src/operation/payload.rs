@@ -1,6 +1,6 @@
 //! Typed operation payloads shared by routing, authorization, and execution.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::access::place::{PlaceRole, PublicAccess, RequestedExecutionContext};
 use crate::error::{Error, Result};
@@ -154,6 +154,28 @@ pub struct PlaceResourceRemoveInput {
     #[serde(alias = "nodeIdentityId")]
     pub identity_id: String,
     #[serde(alias = "nodeDeviceId", alias = "nodeId")]
+    pub device_id: String,
+    pub capability: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FabricResourceSetInput {
+    pub identity_id: String,
+    pub device_id: String,
+    pub capability: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub service_role: Option<String>,
+    #[serde(default)]
+    pub storage_role: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FabricResourceRemoveInput {
+    pub identity_id: String,
     pub device_id: String,
     pub capability: String,
 }
@@ -361,6 +383,9 @@ pub struct QueryExecuteInput {
     pub query: String,
     #[serde(default)]
     pub context: Option<RequestedExecutionContext>,
+    /// Reject the request if the planned query may mutate storage.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -606,6 +631,40 @@ pub struct FileVersionInput {
     pub version_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmMessageInput {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmGenerateInput {
+    pub messages: Vec<LlmMessageInput>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub seed: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmCancelInput {
+    pub run_id: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentRunInput {
+    pub messages: Vec<LlmMessageInput>,
+    pub context: RequestedExecutionContext,
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CollectionsListInput {
@@ -613,6 +672,8 @@ pub struct CollectionsListInput {
     pub stats: bool,
     #[serde(default)]
     pub place_id: Option<String>,
+    #[serde(default)]
+    pub app_instance_id: Option<String>,
 }
 
 /// Validation and normalization owned by a typed operation payload.
@@ -694,10 +755,94 @@ macro_rules! valid_payload {
 
 valid_payload!(UncheckedInput, EmptyInput, EventsSubscribeInput);
 
+impl OperationPayload for LlmCancelInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        if self.run_id == 0 {
+            return Err(invalid_payload(
+                operation,
+                "runId must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OperationPayload for LlmGenerateInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        if self.messages.is_empty() {
+            return Err(invalid_payload(
+                operation,
+                "messages must contain at least one message",
+            ));
+        }
+        for message in &mut self.messages {
+            message.role = message.role.trim().to_owned();
+            non_empty(operation, "messages.role", &message.role)?;
+            if message.content.contains('\0') || message.role.contains('\0') {
+                return Err(invalid_payload(
+                    operation,
+                    "messages must not contain NUL bytes",
+                ));
+            }
+        }
+        if matches!(self.max_tokens, Some(0)) {
+            return Err(invalid_payload(
+                operation,
+                "maxTokens must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OperationPayload for AgentRunInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        if self.messages.is_empty() {
+            return Err(invalid_payload(
+                operation,
+                "messages must contain at least one message",
+            ));
+        }
+        for message in &mut self.messages {
+            message.role = message.role.trim().to_owned();
+            non_empty(operation, "messages.role", &message.role)?;
+            if message.content.contains('\0') || message.role.contains('\0') {
+                return Err(invalid_payload(
+                    operation,
+                    "messages must not contain NUL bytes",
+                ));
+            }
+        }
+        non_empty(operation, "context.placeId", &self.context.place_id)?;
+        if let Some(app_instance_id) = self.context.app_instance_id.as_ref() {
+            non_empty(operation, "context.appInstanceId", app_instance_id)?;
+        }
+        if matches!(self.max_steps, Some(0)) {
+            return Err(invalid_payload(
+                operation,
+                "maxSteps must be greater than zero",
+            ));
+        }
+        if matches!(self.max_tokens, Some(0)) {
+            return Err(invalid_payload(
+                operation,
+                "maxTokens must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl OperationPayload for CollectionsListInput {
     fn validate(&mut self, operation: &str) -> Result<()> {
         if let Some(place_id) = self.place_id.as_ref() {
             non_empty(operation, "placeId", place_id)?;
+        }
+        if let Some(app_instance_id) = self.app_instance_id.as_ref() {
+            if self.place_id.is_none() {
+                return Err(invalid_payload(operation, "appInstanceId requires placeId"));
+            }
+            non_empty(operation, "appInstanceId", app_instance_id)?;
         }
         Ok(())
     }
@@ -751,6 +896,34 @@ impl OperationPayload for PlaceResourceSetInput {
     }
 }
 validate_fields!(PlaceResourceRemoveInput => place_id: "placeId", identity_id: "identityId", device_id: "deviceId", capability: "capability");
+impl OperationPayload for FabricResourceSetInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "identityId", &self.identity_id)?;
+        non_empty(operation, "deviceId", &self.device_id)?;
+        non_empty(operation, "capability", &self.capability)?;
+
+        for (wire, value) in [
+            ("role", self.role.as_mut()),
+            ("serviceRole", self.service_role.as_mut()),
+            ("storageRole", self.storage_role.as_mut()),
+        ] {
+            if let Some(value) = value {
+                *value = value.trim().to_owned();
+                non_empty(operation, wire, value)?;
+            }
+        }
+
+        if self.role.is_none() && self.service_role.is_none() && self.storage_role.is_none() {
+            return Err(invalid_payload(
+                operation,
+                "one of role, serviceRole or storageRole is required",
+            ));
+        }
+        Ok(())
+    }
+}
+validate_fields!(FabricResourceRemoveInput => identity_id: "identityId", device_id: "deviceId", capability: "capability");
+
 validate_fields!(PlaceAccessRemoveInput => place_id: "placeId", identity_id: "identityId");
 validate_fields!(PlacePublicSetInput => place_id: "placeId");
 validate_fields!(AppIdInput => app_id: "appId");

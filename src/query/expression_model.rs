@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Expression model types.
 
 use std::{fmt, sync::Arc};
@@ -490,51 +491,13 @@ pub fn model_backend_error(
 mod tests {
     use super::*;
 
-    #[test]
-    fn builder_reports_completeness() {
-        let builder = NativeExpressionModelBuilder::<bool>::new();
+    #[test] fn builder_reports_completeness() { let builder = NativeExpressionModelBuilder::<bool>::new(); assert!(!builder.is_complete()); assert_eq!( builder.first_missing_operation(), Some(NativeExpressionModelBuildError::MissingClassify), ); }
 
-        assert!(!builder.is_complete());
-        assert_eq!(
-            builder.first_missing_operation(),
-            Some(NativeExpressionModelBuildError::MissingClassify),
-        );
-    }
+    #[test] fn builder_is_cloneable() { let builder = NativeExpressionModelBuilder::<bool>::new(); let clone = builder.clone(); assert_eq!( clone.first_missing_operation(), Some(NativeExpressionModelBuildError::MissingClassify), ); }
 
-    #[test]
-    fn builder_is_cloneable() {
-        let builder = NativeExpressionModelBuilder::<bool>::new();
-        let clone = builder.clone();
+    #[test] fn empty_builder_reports_first_missing_operation() { let error = NativeExpressionModelBuilder::<bool>::new() .build() .unwrap_err(); assert_eq!(error, NativeExpressionModelBuildError::MissingClassify,); }
 
-        assert_eq!(
-            clone.first_missing_operation(),
-            Some(NativeExpressionModelBuildError::MissingClassify),
-        );
-    }
+    #[test] fn build_error_has_actionable_message() { let error = NativeExpressionModelBuildError::MissingStrictBoolean; assert_eq!(error.operation(), "strict boolean conversion"); assert!(error.to_string().contains(error.operation())); }
 
-    #[test]
-    fn empty_builder_reports_first_missing_operation() {
-        let error = NativeExpressionModelBuilder::<bool>::new()
-            .build()
-            .unwrap_err();
-
-        assert_eq!(error, NativeExpressionModelBuildError::MissingClassify,);
-    }
-
-    #[test]
-    fn build_error_has_actionable_message() {
-        let error = NativeExpressionModelBuildError::MissingStrictBoolean;
-
-        assert_eq!(error.operation(), "strict boolean conversion");
-        assert!(error.to_string().contains(error.operation()));
-    }
-
-    #[test]
-    fn public_types_are_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        assert_send_and_sync::<NativeExpressionModel<bool>>();
-        assert_send_and_sync::<NativeExpressionModelBuilder<bool>>();
-        assert_send_and_sync::<NativeExpressionModelBuildError>();
-    }
+    #[test] fn public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<NativeExpressionModel<bool>>(); assert_send_and_sync::<NativeExpressionModelBuilder<bool>>(); assert_send_and_sync::<NativeExpressionModelBuildError>(); }
 }

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Standard projected-value access vector shared by query stages.
 
 use std::sync::Arc;
@@ -655,120 +656,18 @@ impl ExpressionFieldResolver<crate::Value> for ProjectedValueRefRow<'_, '_, '_> 
 mod tests {
     use super::*;
 
-    #[test]
-    fn layout_deduplicates_fields_and_resolves_slots() {
-        let period = ExpressionFieldPath::new(["tPeriode"]).unwrap();
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let layout =
-            ProjectedValueLayout::new([period.clone(), revenue.clone(), period.clone()]).unwrap();
+    #[test] fn layout_deduplicates_fields_and_resolves_slots() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone(), revenue.clone(), period.clone()]).unwrap(); assert_eq!(layout.fields(), &[period.clone(), revenue.clone()]); assert_eq!(layout.slot(&period), Some(0)); assert_eq!(layout.slot(&revenue), Some(1)); assert!(layout.is_top_level()); }
 
-        assert_eq!(layout.fields(), &[period.clone(), revenue.clone()]);
-        assert_eq!(layout.slot(&period), Some(0));
-        assert_eq!(layout.slot(&revenue), Some(1));
-        assert!(layout.is_top_level());
-    }
+    #[test] fn projected_row_reads_values_by_field() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone()]).unwrap(); let values = [Some(crate::Value::string("12-2025"))]; let row = ProjectedValueRow::new(&layout, &values).unwrap(); assert_eq!(row.get(&period), Some(&crate::Value::string("12-2025"))); }
+    #[test] fn projected_pipeline_unions_filter_and_downstream_fields() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap(); let operators = [PhysicalOperator::Filter { predicate }]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert_eq!(pipeline.layout().slot(&period), Some(0)); assert_eq!(pipeline.layout().slot(&revenue), Some(1)); assert_eq!(pipeline.projection_reuse(), ProjectionReuse::Reusable); }
 
-    #[test]
-    fn projected_row_reads_values_by_field() {
-        let period = ExpressionFieldPath::new(["tPeriode"]).unwrap();
-        let layout = ProjectedValueLayout::new([period.clone()]).unwrap();
-        let values = [Some(crate::Value::string("12-2025"))];
-        let row = ProjectedValueRow::new(&layout, &values).unwrap();
+    #[test] fn projected_pipeline_accepts_select_as_slot_visibility_boundary() { let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([revenue.clone()]), }]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert_eq!(pipeline.layout().slot(&revenue), Some(0)); }
 
-        assert_eq!(row.get(&period), Some(&crate::Value::string("12-2025")));
-    }
-    #[test]
-    fn projected_pipeline_unions_filter_and_downstream_fields() {
-        let period = ExpressionFieldPath::new(["tPeriode"]).unwrap();
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap();
-        let operators = [PhysicalOperator::Filter { predicate }];
+    #[test] fn projected_pipeline_composes_filter_before_select() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap(); let operators = [ PhysicalOperator::Filter { predicate }, PhysicalOperator::Select { fields: Arc::from([revenue.clone()]), }, ]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert!(pipeline.layout().slot(&period).is_some()); assert!(pipeline.layout().slot(&revenue).is_some()); }
 
-        let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()])
-            .unwrap()
-            .unwrap();
+    #[test] fn projected_pipeline_select_does_not_force_unused_fields() { let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([revenue]), }]; let pipeline = ProjectedValuePipeline::compile(&operators, std::iter::empty::<ExpressionFieldPath>()) .unwrap() .unwrap(); assert!(pipeline.layout().fields().is_empty()); assert_eq!(pipeline.gate_field_count(), 0); }
 
-        // Gate fields are deliberately placed first so storage can decode
-        // predicate dependencies before downstream-only values.
-        assert_eq!(pipeline.layout().slot(&period), Some(0));
-        assert_eq!(pipeline.layout().slot(&revenue), Some(1));
-        assert_eq!(pipeline.projection_reuse(), ProjectionReuse::Reusable);
-    }
+    #[test] fn projected_pipeline_rejects_downstream_field_removed_by_select() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([period]), }]; assert!(ProjectedValuePipeline::compile(&operators, [revenue]) .unwrap() .is_none()); }
 
-    #[test]
-    fn projected_pipeline_accepts_select_as_slot_visibility_boundary() {
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let operators = [PhysicalOperator::Select {
-            fields: Arc::from([revenue.clone()]),
-        }];
-
-        let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()])
-            .unwrap()
-            .unwrap();
-        assert_eq!(pipeline.layout().slot(&revenue), Some(0));
-    }
-
-    #[test]
-    fn projected_pipeline_composes_filter_before_select() {
-        let period = ExpressionFieldPath::new(["tPeriode"]).unwrap();
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap();
-        let operators = [
-            PhysicalOperator::Filter { predicate },
-            PhysicalOperator::Select {
-                fields: Arc::from([revenue.clone()]),
-            },
-        ];
-
-        let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()])
-            .unwrap()
-            .unwrap();
-        assert!(pipeline.layout().slot(&period).is_some());
-        assert!(pipeline.layout().slot(&revenue).is_some());
-    }
-
-    #[test]
-    fn projected_pipeline_select_does_not_force_unused_fields() {
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let operators = [PhysicalOperator::Select {
-            fields: Arc::from([revenue]),
-        }];
-
-        let pipeline =
-            ProjectedValuePipeline::compile(&operators, std::iter::empty::<ExpressionFieldPath>())
-                .unwrap()
-                .unwrap();
-
-        assert!(pipeline.layout().fields().is_empty());
-        assert_eq!(pipeline.gate_field_count(), 0);
-    }
-
-    #[test]
-    fn projected_pipeline_rejects_downstream_field_removed_by_select() {
-        let period = ExpressionFieldPath::new(["tPeriode"]).unwrap();
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let operators = [PhysicalOperator::Select {
-            fields: Arc::from([period]),
-        }];
-
-        assert!(ProjectedValuePipeline::compile(&operators, [revenue])
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn predicate_compiles_against_projected_layout() {
-        let period = ExpressionFieldPath::new(["tPeriode"]).unwrap();
-        let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap();
-        let layout = ProjectedValueLayout::new([period.clone(), revenue.clone()]).unwrap();
-        let values = [
-            Some(crate::Value::string("12-2025")),
-            Some(crate::Value::float(12.5).unwrap()),
-        ];
-        let row = ProjectedValueRow::new(&layout, &values).unwrap();
-        assert_eq!(
-            row.resolve_field(&period),
-            SemanticValue::Present(crate::Value::string("12-2025"))
-        );
-    }
+    #[test] fn predicate_compiles_against_projected_layout() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone(), revenue.clone()]).unwrap(); let values = [ Some(crate::Value::string("12-2025")), Some(crate::Value::float(12.5).unwrap()), ]; let row = ProjectedValueRow::new(&layout, &values).unwrap(); assert_eq!( row.resolve_field(&period), SemanticValue::Present(crate::Value::string("12-2025")) ); }
 }

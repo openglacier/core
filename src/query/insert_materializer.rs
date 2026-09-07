@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Insert document materialization.
 
 use std::sync::Arc;
@@ -131,77 +132,11 @@ fn materialize_number(source: &str) -> ExecutionResult<Value> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn materializes_explicit_identifier_without_storing_id_field() {
-        let source =
-            InsertDocument::parse(r#"{"_id":"01890f4c-0000-7000-8000-000000000001","name":"Alice","active":true,"score":1.5}"#)
-                .unwrap();
+    #[test] fn materializes_explicit_identifier_without_storing_id_field() { let source = InsertDocument::parse(r#"{"_id":"01890f4c-0000-7000-8000-000000000001","name":"Alice","active":true,"score":1.5}"#) .unwrap(); let prepared = InsertDocumentMaterializer::default() .materialize(&source) .unwrap(); assert_eq!( prepared.id().to_string(), "01890f4c-0000-7000-8000-000000000001" ); assert!(!prepared.document().contains_key("_id")); assert_eq!( prepared.document().get("name").and_then(Value::as_str), Some("Alice") ); assert_eq!( prepared.document().get("active").and_then(Value::as_bool), Some(true) ); }
 
-        let prepared = InsertDocumentMaterializer::default()
-            .materialize(&source)
-            .unwrap();
+    #[test] fn generates_distinct_identifiers_when_id_is_absent() { let source = InsertDocument::parse(r#"{"name":"Alice"}"#).unwrap(); let materializer = InsertDocumentMaterializer::new("ogd"); let first = materializer.materialize(&source).unwrap(); let second = materializer.materialize(&source).unwrap(); assert_ne!(first.id(), second.id()); assert!(first.id() < second.id()); }
 
-        assert_eq!(
-            prepared.id().to_string(),
-            "01890f4c-0000-7000-8000-000000000001"
-        );
-        assert!(!prepared.document().contains_key("_id"));
-        assert_eq!(
-            prepared.document().get("name").and_then(Value::as_str),
-            Some("Alice")
-        );
-        assert_eq!(
-            prepared.document().get("active").and_then(Value::as_bool),
-            Some(true)
-        );
-    }
+    #[test] fn rejects_non_string_identifier() { let source = InsertDocument::parse(r#"{"_id":42}"#).unwrap(); let error = InsertDocumentMaterializer::default() .materialize(&source) .unwrap_err(); assert!(error.to_string().contains("must be a string or identifier")); }
 
-    #[test]
-    fn generates_distinct_identifiers_when_id_is_absent() {
-        let source = InsertDocument::parse(r#"{"name":"Alice"}"#).unwrap();
-        let materializer = InsertDocumentMaterializer::new("ogd");
-
-        let first = materializer.materialize(&source).unwrap();
-        let second = materializer.materialize(&source).unwrap();
-
-        assert_ne!(first.id(), second.id());
-        assert!(first.id() < second.id());
-    }
-
-    #[test]
-    fn rejects_non_string_identifier() {
-        let source = InsertDocument::parse(r#"{"_id":42}"#).unwrap();
-
-        let error = InsertDocumentMaterializer::default()
-            .materialize(&source)
-            .unwrap_err();
-
-        assert!(error.to_string().contains("must be a string or identifier"));
-    }
-
-    #[test]
-    fn materializes_nested_values() {
-        let source =
-            InsertDocument::parse(r#"{"items":[1,-2,3.5,null,{"enabled":false}]}"#).unwrap();
-
-        let prepared = InsertDocumentMaterializer::default()
-            .materialize(&source)
-            .unwrap();
-
-        let items = prepared
-            .document()
-            .get("items")
-            .and_then(Value::as_array)
-            .unwrap();
-
-        assert_eq!(items.len(), 5);
-        assert!(items[3].is_null());
-        assert_eq!(
-            items[4]
-                .as_object()
-                .and_then(|document| document.get("enabled"))
-                .and_then(Value::as_bool),
-            Some(false)
-        );
-    }
+    #[test] fn materializes_nested_values() { let source = InsertDocument::parse(r#"{"items":[1,-2,3.5,null,{"enabled":false}]}"#).unwrap(); let prepared = InsertDocumentMaterializer::default() .materialize(&source) .unwrap(); let items = prepared .document() .get("items") .and_then(Value::as_array) .unwrap(); assert_eq!(items.len(), 5); assert!(items[3].is_null()); assert_eq!( items[4] .as_object() .and_then(|document| document.get("enabled")) .and_then(Value::as_bool), Some(false) ); }
 }

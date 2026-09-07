@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Validated document field paths.
 
 use std::fmt;
@@ -594,285 +595,59 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn segment_preserves_its_text() {
-        let segment = FieldPathSegment::new("address");
-
-        assert_eq!(segment.as_str(), "address");
-        assert_eq!(segment.to_string(), "address");
-    }
-
-    #[test]
-    fn cloned_segments_share_their_allocation() {
-        let original = FieldPathSegment::new("shared");
-        let cloned = original.clone();
-
-        assert!(Arc::ptr_eq(original.as_arc(), cloned.as_arc()));
-    }
-
-    #[test]
-    fn parse_accepts_a_single_segment() {
-        let path = FieldPath::parse("name").expect("a single segment must be valid");
-
-        assert_eq!(path.len(), 1);
-        assert_eq!(path.first().as_str(), "name");
-        assert_eq!(path.last().as_str(), "name");
-        assert_eq!(path.to_string(), "name");
-    }
-
-    #[test]
-    fn parse_accepts_nested_segments() {
-        let path = FieldPath::parse("address.city").expect("the path must be valid");
-
-        assert_eq!(path.len(), 2);
-        assert_eq!(path.get(0).map(FieldPathSegment::as_str), Some("address"));
-        assert_eq!(path.get(1).map(FieldPathSegment::as_str), Some("city"));
-        assert_eq!(path.to_string(), "address.city");
-    }
-
-    #[test]
-    fn parse_rejects_an_empty_path() {
-        let error = FieldPath::parse("").expect_err("an empty path must be rejected");
-
-        assert_eq!(error, Error::EmptyFieldPath);
-    }
-
-    #[test]
-    fn parse_rejects_an_empty_first_segment() {
-        let error = FieldPath::parse(".city").expect_err("an empty first segment must be rejected");
-
-        assert_eq!(error, Error::EmptyFieldPathSegment { index: 0 });
-    }
-
-    #[test]
-    fn parse_rejects_an_empty_middle_segment() {
-        let error = FieldPath::parse("address..city")
-            .expect_err("an empty middle segment must be rejected");
-
-        assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 });
-    }
-
-    #[test]
-    fn parse_rejects_an_empty_last_segment() {
-        let error =
-            FieldPath::parse("address.").expect_err("an empty last segment must be rejected");
-
-        assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 });
-    }
-
-    #[test]
-    fn construction_rejects_an_empty_segment_collection() {
-        let segments: Vec<FieldPathSegment> = Vec::new();
-
-        let error = FieldPath::try_from_segments(segments)
-            .expect_err("an empty collection must be rejected");
-
-        assert_eq!(error, Error::EmptyFieldPath);
-    }
-
-    #[test]
-    fn construction_rejects_a_programmatic_empty_segment() {
-        let error = FieldPath::try_from_segments([
-            FieldPathSegment::new("address"),
-            FieldPathSegment::new(""),
-        ])
-        .expect_err("an empty segment must be rejected");
-
-        assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 });
-    }
-
-    #[test]
-    fn iteration_preserves_segment_order() {
-        let path = FieldPath::parse("user.address.city").expect("the path must be valid");
-
-        let segments = path
-            .iter()
-            .map(FieldPathSegment::as_str)
-            .collect::<Vec<_>>();
-
-        assert_eq!(segments, vec!["user", "address", "city"]);
-    }
-
-    #[test]
-    fn path_navigation_and_composition_are_structural() {
-        let address = FieldPath::parse("user.address").expect("valid path");
-        let city = address.joined("city").expect("valid segment");
-
-        assert_eq!(city.to_string(), "user.address.city");
-        assert_eq!(
-            city.parent().map(|path| path.to_string()),
-            Some(String::from("user.address")),
-        );
-
-        let prefix = FieldPath::parse("user").expect("valid path");
-        assert!(city.starts_with(&prefix));
-        assert_eq!(
-            city.strip_prefix(&prefix).map(|path| path.to_string()),
-            Some(String::from("address.city")),
-        );
-
-        let suffix = FieldPath::parse("postal.code").expect("valid path");
-        assert_eq!(prefix.joined_path(&suffix).to_string(), "user.postal.code",);
-    }
-
-    #[test]
-    fn single_segment_path_has_no_parent_or_non_empty_suffix() {
-        let path = FieldPath::parse("name").expect("valid path");
-
-        assert_eq!(path.parent(), None);
-        assert_eq!(path.strip_prefix(&path), None);
-    }
-
-    #[test]
-    fn joining_an_empty_segment_is_rejected_at_the_new_index() {
-        let path = FieldPath::parse("address").expect("valid path");
-        let error = path.joined("").expect_err("empty segment must fail");
-
-        assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 });
-    }
-
-    #[test]
-    fn resolve_finds_a_top_level_value() {
-        let document = user_document();
-        let path = FieldPath::parse("name").expect("the path must be valid");
-
-        assert_eq!(
-            path.resolve(&document),
-            ResolvedValue::Present(&Value::from("Tom"))
-        );
-    }
-
-    #[test]
-    fn resolve_finds_a_nested_value() {
-        let document = user_document();
-        let path = FieldPath::parse("address.city").expect("the path must be valid");
-
-        assert_eq!(
-            path.resolve(&document),
-            ResolvedValue::Present(&Value::from("Paris"))
-        );
-    }
-
-    #[test]
-    fn resolve_returns_missing_for_an_absent_top_level_field() {
-        let document = user_document();
-        let path = FieldPath::parse("missing").expect("the path must be valid");
-
-        assert_eq!(path.resolve(&document), ResolvedValue::Missing);
-    }
-
-    #[test]
-    fn resolve_returns_missing_for_an_absent_nested_field() {
-        let document = user_document();
-        let path = FieldPath::parse("address.missing").expect("the path must be valid");
-
-        assert_eq!(path.resolve(&document), ResolvedValue::Missing);
-    }
-
-    #[test]
-    fn resolve_returns_missing_when_an_intermediate_value_is_not_an_object() {
-        let document = user_document();
-        let path = FieldPath::parse("name.first").expect("the path must be valid");
-
-        assert_eq!(path.resolve(&document), ResolvedValue::Missing);
-    }
-
-    #[test]
-    fn resolve_distinguishes_null_from_missing() {
-        let document = user_document();
-
-        let null_path = FieldPath::parse("nickname").expect("the path must be valid");
-        let missing_path = FieldPath::parse("unknown").expect("the path must be valid");
-
-        let null_value = null_path.resolve(&document);
-        let missing_value = missing_path.resolve(&document);
-
-        assert_eq!(null_value, ResolvedValue::Present(&Value::Null));
-        assert!(null_value.is_present());
-        assert!(null_value.is_null());
-        assert!(!null_value.is_missing());
-
-        assert_eq!(missing_value, ResolvedValue::Missing);
-        assert!(!missing_value.is_present());
-        assert!(!missing_value.is_null());
-        assert!(missing_value.is_missing());
-    }
-
-    #[test]
-    fn resolve_detects_nested_null() {
-        let document = user_document();
-        let path = FieldPath::parse("address.postal_code").expect("the path must be valid");
-
-        let resolved = path.resolve(&document);
-
-        assert!(resolved.is_present());
-        assert!(resolved.is_null());
-    }
-
-    #[test]
-    fn resolve_stops_when_null_is_intermediate() {
-        let document = user_document();
-        let path = FieldPath::parse("nickname.value").expect("the path must be valid");
-
-        assert_eq!(path.resolve(&document), ResolvedValue::Missing);
-    }
-
-    #[test]
-    fn resolve_value_returns_an_option() {
-        let document = user_document();
-
-        let city = FieldPath::parse("address.city").expect("the path must be valid");
-        let missing = FieldPath::parse("address.missing").expect("the path must be valid");
-
-        assert_eq!(city.resolve_value(&document), Some(&Value::from("Paris")));
-        assert_eq!(missing.resolve_value(&document), None);
-    }
-
-    #[test]
-    fn resolved_value_can_be_mapped() {
-        let value = Value::from("Paris");
-        let resolved = ResolvedValue::Present(&value);
-
-        assert_eq!(resolved.map(|value| value.as_str()), Some(Some("Paris")));
-    }
-
-    #[test]
-    fn resolved_value_supports_option_like_helpers() {
-        let value = Value::from("Paris");
-        let present = ResolvedValue::Present(&value);
-        let missing = ResolvedValue::Missing;
-
-        assert_eq!(present.map_or(0, |_| 1), 1);
-        assert_eq!(missing.map_or(0, |_| 1), 0);
-        assert_eq!(present.map_or_else(|| 0, |_| 1), 1);
-        assert_eq!(missing.map_or_else(|| 0, |_| 1), 0);
-
-        assert_eq!(present.ok_or("missing"), Ok(&value));
-        assert_eq!(missing.ok_or("missing"), Err("missing"));
-        assert_eq!(present.cloned(), Some(value.clone()));
-        assert_eq!(missing.cloned(), None);
-    }
-
-    #[test]
-    fn segment_can_form_a_single_segment_path() {
-        let path = FieldPath::from(FieldPathSegment::new("name"));
-
-        assert_eq!(path.len(), 1);
-        assert_eq!(path.to_string(), "name");
-    }
-
-    #[test]
-    fn try_from_string_parses_a_path() {
-        let path =
-            FieldPath::try_from(String::from("address.city")).expect("the path must be valid");
-
-        assert_eq!(path.to_string(), "address.city");
-    }
-
-    #[test]
-    fn field_path_is_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        assert_send_and_sync::<FieldPath>();
-    }
+    #[test] fn segment_preserves_its_text() { let segment = FieldPathSegment::new("address"); assert_eq!(segment.as_str(), "address"); assert_eq!(segment.to_string(), "address"); }
+
+    #[test] fn cloned_segments_share_their_allocation() { let original = FieldPathSegment::new("shared"); let cloned = original.clone(); assert!(Arc::ptr_eq(original.as_arc(), cloned.as_arc())); }
+
+    #[test] fn parse_accepts_a_single_segment() { let path = FieldPath::parse("name").expect("a single segment must be valid"); assert_eq!(path.len(), 1); assert_eq!(path.first().as_str(), "name"); assert_eq!(path.last().as_str(), "name"); assert_eq!(path.to_string(), "name"); }
+
+    #[test] fn parse_accepts_nested_segments() { let path = FieldPath::parse("address.city").expect("the path must be valid"); assert_eq!(path.len(), 2); assert_eq!(path.get(0).map(FieldPathSegment::as_str), Some("address")); assert_eq!(path.get(1).map(FieldPathSegment::as_str), Some("city")); assert_eq!(path.to_string(), "address.city"); }
+
+    #[test] fn parse_rejects_an_empty_path() { let error = FieldPath::parse("").expect_err("an empty path must be rejected"); assert_eq!(error, Error::EmptyFieldPath); }
+
+    #[test] fn parse_rejects_an_empty_first_segment() { let error = FieldPath::parse(".city").expect_err("an empty first segment must be rejected"); assert_eq!(error, Error::EmptyFieldPathSegment { index: 0 }); }
+
+    #[test] fn parse_rejects_an_empty_middle_segment() { let error = FieldPath::parse("address..city") .expect_err("an empty middle segment must be rejected"); assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 }); }
+
+    #[test] fn parse_rejects_an_empty_last_segment() { let error = FieldPath::parse("address.").expect_err("an empty last segment must be rejected"); assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 }); }
+
+    #[test] fn construction_rejects_an_empty_segment_collection() { let segments: Vec<FieldPathSegment> = Vec::new(); let error = FieldPath::try_from_segments(segments) .expect_err("an empty collection must be rejected"); assert_eq!(error, Error::EmptyFieldPath); }
+
+    #[test] fn construction_rejects_a_programmatic_empty_segment() { let error = FieldPath::try_from_segments([ FieldPathSegment::new("address"), FieldPathSegment::new(""), ]) .expect_err("an empty segment must be rejected"); assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 }); }
+
+    #[test] fn iteration_preserves_segment_order() { let path = FieldPath::parse("user.address.city").expect("the path must be valid"); let segments = path .iter() .map(FieldPathSegment::as_str) .collect::<Vec<_>>(); assert_eq!(segments, vec!["user", "address", "city"]); }
+
+    #[test] fn path_navigation_and_composition_are_structural() { let address = FieldPath::parse("user.address").expect("valid path"); let city = address.joined("city").expect("valid segment"); assert_eq!(city.to_string(), "user.address.city"); assert_eq!( city.parent().map(|path| path.to_string()), Some(String::from("user.address")), ); let prefix = FieldPath::parse("user").expect("valid path"); assert!(city.starts_with(&prefix)); assert_eq!( city.strip_prefix(&prefix).map(|path| path.to_string()), Some(String::from("address.city")), ); let suffix = FieldPath::parse("postal.code").expect("valid path"); assert_eq!(prefix.joined_path(&suffix).to_string(), "user.postal.code",); }
+
+    #[test] fn single_segment_path_has_no_parent_or_non_empty_suffix() { let path = FieldPath::parse("name").expect("valid path"); assert_eq!(path.parent(), None); assert_eq!(path.strip_prefix(&path), None); }
+
+    #[test] fn joining_an_empty_segment_is_rejected_at_the_new_index() { let path = FieldPath::parse("address").expect("valid path"); let error = path.joined("").expect_err("empty segment must fail"); assert_eq!(error, Error::EmptyFieldPathSegment { index: 1 }); }
+
+    #[test] fn resolve_finds_a_top_level_value() { let document = user_document(); let path = FieldPath::parse("name").expect("the path must be valid"); assert_eq!( path.resolve(&document), ResolvedValue::Present(&Value::from("Tom")) ); }
+
+    #[test] fn resolve_finds_a_nested_value() { let document = user_document(); let path = FieldPath::parse("address.city").expect("the path must be valid"); assert_eq!( path.resolve(&document), ResolvedValue::Present(&Value::from("Paris")) ); }
+
+    #[test] fn resolve_returns_missing_for_an_absent_top_level_field() { let document = user_document(); let path = FieldPath::parse("missing").expect("the path must be valid"); assert_eq!(path.resolve(&document), ResolvedValue::Missing); }
+
+    #[test] fn resolve_returns_missing_for_an_absent_nested_field() { let document = user_document(); let path = FieldPath::parse("address.missing").expect("the path must be valid"); assert_eq!(path.resolve(&document), ResolvedValue::Missing); }
+
+    #[test] fn resolve_returns_missing_when_an_intermediate_value_is_not_an_object() { let document = user_document(); let path = FieldPath::parse("name.first").expect("the path must be valid"); assert_eq!(path.resolve(&document), ResolvedValue::Missing); }
+
+    #[test] fn resolve_distinguishes_null_from_missing() { let document = user_document(); let null_path = FieldPath::parse("nickname").expect("the path must be valid"); let missing_path = FieldPath::parse("unknown").expect("the path must be valid"); let null_value = null_path.resolve(&document); let missing_value = missing_path.resolve(&document); assert_eq!(null_value, ResolvedValue::Present(&Value::Null)); assert!(null_value.is_present()); assert!(null_value.is_null()); assert!(!null_value.is_missing()); assert_eq!(missing_value, ResolvedValue::Missing); assert!(!missing_value.is_present()); assert!(!missing_value.is_null()); assert!(missing_value.is_missing()); }
+
+    #[test] fn resolve_detects_nested_null() { let document = user_document(); let path = FieldPath::parse("address.postal_code").expect("the path must be valid"); let resolved = path.resolve(&document); assert!(resolved.is_present()); assert!(resolved.is_null()); }
+
+    #[test] fn resolve_stops_when_null_is_intermediate() { let document = user_document(); let path = FieldPath::parse("nickname.value").expect("the path must be valid"); assert_eq!(path.resolve(&document), ResolvedValue::Missing); }
+
+    #[test] fn resolve_value_returns_an_option() { let document = user_document(); let city = FieldPath::parse("address.city").expect("the path must be valid"); let missing = FieldPath::parse("address.missing").expect("the path must be valid"); assert_eq!(city.resolve_value(&document), Some(&Value::from("Paris"))); assert_eq!(missing.resolve_value(&document), None); }
+
+    #[test] fn resolved_value_can_be_mapped() { let value = Value::from("Paris"); let resolved = ResolvedValue::Present(&value); assert_eq!(resolved.map(|value| value.as_str()), Some(Some("Paris"))); }
+
+    #[test] fn resolved_value_supports_option_like_helpers() { let value = Value::from("Paris"); let present = ResolvedValue::Present(&value); let missing = ResolvedValue::Missing; assert_eq!(present.map_or(0, |_| 1), 1); assert_eq!(missing.map_or(0, |_| 1), 0); assert_eq!(present.map_or_else(|| 0, |_| 1), 1); assert_eq!(missing.map_or_else(|| 0, |_| 1), 0); assert_eq!(present.ok_or("missing"), Ok(&value)); assert_eq!(missing.ok_or("missing"), Err("missing")); assert_eq!(present.cloned(), Some(value.clone())); assert_eq!(missing.cloned(), None); }
+
+    #[test] fn segment_can_form_a_single_segment_path() { let path = FieldPath::from(FieldPathSegment::new("name")); assert_eq!(path.len(), 1); assert_eq!(path.to_string(), "name"); }
+
+    #[test] fn try_from_string_parses_a_path() { let path = FieldPath::try_from(String::from("address.city")).expect("the path must be valid"); assert_eq!(path.to_string(), "address.city"); }
+
+    #[test] fn field_path_is_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<FieldPath>(); }
 }

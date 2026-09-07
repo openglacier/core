@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Public in-memory storage engine. Thread-safe in-memory storage engine.
 
 use super::{backend::memory::MemoryBackend, BackendStorage, StorageResult};
@@ -37,28 +38,7 @@ mod tests {
     use super::*;
     use crate::storage::{StorageBackend, StorageEngine};
 
-    #[test]
-    fn public_memory_storage_uses_memory_backend() {
-        let storage = MemoryStorage::new();
+    #[test] fn public_memory_storage_uses_memory_backend() { let storage = MemoryStorage::new(); assert_eq!(storage.generation().unwrap(), 0); assert_eq!(storage.collection_count().unwrap(), 0); assert_eq!(storage.document_count().unwrap(), 0); }
 
-        assert_eq!(storage.generation().unwrap(), 0);
-        assert_eq!(storage.collection_count().unwrap(), 0);
-        assert_eq!(storage.document_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn facade_delegates_reads_to_backend() {
-        let storage = MemoryStorage::new();
-
-        assert!(StorageEngine::read(&storage)
-            .unwrap()
-            .collections()
-            .unwrap()
-            .is_empty());
-        assert!(StorageBackend::read(storage.backend())
-            .unwrap()
-            .collections()
-            .unwrap()
-            .is_empty());
-    }
+    #[test] fn facade_delegates_reads_to_backend() { let storage = MemoryStorage::new(); assert!(StorageEngine::read(&storage) .unwrap() .collections() .unwrap() .is_empty()); assert!(StorageBackend::read(storage.backend()) .unwrap() .collections() .unwrap() .is_empty()); }
 }

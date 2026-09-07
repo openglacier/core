@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Logical query plan representation and validation.
 
 use std::{fmt, sync::Arc};
@@ -2203,263 +2204,32 @@ mod tests {
         SetAssignment::new(field(path), parse_expression(value).unwrap())
     }
 
-    #[test]
-    fn supports_complete_native_stage_set() {
-        let mut plan = LogicalPlan::builder(users_source());
-        plan.filter(parse_expression("active == true").unwrap())
-            .unwrap();
-        plan.sort([
-            SortKey::descending(field(&["age"])),
-            SortKey::ascending(field(&["name"])),
-        ])
-        .unwrap();
-        plan.skip(10).unwrap();
-        plan.limit(20).unwrap();
-        plan.select([field(&["name"]), field(&["age"])]).unwrap();
-        plan.distinct([field(&["name"])]).unwrap();
+    #[test] fn supports_complete_native_stage_set() { let mut plan = LogicalPlan::builder(users_source()); plan.filter(parse_expression("active == true").unwrap()) .unwrap(); plan.sort([ SortKey::descending(field(&["age"])), SortKey::ascending(field(&["name"])), ]) .unwrap(); plan.skip(10).unwrap(); plan.limit(20).unwrap(); plan.select([field(&["name"]), field(&["age"])]).unwrap(); plan.distinct([field(&["name"])]).unwrap(); let plan = plan.finish().unwrap(); assert_eq!(plan.len(), 6); assert!(plan.has_filter()); assert!(plan.has_sort()); assert!(plan.has_skip()); assert!(plan.has_limit()); assert!(plan.has_select()); assert!(plan.has_distinct()); assert!(plan.is_read_only()); }
 
-        let plan = plan.finish().unwrap();
-        assert_eq!(plan.len(), 6);
-        assert!(plan.has_filter());
-        assert!(plan.has_sort());
-        assert!(plan.has_skip());
-        assert!(plan.has_limit());
-        assert!(plan.has_select());
-        assert!(plan.has_distinct());
-        assert!(plan.is_read_only());
-    }
+    #[test] fn supports_group_as_chainable_and_count_as_terminal() { let group = LogicalPlan::builder(users_source()) .group([field(&["country"])]) .unwrap() .finish() .unwrap(); assert!(group.has_group()); assert!(!group.operator(0).unwrap().is_terminal()); let chained = LogicalPlan::builder(users_source()) .group([field(&["country"])]) .unwrap() .sort([SortKey::descending(field(&["count"]))]) .unwrap() .finish() .unwrap(); assert_eq!(chained.len(), 2); assert!(chained.has_group()); assert!(chained.has_sort()); let count = LogicalPlan::builder(users_source()) .count("total") .unwrap() .finish() .unwrap(); assert!(count.has_count()); assert_eq!(count.operator(0).unwrap().count_alias(), Some("total")); }
 
-    #[test]
-    fn supports_group_as_chainable_and_count_as_terminal() {
-        let group = LogicalPlan::builder(users_source())
-            .group([field(&["country"])])
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(group.has_group());
-        assert!(!group.operator(0).unwrap().is_terminal());
+    #[test] fn supports_delete_and_insert_mutations() { let delete = LogicalPlan::builder(users_source()) .delete() .unwrap() .finish() .unwrap(); assert!(delete.has_delete()); assert!(delete.is_mutating()); let insert = LogicalPlan::builder(users_source()) .insert("{name:\"Alice\"}") .unwrap() .finish() .unwrap(); assert!(insert.has_insert()); assert!(insert.is_mutating()); }
 
-        let chained = LogicalPlan::builder(users_source())
-            .group([field(&["country"])])
-            .unwrap()
-            .sort([SortKey::descending(field(&["count"]))])
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert_eq!(chained.len(), 2);
-        assert!(chained.has_group());
-        assert!(chained.has_sort());
+    #[test] fn retains_existing_filter_set_and_load_apis() { let filter = LogicalPlan::builder(users_source()) .filter(parse_expression("age >= 18").unwrap()) .unwrap() .finish() .unwrap(); assert!(filter.has_filter()); let set = LogicalPlan::builder(users_source()) .set([assignment(&["enabled"], "true")]) .unwrap() .finish() .unwrap(); assert!(set.has_set()); let load = LogicalPlan::builder(users_source()) .load("profile") .unwrap() .finish() .unwrap(); assert!(load.has_load()); }
 
-        let count = LogicalPlan::builder(users_source())
-            .count("total")
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(count.has_count());
-        assert_eq!(count.operator(0).unwrap().count_alias(), Some("total"));
-    }
+    #[test] fn validates_operator_arguments() { assert!(matches!( LogicalOperator::sort([]).unwrap_err().kind(), LogicalPlanErrorKind::EmptySortKeys )); assert!(matches!( LogicalOperator::select([]).unwrap_err().kind(), LogicalPlanErrorKind::EmptyFieldList { context: FieldListContext::Select } )); assert!(matches!( LogicalOperator::group([]).unwrap_err().kind(), LogicalPlanErrorKind::EmptyFieldList { context: FieldListContext::Group } )); assert!(matches!( LogicalOperator::insert(" ").unwrap_err().kind(), LogicalPlanErrorKind::EmptyInsertSpecification )); }
 
-    #[test]
-    fn supports_delete_and_insert_mutations() {
-        let delete = LogicalPlan::builder(users_source())
-            .delete()
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(delete.has_delete());
-        assert!(delete.is_mutating());
-
-        let insert = LogicalPlan::builder(users_source())
-            .insert("{name:\"Alice\"}")
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(insert.has_insert());
-        assert!(insert.is_mutating());
-    }
-
-    #[test]
-    fn retains_existing_filter_set_and_load_apis() {
-        let filter = LogicalPlan::builder(users_source())
-            .filter(parse_expression("age >= 18").unwrap())
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(filter.has_filter());
-
-        let set = LogicalPlan::builder(users_source())
-            .set([assignment(&["enabled"], "true")])
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(set.has_set());
-
-        let load = LogicalPlan::builder(users_source())
-            .load("profile")
-            .unwrap()
-            .finish()
-            .unwrap();
-        assert!(load.has_load());
-    }
-
-    #[test]
-    fn validates_operator_arguments() {
-        assert!(matches!(
-            LogicalOperator::sort([]).unwrap_err().kind(),
-            LogicalPlanErrorKind::EmptySortKeys
-        ));
-        assert!(matches!(
-            LogicalOperator::select([]).unwrap_err().kind(),
-            LogicalPlanErrorKind::EmptyFieldList {
-                context: FieldListContext::Select
-            }
-        ));
-        assert!(matches!(
-            LogicalOperator::group([]).unwrap_err().kind(),
-            LogicalPlanErrorKind::EmptyFieldList {
-                context: FieldListContext::Group
-            }
-        ));
-        assert!(matches!(
-            LogicalOperator::insert(" ").unwrap_err().kind(),
-            LogicalPlanErrorKind::EmptyInsertSpecification
-        ));
-    }
-
-    #[test]
-    fn validates_nested_insert_object() {
-        let operator = LogicalOperator::insert(
-            r#"{
+    #[test] fn validates_nested_insert_object() { let operator = LogicalOperator::insert( r#"{
                 _id: "u1",
                 active: true,
                 tags: ["rust", "database"],
                 address: {city: "Paris"},
-            }"#,
-        )
-        .unwrap();
+            }"#, ) .unwrap(); assert!(operator.insert_document().is_some()); }
 
-        assert!(operator.insert_document().is_some());
-    }
+    #[test] fn rejects_non_object_insert_values() { assert!(matches!( LogicalOperator::insert(r#""Alice""#).unwrap_err().kind(), LogicalPlanErrorKind::InsertDocumentMustBeObject )); assert!(matches!( LogicalOperator::insert("[{name: \"Alice\"}]") .unwrap_err() .kind(), LogicalPlanErrorKind::InsertDocumentMustBeObject )); }
 
-    #[test]
-    fn rejects_non_object_insert_values() {
-        assert!(matches!(
-            LogicalOperator::insert(r#""Alice""#).unwrap_err().kind(),
-            LogicalPlanErrorKind::InsertDocumentMustBeObject
-        ));
+    #[test] fn rejects_malformed_insert_document() { assert!(matches!( LogicalOperator::insert(r#"{name "Alice"}"#) .unwrap_err() .kind(), LogicalPlanErrorKind::InvalidInsertDocument { .. } )); }
 
-        assert!(matches!(
-            LogicalOperator::insert("[{name: \"Alice\"}]")
-                .unwrap_err()
-                .kind(),
-            LogicalPlanErrorKind::InsertDocumentMustBeObject
-        ));
-    }
+    #[test] fn rejects_duplicate_field_arguments() { let repeated = field(&["country"]); assert!(matches!( LogicalOperator::sort([ SortKey::ascending(repeated.clone()), SortKey::descending(repeated.clone()), ]) .unwrap_err() .kind(), LogicalPlanErrorKind::DuplicateSortKey { .. } )); assert!(matches!( LogicalOperator::select([repeated.clone(), repeated]) .unwrap_err() .kind(), LogicalPlanErrorKind::DuplicateField { context: FieldListContext::Select, .. } )); }
 
-    #[test]
-    fn rejects_malformed_insert_document() {
-        assert!(matches!(
-            LogicalOperator::insert(r#"{name "Alice"}"#)
-                .unwrap_err()
-                .kind(),
-            LogicalPlanErrorKind::InvalidInsertDocument { .. }
-        ));
-    }
+    #[test] fn enforces_terminal_and_unique_operators() { let mut builder = LogicalPlan::builder(users_source()); builder.limit(10).unwrap(); assert!(matches!( builder.limit(20).unwrap_err().kind(), LogicalPlanErrorKind::DuplicateOperator { kind: LogicalOperatorKind::Limit, .. } )); let mut builder = LogicalPlan::builder(users_source()); builder.count("count").unwrap(); assert!(matches!( builder.limit(1).unwrap_err().kind(), LogicalPlanErrorKind::OperatorAfterTerminal { .. } )); }
 
-    #[test]
-    fn rejects_duplicate_field_arguments() {
-        let repeated = field(&["country"]);
+    #[test] fn supports_typed_pivot() { let specification = PivotSpecification::new( [field(&["region"])], [field(&["month"])], [PivotValue::new(field(&["revenue"]), PivotAggregate::Sum, None::<&str>).unwrap()], ) .unwrap(); let plan = LogicalPlan::builder(users_source()) .pivot(specification) .unwrap() .finish() .unwrap(); assert!(plan.has_pivot()); assert!(plan.is_read_only()); assert_eq!( plan.operator(0) .unwrap() .pivot_specification() .unwrap() .values() .len(), 1 ); }
 
-        assert!(matches!(
-            LogicalOperator::sort([
-                SortKey::ascending(repeated.clone()),
-                SortKey::descending(repeated.clone()),
-            ])
-            .unwrap_err()
-            .kind(),
-            LogicalPlanErrorKind::DuplicateSortKey { .. }
-        ));
-
-        assert!(matches!(
-            LogicalOperator::select([repeated.clone(), repeated])
-                .unwrap_err()
-                .kind(),
-            LogicalPlanErrorKind::DuplicateField {
-                context: FieldListContext::Select,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn enforces_terminal_and_unique_operators() {
-        let mut builder = LogicalPlan::builder(users_source());
-        builder.limit(10).unwrap();
-
-        assert!(matches!(
-            builder.limit(20).unwrap_err().kind(),
-            LogicalPlanErrorKind::DuplicateOperator {
-                kind: LogicalOperatorKind::Limit,
-                ..
-            }
-        ));
-
-        let mut builder = LogicalPlan::builder(users_source());
-        builder.count("count").unwrap();
-
-        assert!(matches!(
-            builder.limit(1).unwrap_err().kind(),
-            LogicalPlanErrorKind::OperatorAfterTerminal { .. }
-        ));
-    }
-
-    #[test]
-    fn supports_typed_pivot() {
-        let specification = PivotSpecification::new(
-            [field(&["region"])],
-            [field(&["month"])],
-            [PivotValue::new(field(&["revenue"]), PivotAggregate::Sum, None::<&str>).unwrap()],
-        )
-        .unwrap();
-
-        let plan = LogicalPlan::builder(users_source())
-            .pivot(specification)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        assert!(plan.has_pivot());
-        assert!(plan.is_read_only());
-        assert_eq!(
-            plan.operator(0)
-                .unwrap()
-                .pivot_specification()
-                .unwrap()
-                .values()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn canonical_plan_covers_all_native_operators() {
-        let plan = LogicalPlan::builder(users_source())
-            .sort([SortKey::descending(field(&["age"]))])
-            .unwrap()
-            .skip(2)
-            .unwrap()
-            .limit(5)
-            .unwrap()
-            .select([field(&["name"])])
-            .unwrap()
-            .distinct([])
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        assert_eq!(
-            plan.canonical_string(),
-            "scan(5:users);sort(field(3:age):desc);skip(2);limit(5);select(field(4:name));distinct(document)",
-        );
-    }
+    #[test] fn canonical_plan_covers_all_native_operators() { let plan = LogicalPlan::builder(users_source()) .sort([SortKey::descending(field(&["age"]))]) .unwrap() .skip(2) .unwrap() .limit(5) .unwrap() .select([field(&["name"])]) .unwrap() .distinct([]) .unwrap() .finish() .unwrap(); assert_eq!( plan.canonical_string(), "scan(5:users);sort(field(3:age):desc);skip(2);limit(5);select(field(4:name));distinct(document)", ); }
 }

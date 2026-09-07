@@ -7,20 +7,32 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+        Arc,
+    },
+    thread,
     time::Duration,
 };
 
 use og_core::{
     access::identity_file::{self, IdentityCredential},
     helpers::decode_base64,
-    operation::{OperationRequest, AUTH_BEGIN, AUTH_COMPLETE, QUERY_EXECUTE},
+    operation::{
+        operation_by_name, OperationRequest, TransportKind, AUTH_BEGIN, AUTH_COMPLETE, QUERY_EXECUTE,
+    },
     protocol::{
         decode_stream_response, encode_message, ensure_payload_size, MessageKind, RequestId,
         StreamResponse, LENGTH_PREFIX_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
     },
 };
-use rustyline::{error::ReadlineError, DefaultEditor};
+use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
 use serde_json::{json, Value};
+
+#[cfg(feature = "cli-tui")]
+#[path = "ogcli/tui.rs"]
+mod tui;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const NAME: &str = "ogcli";
@@ -43,7 +55,13 @@ fn run() -> Result<ExitCode> {
         Action::Help => print_help(),
         Action::Version => println!("{NAME} {VERSION}"),
         Action::Run(Some(line)) => return run_line(&config, line),
-        Action::Run(None) => return repl(config),
+        Action::Run(None) => {
+            #[cfg(feature = "cli-tui")]
+            if config.tui {
+                return tui::run(config);
+            }
+            return repl(config);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -55,11 +73,11 @@ fn run_line(config: &Config, line: String) -> Result<ExitCode> {
     Ok(exit)
 }
 
-fn repl(config: Config) -> Result<ExitCode> {
-    let mut client = Client::connect(&config)?;
+fn repl(mut config: Config) -> Result<ExitCode> {
     let mut exit = ExitCode::SUCCESS;
 
     if !io::stdin().is_terminal() {
+        let mut client = Client::connect(&config)?;
         for line in io::stdin().lock().lines() {
             if handle_line(&config, &mut client, line?.trim(), false, &mut exit)? {
                 break;
@@ -68,8 +86,33 @@ fn repl(config: Config) -> Result<ExitCode> {
         return Ok(exit);
     }
 
+    config.prepare_for_background()?;
+    // Reconnect once after caching an interactive identity password so every
+    // background request can authenticate without touching the input terminal.
+    let client = Client::connect(&config)?;
+    drop(client);
+
     println!("Connected to {}. Type help for commands.", config.address);
+    println!("Interactive requests run concurrently; output is printed above the prompt.");
+
     let mut editor = DefaultEditor::new()?;
+    let mut external_printer = editor.create_external_printer()?;
+    let (output_tx, output_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        while let Ok(mut message) = output_rx.recv() {
+            while let Ok(next) = output_rx.try_recv() {
+                message.push('\n');
+                message.push_str(&next);
+            }
+            if external_printer.print(message).is_err() {
+                break;
+            }
+        }
+    });
+
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut next_job_id = 1_u64;
+
     loop {
         match editor.readline("openglacier> ") {
             Ok(line) => {
@@ -78,22 +121,102 @@ fn repl(config: Config) -> Result<ExitCode> {
                     continue;
                 }
                 let _ = editor.add_history_entry(line);
-                match handle_line(&config, &mut client, line, true, &mut exit) {
-                    Ok(true) => return Ok(exit),
-                    Ok(false) => {}
-                    Err(error) => {
-                        eprintln!("{NAME}: {error}");
-                        exit = ExitCode::FAILURE;
+                match line {
+                    "exit" | "quit" | ".exit" | ".quit" => {
+                        return Ok(if failed.load(Ordering::Relaxed) {
+                            ExitCode::FAILURE
+                        } else {
+                            ExitCode::SUCCESS
+                        });
                     }
+                    "help" | ".help" => {
+                        print_repl_help();
+                        continue;
+                    }
+                    "reconnect" | ".reconnect" => {
+                        match Client::connect(&config) {
+                            Ok(_) => println!("Connection to {} verified.", config.address),
+                            Err(error) => {
+                                eprintln!("{NAME}: {error}");
+                                failed.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
                 }
+
+                let job_id = next_job_id;
+                next_job_id = next_job_id.wrapping_add(1);
+                spawn_background_line(
+                    config.clone(),
+                    line.to_owned(),
+                    job_id,
+                    output_tx.clone(),
+                    Arc::clone(&failed),
+                );
             }
             Err(ReadlineError::Interrupted) => continue,
             Err(ReadlineError::Eof) => {
                 println!();
-                return Ok(exit);
+                return Ok(if failed.load(Ordering::Relaxed) {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                });
             }
             Err(error) => return Err(error.into()),
         }
+    }
+}
+
+fn spawn_background_line(
+    config: Config,
+    line: String,
+    job_id: u64,
+    output: mpsc::Sender<String>,
+    failed: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let _ = output.send(format!("[{job_id}] started"));
+        let result = execute_background_line(&config, &line, |message| {
+            output
+                .send(format!("[{job_id}] {message}"))
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "REPL output closed").into())
+        });
+        match result {
+            Ok(code) if code == ExitCode::SUCCESS => {
+                let _ = output.send(format!("[{job_id}] done"));
+            }
+            Ok(_) => {
+                failed.store(true, Ordering::Relaxed);
+                let _ = output.send(format!("[{job_id}] failed"));
+            }
+            Err(error) => {
+                failed.store(true, Ordering::Relaxed);
+                let _ = output.send(format!("[{job_id}] {NAME}: {error}"));
+            }
+        }
+    });
+}
+
+fn execute_background_line(
+    config: &Config,
+    line: &str,
+    mut emit: impl FnMut(String) -> Result<()>,
+) -> Result<ExitCode> {
+    let mut client = Client::connect(config)?;
+    if let Some(operation) = line.strip_prefix('.') {
+        let (op, data) = parse_operation(operation)?;
+        if operation_by_name(op).is_some_and(|descriptor| descriptor.transport == TransportKind::MessageStream) {
+            client.stream_operation_emit(op, data, config.output, &mut emit)
+        } else {
+            let data = client.operation(op, data)?;
+            emit(render_json(&data, config.output)?)?;
+            Ok(ExitCode::SUCCESS)
+        }
+    } else {
+        client.query_stream_emit(line, config.output, &mut emit)
     }
 }
 
@@ -120,9 +243,13 @@ fn handle_line( config: &Config, client: &mut Client, line: &str, interactive: b
     let result = retry_closed(config, client, |client| {
         if let Some(operation) = line.strip_prefix('.') {
             let (op, data) = parse_operation(operation)?;
-            let data = client.operation(op, data)?;
-            print_json(&data, config.output)?;
-            Ok(ExitCode::SUCCESS)
+            if operation_by_name(op).is_some_and(|descriptor| descriptor.transport == TransportKind::MessageStream) {
+                client.stream_operation(op, data, config.output)
+            } else {
+                let data = client.operation(op, data)?;
+                print_json(&data, config.output)?;
+                Ok(ExitCode::SUCCESS)
+            }
         } else {
             client.query(line, config.output)
         }
@@ -218,6 +345,135 @@ impl Client {
         Ok(response.get("data").cloned().unwrap_or(Value::Null))
     }
 
+    fn stream_operation(&mut self, op: &str, data: Value, output: Output) -> Result<ExitCode> {
+        let expected = self.send(op, data)?;
+        let mut message = Vec::with_capacity(4096);
+        loop {
+            self.receive(&mut message)?;
+            match decode_stream_response(&message)? {
+                StreamResponse::Partial { id, data, .. } => {
+                    check_request_id(expected, &id)?;
+                    print_json(&data, if output == Output::Pretty { Output::Compact } else { output })?;
+                }
+                StreamResponse::Complete { id, statistics, .. } => {
+                    check_request_id(expected, &id)?;
+                    if output != Output::Quiet {
+                        print_json(&json!({"complete": true, "statistics": statistics}), output)?;
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                StreamResponse::Error { id, error, .. } => {
+                    if let Some(id) = id.as_ref() {
+                        check_request_id(expected, id)?;
+                    }
+                    match id {
+                        Some(id) => eprintln!("{NAME}: request {id}: {}: {}", error.code, error.message),
+                        None => eprintln!("{NAME}: {}: {}", error.code, error.message),
+                    }
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+        }
+    }
+
+    fn stream_operation_emit(
+        &mut self,
+        op: &str,
+        data: Value,
+        output: Output,
+        emit: &mut impl FnMut(String) -> Result<()>,
+    ) -> Result<ExitCode> {
+        let expected = self.send(op, data)?;
+        let mut message = Vec::with_capacity(4096);
+        loop {
+            self.receive(&mut message)?;
+            match decode_stream_response(&message)? {
+                StreamResponse::Partial { id, data, .. } => {
+                    check_request_id(expected, &id)?;
+                    let partial_output = if output == Output::Pretty {
+                        Output::Compact
+                    } else {
+                        output
+                    };
+                    emit(render_json(&data, partial_output)?)?;
+                }
+                StreamResponse::Complete { id, statistics, .. } => {
+                    check_request_id(expected, &id)?;
+                    if output != Output::Quiet {
+                        emit(render_json(
+                            &json!({"complete": true, "statistics": statistics}),
+                            output,
+                        )?)?;
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                StreamResponse::Error { id, error, .. } => {
+                    if let Some(id) = id.as_ref() {
+                        check_request_id(expected, id)?;
+                    }
+                    emit(match id {
+                        Some(id) => format!(
+                            "{NAME}: request {id}: {}: {}",
+                            error.code, error.message
+                        ),
+                        None => format!("{NAME}: {}: {}", error.code, error.message),
+                    })?;
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+        }
+    }
+
+    fn query_stream_emit(
+        &mut self,
+        query: &str,
+        output: Output,
+        emit: &mut impl FnMut(String) -> Result<()>,
+    ) -> Result<ExitCode> {
+        if query.trim().is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "query cannot be empty").into());
+        }
+        let expected = self.send(QUERY_EXECUTE, json!({"query": query}))?;
+        let mut message = Vec::with_capacity(4096);
+        loop {
+            self.receive(&mut message)?;
+            match decode_stream_response(&message)? {
+                StreamResponse::Partial { id, data, .. } => {
+                    check_request_id(expected, &id)?;
+                    let partial_output = if output == Output::Pretty {
+                        Output::Compact
+                    } else {
+                        output
+                    };
+                    emit(render_json(&data, partial_output)?)?;
+                }
+                StreamResponse::Complete { id, statistics, .. } => {
+                    check_request_id(expected, &id)?;
+                    if output != Output::Quiet {
+                        emit(render_json(
+                            &json!({"complete": true, "statistics": statistics}),
+                            output,
+                        )?)?;
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                StreamResponse::Error { id, error, .. } => {
+                    if let Some(id) = id.as_ref() {
+                        check_request_id(expected, id)?;
+                    }
+                    emit(match id {
+                        Some(id) => format!(
+                            "{NAME}: request {id}: {}: {}",
+                            error.code, error.message
+                        ),
+                        None => format!("{NAME}: {}: {}", error.code, error.message),
+                    })?;
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+        }
+    }
+
     fn query(&mut self, query: &str, output: Output) -> Result<ExitCode> {
         if query.trim().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "query cannot be empty").into());
@@ -306,6 +562,13 @@ fn check_request_id(expected: u64, received: &RequestId) -> Result<()> {
     }
 }
 
+fn render_json(value: &Value, output: Output) -> Result<String> {
+    Ok(match output {
+        Output::Pretty => serde_json::to_string_pretty(value)?,
+        Output::Compact | Output::Quiet => serde_json::to_string(value)?,
+    })
+}
+
 fn print_json(value: &Value, output: Output) -> Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -327,6 +590,8 @@ struct Config {
     identity: Option<PathBuf>,
     password_file: Option<PathBuf>,
     password: Option<String>,
+    #[cfg(feature = "cli-tui")]
+    tui: bool,
 }
 
 impl Config {
@@ -344,7 +609,22 @@ impl Config {
             identity,
             password_file: env::var("OGCLI_IDENTITY_PASSWORD_FILE").ok().map(PathBuf::from),
             password: env::var("OGCLI_IDENTITY_PASSWORD").ok(),
+            #[cfg(feature = "cli-tui")]
+            tui: false,
         })
+    }
+
+    fn prepare_for_background(&mut self) -> Result<()> {
+        let needs_prompt = self.identity.is_some()
+            && self.password_file.is_none()
+            && self
+                .password
+                .as_deref()
+                .map_or(true, |value| value.is_empty());
+        if needs_prompt && io::stdin().is_terminal() {
+            self.password = Some(rpassword::prompt_password("Identity password: ")?);
+        }
+        Ok(())
     }
 
     fn password(&self) -> Result<Vec<u8>> {
@@ -396,6 +676,16 @@ impl Args {
                 "--connect-timeout-ms" => config.connect_timeout = duration(&value!(), false)?.unwrap(),
                 "--read-timeout-ms" => config.read_timeout = duration(&value!(), true)?,
                 "--write-timeout-ms" => config.write_timeout = duration(&value!(), false)?.unwrap(),
+                #[cfg(feature = "cli-tui")]
+                "--tui" => config.tui = true,
+                #[cfg(not(feature = "cli-tui"))]
+                "--tui" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--tui requires building ogcli with the cli-tui feature",
+                    )
+                    .into())
+                }
                 "--compact" => config.output = Output::Compact,
                 "-q" | "--quiet" => config.output = Output::Quiet,
                 "--" => {
@@ -456,6 +746,7 @@ OPTIONS:\n\
     --connect-timeout-ms MS   [default: 5000]\n\
     --read-timeout-ms MS      0 waits indefinitely [default: 0]\n\
     --write-timeout-ms MS     [default: 30000]\n\
+    --tui                     Interactive tabs/tiles UI (requires cli-tui)\n\
     --compact                 Compact JSON\n\
     --quiet, -q               Documents only\n\
     --help, -h\n\
@@ -470,8 +761,10 @@ fn print_repl_help() {
     .OPERATION [JSON]  Execute an ogd operation\n\
     help, .help        Show this help\n\
     reconnect, .reconnect\n\
-                       Reconnect\n\
+                       Verify the daemon connection\n\
     quit, exit         Exit (also .quit, .exit)\n\n\
+Interactive requests run concurrently on independent connections.\n\
+Background output is prefixed with a local [job] id and printed above the prompt.\n\
 Any other non-empty line is sent as a query."
     );
 }

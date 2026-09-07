@@ -6,6 +6,7 @@
 
 pub mod access;
 pub mod backup;
+pub mod build;
 pub mod model;
 pub mod debug;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod helpers;
 pub mod memory;
 pub mod operation;
 pub mod query;
+pub mod service;
 pub mod spill;
 pub use model::capability::{ capabilities_of, capabilities_of_number, Capabilities, Capability, ValueCapabilities, };
 pub use model::compare::{
@@ -49,36 +51,15 @@ pub const fn api_version_string() -> &'static str { "1" }
 mod tests {
     use super::*;
 
-    #[test]
-    fn public_api_version_is_defined() { assert_eq!(API_VERSION, 1); }
+    #[test] fn public_api_version_is_defined() { assert_eq!(API_VERSION, 1); }
 
-    #[test]
-    fn public_result_alias_is_available() {
-        fn successful_operation() -> Result<()> {
-            Ok(())
-        }
+    #[test] fn public_result_alias_is_available() { fn successful_operation() -> Result<()> { Ok(()) } assert!(successful_operation().is_ok()); }
 
-        assert!(successful_operation().is_ok());
-    }
+    #[test] fn api_version_string_is_stable() { assert_eq!(api_version_string(), "1"); }
 
-    #[test]
-    fn api_version_string_is_stable() {
-        assert_eq!(api_version_string(), "1");
-    }
+    #[test] fn comparison_helpers_are_exported() { let _ = less_than; let _ = greater_than; let _ = physically_equals; }
 
-    #[test]
-    fn comparison_helpers_are_exported() {
-        let _ = less_than;
-        let _ = greater_than;
-        let _ = physically_equals;
-    }
-
-    #[test]
-    fn value_is_exported_from_the_crate_root() {
-        let value = Value::Null;
-
-        assert_eq!(value, Value::Null);
-    }
+    #[test] fn value_is_exported_from_the_crate_root() { let value = Value::Null; assert_eq!(value, Value::Null); }
 }
 
 pub mod engine;

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Logical-to-physical plan lowering.
 
 use std::{error::Error as StdError, fmt, sync::Arc};
@@ -970,394 +971,43 @@ mod tests {
         output
     }
 
-    #[test]
-    fn lowers_scan_only_plan() {
-        let logical = LogicalPlan::scan(source());
-        let physical = lower(&logical);
-
-        assert!(physical.is_scan_only());
-        assert_eq!(physical.source().collection().as_str(), "users");
-        assert!(!physical.is_write());
-    }
-
-    #[test]
-    fn lowers_complete_read_pipeline_in_order() {
-        let logical = LogicalPlan::builder(source())
-            .filter(parse_expression("active == true").unwrap())
-            .unwrap()
-            .sort([
-                SortKey::new(field(&["age"]), SortDirection::Descending),
-                SortKey::new(field(&["name"]), SortDirection::Ascending),
-            ])
-            .unwrap()
-            .skip(10)
-            .unwrap()
-            .limit(20)
-            .unwrap()
-            .select([field(&["name"]), field(&["age"])])
-            .unwrap()
-            .distinct([field(&["name"])])
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-        let names = physical
-            .operators()
-            .iter()
-            .map(PhysicalOperator::name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            names,
-            ["filter", "sort", "skip", "limit", "select", "distinct"],
-        );
-        assert!(!physical.is_write());
-        assert!(physical.changes_cardinality());
-    }
-
-    #[test]
-    fn preserves_filter_payload() {
-        let logical = LogicalPlan::builder(source())
-            .filter(parse_expression("age >= 18").unwrap())
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(
-            physical.operators()[0].predicate(),
-            logical.operators().next().unwrap().predicate(),
-        );
-    }
-
-    #[test]
-    fn preserves_set_assignments_and_write_mode() {
-        let logical = LogicalPlan::builder(source())
-            .set([
-                assignment(&["enabled"], "true"),
-                assignment(&["profile", "level"], "level + 1"),
-            ])
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(physical.operators()[0].name(), "set");
-        assert_eq!(physical.operators()[0].assignments().unwrap().len(), 2);
-        assert!(physical.is_write());
-    }
-
-    #[test]
-    fn preserves_compact_load_target() {
-        let logical = LogicalPlan::builder(source())
-            .load("profile")
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(physical.operators()[0].load_target(), Some("profile"));
-        assert!(physical.is_write());
-    }
-
-    #[test]
-    fn lowers_streaming_load_payload() {
-        let specification = streaming_payload("replace", &["batch1", "batch2"]);
-
-        let logical = LogicalPlan::builder(source())
-            .load(specification)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-        let operator = &physical.operators()[0];
-
-        assert_eq!(operator.name(), "streaming-load");
-        assert_eq!(
-            operator.streaming_load_mode(),
-            Some(PhysicalLoadMode::Replace)
-        );
-        assert_eq!(operator.streaming_load_chunks().unwrap().len(), 2);
-        assert!(physical.is_write());
-    }
-
-    #[test]
-    fn lowers_lookup_payload() {
-        let payload = lookup_payload(
-            "workspace",
-            Some("w"),
-            "public",
-            &[("where", "w.public == true"), ("limit", "5")],
-        );
-
-        let logical = LogicalPlan::new(source(), [native_custom("lookup", &payload)]).unwrap();
-
-        let physical = lower(&logical);
-        let operator = &physical.operators()[0];
-
-        assert_eq!(operator.name(), "lookup");
-        assert_eq!(operator.lookup_collection().unwrap().as_str(), "workspace");
-        assert_eq!(operator.lookup_alias(), Some("w"));
-        assert_eq!(operator.lookup_target(), Some("public"));
-        assert_eq!(operator.nested_pipeline().unwrap().len(), 2);
-        assert!(!operator.execution_properties().writes());
-    }
-
-    #[test]
-    fn lowers_union_payload() {
-        let payload = union_payload(
-            "archived_users",
-            None,
-            &[("where", "active == true"), ("select", "name, age")],
-        );
-
-        let logical = LogicalPlan::new(source(), [native_custom("union", &payload)]).unwrap();
-
-        let physical = lower(&logical);
-        let operator = &physical.operators()[0];
-
-        assert_eq!(operator.name(), "union");
-        assert_eq!(
-            operator.union_collection().unwrap().as_str(),
-            "archived_users"
-        );
-        assert_eq!(operator.union_alias(), None);
-        assert_eq!(operator.nested_pipeline().unwrap().len(), 2);
-        assert!(!matches!(
-            operator.execution_properties().cardinality,
-            crate::query::CardinalityEffect::Preserve
-        ));
-    }
-
-    #[test]
-    fn lowers_nested_lookup_inside_union() {
-        let nested_lookup = lookup_payload(
-            "workspace",
-            Some("w"),
-            "spaces",
-            &[("where", "w.public == true")],
-        );
-
-        let union = union_payload("archived_users", Some("a"), &[("lookup", &nested_lookup)]);
-
-        let logical = LogicalPlan::new(source(), [native_custom("union", &union)]).unwrap();
-
-        let physical = lower(&logical);
-        let nested = physical.operators()[0]
-            .nested_pipeline()
-            .unwrap()
-            .operators();
-
-        assert_eq!(nested.len(), 1);
-        assert_eq!(nested[0].name(), "lookup");
-        assert_eq!(nested[0].lookup_alias(), Some("w"));
-    }
-
-    #[test]
-    fn malformed_lookup_payload_is_rejected() {
-        let logical =
-            LogicalPlan::new(source(), [native_custom("lookup", "source=9:workspace")]).unwrap();
-
-        let error = ScanPlanLowerer::new()
-            .lower_plan_detailed(&logical, &PhysicalPlanner::new())
-            .unwrap_err();
-
-        assert_eq!(error.operator_index(), Some(0));
-        assert!(matches!(
-            error.kind(),
-            LoweringErrorKind::InvalidNativePayload { stage, .. }
-                if stage.as_ref() == "lookup"
-        ));
-    }
-
-    #[test]
-    fn malformed_streaming_load_is_rejected() {
-        let logical = LogicalPlan::builder(source())
-            .load("streaming;mode=replace;chunks=")
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let error = ScanPlanLowerer::new()
-            .lower_plan_detailed(&logical, &PhysicalPlanner::new())
-            .unwrap_err();
-
-        assert!(matches!(
-            error.kind(),
-            LoweringErrorKind::InvalidNativePayload { stage, .. }
-                if stage.as_ref() == "load"
-        ));
-    }
-
-    #[test]
-    fn preserves_limit_and_skip_counts() {
-        let logical = LogicalPlan::builder(source())
-            .skip(7)
-            .unwrap()
-            .limit(11)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(physical.operators()[0].row_count(), Some(7));
-        assert_eq!(physical.operators()[1].row_count(), Some(11));
-    }
-
-    #[test]
-    fn preserves_sort_keys() {
-        let logical = LogicalPlan::builder(source())
-            .sort([
-                SortKey::descending(field(&["age"])),
-                SortKey::ascending(field(&["name"])),
-            ])
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-        let keys = physical.operators()[0].sort_keys().unwrap();
-
-        assert_eq!(keys.len(), 2);
-        assert_eq!(keys[0].field(), &field(&["age"]));
-        assert_eq!(keys[0].direction(), SortDirection::Descending);
-        assert_eq!(keys[1].field(), &field(&["name"]));
-        assert_eq!(keys[1].direction(), SortDirection::Ascending);
-    }
-
-    #[test]
-    fn preserves_select_and_distinct_fields() {
-        let logical = LogicalPlan::builder(source())
-            .select([field(&["name"]), field(&["profile", "country"])])
-            .unwrap()
-            .distinct([field(&["name"])])
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(
-            physical.operators()[0].selected_fields().unwrap(),
-            &[field(&["name"]), field(&["profile", "country"])],
-        );
-        assert_eq!(
-            physical.operators()[1].distinct_fields().unwrap(),
-            &[field(&["name"])],
-        );
-    }
-
-    #[test]
-    fn preserves_count_alias() {
-        let logical = LogicalPlan::builder(source())
-            .count("total")
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(physical.operators()[0].count_alias(), Some("total"));
-        assert!(!physical.is_write());
-    }
-
-    #[test]
-    fn preserves_custom_operator_metadata() {
-        let stage = StageName::parse("inspect").unwrap();
-
-        let logical = LogicalPlan::builder(source())
-            .custom(stage, "verbose", false)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-
-        assert_eq!(physical.operators()[0].name(), "inspect");
-        assert!(!physical.is_write());
-    }
-
-    #[test]
-    fn length_prefixed_decoder_supports_utf8() {
-        let payload = lookup_payload(
-            "workspace",
-            Some("équipe"),
-            "résultat",
-            &[("where", "actif == true")],
-        );
-
-        let parsed = parse_lookup_payload(&payload).unwrap();
-
-        assert_eq!(parsed.alias, Some("équipe"));
-        assert_eq!(parsed.into, "résultat");
-    }
-
-    #[test]
-    fn trailing_payload_is_rejected() {
-        let mut payload = union_payload("archived_users", None, &[("where", "true")]);
-        payload.push('x');
-
-        assert!(parse_union_payload(&payload).is_err());
-    }
-
-    #[test]
-    fn preserves_typed_insert_document() {
-        let logical = LogicalPlan::builder(source())
-            .insert(r#"{name:"Alice",active:true,tags:["rust"],profile:{level:2}}"#)
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let expected = logical
-            .operators()
-            .next()
-            .and_then(LogicalOperator::insert_document)
-            .expect("logical insert document")
-            .clone();
-
-        let physical = lower(&logical);
-
-        assert_eq!(physical.operators()[0].insert_document(), Some(&expected),);
-        assert!(physical.is_write());
-    }
-
-    #[test]
-    fn preserves_typed_pivot_specification() {
-        use crate::query::logical_plan::{PivotAggregate, PivotSpecification, PivotValue};
-
-        let specification = PivotSpecification::new(
-            [field(&["region"])],
-            [field(&["month"])],
-            [PivotValue::new(
-                field(&["revenue"]),
-                PivotAggregate::Sum,
-                Option::<&str>::None,
-            )
-            .unwrap()],
-        )
-        .unwrap();
-
-        let logical = LogicalPlan::builder(source())
-            .pivot(specification.clone())
-            .unwrap()
-            .finish()
-            .unwrap();
-
-        let physical = lower(&logical);
-        let operator = &physical.operators()[0];
-
-        assert_eq!(operator.name(), "pivot");
-        assert_eq!(operator.pivot_specification(), Some(&specification));
-        assert!(!operator.execution_properties().writes());
-        assert!(!matches!(
-            operator.execution_properties().cardinality,
-            crate::query::CardinalityEffect::Preserve
-        ));
-    }
+    #[test] fn lowers_scan_only_plan() { let logical = LogicalPlan::scan(source()); let physical = lower(&logical); assert!(physical.is_scan_only()); assert_eq!(physical.source().collection().as_str(), "users"); assert!(!physical.is_write()); }
+
+    #[test] fn lowers_complete_read_pipeline_in_order() { let logical = LogicalPlan::builder(source()) .filter(parse_expression("active == true").unwrap()) .unwrap() .sort([ SortKey::new(field(&["age"]), SortDirection::Descending), SortKey::new(field(&["name"]), SortDirection::Ascending), ]) .unwrap() .skip(10) .unwrap() .limit(20) .unwrap() .select([field(&["name"]), field(&["age"])]) .unwrap() .distinct([field(&["name"])]) .unwrap() .finish() .unwrap(); let physical = lower(&logical); let names = physical .operators() .iter() .map(PhysicalOperator::name) .collect::<Vec<_>>(); assert_eq!( names, ["filter", "sort", "skip", "limit", "select", "distinct"], ); assert!(!physical.is_write()); assert!(physical.changes_cardinality()); }
+
+    #[test] fn preserves_filter_payload() { let logical = LogicalPlan::builder(source()) .filter(parse_expression("age >= 18").unwrap()) .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!( physical.operators()[0].predicate(), logical.operators().next().unwrap().predicate(), ); }
+
+    #[test] fn preserves_set_assignments_and_write_mode() { let logical = LogicalPlan::builder(source()) .set([ assignment(&["enabled"], "true"), assignment(&["profile", "level"], "level + 1"), ]) .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!(physical.operators()[0].name(), "set"); assert_eq!(physical.operators()[0].assignments().unwrap().len(), 2); assert!(physical.is_write()); }
+
+    #[test] fn preserves_compact_load_target() { let logical = LogicalPlan::builder(source()) .load("profile") .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!(physical.operators()[0].load_target(), Some("profile")); assert!(physical.is_write()); }
+
+    #[test] fn lowers_streaming_load_payload() { let specification = streaming_payload("replace", &["batch1", "batch2"]); let logical = LogicalPlan::builder(source()) .load(specification) .unwrap() .finish() .unwrap(); let physical = lower(&logical); let operator = &physical.operators()[0]; assert_eq!(operator.name(), "streaming-load"); assert_eq!( operator.streaming_load_mode(), Some(PhysicalLoadMode::Replace) ); assert_eq!(operator.streaming_load_chunks().unwrap().len(), 2); assert!(physical.is_write()); }
+
+    #[test] fn lowers_lookup_payload() { let payload = lookup_payload( "workspace", Some("w"), "public", &[("where", "w.public == true"), ("limit", "5")], ); let logical = LogicalPlan::new(source(), [native_custom("lookup", &payload)]).unwrap(); let physical = lower(&logical); let operator = &physical.operators()[0]; assert_eq!(operator.name(), "lookup"); assert_eq!(operator.lookup_collection().unwrap().as_str(), "workspace"); assert_eq!(operator.lookup_alias(), Some("w")); assert_eq!(operator.lookup_target(), Some("public")); assert_eq!(operator.nested_pipeline().unwrap().len(), 2); assert!(!operator.execution_properties().writes()); }
+
+    #[test] fn lowers_union_payload() { let payload = union_payload( "archived_users", None, &[("where", "active == true"), ("select", "name, age")], ); let logical = LogicalPlan::new(source(), [native_custom("union", &payload)]).unwrap(); let physical = lower(&logical); let operator = &physical.operators()[0]; assert_eq!(operator.name(), "union"); assert_eq!( operator.union_collection().unwrap().as_str(), "archived_users" ); assert_eq!(operator.union_alias(), None); assert_eq!(operator.nested_pipeline().unwrap().len(), 2); assert!(!matches!( operator.execution_properties().cardinality, crate::query::CardinalityEffect::Preserve )); }
+
+    #[test] fn lowers_nested_lookup_inside_union() { let nested_lookup = lookup_payload( "workspace", Some("w"), "spaces", &[("where", "w.public == true")], ); let union = union_payload("archived_users", Some("a"), &[("lookup", &nested_lookup)]); let logical = LogicalPlan::new(source(), [native_custom("union", &union)]).unwrap(); let physical = lower(&logical); let nested = physical.operators()[0] .nested_pipeline() .unwrap() .operators(); assert_eq!(nested.len(), 1); assert_eq!(nested[0].name(), "lookup"); assert_eq!(nested[0].lookup_alias(), Some("w")); }
+
+    #[test] fn malformed_lookup_payload_is_rejected() { let logical = LogicalPlan::new(source(), [native_custom("lookup", "source=9:workspace")]).unwrap(); let error = ScanPlanLowerer::new() .lower_plan_detailed(&logical, &PhysicalPlanner::new()) .unwrap_err(); assert_eq!(error.operator_index(), Some(0)); assert!(matches!( error.kind(), LoweringErrorKind::InvalidNativePayload { stage, .. } if stage.as_ref() == "lookup" )); }
+
+    #[test] fn malformed_streaming_load_is_rejected() { let logical = LogicalPlan::builder(source()) .load("streaming;mode=replace;chunks=") .unwrap() .finish() .unwrap(); let error = ScanPlanLowerer::new() .lower_plan_detailed(&logical, &PhysicalPlanner::new()) .unwrap_err(); assert!(matches!( error.kind(), LoweringErrorKind::InvalidNativePayload { stage, .. } if stage.as_ref() == "load" )); }
+
+    #[test] fn preserves_limit_and_skip_counts() { let logical = LogicalPlan::builder(source()) .skip(7) .unwrap() .limit(11) .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!(physical.operators()[0].row_count(), Some(7)); assert_eq!(physical.operators()[1].row_count(), Some(11)); }
+
+    #[test] fn preserves_sort_keys() { let logical = LogicalPlan::builder(source()) .sort([ SortKey::descending(field(&["age"])), SortKey::ascending(field(&["name"])), ]) .unwrap() .finish() .unwrap(); let physical = lower(&logical); let keys = physical.operators()[0].sort_keys().unwrap(); assert_eq!(keys.len(), 2); assert_eq!(keys[0].field(), &field(&["age"])); assert_eq!(keys[0].direction(), SortDirection::Descending); assert_eq!(keys[1].field(), &field(&["name"])); assert_eq!(keys[1].direction(), SortDirection::Ascending); }
+
+    #[test] fn preserves_select_and_distinct_fields() { let logical = LogicalPlan::builder(source()) .select([field(&["name"]), field(&["profile", "country"])]) .unwrap() .distinct([field(&["name"])]) .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!( physical.operators()[0].selected_fields().unwrap(), &[field(&["name"]), field(&["profile", "country"])], ); assert_eq!( physical.operators()[1].distinct_fields().unwrap(), &[field(&["name"])], ); }
+
+    #[test] fn preserves_count_alias() { let logical = LogicalPlan::builder(source()) .count("total") .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!(physical.operators()[0].count_alias(), Some("total")); assert!(!physical.is_write()); }
+
+    #[test] fn preserves_custom_operator_metadata() { let stage = StageName::parse("inspect").unwrap(); let logical = LogicalPlan::builder(source()) .custom(stage, "verbose", false) .unwrap() .finish() .unwrap(); let physical = lower(&logical); assert_eq!(physical.operators()[0].name(), "inspect"); assert!(!physical.is_write()); }
+
+    #[test] fn length_prefixed_decoder_supports_utf8() { let payload = lookup_payload( "workspace", Some("équipe"), "résultat", &[("where", "actif == true")], ); let parsed = parse_lookup_payload(&payload).unwrap(); assert_eq!(parsed.alias, Some("équipe")); assert_eq!(parsed.into, "résultat"); }
+
+    #[test] fn trailing_payload_is_rejected() { let mut payload = union_payload("archived_users", None, &[("where", "true")]); payload.push('x'); assert!(parse_union_payload(&payload).is_err()); }
+
+    #[test] fn preserves_typed_insert_document() { let logical = LogicalPlan::builder(source()) .insert(r#"{name:"Alice",active:true,tags:["rust"],profile:{level:2}}"#) .unwrap() .finish() .unwrap(); let expected = logical .operators() .next() .and_then(LogicalOperator::insert_document) .expect("logical insert document") .clone(); let physical = lower(&logical); assert_eq!(physical.operators()[0].insert_document(), Some(&expected),); assert!(physical.is_write()); }
+
+    #[test] fn preserves_typed_pivot_specification() { use crate::query::logical_plan::{PivotAggregate, PivotSpecification, PivotValue}; let specification = PivotSpecification::new( [field(&["region"])], [field(&["month"])], [PivotValue::new( field(&["revenue"]), PivotAggregate::Sum, Option::<&str>::None, ) .unwrap()], ) .unwrap(); let logical = LogicalPlan::builder(source()) .pivot(specification.clone()) .unwrap() .finish() .unwrap(); let physical = lower(&logical); let operator = &physical.operators()[0]; assert_eq!(operator.name(), "pivot"); assert_eq!(operator.pivot_specification(), Some(&specification)); assert!(!operator.execution_properties().writes()); assert!(!matches!( operator.execution_properties().cardinality, crate::query::CardinalityEffect::Preserve )); }
 }

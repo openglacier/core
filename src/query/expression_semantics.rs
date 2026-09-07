@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Expression semantic validation.
 
 use std::{fmt, sync::Arc};
@@ -464,45 +465,13 @@ fn assignment_error(field: Arc<str>, index: usize, error: EvaluationError) -> Ev
 mod tests {
     use super::*;
 
-    #[test]
-    fn semantic_value_presence_helpers_are_consistent() {
-        let present = SemanticValue::Present(7_u64);
-        let missing: SemanticValue<u64> = SemanticValue::Missing;
+    #[test] fn semantic_value_presence_helpers_are_consistent() { let present = SemanticValue::Present(7_u64); let missing: SemanticValue<u64> = SemanticValue::Missing; assert!(present.is_present()); assert!(!present.is_missing()); assert_eq!(present.as_present(), Some(&7)); assert!(!missing.is_present()); assert!(missing.is_missing()); assert_eq!(missing.as_present(), None); }
 
-        assert!(present.is_present());
-        assert!(!present.is_missing());
-        assert_eq!(present.as_present(), Some(&7));
+    #[test] fn semantic_value_preserves_missing_during_map() { let value: SemanticValue<u64> = SemanticValue::Missing; assert_eq!(value.map(|number| number + 1), SemanticValue::Missing); }
 
-        assert!(!missing.is_present());
-        assert!(missing.is_missing());
-        assert_eq!(missing.as_present(), None);
-    }
+    #[test] fn semantic_value_maps_present_values() { let value = SemanticValue::Present(2_u64); assert_eq!(value.map(|number| number + 1), SemanticValue::Present(3),); }
 
-    #[test]
-    fn semantic_value_preserves_missing_during_map() {
-        let value: SemanticValue<u64> = SemanticValue::Missing;
+    #[test] fn semantic_value_rejects_missing_as_present() { let value: SemanticValue<u64> = SemanticValue::Missing; assert!(value.into_present().is_err()); }
 
-        assert_eq!(value.map(|number| number + 1), SemanticValue::Missing);
-    }
-
-    #[test]
-    fn semantic_value_maps_present_values() {
-        let value = SemanticValue::Present(2_u64);
-
-        assert_eq!(value.map(|number| number + 1), SemanticValue::Present(3),);
-    }
-
-    #[test]
-    fn semantic_value_rejects_missing_as_present() {
-        let value: SemanticValue<u64> = SemanticValue::Missing;
-
-        assert!(value.into_present().is_err());
-    }
-
-    #[test]
-    fn semantic_value_is_cloneable_and_debuggable() {
-        fn assert_traits<T: Clone + fmt::Debug>() {}
-
-        assert_traits::<SemanticValue<u64>>();
-    }
+    #[test] fn semantic_value_is_cloneable_and_debuggable() { fn assert_traits<T: Clone + fmt::Debug>() {} assert_traits::<SemanticValue<u64>>(); }
 }

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Default expression evaluator.
 
 use std::{
@@ -409,70 +410,13 @@ pub struct NativeEvaluationStatisticsSnapshot {
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_limits_are_non_zero() {
-        let limits = NativeEvaluationLimits::default();
+    #[test] fn default_limits_are_non_zero() { let limits = NativeEvaluationLimits::default(); assert!(limits.max_depth > 0); assert!(limits.max_steps > 0); }
 
-        assert!(limits.max_depth > 0);
-        assert!(limits.max_steps > 0);
-    }
+    #[test] fn rejects_zero_limits() { assert_eq!( NativeEvaluationLimits::new(0, 1), Err(NativeEvaluationLimitsError::ZeroDepth) ); assert_eq!( NativeEvaluationLimits::new(1, 0), Err(NativeEvaluationLimitsError::ZeroSteps) ); }
 
-    #[test]
-    fn rejects_zero_limits() {
-        assert_eq!(
-            NativeEvaluationLimits::new(0, 1),
-            Err(NativeEvaluationLimitsError::ZeroDepth)
-        );
-        assert_eq!(
-            NativeEvaluationLimits::new(1, 0),
-            Err(NativeEvaluationLimitsError::ZeroSteps)
-        );
-    }
+    #[test] fn session_enforces_step_limit() { let context = EvaluationContext::default(); let mut session = NativeEvaluationSession { context: &context, limits: NativeEvaluationLimits { max_depth: 2, max_steps: 1, }, depth: 0, steps: 0, }; assert!(session.charge().is_ok()); assert!(session.charge().is_err()); }
 
-    #[test]
-    fn session_enforces_step_limit() {
-        let context = EvaluationContext::default();
-        let mut session = NativeEvaluationSession {
-            context: &context,
-            limits: NativeEvaluationLimits {
-                max_depth: 2,
-                max_steps: 1,
-            },
-            depth: 0,
-            steps: 0,
-        };
+    #[test] fn depth_guard_restores_depth() { let context = EvaluationContext::default(); let mut session = NativeEvaluationSession { context: &context, limits: NativeEvaluationLimits { max_depth: 2, max_steps: 10, }, depth: 0, steps: 0, }; { let mut guard = session.enter().unwrap(); assert_eq!(guard.session().depth(), 1); } assert_eq!(session.depth(), 0); }
 
-        assert!(session.charge().is_ok());
-        assert!(session.charge().is_err());
-    }
-
-    #[test]
-    fn depth_guard_restores_depth() {
-        let context = EvaluationContext::default();
-        let mut session = NativeEvaluationSession {
-            context: &context,
-            limits: NativeEvaluationLimits {
-                max_depth: 2,
-                max_steps: 10,
-            },
-            depth: 0,
-            steps: 0,
-        };
-
-        {
-            let mut guard = session.enter().unwrap();
-            assert_eq!(guard.session().depth(), 1);
-        }
-
-        assert_eq!(session.depth(), 0);
-    }
-
-    #[test]
-    fn public_types_are_send_and_sync() {
-        fn assert_send_and_sync<T: Send + Sync>() {}
-
-        assert_send_and_sync::<NativeEvaluator>();
-        assert_send_and_sync::<NativeEvaluationLimits>();
-        assert_send_and_sync::<NativeEvaluationStatisticsSnapshot>();
-    }
+    #[test] fn public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<NativeEvaluator>(); assert_send_and_sync::<NativeEvaluationLimits>(); assert_send_and_sync::<NativeEvaluationStatisticsSnapshot>(); }
 }

@@ -10,6 +10,11 @@ macro_rules! operation_definitions {
             CORE_OPERATIONS => CoreOperations, "core.operations", AccessPolicy::Public, ExecutionMode::Standard, HandlerKind::Core, TransportKind::Message, ConnectionKind::Shared, EmptyInput;
             NODE_STATUS => NodeStatus, "node.status", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Core, TransportKind::Message, ConnectionKind::Shared, EmptyInput;
             PING => Ping, "ping", AccessPolicy::Public, ExecutionMode::Standard, HandlerKind::Core, TransportKind::Message, ConnectionKind::Shared, UncheckedInput;
+            LLM_STATUS => LlmStatus, "llm.status", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Llm, TransportKind::Message, ConnectionKind::Shared, EmptyInput;
+            LLM_GENERATE => LlmGenerate, "llm.generate", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Llm, TransportKind::MessageStream, ConnectionKind::Shared, LlmGenerateInput;
+            LLM_CANCEL => LlmCancel, "llm.cancel", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Llm, TransportKind::Message, ConnectionKind::Shared, LlmCancelInput;
+            AGENT_STATUS => AgentStatus, "agent.status", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Agent, TransportKind::Message, ConnectionKind::Shared, EmptyInput;
+            AGENT_RUN => AgentRun, "agent.run", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Agent, TransportKind::MessageStream, ConnectionKind::Shared, AgentRunInput;
             QUERY_EXECUTE => QueryExecute, "query.execute", AccessPolicy::Query, ExecutionMode::Query, HandlerKind::Query, TransportKind::MessageStream, ConnectionKind::Shared, QueryExecuteInput;
             QUERY_CONTEXT_RESOLVE => QueryContextResolve, "query.context.resolve", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::App, TransportKind::Message, ConnectionKind::Shared, QueryContextResolveInput;
             AUTH_BEGIN => AuthBegin, "auth.begin", AccessPolicy::Public, ExecutionMode::Authentication, HandlerKind::Authentication, TransportKind::Message, ConnectionKind::Shared, AuthBeginInput;
@@ -45,6 +50,9 @@ macro_rules! operation_definitions {
             PLACE_RESOURCE_LIST => PlaceResourceList, "place.resource.list", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Place, TransportKind::Message, ConnectionKind::Shared, PlaceIdInput;
             PLACE_RESOURCE_SET => PlaceResourceSet, "place.resource.set", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Place, TransportKind::Message, ConnectionKind::Shared, PlaceResourceSetInput;
             PLACE_RESOURCE_REMOVE => PlaceResourceRemove, "place.resource.remove", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Place, TransportKind::Message, ConnectionKind::Shared, PlaceResourceRemoveInput;
+            FABRIC_RESOURCE_LIST => FabricResourceList, "fabric.resource.list", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::Core, TransportKind::Message, ConnectionKind::Shared, EmptyInput;
+            FABRIC_RESOURCE_SET => FabricResourceSet, "fabric.resource.set", AccessPolicy::Permission { action: AuthorizationAction::FabricManage, resource: "_fabric_resources" }, ExecutionMode::Standard, HandlerKind::Core, TransportKind::Message, ConnectionKind::Shared, FabricResourceSetInput;
+            FABRIC_RESOURCE_REMOVE => FabricResourceRemove, "fabric.resource.remove", AccessPolicy::Permission { action: AuthorizationAction::FabricManage, resource: "_fabric_resources" }, ExecutionMode::Standard, HandlerKind::Core, TransportKind::Message, ConnectionKind::Shared, FabricResourceRemoveInput;
             APP_CREATE => AppCreate, "app.create", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::App, TransportKind::Message, ConnectionKind::Shared, AppCreateInput;
             APP_LIST => AppList, "app.list", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::App, TransportKind::Message, ConnectionKind::Shared, UncheckedInput;
             APP_GET => AppGet, "app.get", AccessPolicy::Authenticated, ExecutionMode::Standard, HandlerKind::App, TransportKind::Message, ConnectionKind::Shared, AppIdInput;

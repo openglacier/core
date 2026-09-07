@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Value coercion rules used by query evaluation.
 
 use std::fmt;
@@ -626,445 +627,91 @@ fn classify_float_parse_error(_error: ParseFloatError) -> CoercionFailure {
 mod tests {
     use super::*;
 
-    #[test]
-    fn policy_names_are_stable() {
-        assert_eq!(CoercionPolicy::Strict.as_str(), "strict");
-        assert_eq!(CoercionPolicy::Numeric.as_str(), "numeric");
-        assert_eq!(CoercionPolicy::Implicit.as_str(), "implicit");
-    }
-
-    #[test]
-    fn strict_policy_allows_no_conversion() {
-        assert!(!CoercionPolicy::Strict.allows_numeric_conversion());
-
-        assert!(!CoercionPolicy::Strict.allows_string_to_number());
-    }
-
-    #[test]
-    fn numeric_policy_allows_numeric_conversion_only() {
-        assert!(CoercionPolicy::Numeric.allows_numeric_conversion());
-
-        assert!(!CoercionPolicy::Numeric.allows_string_to_number());
-    }
-
-    #[test]
-    fn implicit_policy_allows_all_current_coercions() {
-        assert!(CoercionPolicy::Implicit.allows_numeric_conversion());
-
-        assert!(CoercionPolicy::Implicit.allows_string_to_number());
-    }
-
-    #[test]
-    fn failure_names_are_stable() {
-        assert_eq!(
-            CoercionFailure::ForbiddenByPolicy.as_str(),
-            "forbidden_by_policy"
-        );
-
-        assert_eq!(
-            CoercionFailure::IncompatibleValue.as_str(),
-            "incompatible_value"
-        );
-
-        assert_eq!(CoercionFailure::OutOfRange.as_str(), "out_of_range");
-
-        assert_eq!(CoercionFailure::PrecisionLoss.as_str(), "precision_loss");
-    }
-
-    #[test]
-    fn numeric_value_requires_no_coercion() {
-        let value = Value::from(18_i64);
-
-        assert_eq!(
-            coerce_value_to_number(&value, CoercionPolicy::Strict,),
-            Ok(CoercedNumber::Signed(18))
-        );
-    }
-
-    #[test]
-    fn numeric_string_is_accepted_implicitly() {
-        let value = Value::from("18");
-
-        assert_eq!(
-            coerce_value_to_number(&value, CoercionPolicy::Implicit,),
-            Ok(CoercedNumber::Signed(18))
-        );
-    }
-
-    #[test]
-    fn numeric_string_is_rejected_by_numeric_policy() {
-        let value = Value::from("18");
-
-        assert_eq!(
-            coerce_value_to_number(&value, CoercionPolicy::Numeric,),
-            Err(CoercionFailure::ForbiddenByPolicy)
-        );
-    }
-
-    #[test]
-    fn numeric_string_is_rejected_by_strict_policy() {
-        let value = Value::from("18");
-
-        assert_eq!(
-            coerce_value_to_number(&value, CoercionPolicy::Strict,),
-            Err(CoercionFailure::ForbiddenByPolicy)
-        );
-    }
-
-    #[test]
-    fn non_numeric_values_are_incompatible() {
-        let values = [Value::Null, Value::from(true), Value::array([])];
-
-        for value in values {
-            assert_eq!(
-                coerce_value_to_number(&value, CoercionPolicy::Implicit,),
-                Err(CoercionFailure::IncompatibleValue)
-            );
-        }
-    }
-
-    #[test]
-    fn positive_integer_string_becomes_signed_when_possible() {
-        assert_eq!(parse_number("18"), Ok(CoercedNumber::Signed(18)));
-    }
-
-    #[test]
-    fn explicitly_positive_integer_is_accepted() {
-        assert_eq!(parse_number("+18"), Ok(CoercedNumber::Signed(18)));
-    }
-
-    #[test]
-    fn negative_integer_string_becomes_signed() {
-        assert_eq!(parse_number("-18"), Ok(CoercedNumber::Signed(-18)));
-    }
-
-    #[test]
-    fn large_positive_integer_becomes_unsigned() {
-        let text = u64::MAX.to_string();
-
-        assert_eq!(parse_number(&text), Ok(CoercedNumber::Unsigned(u64::MAX)));
-    }
-
-    #[test]
-    fn integer_above_u64_is_out_of_range() {
-        assert_eq!(
-            parse_number("18446744073709551616"),
-            Err(CoercionFailure::OutOfRange)
-        );
-    }
-
-    #[test]
-    fn integer_below_i64_is_out_of_range() {
-        assert_eq!(
-            parse_number("-9223372036854775809"),
-            Err(CoercionFailure::OutOfRange)
-        );
-    }
-
-    #[test]
-    fn decimal_string_becomes_float() {
-        assert_eq!(parse_number("18.5"), Ok(CoercedNumber::Float(18.5)));
-    }
-
-    #[test]
-    fn exponent_string_becomes_float() {
-        assert_eq!(parse_number("1e3"), Ok(CoercedNumber::Float(1000.0)));
-    }
-
-    #[test]
-    fn negative_zero_is_normalized() {
-        let number = parse_number("-0.0").expect("-0.0 must be accepted");
-
-        let CoercedNumber::Float(value) = number else {
-            panic!("expected a floating-point value");
-        };
-
-        assert_eq!(value.to_bits(), 0.0_f64.to_bits());
-    }
-
-    #[test]
-    fn nan_is_rejected() {
-        assert_eq!(parse_number("NaN"), Err(CoercionFailure::OutOfRange));
-    }
-
-    #[test]
-    fn positive_infinity_is_rejected() {
-        assert_eq!(parse_number("inf"), Err(CoercionFailure::OutOfRange));
-    }
-
-    #[test]
-    fn negative_infinity_is_rejected() {
-        assert_eq!(parse_number("-inf"), Err(CoercionFailure::OutOfRange));
-    }
-
-    #[test]
-    fn surrounding_spaces_are_rejected() {
-        assert_eq!(parse_number(" 18"), Err(CoercionFailure::IncompatibleValue));
-
-        assert_eq!(parse_number("18 "), Err(CoercionFailure::IncompatibleValue));
-    }
-
-    #[test]
-    fn empty_string_is_rejected() {
-        assert_eq!(parse_number(""), Err(CoercionFailure::IncompatibleValue));
-    }
-
-    #[test]
-    fn underscores_are_rejected() {
-        assert_eq!(
-            parse_number("1_000"),
-            Err(CoercionFailure::IncompatibleValue)
-        );
-    }
-
-    #[test]
-    fn hexadecimal_syntax_is_rejected() {
-        assert_eq!(
-            parse_number("0x10"),
-            Err(CoercionFailure::IncompatibleValue)
-        );
-    }
-
-    #[test]
-    fn arbitrary_text_is_rejected() {
-        assert_eq!(
-            parse_number("eighteen"),
-            Err(CoercionFailure::IncompatibleValue)
-        );
-    }
-
-    #[test]
-    fn integer_syntax_detection_is_strict() {
-        assert!(is_integer_syntax("18"));
-        assert!(is_integer_syntax("+18"));
-        assert!(is_integer_syntax("-18"));
-        assert!(is_integer_syntax("018"));
-
-        assert!(!is_integer_syntax(""));
-        assert!(!is_integer_syntax("+"));
-        assert!(!is_integer_syntax("-"));
-        assert!(!is_integer_syntax("18.0"));
-        assert!(!is_integer_syntax("1e3"));
-        assert!(!is_integer_syntax("1_000"));
-    }
-
-    #[test]
-    fn numeric_string_detection_uses_the_full_parser() {
-        assert!(is_numeric_string("18"));
-        assert!(is_numeric_string("-18"));
-        assert!(is_numeric_string("18.5"));
-        assert!(is_numeric_string("1e3"));
-
-        assert!(!is_numeric_string(""));
-        assert!(!is_numeric_string(" 18"));
-        assert!(!is_numeric_string("NaN"));
-        assert!(!is_numeric_string("unknown"));
-    }
-
-    #[test]
-    fn equal_signed_numbers_require_no_conversion() {
-        let pair = coerce_number_pair(
-            CoercedNumber::Signed(18),
-            CoercedNumber::Signed(19),
-            CoercionPolicy::Strict,
-        )
-        .expect("matching representations must be accepted");
-
-        assert_eq!(
-            pair.into_tuple(),
-            (CoercedNumber::Signed(18), CoercedNumber::Signed(19),)
-        );
-    }
-
-    #[test]
-    fn strict_policy_rejects_distinct_numeric_representations() {
-        assert_eq!(
-            coerce_number_pair(
-                CoercedNumber::Signed(18),
-                CoercedNumber::Unsigned(18),
-                CoercionPolicy::Strict,
-            ),
-            Err(CoercionFailure::ForbiddenByPolicy)
-        );
-    }
-
-    #[test]
-    fn small_unsigned_value_can_join_signed_representation() {
-        let pair = coerce_number_pair(
-            CoercedNumber::Signed(-1),
-            CoercedNumber::Unsigned(18),
-            CoercionPolicy::Numeric,
-        )
-        .expect("18 fits in i64");
-
-        assert_eq!(
-            pair.into_tuple(),
-            (CoercedNumber::Signed(-1), CoercedNumber::Signed(18),)
-        );
-    }
-
-    #[test]
-    fn large_unsigned_value_can_join_unsigned_positive_signed_value() {
-        let pair = coerce_number_pair(
-            CoercedNumber::Signed(18),
-            CoercedNumber::Unsigned(u64::MAX),
-            CoercionPolicy::Numeric,
-        )
-        .expect("positive signed value fits in u64");
-
-        assert_eq!(
-            pair.into_tuple(),
-            (
-                CoercedNumber::Unsigned(18),
-                CoercedNumber::Unsigned(u64::MAX),
-            )
-        );
-    }
-
-    #[test]
-    fn negative_signed_and_large_unsigned_are_not_coercible() {
-        assert_eq!(
-            coerce_number_pair(
-                CoercedNumber::Signed(-1),
-                CoercedNumber::Unsigned(u64::MAX),
-                CoercionPolicy::Numeric,
-            ),
-            Err(CoercionFailure::OutOfRange)
-        );
-    }
-
-    #[test]
-    fn exactly_representable_signed_integer_can_join_float() {
-        let pair = coerce_number_pair(
-            CoercedNumber::Signed(18),
-            CoercedNumber::Float(18.5),
-            CoercionPolicy::Numeric,
-        )
-        .expect("18 is exactly representable as f64");
-
-        assert_eq!(
-            pair.into_tuple(),
-            (CoercedNumber::Float(18.0), CoercedNumber::Float(18.5),)
-        );
-    }
-
-    #[test]
-    fn imprecise_signed_integer_cannot_join_float() {
-        let value = 9_007_199_254_740_993_i64;
-
-        assert_eq!(
-            coerce_number_pair(
-                CoercedNumber::Signed(value),
-                CoercedNumber::Float(1.0),
-                CoercionPolicy::Numeric,
-            ),
-            Err(CoercionFailure::PrecisionLoss)
-        );
-    }
-
-    #[test]
-    fn imprecise_unsigned_integer_cannot_join_float() {
-        let value = 9_007_199_254_740_993_u64;
-
-        assert_eq!(
-            coerce_number_pair(
-                CoercedNumber::Unsigned(value),
-                CoercedNumber::Float(1.0),
-                CoercionPolicy::Numeric,
-            ),
-            Err(CoercionFailure::PrecisionLoss)
-        );
-    }
-
-    #[test]
-    fn value_pair_supports_implicit_string_to_number() {
-        let left = Value::from(18_i64);
-        let right = Value::from("18");
-
-        let pair = coerce_value_pair_to_numbers(&left, &right, CoercionPolicy::Implicit)
-            .expect("the string must be interpreted as a number");
-
-        assert_eq!(
-            pair.into_tuple(),
-            (CoercedNumber::Signed(18), CoercedNumber::Signed(18),)
-        );
-    }
-
-    #[test]
-    fn value_pair_rejects_string_under_numeric_policy() {
-        let left = Value::from(18_i64);
-        let right = Value::from("18");
-
-        assert_eq!(
-            coerce_value_pair_to_numbers(&left, &right, CoercionPolicy::Numeric,),
-            Err(CoercionFailure::ForbiddenByPolicy)
-        );
-    }
-
-    #[test]
-    fn coerced_number_converts_back_to_number() {
-        assert_eq!(CoercedNumber::Signed(-1).into_number(), Number::Signed(-1));
-
-        assert_eq!(
-            CoercedNumber::Unsigned(1).into_number(),
-            Number::Unsigned(1)
-        );
-
-        assert_eq!(CoercedNumber::Float(1.5).into_number(), Number::Float(1.5));
-    }
-
-    #[test]
-    fn policy_and_failure_predicates_are_consistent() {
-        assert!(CoercionPolicy::Strict.is_strict());
-        assert!(!CoercionPolicy::Numeric.is_strict());
-        assert!(!CoercionPolicy::Implicit.is_strict());
-
-        assert!(CoercionFailure::ForbiddenByPolicy.is_forbidden_by_policy());
-        assert!(CoercionFailure::IncompatibleValue.is_incompatible_value());
-        assert!(CoercionFailure::OutOfRange.is_out_of_range());
-        assert!(CoercionFailure::PrecisionLoss.is_precision_loss());
-    }
-
-    #[test]
-    fn coerced_number_reports_its_category_and_finiteness() {
-        assert!(CoercedNumber::Signed(-1).is_integer());
-        assert!(CoercedNumber::Unsigned(1).is_integer());
-        assert!(!CoercedNumber::Float(1.5).is_integer());
-
-        assert!(CoercedNumber::Float(1.5).is_float());
-        assert!(CoercedNumber::Float(1.5).is_finite());
-        assert!(!CoercedNumber::Float(f64::INFINITY).is_finite());
-    }
-
-    #[test]
-    fn coerced_pair_exposes_common_kind_and_physical_numbers() {
-        let pair = CoercedNumberPair::new(CoercedNumber::Signed(18), CoercedNumber::Signed(20));
-
-        assert!(pair.has_common_kind());
-        assert_eq!(
-            pair.into_numbers(),
-            (Number::Signed(18), Number::Signed(20)),
-        );
-
-        let heterogeneous =
-            CoercedNumberPair::new(CoercedNumber::Signed(18), CoercedNumber::Float(18.0));
-        assert!(!heterogeneous.has_common_kind());
-    }
-
-    #[test]
-    fn number_convenience_helpers_delegate_to_core_coercion() {
-        let pair = coerce_numbers(
-            Number::Signed(18),
-            Number::Unsigned(20),
-            CoercionPolicy::Numeric,
-        )
-        .expect("the numeric policy must reconcile compatible integers");
-
-        assert_eq!(
-            pair.into_tuple(),
-            (CoercedNumber::Signed(18), CoercedNumber::Signed(20)),
-        );
-
-        assert_eq!(parse_number_value("18.5"), Ok(Number::Float(18.5)),);
-    }
+    #[test] fn policy_names_are_stable() { assert_eq!(CoercionPolicy::Strict.as_str(), "strict"); assert_eq!(CoercionPolicy::Numeric.as_str(), "numeric"); assert_eq!(CoercionPolicy::Implicit.as_str(), "implicit"); }
+
+    #[test] fn strict_policy_allows_no_conversion() { assert!(!CoercionPolicy::Strict.allows_numeric_conversion()); assert!(!CoercionPolicy::Strict.allows_string_to_number()); }
+
+    #[test] fn numeric_policy_allows_numeric_conversion_only() { assert!(CoercionPolicy::Numeric.allows_numeric_conversion()); assert!(!CoercionPolicy::Numeric.allows_string_to_number()); }
+
+    #[test] fn implicit_policy_allows_all_current_coercions() { assert!(CoercionPolicy::Implicit.allows_numeric_conversion()); assert!(CoercionPolicy::Implicit.allows_string_to_number()); }
+
+    #[test] fn failure_names_are_stable() { assert_eq!( CoercionFailure::ForbiddenByPolicy.as_str(), "forbidden_by_policy" ); assert_eq!( CoercionFailure::IncompatibleValue.as_str(), "incompatible_value" ); assert_eq!(CoercionFailure::OutOfRange.as_str(), "out_of_range"); assert_eq!(CoercionFailure::PrecisionLoss.as_str(), "precision_loss"); }
+
+    #[test] fn numeric_value_requires_no_coercion() { let value = Value::from(18_i64); assert_eq!( coerce_value_to_number(&value, CoercionPolicy::Strict,), Ok(CoercedNumber::Signed(18)) ); }
+
+    #[test] fn numeric_string_is_accepted_implicitly() { let value = Value::from("18"); assert_eq!( coerce_value_to_number(&value, CoercionPolicy::Implicit,), Ok(CoercedNumber::Signed(18)) ); }
+
+    #[test] fn numeric_string_is_rejected_by_numeric_policy() { let value = Value::from("18"); assert_eq!( coerce_value_to_number(&value, CoercionPolicy::Numeric,), Err(CoercionFailure::ForbiddenByPolicy) ); }
+
+    #[test] fn numeric_string_is_rejected_by_strict_policy() { let value = Value::from("18"); assert_eq!( coerce_value_to_number(&value, CoercionPolicy::Strict,), Err(CoercionFailure::ForbiddenByPolicy) ); }
+
+    #[test] fn non_numeric_values_are_incompatible() { let values = [Value::Null, Value::from(true), Value::array([])]; for value in values { assert_eq!( coerce_value_to_number(&value, CoercionPolicy::Implicit,), Err(CoercionFailure::IncompatibleValue) ); } }
+
+    #[test] fn positive_integer_string_becomes_signed_when_possible() { assert_eq!(parse_number("18"), Ok(CoercedNumber::Signed(18))); }
+
+    #[test] fn explicitly_positive_integer_is_accepted() { assert_eq!(parse_number("+18"), Ok(CoercedNumber::Signed(18))); }
+
+    #[test] fn negative_integer_string_becomes_signed() { assert_eq!(parse_number("-18"), Ok(CoercedNumber::Signed(-18))); }
+
+    #[test] fn large_positive_integer_becomes_unsigned() { let text = u64::MAX.to_string(); assert_eq!(parse_number(&text), Ok(CoercedNumber::Unsigned(u64::MAX))); }
+
+    #[test] fn integer_above_u64_is_out_of_range() { assert_eq!( parse_number("18446744073709551616"), Err(CoercionFailure::OutOfRange) ); }
+
+    #[test] fn integer_below_i64_is_out_of_range() { assert_eq!( parse_number("-9223372036854775809"), Err(CoercionFailure::OutOfRange) ); }
+
+    #[test] fn decimal_string_becomes_float() { assert_eq!(parse_number("18.5"), Ok(CoercedNumber::Float(18.5))); }
+
+    #[test] fn exponent_string_becomes_float() { assert_eq!(parse_number("1e3"), Ok(CoercedNumber::Float(1000.0))); }
+
+    #[test] fn negative_zero_is_normalized() { let number = parse_number("-0.0").expect("-0.0 must be accepted"); let CoercedNumber::Float(value) = number else { panic!("expected a floating-point value"); }; assert_eq!(value.to_bits(), 0.0_f64.to_bits()); }
+
+    #[test] fn nan_is_rejected() { assert_eq!(parse_number("NaN"), Err(CoercionFailure::OutOfRange)); }
+
+    #[test] fn positive_infinity_is_rejected() { assert_eq!(parse_number("inf"), Err(CoercionFailure::OutOfRange)); }
+
+    #[test] fn negative_infinity_is_rejected() { assert_eq!(parse_number("-inf"), Err(CoercionFailure::OutOfRange)); }
+
+    #[test] fn surrounding_spaces_are_rejected() { assert_eq!(parse_number(" 18"), Err(CoercionFailure::IncompatibleValue)); assert_eq!(parse_number("18 "), Err(CoercionFailure::IncompatibleValue)); }
+
+    #[test] fn empty_string_is_rejected() { assert_eq!(parse_number(""), Err(CoercionFailure::IncompatibleValue)); }
+
+    #[test] fn underscores_are_rejected() { assert_eq!( parse_number("1_000"), Err(CoercionFailure::IncompatibleValue) ); }
+
+    #[test] fn hexadecimal_syntax_is_rejected() { assert_eq!( parse_number("0x10"), Err(CoercionFailure::IncompatibleValue) ); }
+
+    #[test] fn arbitrary_text_is_rejected() { assert_eq!( parse_number("eighteen"), Err(CoercionFailure::IncompatibleValue) ); }
+
+    #[test] fn integer_syntax_detection_is_strict() { assert!(is_integer_syntax("18")); assert!(is_integer_syntax("+18")); assert!(is_integer_syntax("-18")); assert!(is_integer_syntax("018")); assert!(!is_integer_syntax("")); assert!(!is_integer_syntax("+")); assert!(!is_integer_syntax("-")); assert!(!is_integer_syntax("18.0")); assert!(!is_integer_syntax("1e3")); assert!(!is_integer_syntax("1_000")); }
+
+    #[test] fn numeric_string_detection_uses_the_full_parser() { assert!(is_numeric_string("18")); assert!(is_numeric_string("-18")); assert!(is_numeric_string("18.5")); assert!(is_numeric_string("1e3")); assert!(!is_numeric_string("")); assert!(!is_numeric_string(" 18")); assert!(!is_numeric_string("NaN")); assert!(!is_numeric_string("unknown")); }
+
+    #[test] fn equal_signed_numbers_require_no_conversion() { let pair = coerce_number_pair( CoercedNumber::Signed(18), CoercedNumber::Signed(19), CoercionPolicy::Strict, ) .expect("matching representations must be accepted"); assert_eq!( pair.into_tuple(), (CoercedNumber::Signed(18), CoercedNumber::Signed(19),) ); }
+
+    #[test] fn strict_policy_rejects_distinct_numeric_representations() { assert_eq!( coerce_number_pair( CoercedNumber::Signed(18), CoercedNumber::Unsigned(18), CoercionPolicy::Strict, ), Err(CoercionFailure::ForbiddenByPolicy) ); }
+
+    #[test] fn small_unsigned_value_can_join_signed_representation() { let pair = coerce_number_pair( CoercedNumber::Signed(-1), CoercedNumber::Unsigned(18), CoercionPolicy::Numeric, ) .expect("18 fits in i64"); assert_eq!( pair.into_tuple(), (CoercedNumber::Signed(-1), CoercedNumber::Signed(18),) ); }
+
+    #[test] fn large_unsigned_value_can_join_unsigned_positive_signed_value() { let pair = coerce_number_pair( CoercedNumber::Signed(18), CoercedNumber::Unsigned(u64::MAX), CoercionPolicy::Numeric, ) .expect("positive signed value fits in u64"); assert_eq!( pair.into_tuple(), ( CoercedNumber::Unsigned(18), CoercedNumber::Unsigned(u64::MAX), ) ); }
+
+    #[test] fn negative_signed_and_large_unsigned_are_not_coercible() { assert_eq!( coerce_number_pair( CoercedNumber::Signed(-1), CoercedNumber::Unsigned(u64::MAX), CoercionPolicy::Numeric, ), Err(CoercionFailure::OutOfRange) ); }
+
+    #[test] fn exactly_representable_signed_integer_can_join_float() { let pair = coerce_number_pair( CoercedNumber::Signed(18), CoercedNumber::Float(18.5), CoercionPolicy::Numeric, ) .expect("18 is exactly representable as f64"); assert_eq!( pair.into_tuple(), (CoercedNumber::Float(18.0), CoercedNumber::Float(18.5),) ); }
+
+    #[test] fn imprecise_signed_integer_cannot_join_float() { let value = 9_007_199_254_740_993_i64; assert_eq!( coerce_number_pair( CoercedNumber::Signed(value), CoercedNumber::Float(1.0), CoercionPolicy::Numeric, ), Err(CoercionFailure::PrecisionLoss) ); }
+
+    #[test] fn imprecise_unsigned_integer_cannot_join_float() { let value = 9_007_199_254_740_993_u64; assert_eq!( coerce_number_pair( CoercedNumber::Unsigned(value), CoercedNumber::Float(1.0), CoercionPolicy::Numeric, ), Err(CoercionFailure::PrecisionLoss) ); }
+
+    #[test] fn value_pair_supports_implicit_string_to_number() { let left = Value::from(18_i64); let right = Value::from("18"); let pair = coerce_value_pair_to_numbers(&left, &right, CoercionPolicy::Implicit) .expect("the string must be interpreted as a number"); assert_eq!( pair.into_tuple(), (CoercedNumber::Signed(18), CoercedNumber::Signed(18),) ); }
+
+    #[test] fn value_pair_rejects_string_under_numeric_policy() { let left = Value::from(18_i64); let right = Value::from("18"); assert_eq!( coerce_value_pair_to_numbers(&left, &right, CoercionPolicy::Numeric,), Err(CoercionFailure::ForbiddenByPolicy) ); }
+
+    #[test] fn coerced_number_converts_back_to_number() { assert_eq!(CoercedNumber::Signed(-1).into_number(), Number::Signed(-1)); assert_eq!( CoercedNumber::Unsigned(1).into_number(), Number::Unsigned(1) ); assert_eq!(CoercedNumber::Float(1.5).into_number(), Number::Float(1.5)); }
+
+    #[test] fn policy_and_failure_predicates_are_consistent() { assert!(CoercionPolicy::Strict.is_strict()); assert!(!CoercionPolicy::Numeric.is_strict()); assert!(!CoercionPolicy::Implicit.is_strict()); assert!(CoercionFailure::ForbiddenByPolicy.is_forbidden_by_policy()); assert!(CoercionFailure::IncompatibleValue.is_incompatible_value()); assert!(CoercionFailure::OutOfRange.is_out_of_range()); assert!(CoercionFailure::PrecisionLoss.is_precision_loss()); }
+
+    #[test] fn coerced_number_reports_its_category_and_finiteness() { assert!(CoercedNumber::Signed(-1).is_integer()); assert!(CoercedNumber::Unsigned(1).is_integer()); assert!(!CoercedNumber::Float(1.5).is_integer()); assert!(CoercedNumber::Float(1.5).is_float()); assert!(CoercedNumber::Float(1.5).is_finite()); assert!(!CoercedNumber::Float(f64::INFINITY).is_finite()); }
+
+    #[test] fn coerced_pair_exposes_common_kind_and_physical_numbers() { let pair = CoercedNumberPair::new(CoercedNumber::Signed(18), CoercedNumber::Signed(20)); assert!(pair.has_common_kind()); assert_eq!( pair.into_numbers(), (Number::Signed(18), Number::Signed(20)), ); let heterogeneous = CoercedNumberPair::new(CoercedNumber::Signed(18), CoercedNumber::Float(18.0)); assert!(!heterogeneous.has_common_kind()); }
+
+    #[test] fn number_convenience_helpers_delegate_to_core_coercion() { let pair = coerce_numbers( Number::Signed(18), Number::Unsigned(20), CoercionPolicy::Numeric, ) .expect("the numeric policy must reconcile compatible integers"); assert_eq!( pair.into_tuple(), (CoercedNumber::Signed(18), CoercedNumber::Signed(20)), ); assert_eq!(parse_number_value("18.5"), Ok(Number::Float(18.5)),); }
 }

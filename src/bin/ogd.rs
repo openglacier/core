@@ -2,11 +2,11 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
     env, thread, fs, error::Error, fmt::{self, Display, Formatter}, io::{self, BufReader, Read, Write},
-    net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::{HashMap, HashSet}, sync::{ atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock },
+    net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::{HashMap, HashSet}, sync::{ atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc, Condvar, Mutex, OnceLock },
     time::{Duration, Instant},
 };
 use og_core::access::{
-    auth::{validate_ed25519_public_key, ConnectionAuth, DeviceCredential, DEFAULT_CHALLENGE_TTL},
+    auth::{validate_ed25519_public_key, verify_ed25519, ConnectionAuth, DeviceCredential, DEFAULT_CHALLENGE_TTL},
     bootstrap::BootstrapAdmin,
     identity_file::{self, IdentityCredential},
     authorization::{
@@ -19,20 +19,19 @@ use og_core::access::{
     },
 };
 use og_core::{
+    build as build_profile,
     debug::{self, DebugTopic},
-    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, unix_time_millis, PLACE_SCOPE_FIELD},
-    engine::Engine, files::{FileEntry, FileId, FileRange, FileStore, FileStoreEntry, FileStoreError, FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelectionMode, FileWrite, NativeFileStore, StoreId, APP_FILES_DIRECTORY, PRIMARY_APPS_COLLISION_NAME, file_sync_projection_component, file_sync_projection_suffix}, Principal, backup,
+    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, unix_time_millis, APP_INSTANCE_SCOPE_FIELD, PLACE_SCOPE_FIELD},
+    engine::Engine, files::{FileEntry, FileId, FileStore, FileStoreEntry, FileStoreError, FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelectionMode, FileWrite, NativeFileStore, StoreId, APP_FILES_DIRECTORY, PRIMARY_APPS_COLLISION_NAME, file_sync_projection_component, file_sync_projection_suffix}, Principal, backup,
     event_engine::{EventEngine, EventSubscription},
     memory::{MemoryClass, MemoryGovernor, MemoryProfileConfig, WorkloadClass},
     operation::{
-        decode_operation_request, AccessPolicy, ExecutionMode, ServiceCapability, ServiceCapabilities, AppCreateInput, AuthBeginInput, AuthEnrollBeginInput, ClassicAuthLoginInput, ClassicAuthRegisterInput, ChallengeSignatureInput, DeviceRegisterInput, DeviceRenameInput, DeviceRevokeInput, EventsSubscribeInput, IdentityOpenInput, IdentityRegisterInput, IdentityRenewInput, PasswordInput, QueryExecuteInput, QueryContextResolveInput, AppDeleteInput, AppIdInput,
-        AppInstanceCreateInput, AppInstanceRemoveInput, AppUpdateInput, DataAnalyzeInput, DataImportInput, DataWorkerRunInput, DataMappingSaveInput, DataMappingListInput, DataMappingUpdateInput, DataMappingDeleteInput, Audience, BackupNameInput,
-        CollectionsListInput, FileEntryInput, FileListInput, FileMkdirInput, FileMoveInput,
-        FileReadInput, FileScopeInput, FileSyncConfigSetInput, FileSyncSelectionRemoveInput,
-        FileSyncSelectionSetInput, FileVersionInput, FileVersionReadInput, FileWriteInput,
+        decode_operation_request, AccessPolicy, ExecutionMode, ServiceCapability, ServiceCapabilities, AppCreateInput, AuthBeginInput, AuthEnrollBeginInput, ClassicAuthLoginInput, ClassicAuthRegisterInput, ChallengeSignatureInput, DeviceRegisterInput, DeviceRenameInput, DeviceRevokeInput, IdentityOpenInput, IdentityRegisterInput, IdentityRenewInput, PasswordInput, QueryExecuteInput, QueryContextResolveInput, AppDeleteInput, AppIdInput,
+        AppInstanceCreateInput, AppInstanceRemoveInput, AppUpdateInput, DataAnalyzeInput, DataImportInput, DataMappingSaveInput, DataMappingListInput, DataMappingUpdateInput, DataMappingDeleteInput, Audience, BackupNameInput,
+        CollectionsListInput,
         BackupRestoreInput, HandlerKind, OperationKind, OperationRequest, OperationResponse, OperationRouter, OperationScope, PermissionGrantInput,
         PermissionRevokeInput, PlaceAccessRemoveInput, PlaceAccessSetInput, PlaceCreateInput, PlacePublicSetInput,
-        PlaceDeleteInput, PlaceIdInput, PlaceUpdateInput, PlaceResourceSetInput, PlaceResourceRemoveInput, Routed, RoutedOperation, SharingCreateInput,
+        PlaceDeleteInput, PlaceIdInput, PlaceUpdateInput, PlaceResourceSetInput, PlaceResourceRemoveInput, FabricResourceSetInput, FabricResourceRemoveInput, Routed, RoutedOperation, SharingCreateInput,
         SharingDeleteInput, SharingUpdateInput, OPERATION_CATALOG,
     },
     protocol::{
@@ -48,14 +47,38 @@ use og_core::{
     Document, Number, Value,
 };
 
+#[cfg(feature = "files")]
+use og_core::{
+    files::FileRange,
+    operation::{
+        FileEntryInput, FileListInput, FileMkdirInput, FileMoveInput, FileReadInput,
+        FileScopeInput, FileSyncConfigSetInput, FileSyncSelectionRemoveInput,
+        FileSyncSelectionSetInput, FileVersionInput, FileVersionReadInput, FileWriteInput,
+    },
+};
+#[cfg(feature = "events")]
+use og_core::operation::EventsSubscribeInput;
+#[cfg(feature = "data-import")]
+use og_core::operation::DataWorkerRunInput;
+#[cfg(feature = "llm")]
+use og_core::service::llm::LlmService;
+#[cfg(feature = "agent")]
+use og_core::service::agent::{AgentCapabilityInvoker, AgentCapabilityResponse, AgentError, AgentService};
+
+#[cfg(feature = "auth")]
 use argon2::{Algorithm, Argon2, Params, Version};
+#[cfg(feature = "fabric")]
+use sha2::{Digest, Sha256};
 use serde::{ ser::{Error as SerializeError, SerializeMap, SerializeSeq}, Deserialize, Serialize, Serializer, };
 use serde_json::Value as JsonValue;
+#[cfg(feature = "fabric")]
 use tungstenite::{connect as websocket_connect, Message as WebSocketMessage, WebSocket, stream::MaybeTlsStream};
+#[cfg(feature = "files-watch")]
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:7878";
-const DEFAULT_NODE_CAPABILITIES: &str = "auth,database,files,events";
+#[cfg(feature = "fabric")]
+const NODE_CONTROL_PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_STORAGE_BACKEND: &str = "memory";
@@ -127,8 +150,13 @@ fn main() -> ExitCode { match run() { Ok(()) => ExitCode::SUCCESS, Err(error) =>
 fn run() -> Result<(), DaemonError> {
     let configuration = Configuration::from_environment()?;
     let version = env!("CARGO_PKG_VERSION");
-    let gateway_endpoint = gateway_endpoint(&configuration.bind_address);
-    let listener_bind_address = if gateway_endpoint.is_some() {
+    let fabric_enabled = !configuration.gateway_endpoints.is_empty();
+    if fabric_enabled && !build_profile::has_fabric() {
+        return Err(DaemonError::Runtime(
+            "Gateway mode requires an ogd build with the `fabric` feature".to_owned(),
+        ));
+    }
+    let listener_bind_address = if fabric_enabled {
         configuration.local_bind_address.as_deref()
     } else {
         Some(configuration.bind_address.as_str())
@@ -141,19 +169,24 @@ fn run() -> Result<(), DaemonError> {
         None => None,
     };
 
-    let local_address = match (gateway_endpoint.as_ref(), listener.as_ref()) {
-        (Some(_), Some(listener)) => format!(
-            "outbound {}, local {}",
-            configuration.bind_address,
+    let local_address = match (fabric_enabled, listener.as_ref()) {
+        (true, Some(listener)) => format!(
+            "outbound [{}], local {}",
+            configuration.gateway_endpoints.join(","),
             listener.local_addr().map_err(DaemonError::LocalAddress)?
         ),
-        (Some(_), None) => format!("outbound {}", configuration.bind_address),
-        (None, Some(listener)) => listener.local_addr().map_err(DaemonError::LocalAddress)?.to_string(),
-        (None, None) => unreachable!("standalone ogd always has a listener"),
+        (true, None) => format!("outbound [{}]", configuration.gateway_endpoints.join(",")),
+        (false, Some(listener)) => listener.local_addr().map_err(DaemonError::LocalAddress)?.to_string(),
+        (false, None) => unreachable!("standalone ogd always has a listener"),
     };
 
-    let (engine_value, glacier_storage) = build_engine(&configuration)?;
-    let engine = Arc::new(engine_value);
+    #[cfg(feature = "db-engine")]
+    let (engine, glacier_storage) = {
+        let (engine_value, glacier_storage) = build_engine(&configuration)?;
+        (Some(Arc::new(engine_value)), glacier_storage)
+    };
+    #[cfg(not(feature = "db-engine"))]
+    let (engine, glacier_storage): (Option<Arc<Engine>>, Option<Arc<GlacierStorage>>) = (None, None);
     if configuration.node_capabilities.contains(ServiceCapability::Files) {
         fs::create_dir_all(&configuration.files_path).map_err(|source| DaemonError::PrepareStorageDirectory {
             path: configuration.files_path.clone(),
@@ -172,31 +205,39 @@ fn run() -> Result<(), DaemonError> {
         }
     }
     debug::log(DebugTopic::Core, None, format!(
-        "starting storage={} bind={} capabilities={}",
-        configuration.storage_backend.as_str(),
+        "starting storage={} bind={} enabled={} published={} compiled={}",
+        if build_profile::has_db_engine() { configuration.storage_backend.as_str() } else { "disabled" },
         configuration.bind_address,
         configuration.node_capabilities.names().join(","),
+        configuration.published_capabilities.names().join(","),
+        ServiceCapabilities::compiled().names().join(","),
     ));
-    start_debug_memory_reporter(Arc::clone(&engine));
-    let node_credential = if gateway_endpoint.is_some() {
-        load_node_identity_credential(&configuration)?
+    if let Some(engine) = engine.as_ref() {
+        start_debug_memory_reporter(Arc::clone(engine));
+    }
+    let node_credential = if fabric_enabled {
+        Some(load_node_identity_credential(&configuration)?)
     } else {
         None
     };
     if configuration.node_capabilities.contains(ServiceCapability::Auth) {
-        if gateway_endpoint.is_some() {
-            if let Some(credential) = node_credential.as_ref() {
-                ensure_node_device_credential(&engine, credential)?;
-                if configuration.node_capabilities.contains(ServiceCapability::Events) {
-                    ensure_node_events_permission(&engine, credential);
-                }
+        let engine = engine.as_ref().expect("auth capability requires the db-engine feature");
+        // Bootstrap is a local Core concern and must not depend on whether the fabric
+        // transport is inbound or outbound. Once _identities is populated this is a no-op,
+        // so normal reboots do not need admin.ogid or the bootstrap password.
+        bootstrap_admin_if_needed(engine, &configuration)?;
+        if fabric_enabled {
+            let credential = node_credential.as_ref().expect("gateway nodes require an identity credential");
+            ensure_node_device_credential(engine, credential)?;
+            bootstrap_fabric_defaults_if_needed(engine, credential, configuration.published_capabilities)?;
+            if configuration.node_capabilities.contains(ServiceCapability::Events) {
+                ensure_node_events_permission(engine, credential);
             }
-        } else {
-            bootstrap_admin_if_needed(&engine, &configuration)?;
         }
     }
     if configuration.node_capabilities.contains(ServiceCapability::Database) {
-        bootstrap_apps_if_needed(&engine)?;
+        let engine = engine.as_ref().expect("database capability requires the db-engine feature");
+        bootstrap_apps_if_needed(engine)?;
     }
     let operation_router = Arc::new(OperationRouter::for_capabilities(configuration.node_capabilities));
     let event_engine = Arc::new(EventEngine::default());
@@ -208,10 +249,27 @@ fn run() -> Result<(), DaemonError> {
     if configuration.node_capabilities.contains(ServiceCapability::Events) {
         debug::log( DebugTopic::Events, None, format!( "event engine started capacity=default heartbeat={}", configuration .heartbeat_interval .map(|value| format!("{}ms", value.as_millis())) .unwrap_or_else(|| "disabled".to_owned()) ), );
         event_engine.publish_global("core.started", serde_json::json!({ "daemon": "ogd" }));
-        start_event_outbox_worker(Arc::clone(&engine), Arc::clone(&event_engine));
+        let engine = engine.as_ref().expect("events capability requires the db-engine feature");
+        start_event_outbox_worker(Arc::clone(engine), Arc::clone(&event_engine));
     } else {
         debug::log(DebugTopic::Events, None, "event service disabled by OGD_NODE_CAPABILITIES");
     }
+    #[cfg(feature = "llm")]
+    let llm_service = if configuration.node_capabilities.contains(ServiceCapability::Llm) {
+        Some(Arc::new(LlmService::from_environment().map_err(|error| {
+            DaemonError::Runtime(format!("unable to initialize llm provider: {error}"))
+        })?))
+    } else {
+        None
+    };
+    #[cfg(feature = "agent")]
+    let agent_service = if configuration.node_capabilities.contains(ServiceCapability::Agent) {
+        Some(Arc::new(AgentService::from_environment().map_err(|error| {
+            DaemonError::Runtime(format!("unable to initialize agent provider: {error}"))
+        })?))
+    } else {
+        None
+    };
     let connection_settings = Arc::new(ConnectionSettings {
         read_timeout: configuration.read_timeout,
         write_timeout: configuration.write_timeout,
@@ -227,20 +285,46 @@ fn run() -> Result<(), DaemonError> {
         storage_backend: configuration.storage_backend,
         glacier_storage,
         files_path: configuration.files_path.clone(),
-        file_sync: Mutex::new(load_file_sync_runtime(&configuration)?),
+        file_sync: Mutex::new(if configuration.node_capabilities.contains(ServiceCapability::Files) {
+            load_file_sync_runtime(&configuration)?
+        } else {
+            FileSyncRuntime::disabled(&configuration)
+        }),
         file_sync_run: Mutex::new(()),
         file_sync_applying: Arc::new(AtomicBool::new(false)),
         file_sync_watcher_dirty: Arc::new(AtomicBool::new(false)),
         service_capabilities: configuration.node_capabilities,
-        upstream: gateway_endpoint.as_ref().map(|_| configuration.bind_address.clone()),
-        upstream_client_endpoint: gateway_client_endpoint(&configuration.bind_address),
+        published_capabilities: configuration.published_capabilities,
+        #[cfg(feature = "llm")]
+        llm_service,
+        #[cfg(feature = "agent")]
+        agent_service,
+        upstream: configuration.gateway_endpoints.first().cloned(),
+        upstream_client_endpoints: Mutex::new(
+            configuration.gateway_endpoints.iter()
+                .filter_map(|endpoint| gateway_client_endpoint_from_node(endpoint))
+                .collect()
+        ),
         upstream_identity: node_credential.clone(),
-        gateway_state: Mutex::new(if gateway_endpoint.is_some() { "connecting" } else { "standalone" }),
+        gateway_state: Mutex::new(if fabric_enabled { "connecting" } else { "standalone" }),
+        gateway_connections: Mutex::new(HashMap::new()),
     });
-    let _file_sync_worker = start_file_sync_worker(Arc::clone(&connection_settings), Arc::clone(&engine), Arc::clone(&event_engine));
+    let _file_sync_worker = if configuration.node_capabilities.contains(ServiceCapability::Files) {
+        let engine = engine.as_ref().expect("files capability requires the db-engine feature");
+        start_file_sync_worker(Arc::clone(&connection_settings), Arc::clone(engine), Arc::clone(&event_engine))
+    } else {
+        None
+    };
     let _upstream_event_relay = start_upstream_event_relay(Arc::clone(&connection_settings), Arc::clone(&event_engine));
-    let with_engine = configuration.storage_backend.as_str();
-    let with_storage_path = match configuration.storage_backend { StorageBackend::Memory => "virtual".to_owned(), StorageBackend::Glacier => configuration.storage_path.display().to_string(), };
+    let with_engine = engine.as_ref().map_or("none", |_| configuration.storage_backend.as_str());
+    let with_storage_path = if engine.is_some() {
+        match configuration.storage_backend {
+            StorageBackend::Memory => "virtual".to_owned(),
+            StorageBackend::Glacier => configuration.storage_path.display().to_string(),
+        }
+    } else {
+        "disabled".to_owned()
+    };
     let with_modules = match configuration.storage_backend {
         _default => {
             let metrics = if configuration.import_metrics { ", metrics enabled" } else { "" };
@@ -309,21 +393,20 @@ fn run() -> Result<(), DaemonError> {
                                           {with_modules14}
 "
     );
-    if let Some(gateway_endpoint) = gateway_endpoint {
+    if fabric_enabled {
         if let Some(listener) = listener {
             spawn_listener_thread(
                 listener,
-                Arc::clone(&engine),
+                engine.clone(),
                 Arc::clone(&operation_router),
                 Arc::clone(&event_engine),
                 Arc::clone(&connection_settings),
                 "ogd-local-listener",
             )?;
         }
-        run_gateway_node(
-            gateway_endpoint,
-            &configuration,
-            node_credential,
+        run_gateway_fabric(
+            configuration,
+            node_credential.expect("gateway nodes require an identity credential"),
             engine,
             operation_router,
             event_engine,
@@ -336,7 +419,7 @@ fn run() -> Result<(), DaemonError> {
                 Ok(stream) => {
                     spawn_serving_connection(
                         stream,
-                        Arc::clone(&engine),
+                        engine.clone(),
                         Arc::clone(&operation_router),
                         Arc::clone(&event_engine),
                         Arc::clone(&connection_settings),
@@ -352,7 +435,7 @@ fn run() -> Result<(), DaemonError> {
 
 fn spawn_listener_thread(
     listener: TcpListener,
-    engine: Arc<Engine>,
+    engine: Option<Arc<Engine>>,
     operation_router: Arc<OperationRouter>,
     event_engine: Arc<EventEngine>,
     settings: Arc<ConnectionSettings>,
@@ -365,7 +448,7 @@ fn spawn_listener_thread(
                 Ok(stream) => {
                     if let Err(error) = spawn_serving_connection(
                         stream,
-                        Arc::clone(&engine),
+                        engine.clone(),
                         Arc::clone(&operation_router),
                         Arc::clone(&event_engine),
                         Arc::clone(&settings),
@@ -383,7 +466,7 @@ fn spawn_listener_thread(
 
 fn spawn_serving_connection(
     stream: TcpStream,
-    engine: Arc<Engine>,
+    engine: Option<Arc<Engine>>,
     operation_router: Arc<OperationRouter>,
     event_engine: Arc<EventEngine>,
     settings: Arc<ConnectionSettings>,
@@ -404,7 +487,7 @@ fn spawn_serving_connection(
         if let Err(error) = serve_connection(
             connection_id,
             stream,
-            &engine,
+            engine.as_deref(),
             &operation_router,
             &event_engine,
             &settings,
@@ -423,6 +506,39 @@ fn spawn_serving_connection(
 }
 
 
+fn normalize_gateway_node_endpoint(value: &str) -> Option<String> {
+    fn from_authority(authority: &str, secure: bool) -> Option<String> {
+        let authority = authority.trim().trim_end_matches('/');
+        if authority.is_empty() { return None; }
+        let scheme = if secure { "wss" } else { "ws" };
+        Some(format!("{scheme}://{authority}/node"))
+    }
+    let raw = value.trim();
+    if let Some(authority) = raw.strip_prefix("gw+insecure://") {
+        return from_authority(authority, false);
+    }
+    if let Some(authority) = raw.strip_prefix("gw://") {
+        return from_authority(authority, true);
+    }
+    if raw.starts_with("ws://") || raw.starts_with("wss://") {
+        let base = raw.trim_end_matches('/');
+        if base.ends_with("/node") {
+            return Some(base.to_owned());
+        }
+        if base.ends_with("/peer") || base.ends_with("/ws") {
+            let base = base.rsplit_once('/').map(|(head, _)| head).unwrap_or(base);
+            return Some(format!("{base}/node"));
+        }
+        return Some(format!("{base}/node"));
+    }
+    None
+}
+
+fn gateway_client_endpoint_from_node(endpoint: &str) -> Option<String> {
+    let endpoint = endpoint.trim();
+    endpoint.strip_suffix("/node").map(|base| format!("{base}/ws"))
+}
+
 fn gateway_endpoint(bind: &str) -> Option<String> {
     fn normalize(authority: &str, secure: bool) -> Option<String> {
         let authority = authority.trim().trim_end_matches('/');
@@ -434,24 +550,29 @@ fn gateway_endpoint(bind: &str) -> Option<String> {
     bind.strip_prefix("gw://").and_then(|raw| normalize(raw, true))
 }
 
-fn gateway_client_endpoint(bind: &str) -> Option<String> {
-    fn normalize(authority: &str, secure: bool) -> Option<String> {
-        let authority = authority.trim().trim_end_matches('/');
-        if authority.is_empty() { return None; }
-        let scheme = if secure { "wss" } else { "ws" };
-        Some(format!("{scheme}://{authority}/ws"))
-    }
-    if let Some(raw) = bind.strip_prefix("gw+insecure://") { return normalize(raw, false); }
-    bind.strip_prefix("gw://").and_then(|raw| normalize(raw, true))
-}
 
+#[cfg(feature = "fabric")]
 type NodeWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 
+#[cfg(not(feature = "fabric"))]
+#[derive(Debug)]
+struct NodeWebSocket;
+
+#[cfg(feature = "fabric")]
+fn close_node_websocket(websocket: &mut NodeWebSocket) {
+    let _ = websocket.close(None);
+}
+
+#[cfg(not(feature = "fabric"))]
+fn close_node_websocket(_websocket: &mut NodeWebSocket) {}
+
+#[cfg(feature = "fabric")]
 fn write_node_message(websocket: &mut NodeWebSocket, value: &JsonValue) -> Result<(), String> {
     let payload = rmp_serde::to_vec_named(value).map_err(|error| error.to_string())?;
     websocket.send(WebSocketMessage::Binary(payload.into())).map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "fabric")]
 fn read_node_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>, String> {
     loop {
         match websocket.read() {
@@ -470,11 +591,45 @@ fn read_node_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>,
     }
 }
 
+#[cfg(feature = "fabric")]
+enum NodeMessagePoll {
+    Message(JsonValue),
+    Closed,
+    Idle,
+}
+
+#[cfg(feature = "fabric")]
+fn poll_node_message(websocket: &mut NodeWebSocket) -> Result<NodeMessagePoll, String> {
+    loop {
+        match websocket.read() {
+            Ok(WebSocketMessage::Binary(payload)) => {
+                let message = rmp_serde::from_slice::<JsonValue>(&payload).map_err(|error| error.to_string())?;
+                return Ok(NodeMessagePoll::Message(message));
+            }
+            Ok(WebSocketMessage::Close(_)) => return Ok(NodeMessagePoll::Closed),
+            Ok(WebSocketMessage::Ping(payload)) => {
+                websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?;
+            }
+            Ok(WebSocketMessage::Pong(_)) => {}
+            Ok(WebSocketMessage::Text(_)) => return Err("node control channel requires binary MessagePack frames".to_owned()),
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
+            {
+                return Ok(NodeMessagePoll::Idle);
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(feature = "fabric")]
 fn write_gateway_message(websocket: &mut NodeWebSocket, value: &JsonValue) -> Result<(), String> {
     let payload = serde_json::to_string(value).map_err(|error| error.to_string())?;
     websocket.send(WebSocketMessage::Text(payload.into())).map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "fabric")]
 fn read_gateway_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>, String> {
     loop {
         match websocket.read() {
@@ -493,6 +648,7 @@ fn read_gateway_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValu
     }
 }
 
+#[cfg(feature = "fabric")]
 fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &OperationRequest) -> Result<JsonValue, String> {
     let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
     let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
@@ -509,6 +665,7 @@ fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &Operati
     }
 }
 
+#[cfg(feature = "fabric")]
 fn connect_authenticated_gateway_client(
     endpoint: &str,
     credential: &IdentityCredential,
@@ -568,6 +725,49 @@ fn connect_authenticated_gateway_client(
     Ok(websocket)
 }
 
+fn gateway_client_endpoints(settings: &ConnectionSettings) -> Vec<String> {
+    settings
+        .upstream_client_endpoints
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn has_upstream_gateway(settings: &ConnectionSettings) -> bool {
+    !gateway_client_endpoints(settings).is_empty()
+}
+
+#[cfg(feature = "fabric")]
+fn connect_authenticated_gateway_client_any(
+    settings: &ConnectionSettings,
+    credential: &IdentityCredential,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<(NodeWebSocket, String), String> {
+    let endpoints = gateway_client_endpoints(settings);
+    if endpoints.is_empty() {
+        return Err("no upstream Gateway client endpoint".to_owned());
+    }
+    let mut errors = Vec::new();
+    for endpoint in endpoints {
+        match connect_authenticated_gateway_client(&endpoint, credential, read_timeout, write_timeout) {
+            Ok(websocket) => return Ok((websocket, endpoint)),
+            Err(error) => errors.push(format!("{endpoint}: {error}")),
+        }
+    }
+    Err(format!("all upstream Gateways failed: {}", errors.join("; ")))
+}
+
+#[cfg(not(feature = "fabric"))]
+fn connect_authenticated_gateway_client_any(
+    _settings: &ConnectionSettings,
+    _credential: &IdentityCredential,
+    _read_timeout: Duration,
+    _write_timeout: Duration,
+) -> Result<(NodeWebSocket, String), String> {
+    Err("ogd was built without the `fabric` feature".to_owned())
+}
+
 fn write_json_wire_response(writer: &mut TcpStream, response: &JsonValue) -> Result<(), ConnectionError> {
     let encoded = encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
         .map_err(ConnectionError::Encode)?;
@@ -580,7 +780,7 @@ fn forward_authority_operation(
     principal: &Principal,
     request: &OperationRequest,
 ) -> Result<bool, ConnectionError> {
-    if request.op.is_empty() || settings.upstream_client_endpoint.is_none() {
+    if request.op.is_empty() || !has_upstream_gateway(settings) {
         return Ok(false);
     }
     let Some(credential) = settings.upstream_identity.as_ref() else {
@@ -597,17 +797,16 @@ fn forward_authority_operation(
         return Ok(false);
     }
 
-    let endpoint = settings.upstream_client_endpoint.as_deref().expect("checked above");
-    debug::log(DebugTopic::Gateway, None, format!("forward authority op={} endpoint={endpoint}", request.op));
-    match connect_authenticated_gateway_client(
-        endpoint,
+    match connect_authenticated_gateway_client_any(
+        settings,
         credential,
         settings.read_timeout,
         settings.write_timeout,
     )
-    .and_then(|mut websocket| {
+    .and_then(|(mut websocket, endpoint)| {
+        debug::log(DebugTopic::Gateway, None, format!("forward authority op={} endpoint={endpoint}", request.op));
         let response = gateway_response_for_request(&mut websocket, request);
-        let _ = websocket.close(None);
+        close_node_websocket(&mut websocket);
         response
     }) {
         Ok(response) => {
@@ -626,6 +825,7 @@ fn forward_authority_operation(
     }
 }
 
+#[cfg(feature = "fabric")]
 fn configure_websocket_timeouts(
     websocket: &mut NodeWebSocket,
     read_timeout: Duration,
@@ -645,6 +845,7 @@ fn configure_websocket_timeouts(
     }
 }
 
+#[cfg(feature = "fabric")]
 fn configure_websocket_polling(websocket: &mut NodeWebSocket) -> io::Result<()> {
     let timeout = Some(Duration::from_millis(25));
     match websocket.get_mut() {
@@ -654,6 +855,7 @@ fn configure_websocket_polling(websocket: &mut NodeWebSocket) -> io::Result<()> 
     }
 }
 
+#[cfg(feature = "fabric")]
 fn tcp_pair() -> io::Result<(TcpStream, TcpStream)> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -662,6 +864,7 @@ fn tcp_pair() -> io::Result<(TcpStream, TcpStream)> {
     Ok((server, client))
 }
 
+#[cfg(feature = "fabric")]
 fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) -> Result<(), String> {
     local.set_nonblocking(true).map_err(|error| error.to_string())?;
     configure_websocket_polling(&mut websocket).map_err(|error| error.to_string())?;
@@ -669,7 +872,7 @@ fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) 
     loop {
         loop {
             match local.read(&mut buffer) {
-                Ok(0) => { let _ = websocket.close(None); return Ok(()); }
+                Ok(0) => { close_node_websocket(&mut websocket); return Ok(()); }
                 Ok(bytes) => websocket.send(WebSocketMessage::Binary(buffer[..bytes].to_vec().into())).map_err(|error| error.to_string())?,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.to_string()),
@@ -690,84 +893,550 @@ fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) 
     }
 }
 
-fn run_gateway_node(
-    endpoint: String,
+fn node_identity_proof(challenge: &str, node_id: &str, identity_id: &str, device_id: &str) -> String {
+    format!("og.node.challenge.v1\n{challenge}\n{node_id}\n{identity_id}\n{device_id}")
+}
+
+fn registered_device_matches(engine: &Engine, identity_id: &str, device_id: &str, public_key: &str) -> bool {
+    if identity_id.is_empty() || device_id.is_empty() || public_key.is_empty() { return false; }
+    let query = format!(
+        "on _devices | where identityId == {} and deviceId == {} and publicKey == {} and state == \"active\" | limit 1",
+        query_string(identity_id),
+        query_string(device_id),
+        query_string(public_key),
+    );
+    matches!(
+        execute_request(engine, QueryRequest::new(0, query)),
+        QueryResponse::Ok { documents, .. } if !documents.is_empty()
+    )
+}
+
+fn registered_identity_matches(engine: &Engine, identity_id: &str, public_key: &str) -> bool {
+    if identity_id.is_empty() || public_key.is_empty() { return false; }
+    let query = format!(
+        "on _identities | where identityId == {} and publicKey == {} and state == \"active\" | limit 1",
+        query_string(identity_id),
+        query_string(public_key),
+    );
+    matches!(
+        execute_request(engine, QueryRequest::new(0, query)),
+        QueryResponse::Ok { documents, .. } if !documents.is_empty()
+    )
+}
+
+#[cfg(feature = "fabric")]
+fn gateway_random_challenge() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .map_err(|error| format!("unable to generate Gateway challenge: {error}"))?;
+    Ok(encode_base64(&bytes))
+}
+
+#[cfg(feature = "fabric")]
+fn gateway_identity_proof(challenge: &str, identity_id: &str, device_id: &str) -> String {
+    format!("og.gateway.challenge.v1\n{challenge}\n{identity_id}\n{device_id}")
+}
+
+#[cfg(feature = "fabric")]
+fn gateway_enrollment_payload(challenge: &str, public_key: &str) -> String {
+    format!("og.gateway.enroll.v1\n{challenge}\n{public_key}")
+}
+
+#[cfg(feature = "fabric")]
+fn hmac_sha256_base64(key: &[u8], message: &[u8]) -> String {
+    const BLOCK_BYTES: usize = 64;
+    let mut normalized = [0u8; BLOCK_BYTES];
+    if key.len() > BLOCK_BYTES {
+        let digest = Sha256::digest(key);
+        normalized[..digest.len()].copy_from_slice(&digest);
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_key = [0x36u8; BLOCK_BYTES];
+    let mut outer_key = [0x5cu8; BLOCK_BYTES];
+    for index in 0..BLOCK_BYTES {
+        inner_key[index] ^= normalized[index];
+        outer_key[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_key);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_key);
+    outer.update(inner_digest);
+    encode_base64(&outer.finalize())
+}
+
+fn ensure_gateway_device_registration(engine: &Engine, identity_id: &str, device_id: &str, public_key: &str) -> Result<(), String> {
+    if registered_identity_matches(engine, identity_id, public_key)
+        && registered_device_matches(engine, identity_id, device_id, public_key)
+    {
+        return Ok(());
+    }
+
+    let identity_lookup = format!("on _identities | where identityId == {} | limit 1", query_string(identity_id));
+    let identity_exists = match execute_request(engine, QueryRequest::new(0, identity_lookup)) {
+        QueryResponse::Ok { documents, .. } => !documents.is_empty(),
+        QueryResponse::Error { .. } => false,
+    };
+    if identity_exists {
+        return Err(format!("Gateway identity {identity_id} conflicts with an existing identity"));
+    }
+    let device_lookup = format!("on _devices | where deviceId == {} | limit 1", query_string(device_id));
+    let device_exists = match execute_request(engine, QueryRequest::new(0, device_lookup)) {
+        QueryResponse::Ok { documents, .. } => !documents.is_empty(),
+        QueryResponse::Error { .. } => false,
+    };
+    if device_exists {
+        return Err(format!("Gateway device {device_id} conflicts with an existing Device"));
+    }
+
+    let created_at = unix_time_millis();
+    let identity_insert = format!(
+        "on _identities | insert {{identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}, kind: \"gateway\"}}",
+        query_string(identity_id), query_string(public_key),
+    );
+    if !execute_request(engine, QueryRequest::new(0, identity_insert)).is_ok() {
+        return Err("unable to persist Gateway identity".to_owned());
+    }
+    let device_insert = format!(
+        "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}, kind: \"gateway\"}}",
+        query_string(device_id), query_string(identity_id), query_string(public_key),
+    );
+    if !execute_request(engine, QueryRequest::new(0, device_insert)).is_ok() {
+        let rollback = format!("on _identities | where identityId == {} | delete", query_string(identity_id));
+        let _ = execute_request(engine, QueryRequest::new(0, rollback));
+        return Err("unable to persist Gateway Device".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "fabric")]
+fn authenticate_gateway_fabric(
+    control: &mut NodeWebSocket,
     configuration: &Configuration,
-    node_credential: Option<IdentityCredential>,
-    engine: Arc<Engine>,
+    engine: Option<&Engine>,
+) -> Result<(), String> {
+    write_node_message(control, &serde_json::json!({"kind": "gateway.probe", "version": 1}))?;
+    let hello = read_node_message(control)?
+        .ok_or_else(|| "Gateway closed before gateway.hello".to_owned())?;
+    if hello.get("kind").and_then(JsonValue::as_str) != Some("gateway.hello")
+        || hello.get("version").and_then(JsonValue::as_u64) != Some(1)
+    {
+        return Err("Gateway did not provide a supported gateway.hello".to_owned());
+    }
+    let state = hello.get("state").and_then(JsonValue::as_str).unwrap_or_default();
+    let public_key = hello.get("publicKey").and_then(JsonValue::as_str).unwrap_or_default();
+    validate_ed25519_public_key(public_key).map_err(|error| format!("invalid Gateway public key: {error}"))?;
+
+    if state == "enrolled" {
+        let identity_id = hello.get("identityId").and_then(JsonValue::as_str).unwrap_or_default();
+        let device_id = hello.get("deviceId").and_then(JsonValue::as_str).unwrap_or_default();
+        let engine = engine.ok_or_else(|| "Gateway Device verification requires a local Core trust store in Step 2".to_owned())?;
+        if !registered_identity_matches(engine, identity_id, public_key)
+            || !registered_device_matches(engine, identity_id, device_id, public_key)
+        {
+            return Err(format!("Gateway Device {device_id} is unknown, revoked, or has a different key"));
+        }
+        let challenge = gateway_random_challenge()?;
+        write_node_message(control, &serde_json::json!({
+            "kind": "gateway.challenge", "version": 1,
+            "identityId": identity_id, "deviceId": device_id, "challenge": challenge,
+        }))?;
+        let proof = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.proof".to_owned())?;
+        if proof.get("kind").and_then(JsonValue::as_str) != Some("gateway.proof")
+            || proof.get("version").and_then(JsonValue::as_u64) != Some(1)
+        {
+            return Err("Gateway did not answer the Device challenge".to_owned());
+        }
+        let signature = proof.get("signature").and_then(JsonValue::as_str).unwrap_or_default();
+        let payload = gateway_identity_proof(&challenge, identity_id, device_id);
+        verify_ed25519(public_key, signature, payload.as_bytes())
+            .map_err(|error| format!("Gateway Device signature rejected: {error}"))?;
+        write_node_message(control, &serde_json::json!({
+            "kind": "gateway.accepted", "version": 1,
+            "identityId": identity_id, "deviceId": device_id,
+        }))?;
+        return Ok(());
+    }
+
+    if state != "unenrolled" && state != "enrolling" {
+        return Err(format!("unsupported Gateway enrollment state {state:?}"));
+    }
+    if !configuration.node_capabilities.contains(ServiceCapability::Auth) {
+        return Err("Only a Core with the auth capability may enroll an unenrolled Gateway".to_owned());
+    }
+    let engine = engine.ok_or_else(|| "Gateway enrollment requires the Core auth store".to_owned())?;
+    let token = configuration.gateway_token.as_deref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Gateway enrollment requires OGD_GATEWAY_TOKEN on the enrolling Core".to_owned())?;
+    let enrollment_challenge = hello.get("enrollmentChallenge").and_then(JsonValue::as_str).unwrap_or_default();
+    if enrollment_challenge.is_empty() {
+        return Err("unenrolled Gateway did not provide an enrollment challenge".to_owned());
+    }
+    let (identity_id, device_id) = if state == "enrolling" {
+        let identity_id = hello.get("identityId").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
+        let device_id = hello.get("deviceId").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
+        if identity_id.is_empty() || device_id.is_empty() {
+            return Err("pending Gateway enrollment is missing identityId/deviceId".to_owned());
+        }
+        (identity_id, device_id)
+    } else {
+        let ids = UuidV7Generator::new();
+        (ids.next_id().to_string(), ids.next_id().to_string())
+    };
+    let bootstrap_proof = hmac_sha256_base64(
+        token.as_bytes(),
+        gateway_enrollment_payload(enrollment_challenge, public_key).as_bytes(),
+    );
+    let challenge = gateway_random_challenge()?;
+    write_node_message(control, &serde_json::json!({
+        "kind": "gateway.enroll", "version": 1,
+        "identityId": identity_id, "deviceId": device_id,
+        "bootstrapProof": bootstrap_proof,
+        "challenge": challenge,
+    }))?;
+    let proof = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.enroll.proof".to_owned())?;
+    if proof.get("kind").and_then(JsonValue::as_str) != Some("gateway.enroll.proof")
+        || proof.get("version").and_then(JsonValue::as_u64) != Some(1)
+        || proof.get("identityId").and_then(JsonValue::as_str) != Some(identity_id.as_str())
+        || proof.get("deviceId").and_then(JsonValue::as_str) != Some(device_id.as_str())
+        || proof.get("publicKey").and_then(JsonValue::as_str) != Some(public_key)
+    {
+        return Err("Gateway enrollment proof does not match its assignment".to_owned());
+    }
+    let signature = proof.get("signature").and_then(JsonValue::as_str).unwrap_or_default();
+    let payload = gateway_identity_proof(&challenge, &identity_id, &device_id);
+    verify_ed25519(public_key, signature, payload.as_bytes())
+        .map_err(|error| format!("Gateway enrollment Device signature rejected: {error}"))?;
+    ensure_gateway_device_registration(engine, &identity_id, &device_id, public_key)?;
+    write_node_message(control, &serde_json::json!({
+        "kind": "gateway.enroll.committed", "version": 1,
+        "identityId": identity_id, "deviceId": device_id,
+    }))?;
+    let ack = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.enroll.ack".to_owned())?;
+    if ack.get("kind").and_then(JsonValue::as_str) != Some("gateway.enroll.ack")
+        || ack.get("version").and_then(JsonValue::as_u64) != Some(1)
+        || ack.get("identityId").and_then(JsonValue::as_str) != Some(identity_id.as_str())
+        || ack.get("deviceId").and_then(JsonValue::as_str) != Some(device_id.as_str())
+    {
+        return Err("Gateway enrollment commit was not acknowledged".to_owned());
+    }
+    Ok(())
+}
+
+
+#[cfg(feature = "fabric")]
+fn load_gateway_directory(path: &Path) -> Vec<String> {
+    let Ok(bytes) = fs::read(path) else { return Vec::new(); };
+    let Ok(value) = serde_json::from_slice::<JsonValue>(&bytes) else { return Vec::new(); };
+    value.get("endpoints")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .filter_map(normalize_gateway_node_endpoint)
+        .collect()
+}
+
+#[cfg(feature = "fabric")]
+fn persist_gateway_directory(path: &Path, endpoints: &HashSet<String>) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut values = endpoints.iter().cloned().collect::<Vec<_>>();
+    values.sort();
+    let payload = serde_json::to_vec_pretty(&serde_json::json!({
+        "version": 1,
+        "endpoints": values,
+    })).map_err(|error| error.to_string())?;
+    let staged = path.with_extension("json.next");
+    fs::write(&staged, payload).map_err(|error| error.to_string())?;
+    fs::rename(&staged, path).map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+#[cfg(feature = "fabric")]
+fn run_gateway_fabric(
+    configuration: Configuration,
+    node_credential: IdentityCredential,
+    engine: Option<Arc<Engine>>,
     operation_router: Arc<OperationRouter>,
     event_engine: Arc<EventEngine>,
     settings: Arc<ConnectionSettings>,
 ) -> Result<(), DaemonError> {
-    let capabilities = configuration.node_capabilities.names();
+    let configuration = Arc::new(configuration);
+    let known = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let (sender, receiver) = mpsc::channel::<String>();
+
+    for endpoint in configuration
+        .gateway_endpoints
+        .iter()
+        .cloned()
+        .chain(load_gateway_directory(&configuration.gateway_directory_path))
+    {
+        let _ = sender.send(endpoint);
+    }
+
+    loop {
+        let endpoint = receiver
+            .recv()
+            .map_err(|error| DaemonError::Runtime(format!("Gateway connection manager stopped: {error}")))?;
+        let Some(endpoint) = normalize_gateway_node_endpoint(&endpoint) else { continue; };
+        {
+            let mut known_guard = known.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !known_guard.insert(endpoint.clone()) { continue; }
+            if let Err(error) = persist_gateway_directory(&configuration.gateway_directory_path, &known_guard) {
+                eprintln!("ogd gateway directory persist {}: {error}", configuration.gateway_directory_path.display());
+            }
+            if let Some(client_endpoint) = gateway_client_endpoint_from_node(&endpoint) {
+                let mut clients = settings.upstream_client_endpoints.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !clients.contains(&client_endpoint) { clients.push(client_endpoint); }
+            }
+        }
+
+        let configuration = Arc::clone(&configuration);
+        let credential = node_credential.clone();
+        let engine = engine.clone();
+        let operation_router = Arc::clone(&operation_router);
+        let event_engine = Arc::clone(&event_engine);
+        let settings = Arc::clone(&settings);
+        let discovery_sender = sender.clone();
+        thread::Builder::new()
+            .name(format!("ogd-gateway-{}", endpoint.replace('/', "_").replace(':', "_")))
+            .spawn(move || {
+                if let Err(error) = run_gateway_node(
+                    endpoint,
+                    configuration.as_ref(),
+                    credential,
+                    engine,
+                    operation_router,
+                    event_engine,
+                    settings,
+                    Some(discovery_sender),
+                ) {
+                    eprintln!("ogd gateway worker stopped: {error}");
+                }
+            })
+            .map_err(DaemonError::SpawnConnectionThread)?;
+    }
+}
+
+#[cfg(not(feature = "fabric"))]
+fn run_gateway_fabric(
+    _configuration: Configuration,
+    _node_credential: IdentityCredential,
+    _engine: Option<Arc<Engine>>,
+    _operation_router: Arc<OperationRouter>,
+    _event_engine: Arc<EventEngine>,
+    _settings: Arc<ConnectionSettings>,
+) -> Result<(), DaemonError> {
+    Err(DaemonError::Runtime(
+        "Gateway mode requires an ogd build with the `fabric` feature".to_owned(),
+    ))
+}
+
+#[cfg(feature = "fabric")]
+fn set_gateway_runtime_state(
+    settings: &ConnectionSettings,
+    endpoint: &str,
+    connected: bool,
+    disconnected_state: &'static str,
+) {
+    let any_connected = {
+        let mut connections = settings.gateway_connections.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        connections.insert(endpoint.to_owned(), connected);
+        connections.values().any(|value| *value)
+    };
+    *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        if any_connected { "connected" } else { disconnected_state };
+}
+
+#[cfg(feature = "fabric")]
+fn run_gateway_node(
+    endpoint: String,
+    configuration: &Configuration,
+    node_credential: IdentityCredential,
+    engine: Option<Arc<Engine>>,
+    operation_router: Arc<OperationRouter>,
+    event_engine: Arc<EventEngine>,
+    settings: Arc<ConnectionSettings>,
+    discovery_sender: Option<mpsc::Sender<String>>,
+) -> Result<(), DaemonError> {
+    let capabilities = configuration.published_capabilities.names();
     let operation_contracts = OPERATION_CATALOG
         .iter()
-        .filter(|operation| configuration.node_capabilities.contains_all(operation.kind.required_capabilities()))
+        .filter(|operation| {
+            operation.kind.is_compiled()
+                && operation.kind.is_published_by(configuration.published_capabilities)
+                && configuration.node_capabilities.contains_all(operation.kind.required_capabilities())
+        })
         .map(|operation| {
             (
                 operation.name.to_owned(),
                 serde_json::json!({
+                    "capability": operation.kind.provider_capability().map(ServiceCapability::as_str),
                     "transport": operation.transport.as_str(),
                     "connection": operation.connection.as_str(),
                 }),
             )
         })
         .collect::<serde_json::Map<String, JsonValue>>();
+    let revocation_subscription = configuration
+        .node_capabilities
+        .contains(ServiceCapability::Auth)
+        .then(|| event_engine.subscribe(vec!["fabric.device.revoked".to_owned()]));
     loop {
-        *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "connecting";
+        set_gateway_runtime_state(&settings, &endpoint, false, "connecting");
         debug::log(DebugTopic::Gateway, None, format!("connecting node fabric endpoint={endpoint}"));
         let (mut control, _) = match websocket_connect(endpoint.as_str()) {
             Ok(connection) => connection,
             Err(error) => {
-                *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "retrying";
+                set_gateway_runtime_state(&settings, &endpoint, false, "retrying");
                 eprintln!("ogd gateway connect {endpoint}: {error}; retrying");
                 thread::sleep(Duration::from_secs(2));
                 continue;
             }
         };
-        let issued_at = unix_time_millis();
-        let (node_id, identity_id, device_id, public_key, signature) = if let Some(credential) = node_credential.as_ref() {
-            // A Node is a Device of an Identity. The device identifier is therefore
-            // the stable Node identifier exposed to the Gateway and governance layer.
-            let node_id = credential.device_id.clone();
-            let proof = format!("og.node.hello.v1\n{}\n{}\n{}\n{}", node_id, credential.identity_id, credential.device_id, issued_at);
-            (node_id, Some(credential.identity_id.clone()), Some(credential.device_id.clone()), Some(credential.public_key.clone()), Some(credential.sign_base64(proof.as_bytes())))
-        } else {
-            // Legacy/unverified nodes keep instance_id as their transport identifier.
-            (configuration.instance_id.clone(), configuration.node_identity.clone(), None, None, None)
-        };
+        if let Err(error) = authenticate_gateway_fabric(&mut control, configuration, engine.as_deref()) {
+            set_gateway_runtime_state(&settings, &endpoint, false, "retrying");
+            eprintln!("ogd gateway identity {endpoint}: {error}; retrying");
+            thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        // Every Core participating in the fabric is a Node. `deviceId` is the stable
+        // routing identifier; identity proof is challenge-based and carries no role.
+        let node_id = node_credential.device_id.clone();
         let hello = serde_json::json!({
             "kind": "node.hello",
-            "version": 1,
+            "version": NODE_CONTROL_PROTOCOL_VERSION,
             "nodeId": node_id.clone(),
             "instanceId": configuration.instance_id.clone(),
-            "identityId": identity_id,
-            "deviceId": device_id,
-            "publicKey": public_key,
-            "issuedAt": issued_at,
-            "signature": signature,
+            "identityId": node_credential.identity_id.clone(),
+            "deviceId": node_credential.device_id.clone(),
+            "publicKey": node_credential.public_key.clone(),
             "nodeVersion": env!("CARGO_PKG_VERSION"),
             "capabilities": capabilities.clone(),
             "operationContracts": operation_contracts.clone(),
-            "role": configuration.node_role.clone(),
             "token": configuration.gateway_token.clone(),
         });
         if let Err(error) = write_node_message(&mut control, &hello) {
-            *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "retrying";
+            set_gateway_runtime_state(&settings, &endpoint, false, "retrying");
             eprintln!("ogd gateway hello {endpoint}: {error}");
             thread::sleep(Duration::from_secs(2));
             continue;
         }
+        let mut accepted = false;
         loop {
-            let message = match read_node_message(&mut control) {
-                Ok(Some(message)) => message,
-                Ok(None) => break,
-                Err(error) => { eprintln!("ogd gateway control: {error}"); break; }
+            if accepted {
+                if let Some(subscription) = revocation_subscription.as_ref() {
+                    loop {
+                        match subscription.try_recv() {
+                            Ok(event) => {
+                                let Some(device_id) = event.payload.get("deviceId").and_then(JsonValue::as_str) else { continue; };
+                                let notification = serde_json::json!({
+                                    "kind": "fabric.device.revoked",
+                                    "version": 1,
+                                    "eventId": event.id,
+                                    "deviceId": device_id,
+                                    "revokedAt": event.payload.get("revokedAt").cloned().unwrap_or(JsonValue::Null),
+                                });
+                                if let Err(error) = write_node_message(&mut control, &notification) {
+                                    eprintln!("ogd gateway revocation notification: {error}");
+                                    break;
+                                }
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                }
+            }
+            let message = if accepted {
+                match poll_node_message(&mut control) {
+                    Ok(NodeMessagePoll::Message(message)) => message,
+                    Ok(NodeMessagePoll::Idle) => continue,
+                    Ok(NodeMessagePoll::Closed) => break,
+                    Err(error) => { eprintln!("ogd gateway control: {error}"); break; }
+                }
+            } else {
+                match read_node_message(&mut control) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) => { eprintln!("ogd gateway control: {error}"); break; }
+                }
             };
             match message.get("kind").and_then(JsonValue::as_str) {
+                Some("node.challenge") => {
+                    if message.get("version").and_then(JsonValue::as_u64) != Some(NODE_CONTROL_PROTOCOL_VERSION) {
+                        eprintln!("ogd gateway control: unsupported node challenge version");
+                        break;
+                    }
+                    let Some(challenge) = message.get("challenge").and_then(JsonValue::as_str) else {
+                        eprintln!("ogd gateway control: node challenge is missing its nonce");
+                        break;
+                    };
+                    let proof = node_identity_proof(
+                        challenge,
+                        &node_id,
+                        &node_credential.identity_id,
+                        &node_credential.device_id,
+                    );
+                    let response = serde_json::json!({
+                        "kind": "node.proof",
+                        "version": NODE_CONTROL_PROTOCOL_VERSION,
+                        "signature": node_credential.sign_base64(proof.as_bytes()),
+                    });
+                    if let Err(error) = write_node_message(&mut control, &response) {
+                        eprintln!("ogd gateway control proof: {error}");
+                        break;
+                    }
+                }
                 Some("node.accepted") => {
-                    *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "connected";
+                    set_gateway_runtime_state(&settings, &endpoint, true, "retrying");
+                    accepted = true;
+                    if let Err(error) = configure_websocket_polling(&mut control) {
+                        eprintln!("ogd gateway control polling: {error}");
+                        break;
+                    }
                     debug::log(DebugTopic::Gateway, None, format!("node accepted endpoint={endpoint}"));
+                }
+                Some("node.rejected") => {
+                    let code = message.get("code").and_then(JsonValue::as_str).unwrap_or("NODE_REJECTED");
+                    let reason = message.get("message").and_then(JsonValue::as_str).unwrap_or("Gateway rejected this Node");
+                    eprintln!("ogd gateway node rejected endpoint={endpoint} code={code}: {reason}");
+                    break;
+                }
+                Some("fabric.gateways") if accepted => {
+                    if message.get("version").and_then(JsonValue::as_u64) != Some(1) { continue; }
+                    let Some(sender) = discovery_sender.as_ref() else { continue; };
+                    for value in message.get("endpoints").and_then(JsonValue::as_array).into_iter().flatten() {
+                        let Some(raw) = value.as_str() else { continue; };
+                        let Some(discovered) = normalize_gateway_node_endpoint(raw) else { continue; };
+                        if discovered == endpoint { continue; }
+                        debug::log(DebugTopic::Gateway, None, format!("discovered Gateway endpoint={discovered} via={endpoint}"));
+                        let _ = sender.send(discovered);
+                    }
+                }
+                Some("node.device.verify") => {
+                    let request_id = message.get("requestId").and_then(JsonValue::as_str).unwrap_or_default();
+                    let identity_id = message.get("identityId").and_then(JsonValue::as_str).unwrap_or_default();
+                    let device_id = message.get("deviceId").and_then(JsonValue::as_str).unwrap_or_default();
+                    let public_key = message.get("publicKey").and_then(JsonValue::as_str).unwrap_or_default();
+                    let verified = configuration.node_capabilities.contains(ServiceCapability::Auth)
+                        && engine.as_deref().map(|engine| registered_device_matches(engine, identity_id, device_id, public_key)).unwrap_or(false);
+                    let response = serde_json::json!({
+                        "kind": "node.device.verify.result",
+                        "version": NODE_CONTROL_PROTOCOL_VERSION,
+                        "requestId": request_id,
+                        "verified": verified,
+                    });
+                    if let Err(error) = write_node_message(&mut control, &response) {
+                        eprintln!("ogd gateway device verification response: {error}");
+                        break;
+                    }
                 }
                 Some("node.open") => {
                     let Some(channel_id) = message.get("channelId").and_then(JsonValue::as_str).map(str::to_owned) else { continue; };
@@ -775,10 +1444,29 @@ fn run_gateway_node(
                     let delegated_device_id = message.get("deviceId").and_then(JsonValue::as_str).map(str::to_owned);
                     let delegated_place_id = message.get("placeId").and_then(JsonValue::as_str).map(str::to_owned);
                     let delegated_capability = message.get("capability").and_then(JsonValue::as_str).map(str::to_owned);
+                    let delegated_token = message.get("delegationToken").and_then(JsonValue::as_str).map(str::to_owned);
+                    if let Some(capability_name) = delegated_capability.as_deref() {
+                        let Some(capability) = ServiceCapability::parse(capability_name) else {
+                            debug::log(
+                                DebugTopic::Gateway,
+                                None,
+                                format!("rejecting node.open for unknown capability={capability_name}"),
+                            );
+                            continue;
+                        };
+                        if !configuration.published_capabilities.contains(capability) {
+                            debug::log(
+                                DebugTopic::Gateway,
+                                None,
+                                format!("rejecting node.open for unpublished capability={capability_name}"),
+                            );
+                            continue;
+                        }
+                    }
                     let delegated_app_instance_id = message.get("appInstanceId").and_then(JsonValue::as_str).map(str::to_owned);
                     let delegated_place_role = message.get("placeRole").and_then(JsonValue::as_str).and_then(PlaceRole::parse);
                     let endpoint = endpoint.clone();
-                    let engine = Arc::clone(&engine);
+                    let engine = engine.clone();
                     let operation_router = Arc::clone(&operation_router);
                     let event_engine = Arc::clone(&event_engine);
                     let settings = Arc::clone(&settings);
@@ -790,7 +1478,7 @@ fn run_gateway_node(
                         };
                         let hello = serde_json::json!({
                             "kind": "node.channel",
-                            "version": 1,
+                            "version": 2,
                             "nodeId": channel_node_id,
                             "channelId": channel_id,
                         });
@@ -812,15 +1500,19 @@ fn run_gateway_node(
                             return;
                         }
                         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-                        let delegation = match (delegated_identity_id, delegated_device_id, delegated_place_id, delegated_capability) {
-                            (Some(identity_id), Some(device_id), Some(place_id), Some(capability)) => Some(GatewayDelegation {
-                                principal: Principal::Identity { identity_id, device_id }, place_id, capability,
-                                app_instance_id: delegated_app_instance_id, place_role: delegated_place_role,
+                        let delegation = match (delegated_identity_id, delegated_device_id, delegated_capability) {
+                            (Some(identity_id), Some(device_id), Some(capability)) => Some(GatewayDelegation {
+                                principal: Principal::Identity { identity_id, device_id },
+                                place_id: delegated_place_id,
+                                capability,
+                                app_instance_id: delegated_app_instance_id,
+                                place_role: delegated_place_role,
+                                token: delegated_token,
                             }),
                             _ => None,
                         };
                         if let Err(error) = serve_connection(
-                            connection_id, core_stream, &engine, &operation_router, &event_engine, &settings, delegation,
+                            connection_id, core_stream, engine.as_deref(), &operation_router, &event_engine, &settings, delegation,
                         ) {
                             eprintln!("ogd gateway channel: {error}");
                         }
@@ -829,22 +1521,57 @@ fn run_gateway_node(
                 _ => {}
             }
         }
-        *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = "retrying";
+        set_gateway_runtime_state(&settings, &endpoint, false, "retrying");
         thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn load_node_identity_credential(configuration: &Configuration) -> Result<Option<IdentityCredential>, DaemonError> {
+#[cfg(not(feature = "fabric"))]
+fn read_gateway_message(_websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>, String> {
+    Err("ogd was built without the `fabric` feature".to_owned())
+}
+
+#[cfg(not(feature = "fabric"))]
+fn gateway_response_for_request(_websocket: &mut NodeWebSocket, _request: &OperationRequest) -> Result<JsonValue, String> {
+    Err("ogd was built without the `fabric` feature".to_owned())
+}
+
+#[cfg(not(feature = "fabric"))]
+fn connect_authenticated_gateway_client(
+    _endpoint: &str,
+    _credential: &IdentityCredential,
+    _read_timeout: Duration,
+    _write_timeout: Duration,
+) -> Result<NodeWebSocket, String> {
+    Err("ogd was built without the `fabric` feature".to_owned())
+}
+
+#[cfg(not(feature = "fabric"))]
+fn run_gateway_node(
+    _endpoint: String,
+    _configuration: &Configuration,
+    _credential: IdentityCredential,
+    _engine: Option<Arc<Engine>>,
+    _operation_router: Arc<OperationRouter>,
+    _event_engine: Arc<EventEngine>,
+    _settings: Arc<ConnectionSettings>,
+    _discovery_sender: Option<mpsc::Sender<String>>,
+) -> Result<(), DaemonError> {
+    Err(DaemonError::Runtime(
+        "Gateway mode requires an ogd build with the `fabric` feature".to_owned(),
+    ))
+}
+
+fn load_node_identity_credential(configuration: &Configuration) -> Result<IdentityCredential, DaemonError> {
     match (&configuration.node_identity_file, &configuration.node_identity_password) {
         (Some(path), Some(password)) => identity_file::load(path, password.as_bytes())
-            .map(Some)
             .map_err(DaemonError::NodeIdentity),
         (Some(_), None) => Err(DaemonError::NodeIdentityPasswordMissing),
-        _ => Ok(None),
+        (None, _) => Err(DaemonError::NodeIdentityMissing),
     }
 }
 
-/// Ensures that the credential used by this client/node to authenticate to its master can
+/// Ensures that the credential used by this Node to join the fabric can
 /// also authenticate to the local control listener.
 ///
 /// This deliberately creates only the public `_devices` record. It does not bootstrap an
@@ -931,6 +1658,76 @@ fn ensure_node_events_permission(engine: &Engine, credential: &IdentityCredentia
             ),
         );
     }
+}
+
+const FABRIC_DEFAULTS_ID: &str = "defaults";
+
+fn bootstrap_fabric_defaults_if_needed(
+    engine: &Engine,
+    credential: &og_core::access::identity_file::IdentityCredential,
+    published: ServiceCapabilities,
+) -> Result<(), DaemonError> {
+    let query = format!(
+        "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
+        query_string(FABRIC_DEFAULTS_ID),
+    );
+    match execute_request(engine, QueryRequest::new(0, query)) {
+        QueryResponse::Ok { documents, .. } if !documents.is_empty() => return Ok(()),
+        QueryResponse::Ok { .. } => {}
+        QueryResponse::Error { .. } => {}
+    }
+
+    let now = unix_time_millis();
+    let assignments: Vec<JsonValue> = published
+        .names()
+        .into_iter()
+        .filter(|capability| *capability != "auth")
+        .map(|capability| {
+            if capability == "files" {
+                serde_json::json!({
+                    "identityId": &credential.identity_id,
+                    "deviceId": &credential.device_id,
+                    "capability": capability,
+                    "role": "primary",
+                    "serviceRole": "primary",
+                    "storageRole": "provider",
+                    "assignedBy": &credential.identity_id,
+                    "assignedAt": now,
+                })
+            } else {
+                serde_json::json!({
+                    "identityId": &credential.identity_id,
+                    "deviceId": &credential.device_id,
+                    "capability": capability,
+                    "role": "provider",
+                    "assignedBy": &credential.identity_id,
+                    "assignedAt": now,
+                })
+            }
+        })
+        .collect();
+    let encoded = serde_json::to_string(&assignments).expect("fabric defaults serialize");
+    let insert = format!(
+        "on _fabric_resources | insert {{fabricId: {}, resourceAssignments: {encoded}, state: \"active\", createdAt: {now}, updatedAt: {now}}}",
+        query_string(FABRIC_DEFAULTS_ID),
+    );
+    if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
+        return Err(DaemonError::BootstrapFabricResourcesState);
+    }
+    debug::log(
+        DebugTopic::Gateway,
+        None,
+        format!(
+            "seed fabric defaults device={} capabilities={}",
+            credential.device_id,
+            assignments
+                .iter()
+                .filter_map(|assignment| assignment.get("capability").and_then(JsonValue::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+    );
+    Ok(())
 }
 
 fn bootstrap_admin_if_needed( engine: &Engine, configuration: &Configuration, ) -> Result<(), DaemonError> {
@@ -1123,13 +1920,379 @@ fn build_runtime() -> Result<QueryRuntime, DaemonError> {
 #[derive(Debug, Clone)]
 struct GatewayDelegation {
     principal: Principal,
-    place_id: String,
+    place_id: Option<String>,
     capability: String,
     app_instance_id: Option<String>,
     place_role: Option<PlaceRole>,
+    token: Option<String>,
 }
 
-fn serve_connection( connection_id: u64, stream: TcpStream, engine: &Engine, operation_router: &OperationRouter, event_engine: &EventEngine, settings: &ConnectionSettings, delegation: Option<GatewayDelegation>, ) -> Result<(), ConnectionError> {
+#[cfg(feature = "llm")]
+fn llm_run_owner(authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>) -> String {
+    let principal = match authentication.principal() {
+        Principal::Anonymous => "anonymous".to_owned(),
+        Principal::Identity { identity_id, device_id } => format!("{identity_id}/{device_id}"),
+    };
+    match delegation {
+        Some(value) => format!(
+            "{principal}|{}|{}",
+            value.place_id.as_deref().unwrap_or(""),
+            value.app_instance_id.as_deref().unwrap_or("")
+        ),
+        None => principal,
+    }
+}
+
+
+#[cfg(all(feature = "agent", feature = "fabric"))]
+fn connect_delegated_gateway_client(
+    endpoint: &str,
+    token: &str,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<NodeWebSocket, AgentError> {
+    let (mut websocket, _) = websocket_connect(endpoint)
+        .map_err(|error| AgentError::capability("gateway.delegation.open", error.to_string()))?;
+    configure_websocket_timeouts(&mut websocket, read_timeout, write_timeout)
+        .map_err(|error| AgentError::capability("gateway.delegation.open", error.to_string()))?;
+
+    loop {
+        let Some(message) = read_gateway_message(&mut websocket)
+            .map_err(|error| AgentError::capability("gateway.delegation.open", error))?
+        else {
+            return Err(AgentError::capability(
+                "gateway.delegation.open",
+                "Gateway closed before gateway.ready",
+            ));
+        };
+        if message.get("kind").and_then(JsonValue::as_str) == Some("event")
+            && message.get("type").and_then(JsonValue::as_str) == Some("gateway.ready")
+        {
+            break;
+        }
+    }
+
+    let request = OperationRequest::new(
+        RequestId::Number(1),
+        "gateway.delegation.open",
+        serde_json::json!({"token": token}),
+    );
+    let response = gateway_response_for_request(&mut websocket, &request)
+        .map_err(|error| AgentError::capability("gateway.delegation.open", error))?;
+    if let Some(error) = response.get("error") {
+        return Err(AgentError::capability(
+            "gateway.delegation.open",
+            error.to_string(),
+        ));
+    }
+    if response.get("status").and_then(JsonValue::as_str) != Some("ok") {
+        return Err(AgentError::capability(
+            "gateway.delegation.open",
+            "Gateway did not accept the delegated Agent session",
+        ));
+    }
+    Ok(websocket)
+}
+
+#[cfg(all(feature = "agent", feature = "fabric"))]
+fn connect_delegated_gateway_client_any(
+    settings: &ConnectionSettings,
+    token: &str,
+) -> Result<NodeWebSocket, AgentError> {
+    let endpoints = gateway_client_endpoints(settings);
+    if endpoints.is_empty() {
+        return Err(AgentError::capability(
+            "gateway.delegation.open",
+            "Gateway client endpoint is unavailable",
+        ));
+    }
+    let mut last_error = None;
+    for endpoint in endpoints {
+        match connect_delegated_gateway_client(
+            &endpoint,
+            token,
+            settings.read_timeout,
+            settings.write_timeout,
+        ) {
+            Ok(websocket) => return Ok(websocket),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| AgentError::capability(
+        "gateway.delegation.open",
+        "No Gateway accepted the delegated Agent session",
+    )))
+}
+
+#[cfg(feature = "agent")]
+struct LocalAgentInvoker<'a> {
+    settings: &'a ConnectionSettings,
+    engine: Option<&'a Engine>,
+    context: &'a ExecutionContext,
+    owner: String,
+}
+
+#[cfg(feature = "agent")]
+impl fmt::Debug for LocalAgentInvoker<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalAgentInvoker")
+            .field("place_id", &self.context.place_id)
+            .field("app_instance_id", &self.context.app_instance_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "agent")]
+impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
+    fn invoke(
+        &mut self,
+        operation: &str,
+        data: JsonValue,
+    ) -> Result<AgentCapabilityResponse, AgentError> {
+        match operation {
+            "llm.generate" => {
+                #[cfg(feature = "llm")]
+                {
+                    if !self.settings.service_capabilities.contains(ServiceCapability::Llm) {
+                        return Err(AgentError::capability(operation, "local llm capability is disabled"));
+                    }
+                    let service = self.settings.llm_service.as_ref()
+                        .ok_or_else(|| AgentError::capability(operation, "local llm provider is unavailable"))?;
+                    let input = serde_json::from_value(data)
+                        .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                    let mut run = service.schedule(self.owner.clone())
+                        .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                    let run_id = run.run_id();
+                    let mut partials = Vec::new();
+                    let statistics = service.generate(&mut run, &input, |text| {
+                        partials.push(serde_json::json!({
+                            "type":"token",
+                            "runId":run_id,
+                            "text":text,
+                        }));
+                        true
+                    }).map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                    return Ok(AgentCapabilityResponse::stream(
+                        partials,
+                        Some(serde_json::json!({
+                            "runId":run_id,
+                            "promptTokens":statistics.prompt_tokens,
+                            "completionTokens":statistics.completion_tokens,
+                            "elapsedMs":statistics.elapsed_ms,
+                            "finishReason":statistics.finish_reason,
+                        })),
+                    ));
+                }
+                #[cfg(not(feature = "llm"))]
+                {
+                    let _ = data;
+                    Err(AgentError::capability(operation, "ogd was built without the llm feature"))
+                }
+            }
+            "collections.list" => {
+                if !self.settings.service_capabilities.contains(ServiceCapability::Database) {
+                    return Err(AgentError::capability(operation, "local database capability is disabled"));
+                }
+                let engine = self.engine
+                    .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
+                let snapshot = engine.storage().read()
+                    .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                let collections = list_storage_collections(
+                    snapshot.as_ref(),
+                    false,
+                    Some(&self.context.place_id),
+                    self.context.app_instance_id.as_deref(),
+                ).map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                Ok(AgentCapabilityResponse::message(
+                    serde_json::json!({"collections":collections}),
+                ))
+            }
+            "query.execute" => {
+                if !self.settings.service_capabilities.contains(ServiceCapability::Database) {
+                    return Err(AgentError::capability(operation, "local database capability is disabled"));
+                }
+                let engine = self.engine
+                    .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
+                let query = data.get("query").and_then(JsonValue::as_str)
+                    .ok_or_else(|| AgentError::capability(operation, "query is required"))?;
+                if data.get("readOnly").and_then(JsonValue::as_bool) != Some(true) {
+                    return Err(AgentError::capability(operation, "Agent database queries must set readOnly=true"));
+                }
+                let pipeline = parse_pipeline(query)
+                    .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                let plan = og_core::query::Planner::new().plan(&pipeline)
+                    .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                if !plan.is_read_only() {
+                    return Err(AgentError::capability(operation, "read-only Agent query attempted to mutate storage"));
+                }
+                let access = QueryAccess::analyze(query)
+                    .map_err(|error| AgentError::capability(operation, error))?;
+                if access.collection.starts_with('_') {
+                    return Err(AgentError::capability(operation, "Agent queries cannot access system collections"));
+                }
+                match execute_request_scoped(
+                    engine,
+                    QueryRequest::new(0, query),
+                    Some(self.context),
+                ) {
+                    QueryResponse::Ok { documents, statistics, .. } => {
+                        Ok(AgentCapabilityResponse::stream(documents, statistics))
+                    }
+                    QueryResponse::Error { error, .. } => {
+                        Err(AgentError::capability(operation, format!("{}: {}", error.code, error.message)))
+                    }
+                }
+            }
+            "file.list" => {
+                #[cfg(feature = "files")]
+                {
+                    if !self.settings.service_capabilities.contains(ServiceCapability::Files) {
+                        return Err(AgentError::capability(operation, "local files capability is disabled"));
+                    }
+                    let engine = self.engine
+                        .ok_or_else(|| AgentError::capability(operation, "local files database is unavailable"))?;
+                    let instance_id = self.context.app_instance_id.as_deref()
+                        .ok_or_else(|| AgentError::capability(operation, "files.list requires an AppInstance scope"))?;
+                    let parent_id = data.get("parentId").and_then(JsonValue::as_str);
+                    let entries = list_file_entries(
+                        engine,
+                        RequestId::Number(0),
+                        &self.context.place_id,
+                        instance_id,
+                        parent_id,
+                    ).map_err(|response| AgentError::capability(operation, format!("{response:?}")))?;
+                    return Ok(AgentCapabilityResponse::message(JsonValue::Array(entries)));
+                }
+                #[cfg(not(feature = "files"))]
+                {
+                    let _ = data;
+                    Err(AgentError::capability(operation, "ogd was built without the files feature"))
+                }
+            }
+            _ => Err(AgentError::capability(operation, "operation is not exposed to the Agent")),
+        }
+    }
+}
+
+#[cfg(all(feature = "agent", feature = "fabric"))]
+struct GatewayAgentInvoker {
+    websocket: NodeWebSocket,
+    next_id: u64,
+}
+
+#[cfg(all(feature = "agent", feature = "fabric"))]
+impl fmt::Debug for GatewayAgentInvoker {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayAgentInvoker")
+            .field("next_id", &self.next_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(all(feature = "agent", feature = "fabric"))]
+impl GatewayAgentInvoker {
+    fn connect(settings: &ConnectionSettings, token: &str) -> Result<Self, AgentError> {
+        let websocket = connect_delegated_gateway_client_any(settings, token)?;
+        Ok(Self { websocket, next_id: 2 })
+    }
+}
+
+#[cfg(all(feature = "agent", feature = "fabric"))]
+impl AgentCapabilityInvoker for GatewayAgentInvoker {
+    fn invoke(
+        &mut self,
+        operation: &str,
+        data: JsonValue,
+    ) -> Result<AgentCapabilityResponse, AgentError> {
+        let id = RequestId::Number(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
+        let request_id = serde_json::to_value(id)
+            .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+        let request = OperationRequest::new(id, operation, data);
+        let value = serde_json::to_value(&request)
+            .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+        write_gateway_message(&mut self.websocket, &value)
+            .map_err(|error| AgentError::capability(operation, error))?;
+
+        let mut partials = Vec::new();
+        loop {
+            let Some(message) = read_gateway_message(&mut self.websocket)
+                .map_err(|error| AgentError::capability(operation, error))?
+            else {
+                return Err(AgentError::capability(operation, "Gateway closed before capability response completed"));
+            };
+            if message.get("kind").and_then(JsonValue::as_str) != Some("response")
+                || message.get("id") != Some(&request_id)
+            {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                return Err(AgentError::capability(operation, error.to_string()));
+            }
+            match message.get("status").and_then(JsonValue::as_str) {
+                Some("partial") => {
+                    if let Some(data) = message.get("data") {
+                        partials.push(data.clone());
+                    }
+                }
+                Some("complete") => {
+                    return Ok(AgentCapabilityResponse::stream(
+                        partials,
+                        message.get("statistics").cloned().filter(|value| !value.is_null()),
+                    ));
+                }
+                Some("ok") => {
+                    return Ok(AgentCapabilityResponse::message(
+                        message.get("data").cloned().unwrap_or(JsonValue::Null),
+                    ));
+                }
+                Some(other) => {
+                    return Err(AgentError::capability(operation, format!("unexpected Gateway response status {other:?}")));
+                }
+                None => {
+                    return Err(AgentError::capability(operation, "Gateway response has no status"));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
+enum OgdAgentInvoker<'a> {
+    Local(LocalAgentInvoker<'a>),
+    #[cfg(feature = "fabric")]
+    Gateway(GatewayAgentInvoker),
+}
+
+#[cfg(feature = "agent")]
+impl fmt::Debug for OgdAgentInvoker<'_> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local(value) => value.fmt(formatter),
+            #[cfg(feature = "fabric")]
+            Self::Gateway(value) => value.fmt(formatter),
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
+impl AgentCapabilityInvoker for OgdAgentInvoker<'_> {
+    fn invoke(
+        &mut self,
+        operation: &str,
+        data: JsonValue,
+    ) -> Result<AgentCapabilityResponse, AgentError> {
+        match self {
+            Self::Local(value) => value.invoke(operation, data),
+            #[cfg(feature = "fabric")]
+            Self::Gateway(value) => value.invoke(operation, data),
+        }
+    }
+}
+
+fn serve_connection( connection_id: u64, stream: TcpStream, engine: Option<&Engine>, operation_router: &OperationRouter, event_engine: &EventEngine, settings: &ConnectionSettings, delegation: Option<GatewayDelegation>, ) -> Result<(), ConnectionError> {
     stream.set_read_timeout(Some(settings.read_timeout)).map_err(ConnectionError::ConfigureSocket)?;
     stream.set_write_timeout(Some(settings.write_timeout)).map_err(ConnectionError::ConfigureSocket)?;
     stream.set_nodelay(true).map_err(ConnectionError::ConfigureSocket)?;
@@ -1207,6 +2370,32 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: &Engine, ope
                 let authority_request = operation_request.clone();
                 match operation_router.route(operation_request) {
                     Ok(operation) => {
+                        if let Some(delegation) = delegation.as_ref() {
+                            if let Some(provider) = operation.kind().provider_capability() {
+                                let expected_capability =
+                                    if operation.kind().scope() == OperationScope::Authority {
+                                        ServiceCapability::Auth.as_str()
+                                    } else {
+                                        provider.as_str()
+                                    };
+                                if expected_capability != delegation.capability {
+                                    write_response(
+                                        &mut writer,
+                                        &QueryResponse::request_error(
+                                            operation.id(),
+                                            "delegation.capability_mismatch",
+                                            format!(
+                                                "delegated capability {:?} cannot execute operation {:?}; expected {:?}",
+                                                delegation.capability,
+                                                operation.kind().name(),
+                                                expected_capability,
+                                            ),
+                                        ),
+                                    )?;
+                                    continue;
+                                }
+                            }
+                        }
                         if !ensure_routed_static_authorized(
                             &mut writer, settings, engine, authentication.principal(), &operation,
                         )? { continue; }
@@ -1219,18 +2408,30 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: &Engine, ope
                         }
                     match operation.execution_mode() {
                         ExecutionMode::Query => {
-                            if handle_query_operation(&mut writer, settings, engine, event_engine, &authentication, delegation.as_ref(), connection_id, operation, &mut compact)? { continue; }
+                            #[cfg(feature = "database")]
+                            if handle_query_operation(&mut writer, settings, engine.expect("database operation routed without db-engine"), event_engine, &authentication, delegation.as_ref(), connection_id, operation, &mut compact)? { continue; }
+                            #[cfg(not(feature = "database"))]
+                            unreachable!("query operation routed without the database feature");
                         }
                         ExecutionMode::Authentication => {
-                            if handle_authentication_operation(&mut writer, &mut reader, settings, engine, event_engine, &mut authentication, connection_id, &mut subscription, operation)? { continue; }
+                            #[cfg(feature = "auth")]
+                            if handle_authentication_operation(&mut writer, &mut reader, settings, engine.expect("auth operation routed without db-engine"), event_engine, &mut authentication, connection_id, &mut subscription, operation)? { continue; }
+                            #[cfg(not(feature = "auth"))]
+                            unreachable!("authentication operation routed without the auth feature");
                         }
                         ExecutionMode::Subscription => {
+                            #[cfg(feature = "events")]
                             if handle_subscription_operation(&mut writer, &mut reader, settings, event_engine, &authentication, connection_id, &mut subscription, operation)? { continue; }
+                            #[cfg(not(feature = "events"))]
+                            unreachable!("subscription operation routed without the events feature");
                         }
                         ExecutionMode::File => {
+                            #[cfg(any(feature = "files", feature = "data-import"))]
                             if handle_file_operation(&mut writer, &mut reader, settings, engine, &authentication, delegation.as_ref(), operation)? { continue; }
+                            #[cfg(not(any(feature = "files", feature = "data-import")))]
+                            unreachable!("file/binary operation routed without a compiled provider feature");
                         }
-                        ExecutionMode::Standard => handle_standard_operation(&mut writer, settings, engine, &authentication, operation)?,
+                        ExecutionMode::Standard => handle_standard_operation(&mut writer, settings, engine, event_engine, &authentication, delegation.as_ref(), operation)?,
                     }
                     }
                     Err(error) => {
@@ -1297,10 +2498,11 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: &Engine, ope
 
 
 
+#[cfg(feature = "database")]
 fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, event_engine: &EventEngine, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, connection_id: u64, operation: RoutedOperation, compact: &mut bool, ) -> Result<bool, ConnectionError> {
     macro_rules! reject_response { ($response:expr)=>{{write_response(&mut writer,&$response)?;return Ok(true);}}; }
     match operation {
-                            RoutedOperation::QueryExecute(Routed { id, input: QueryExecuteInput { query, context } }) => {
+                            RoutedOperation::QueryExecute(Routed { id, input: QueryExecuteInput { query, context, read_only } }) => {
                             debug::log(
                                 DebugTopic::Query,
                                 Some(connection_id),
@@ -1314,7 +2516,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                 Some(requested) => {
                                     let delegated_context = delegation.and_then(|value| {
                                         if value.capability == "database"
-                                            && value.place_id == requested.place_id
+                                            && value.place_id.as_deref() == Some(requested.place_id.as_str())
                                             && value.app_instance_id.as_deref() == requested.app_instance_id.as_deref()
                                         {
                                             value.place_role.map(|place_role| ExecutionContext {
@@ -1339,6 +2541,32 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                 },
                                 None => None,
                             };
+
+                            if read_only {
+                                let readonly_plan = parse_pipeline(&query)
+                                    .and_then(|pipeline| {
+                                        og_core::query::Planner::new()
+                                            .plan(&pipeline)
+                                            .map_err(|error| QueryTextError::Planning(error.to_string()))
+                                    });
+                                match readonly_plan {
+                                    Ok(plan) if plan.is_read_only() => {}
+                                    Ok(_) => {
+                                        reject_response!(QueryResponse::request_error(
+                                            id,
+                                            "query.read_only_violation",
+                                            "readOnly query attempted to mutate storage",
+                                        ));
+                                    }
+                                    Err(error) => {
+                                        reject_response!(QueryResponse::request_error(
+                                            id,
+                                            "query.invalid",
+                                            error.to_string(),
+                                        ));
+                                    }
+                                }
+                            }
 
                             let analyzed_access = QueryAccess::analyze(&query).ok();
                             let scoped_write_collection = analyzed_access.as_ref()
@@ -1499,6 +2727,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
     Ok(false)
 }
 
+#[cfg(feature = "auth")]
 fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, settings: &ConnectionSettings, engine: &Engine, event_engine: &EventEngine, authentication: &mut ConnectionAuth, connection_id: u64, subscription: &mut Option<EventSubscription>, operation: RoutedOperation, ) -> Result<bool, ConnectionError> {
     macro_rules! reject { ($id:expr,$code:expr,$message:expr)=>{{write_response(&mut writer,&QueryResponse::request_error($id,$code,$message))?;return Ok(true);}}; }
     macro_rules! reject_response { ($response:expr)=>{{write_response(&mut writer,&$response)?;return Ok(true);}}; }
@@ -1770,6 +2999,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
     Ok(false)
 }
 
+#[cfg(feature = "events")]
 fn handle_subscription_operation( mut writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, settings: &ConnectionSettings, event_engine: &EventEngine, authentication: &ConnectionAuth, connection_id: u64, subscription: &mut Option<EventSubscription>, operation: RoutedOperation, ) -> Result<bool, ConnectionError> {
     macro_rules! reply { ($id:expr,$data:expr $(,)?)=>{{write_operation_response(&mut writer,&OperationResponse::new($id,$data))?;}}; }
     match operation {
@@ -1802,14 +3032,24 @@ fn handle_subscription_operation( mut writer: &mut TcpStream, reader: &mut BufRe
     Ok(false)
 }
 
-fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, settings: &ConnectionSettings, engine: &Engine, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, operation: RoutedOperation, ) -> Result<bool, ConnectionError> {
+#[cfg(any(feature = "files", feature = "data-import"))]
+fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<TcpStream>, settings: &ConnectionSettings, engine: Option<&Engine>, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, operation: RoutedOperation, ) -> Result<bool, ConnectionError> {
+    #[cfg(feature = "files")]
+    let engine = engine.expect("files operation routed without db-engine");
     macro_rules! reject { ($id:expr,$code:expr,$message:expr)=>{{write_response(&mut writer,&QueryResponse::request_error($id,$code,$message))?;return Ok(true);}}; }
     macro_rules! reject_response { ($response:expr)=>{{write_response(&mut writer,&$response)?;return Ok(true);}}; }
     macro_rules! or_reject { ($result:expr)=>{{match $result{Ok(value)=>value,Err(response)=>reject_response!(response)}}}; }
     macro_rules! reply { ($id:expr,$data:expr $(,)?)=>{{write_operation_response(&mut writer,&OperationResponse::new($id,$data))?;}}; }
     macro_rules! respond { ($id:expr,$result:expr,$map:expr)=>{{match $result{Ok(value)=>write_operation_response(&mut writer,&OperationResponse::new($id,($map)(value)))?,Err(response)=>write_response(&mut writer,&response)?}}}; }
     macro_rules! ensure_file_access { ($id:expr,$place_id:expr,$instance_id:expr,$write:expr)=>{{
-        let delegated = delegation.is_some_and(|value| value.capability == "files" && value.place_id == *$place_id);
+        let delegated = delegation.is_some_and(|value| {
+            value.capability == "files"
+                && value.place_id.as_deref() == Some($place_id.as_str())
+                && match value.app_instance_id.as_deref() {
+                    Some(instance_id) => instance_id == $instance_id.as_str(),
+                    None => true,
+                }
+        });
         if !delegated {
             if let Err(response)=resolve_file_context(engine,$id,authentication.principal(),!settings.authorization_mode.is_enforced(),$place_id,$instance_id,$write){reject_response!(response);}
         }
@@ -1818,8 +3058,9 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
     macro_rules! file_store_or_reject { ($id:expr,$result:expr)=>{{match $result{Ok(value)=>value,Err(error)=>{write_file_store_error(&mut writer,$id,error)?;return Ok(true);}}}}; }
     macro_rules! sync_runtime_or_reject { ($id:expr)=>{{match settings.file_sync.lock(){Ok(value)=>value,Err(_)=>reject!($id,"file.sync.state_poisoned","Files sync local state is unavailable")}}}; }
     match operation {
+                            #[cfg(feature = "data-import")]
                             RoutedOperation::DataWorkerRun(Routed { id, input: DataWorkerRunInput { place_id, file_name, size, operation, mapping } }) => {
-                            let delegated = delegation.is_some_and(|value| value.capability == "data.import" && value.place_id == place_id);
+                            let delegated = delegation.is_some_and(|value| value.capability == "data.import" && value.place_id.as_deref() == Some(place_id.as_str()));
                             if !delegated {
                                 write_response(&mut writer,&QueryResponse::request_error(id,"authorization.denied","data.worker.run requires a delegated data.import channel"))?;
                                 return Ok(true);
@@ -1844,6 +3085,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             }
                             return Ok(true);
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileRead(Routed { id, input: FileReadInput { place_id, instance_id, file_id, offset, length } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             let file_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
@@ -1863,6 +3105,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             if copied!=bytes{return Err(ConnectionError::Write(io::Error::new(io::ErrorKind::UnexpectedEof,format!("file stream ended after {copied} of {bytes} bytes"))));}
                             writer.flush().map_err(ConnectionError::Write)?;
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileWrite(Routed { id, input: FileWriteInput { place_id, instance_id, file_id, parent_id, name, content_type, size } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let file_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
@@ -1908,10 +3151,12 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 }
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileVersions(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             respond!(id, list_file_versions(engine,id,&place_id,&instance_id,&file_id), |versions| serde_json::json!({"versions":versions}));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileVersionRead(Routed { id, input: FileVersionReadInput { place_id, instance_id, file_id, version_id, offset, length } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             let version=or_reject!(load_file_version(engine,id,&place_id,&instance_id,&file_id,&version_id));
@@ -1928,6 +3173,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             io::copy(&mut source,&mut writer).map_err(ConnectionError::Write)?;
                             writer.flush().map_err(ConnectionError::Write)?;
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileVersionRestore(Routed { id, input: FileVersionInput { place_id, instance_id, file_id, version_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let current=or_reject!(load_file_entry(engine,id,&place_id,&instance_id,&file_id));
@@ -1953,6 +3199,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileVersionDelete(Routed { id, input: FileVersionInput { place_id, instance_id, file_id, version_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let version=or_reject!(load_file_version(engine,id,&place_id,&instance_id,&file_id,&version_id));
@@ -1964,6 +3211,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncConfigGet(Routed { id, .. }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync configuration is local to this node");
@@ -1978,6 +3226,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 }
                             }));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncConfigSet(Routed { id, input: FileSyncConfigSetInput { root } }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync configuration is local to this node");
@@ -2004,6 +3253,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 "config": config,
                             }));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncSelectionSet(Routed { id, input: FileSyncSelectionSetInput { place_id, instance_id, all, folder_ids } }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync selection is local to this node");
@@ -2026,6 +3276,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 "selection": selection,
                             }));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncSelectionRemove(Routed { id, input: FileSyncSelectionRemoveInput { place_id, instance_id } }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync selection is local to this node");
@@ -2047,6 +3298,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 "removed": existed,
                             }));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncStatus(Routed { id, .. }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync status is local to this node");
@@ -2184,6 +3436,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 }
                             }));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncRun(Routed { id, .. }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync execution is local to this node");
@@ -2211,6 +3464,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(error) => reject!(id, "file.sync.run_failed", error),
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileSyncFolders(Routed { id, input: FileListInput { place_id, instance_id, parent_id } }) => {
                             if delegation.is_some() {
                                 reject!(id, "file.sync.local_only", "Files sync folder discovery is local to this node");
@@ -2238,19 +3492,23 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 .collect::<Vec<_>>();
                             reply!(id, JsonValue::Array(folders));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileCapabilities(Routed { id, input: FileScopeInput { place_id, instance_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             let file_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
                             reply!(id, serde_json::to_value(file_store.capabilities()).expect("capabilities serialize"));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileList(Routed { id, input: FileListInput { place_id, instance_id, parent_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             respond!(id, list_file_entries(engine,id,&place_id,&instance_id,parent_id.as_deref()), JsonValue::Array);
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileStat(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             respond!(id, load_file_entry_json(engine,id,&place_id,&instance_id,&file_id), |entry| entry);
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileMkdir(Routed { id, input: FileMkdirInput { place_id, instance_id, parent_id, name } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let file_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
@@ -2275,6 +3533,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(error)=>write_file_store_error(&mut writer,id,error)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileMove(Routed { id, input: FileMoveInput { place_id, instance_id, file_id, parent_id, name } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let file_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
@@ -2301,6 +3560,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(error)=>write_file_store_error(&mut writer,id,error)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileCopy(Routed { id, input: FileMoveInput { place_id, instance_id, file_id, parent_id, name } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let file_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
@@ -2332,6 +3592,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(error)=>write_file_store_error(&mut writer,id,error)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileDelete(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             match trash_file_entry(engine,settings,id,&place_id,&instance_id,&file_id) {
@@ -2346,10 +3607,12 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileTrashList(Routed { id, input: FileScopeInput { place_id, instance_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             respond!(id, list_trashed_file_entries(engine,id,&place_id,&instance_id), |entries| serde_json::json!({"entries":entries}));
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileRestore(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             match restore_file_entry(engine,settings,id,&place_id,&instance_id,&file_id) {
@@ -2364,6 +3627,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileDeletePermanent(Routed { id, input: FileEntryInput { place_id, instance_id, file_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             if !file_is_trashed(engine,id,&place_id,&instance_id,&file_id).unwrap_or(false){
@@ -2375,6 +3639,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 Err(response)=>write_response(&mut writer,&response)?,
                             }
                         }
+                            #[cfg(feature = "files")]
                             RoutedOperation::FileTrashEmpty(Routed { id, input: FileScopeInput { place_id, instance_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let entries=or_reject!(list_trashed_file_entries(engine,id,&place_id,&instance_id));
@@ -2396,8 +3661,14 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
     Ok(false)
 }
 
-fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, authentication: &ConnectionAuth, operation: RoutedOperation, ) -> Result<(), ConnectionError> {
-    macro_rules! reject { ($id:expr,$code:expr,$message:expr)=>{{write_response(writer,&QueryResponse::request_error($id,$code,$message))?;return Ok(());}}; }
+fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionSettings, engine: Option<&Engine>, event_engine: &EventEngine, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, operation: RoutedOperation, ) -> Result<(), ConnectionError> {
+    #[cfg(feature = "db-engine")]
+    let engine = engine.expect("database-backed operation routed without db-engine");
+    #[cfg(all(feature = "agent", feature = "db-engine"))]
+    let agent_engine = Some(engine);
+    #[cfg(all(feature = "agent", not(feature = "db-engine")))]
+    let agent_engine = engine;
+    macro_rules! reject { ($id:expr,$code:expr,$message:expr $(,)?)=>{{write_response(writer,&QueryResponse::request_error($id,$code,$message))?;return Ok(());}}; }
     macro_rules! reject_response { ($response:expr)=>{{write_response(writer,&$response)?;return Ok(());}}; }
     macro_rules! identity_or_reject { ($id:expr,$message:expr)=>{{let Some(identity_id)=require_identity(writer,authentication.principal(),$id,$message)? else {return Ok(());};identity_id}}; }
     macro_rules! reply { ($id:expr,$data:expr $(,)?)=>{{write_operation_response(writer,&OperationResponse::new($id,$data))?;}}; }
@@ -2415,37 +3686,385 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
     match operation.handler() {
                             HandlerKind::Core => match operation {
                                 RoutedOperation::CoreHealth(Routed { id, .. }) => {
-                                reply!(id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), }),);
+                                reply!(id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), "compiledCapabilities": ServiceCapabilities::compiled().names(), "buildFeatures": build_profile::feature_names(), }),);
                             }
                                 RoutedOperation::CoreOperations(Routed { id, .. }) => {
                                 let operations = OPERATION_CATALOG
                                     .iter()
-                                    .filter(|operation| settings.service_capabilities.contains_all(operation.kind.required_capabilities()))
+                                    .filter(|operation| operation.kind.is_compiled() && settings.service_capabilities.contains_all(operation.kind.required_capabilities()))
                                     .map(|operation| serde_json::json!({
                                         "name": operation.name,
+                                        "capability": operation.kind.provider_capability().map(ServiceCapability::as_str),
                                         "transport": operation.transport.as_str(),
                                         "connection": operation.connection.as_str(),
                                     }))
                                     .collect::<Vec<_>>();
                                 reply!(id, serde_json::json!({ "operations": operations }),);
                             }
+                                RoutedOperation::FabricResourceList(Routed { id, .. }) => {
+                                #[cfg(feature = "db-engine")]
+                                {
+                                let _identity_id = identity_or_reject!(id, "an authenticated identity is required to inspect Fabric defaults");
+                                let assignments = or_reject!(load_fabric_defaults(engine, id));
+                                let eligible_devices = active_devices_for_assignments(engine, id, &assignments);
+                                let can_manage = !settings.authorization_mode.is_enforced()
+                                    || authorize_connection(engine, authentication.principal(), AuthorizationAction::FabricManage, "_fabric_resources");
+                                reply!(id, serde_json::json!({
+                                    "fabricId": FABRIC_DEFAULTS_ID,
+                                    "assignments": assignments,
+                                    "eligibleDevices": eligible_devices,
+                                    "canManage": can_manage,
+                                }));
+                                }
+                                #[cfg(not(feature = "db-engine"))]
+                                unreachable!("fabric resource authority requires db-engine");
+                            }
+                                RoutedOperation::FabricResourceSet(Routed { id, input: FabricResourceSetInput { identity_id: node_identity_id, device_id: node_device_id, capability, role, service_role, storage_role } }) => {
+                                #[cfg(feature = "db-engine")]
+                                {
+                                let assigned_by = identity_or_reject!(id, "an authenticated identity is required to manage Fabric defaults");
+                                if !valid_resource_capability(&capability) {
+                                    reject!(id, "fabric.resource.invalid_capability", "invalid resource capability");
+                                }
+                                if capability == "auth" {
+                                    reject!(id, "fabric.resource.auth_reserved", "auth authorities are managed by Fabric trust and cannot be configured as a resource default");
+                                }
+                                let _node_device = or_reject!(load_device_credential(engine, id, &node_identity_id, &node_device_id));
+                                let current = or_reject!(load_fabric_defaults(engine, id));
+                                let assignments = match upsert_resource_assignment(
+                                    current, assigned_by, &node_identity_id, &node_device_id, &capability,
+                                    role.as_deref(), service_role.as_deref(), storage_role.as_deref(),
+                                ) {
+                                    Ok(assignments) => assignments,
+                                    Err(error) => reject!(id, format!("fabric.{}", error.code), error.message),
+                                };
+                                or_reject!(save_fabric_defaults(engine, id, &assignments));
+                                publish_durable_event(engine, Audience::Global, "fabric.resources.updated", serde_json::json!({"fabricId": FABRIC_DEFAULTS_ID, "capability": capability}));
+                                reply!(id, serde_json::json!({ "fabricId": FABRIC_DEFAULTS_ID, "assignments": assignments }));
+                                }
+                                #[cfg(not(feature = "db-engine"))]
+                                unreachable!("fabric resource authority requires db-engine");
+                            }
+                                RoutedOperation::FabricResourceRemove(Routed { id, input: FabricResourceRemoveInput { identity_id: node_identity_id, device_id: node_device_id, capability } }) => {
+                                #[cfg(feature = "db-engine")]
+                                {
+                                let _assigned_by = identity_or_reject!(id, "an authenticated identity is required to manage Fabric defaults");
+                                if capability == "auth" {
+                                    reject!(id, "fabric.resource.auth_reserved", "auth authorities are managed by Fabric trust and cannot be configured as a resource default");
+                                }
+                                let current = or_reject!(load_fabric_defaults(engine, id));
+                                let assignments = remove_resource_assignment(current, &node_identity_id, &node_device_id, &capability);
+                                or_reject!(save_fabric_defaults(engine, id, &assignments));
+                                publish_durable_event(engine, Audience::Global, "fabric.resources.updated", serde_json::json!({"fabricId": FABRIC_DEFAULTS_ID, "capability": capability}));
+                                reply!(id, serde_json::json!({ "fabricId": FABRIC_DEFAULTS_ID, "assignments": assignments }));
+                                }
+                                #[cfg(not(feature = "db-engine"))]
+                                unreachable!("fabric resource authority requires db-engine");
+                            }
                                 RoutedOperation::NodeStatus(Routed { id, .. }) => {
                                 let state = *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                                reply!(id, serde_json::json!({ "upstream": settings.upstream.as_deref(), "state": state }),);
+                                reply!(id, serde_json::json!({ "upstream": settings.upstream.as_deref(), "state": state, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), "compiledCapabilities": ServiceCapabilities::compiled().names(), "buildFeatures": build_profile::feature_names(), }),);
                             }
                                 RoutedOperation::Ping(Routed { id, .. }) => {
                                 reply!(id, serde_json::json!({ "data": "pong", "version": PROTOCOL_VERSION, }),);
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            HandlerKind::Llm => match operation {
+                                RoutedOperation::LlmStatus(Routed { id, .. }) => {
+                                    #[cfg(feature = "llm")]
+                                    {
+                                        let service = settings.llm_service.as_ref()
+                                            .expect("llm operation routed without an enabled llm provider");
+                                        reply!(id, serde_json::to_value(service.status())
+                                            .expect("llm status serializes"));
+                                    }
+                                    #[cfg(not(feature = "llm"))]
+                                    unreachable!("llm operation routed without a compiled llm provider");
+                                }
+                                RoutedOperation::LlmGenerate(Routed { id, input }) => {
+                                    #[cfg(feature = "llm")]
+                                    {
+                                        let service = settings.llm_service.as_ref()
+                                            .expect("llm operation routed without an enabled llm provider");
+                                        let owner = llm_run_owner(&authentication, delegation);
+                                        match service.schedule(owner) {
+                                            Ok(mut run) => {
+                                                let run_id = run.run_id();
+                                                write_stream_response(
+                                                    writer,
+                                                    &StreamResponse::partial(
+                                                        id,
+                                                        serde_json::json!({
+                                                            "type": "run",
+                                                            "runId": run_id,
+                                                            "state": run.initial_state(),
+                                                        }),
+                                                    ),
+                                                )?;
+                                                let mut stream_error = None;
+                                                match service.generate(&mut run, &input, |text| {
+                                                    let response = StreamResponse::partial(
+                                                        id,
+                                                        serde_json::json!({
+                                                            "type":"token",
+                                                            "runId":run_id,
+                                                            "text":text
+                                                        }),
+                                                    );
+                                                    match write_stream_response(writer, &response) {
+                                                        Ok(()) => true,
+                                                        Err(error) => {
+                                                            stream_error = Some(error);
+                                                            false
+                                                        }
+                                                    }
+                                                }) {
+                                                    Ok(statistics) => {
+                                                        if let Some(error) = stream_error { return Err(error); }
+                                                        write_stream_response(
+                                                            writer,
+                                                            &StreamResponse::complete(
+                                                                id,
+                                                                Some(serde_json::json!({
+                                                                    "runId": run_id,
+                                                                    "promptTokens": statistics.prompt_tokens,
+                                                                    "completionTokens": statistics.completion_tokens,
+                                                                    "elapsedMs": statistics.elapsed_ms,
+                                                                    "finishReason": statistics.finish_reason,
+                                                                })),
+                                                            ),
+                                                        )?;
+                                                    }
+                                                    Err(error) => {
+                                                        if let Some(error) = stream_error { return Err(error); }
+                                                        write_stream_response(
+                                                            writer,
+                                                            &StreamResponse::error(
+                                                                Some(id),
+                                                                WireError::new(error.code(), error.to_string()),
+                                                            ),
+                                                        )?;
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => {
+                                                write_stream_response(
+                                                    writer,
+                                                    &StreamResponse::error(
+                                                        Some(id),
+                                                        WireError::new(error.code(), error.to_string()),
+                                                    ),
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                    #[cfg(not(feature = "llm"))]
+                                    unreachable!("llm operation routed without a compiled llm provider");
+                                }
+                                RoutedOperation::LlmCancel(Routed { id, input }) => {
+                                    #[cfg(feature = "llm")]
+                                    {
+                                        let service = settings.llm_service.as_ref()
+                                            .expect("llm operation routed without an enabled llm provider");
+                                        let owner = llm_run_owner(&authentication, delegation);
+                                        let cancelled = service.cancel(input.run_id, &owner);
+                                        reply!(id, serde_json::json!({
+                                            "runId": input.run_id,
+                                            "cancelled": cancelled,
+                                        }));
+                                    }
+                                    #[cfg(not(feature = "llm"))]
+                                    unreachable!("llm operation routed without a compiled llm provider");
+                                }
+                                _ => unreachable!("handler domain and routed variant diverged"),
+                            },
+                            HandlerKind::Agent => match operation {
+                                RoutedOperation::AgentStatus(Routed { id, .. }) => {
+                                    #[cfg(feature = "agent")]
+                                    {
+                                        let service = settings.agent_service.as_ref()
+                                            .expect("agent operation routed without an enabled agent provider");
+                                        reply!(id, serde_json::to_value(service.status())
+                                            .expect("agent status serializes"));
+                                    }
+                                    #[cfg(not(feature = "agent"))]
+                                    unreachable!("agent operation routed without a compiled agent provider");
+                                }
+                                RoutedOperation::AgentRun(Routed { id, input }) => {
+                                    #[cfg(feature = "agent")]
+                                    {
+                                        let service = settings.agent_service.as_ref()
+                                            .expect("agent operation routed without an enabled agent provider");
+                                        let requested = &input.context;
+                                        let execution_context = if let Some(delegated) = delegation {
+                                            if delegated.capability != "agent"
+                                                || delegated.place_id.as_deref() != Some(requested.place_id.as_str())
+                                                || delegated.app_instance_id.as_deref() != requested.app_instance_id.as_deref()
+                                            {
+                                                reject!(
+                                                    id,
+                                                    "agent.context_mismatch",
+                                                    "agent.run context does not match the Gateway delegation",
+                                                );
+                                            }
+                                            let Some(place_role) = delegated.place_role else {
+                                                reject!(
+                                                    id,
+                                                    "agent.context_missing_role",
+                                                    "agent.run requires a delegated Place role",
+                                                );
+                                            };
+                                            ExecutionContext {
+                                                principal: delegated.principal.clone(),
+                                                place_id: requested.place_id.clone(),
+                                                app_instance_id: requested.app_instance_id.clone(),
+                                                place_role,
+                                                public_access: None,
+                                            }
+                                        } else {
+                                            let Some(engine) = agent_engine else {
+                                                reject!(
+                                                    id,
+                                                    "agent.context_unavailable",
+                                                    "standalone agent.run requires a local database engine to validate its execution context",
+                                                );
+                                            };
+                                            match resolve_query_execution_context(
+                                                engine,
+                                                id,
+                                                authentication.principal(),
+                                                requested.clone(),
+                                                !settings.authorization_mode.is_enforced(),
+                                            ) {
+                                                Ok(context) => context,
+                                                Err(response) => reject_response!(response),
+                                            }
+                                        };
+
+                                        let mut invoker = if let Some(delegated) = delegation {
+                                            let Some(token) = delegated.token.as_deref() else {
+                                                reject!(
+                                                    id,
+                                                    "agent.gateway_delegation_missing",
+                                                    "Gateway did not provide an Agent sub-call delegation token",
+                                                );
+                                            };
+                                            #[cfg(feature = "fabric")]
+                                            {
+                                                match GatewayAgentInvoker::connect(settings, token) {
+                                                    Ok(invoker) => OgdAgentInvoker::Gateway(invoker),
+                                                    Err(error) => {
+                                                        write_stream_response(
+                                                            writer,
+                                                            &StreamResponse::error(
+                                                                Some(id),
+                                                                WireError::new(error.code(), error.to_string()),
+                                                            ),
+                                                        )?;
+                                                        return Ok(());
+                                                    }
+                                                }
+                                            }
+                                            #[cfg(not(feature = "fabric"))]
+                                            unreachable!("Gateway-delegated agent.run requires the fabric feature");
+                                        } else {
+                                            let principal = match authentication.principal() {
+                                                Principal::Anonymous => "anonymous".to_owned(),
+                                                Principal::Identity { identity_id, device_id } => {
+                                                    format!("{identity_id}/{device_id}")
+                                                }
+                                            };
+                                            let owner = format!(
+                                                "agent:{principal}|{}|{}",
+                                                execution_context.place_id,
+                                                execution_context.app_instance_id.as_deref().unwrap_or(""),
+                                            );
+                                            OgdAgentInvoker::Local(LocalAgentInvoker {
+                                                settings,
+                                                engine: agent_engine,
+                                                context: &execution_context,
+                                                owner,
+                                            })
+                                        };
+
+                                        write_stream_response(
+                                            writer,
+                                            &StreamResponse::partial(
+                                                id,
+                                                serde_json::json!({
+                                                    "type":"run",
+                                                    "state":"running",
+                                                    "stateless":true,
+                                                }),
+                                            ),
+                                        )?;
+                                        let mut stream_error = None;
+                                        match service.run(&input, &mut invoker, |event| {
+                                            match write_stream_response(
+                                                writer,
+                                                &StreamResponse::partial(id, event),
+                                            ) {
+                                                Ok(()) => true,
+                                                Err(error) => {
+                                                    stream_error = Some(error);
+                                                    false
+                                                }
+                                            }
+                                        }) {
+                                            Ok(statistics) => {
+                                                if let Some(error) = stream_error {
+                                                    return Err(error);
+                                                }
+                                                write_stream_response(
+                                                    writer,
+                                                    &StreamResponse::complete(
+                                                        id,
+                                                        Some(serde_json::to_value(statistics)
+                                                            .expect("agent statistics serialize")),
+                                                    ),
+                                                )?;
+                                            }
+                                            Err(error) => {
+                                                if let Some(error) = stream_error {
+                                                    return Err(error);
+                                                }
+                                                write_stream_response(
+                                                    writer,
+                                                    &StreamResponse::error(
+                                                        Some(id),
+                                                        WireError::new(error.code(), error.to_string()),
+                                                    ),
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                    #[cfg(not(feature = "agent"))]
+                                    unreachable!("agent operation routed without a compiled agent provider");
+                                }
+                                _ => unreachable!("handler domain and routed variant diverged"),
+                            },
+                            #[cfg(feature = "database")]
                             HandlerKind::Collections => match operation {
-                                RoutedOperation::CollectionsList(Routed { id, input: CollectionsListInput { stats, place_id } }) => {
+                                RoutedOperation::CollectionsList(Routed { id, input: CollectionsListInput { stats, place_id, app_instance_id } }) => {
                                 if let Some(place_id) = place_id.as_deref() {
-                                    let place = or_reject!(load_place(engine, id, place_id));
-                                    or_reject!(resolve_place_access_for_principal(
-                                        engine, id, authentication.principal(), &place,
-                                        !settings.authorization_mode.is_enforced(),
-                                    ));
+                                    let delegated = delegation.is_some_and(|value| {
+                                        value.capability == "database"
+                                            && value.place_id.as_deref() == Some(place_id)
+                                            && value.app_instance_id.as_deref() == app_instance_id.as_deref()
+                                    });
+                                    if !delegated {
+                                        or_reject!(resolve_query_execution_context(
+                                            engine,
+                                            id,
+                                            authentication.principal(),
+                                            RequestedExecutionContext {
+                                                place_id: place_id.to_owned(),
+                                                app_instance_id: app_instance_id.clone(),
+                                            },
+                                            !settings.authorization_mode.is_enforced(),
+                                        ));
+                                    }
                                 } else {
                                     authorize_resource_or_reject!(id, OperationKind::CollectionsList, "*");
                                 }
@@ -2457,7 +4076,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     }
                                 };
                                 let collections = match list_storage_collections(
-                                    snapshot.as_ref(), stats, place_id.as_deref(),
+                                    snapshot.as_ref(), stats, place_id.as_deref(), app_instance_id.as_deref(),
                                 ) {
                                     Ok(collections) => collections,
                                     Err(error) => reject!(id, "collections.failed", error.to_string()),
@@ -2466,6 +4085,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "database")]
                             HandlerKind::Storage => match operation {
                                 RoutedOperation::StorageStats(Routed { id, .. }) => {
 
@@ -2517,6 +4137,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "database")]
                             HandlerKind::Backup => match operation {
                                 RoutedOperation::BackupCreate(Routed { id, input: BackupNameInput { name } }) => {
                                 let Some(path) = backup_file_path(&settings.backup_path, &name) else {
@@ -2585,6 +4206,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "auth")]
                             HandlerKind::Identity => match operation {
                                 RoutedOperation::IdentityRegister(Routed { id, input: IdentityRegisterInput { identity_id, public_key, algorithm, encoding, created_at } }) => {
                                 let created_at = created_at.unwrap_or_else(unix_time_millis);
@@ -2593,6 +4215,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "auth")]
                             HandlerKind::Device => match operation {
                                 RoutedOperation::DeviceList(Routed { id, .. }) => {
                                 let (identity_id, current_device_id) = authenticated_device_or_reject!(id, "authentication is required");
@@ -2662,15 +4285,33 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     return Ok(());
                                 }
                                 let revoked_at = revoked_at.unwrap_or_else(unix_time_millis);
-                                let identity_filter = self_identity.map(|identity_id| format!(" and identityId == {}", query_string(identity_id))).unwrap_or_default();
+                                let identity_filter = if self_owned {
+                                    self_identity
+                                        .map(|identity_id| format!(" and identityId == {}", query_string(identity_id)))
+                                        .unwrap_or_default()
+                                } else {
+                                    String::new()
+                                };
                                 let query = format!( "on _devices | where deviceId == {}{} | set state = \"revoked\", revokedAt = {revoked_at}", query_string(&device_id), identity_filter, );
-                                let audience = self_identity
-                                    .map(|identity_id| Audience::identities([identity_id.to_owned()]))
-                                    .unwrap_or(Audience::Global);
-                                execute_query_publish!( id, query, audience, "device.revoked", serde_json::json!({"deviceId": device_id, "revokedAt": revoked_at}), );
+                                let audience = if self_owned {
+                                    self_identity
+                                        .map(|identity_id| Audience::identities([identity_id.to_owned()]))
+                                        .unwrap_or(Audience::Global)
+                                } else {
+                                    Audience::Global
+                                };
+                                let payload = serde_json::json!({"deviceId": device_id, "revokedAt": revoked_at});
+                                let response = execute_request(engine, QueryRequest::new(id, query));
+                                let ok = response.is_ok();
+                                write_response(writer, &response)?;
+                                if ok {
+                                    publish_durable_event(engine, audience, "device.revoked", payload.clone());
+                                    event_engine.publish_global("fabric.device.revoked", payload);
+                                }
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "database")]
                             HandlerKind::Permission => match operation {
                                 RoutedOperation::PermissionGrant(Routed { id, input: PermissionGrantInput { identity_id, action, resource, created_at }, }) => {
                                 let created_at = created_at.unwrap_or_else(unix_time_millis);
@@ -2684,6 +4325,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "database")]
                             HandlerKind::Sharing => match operation {
                                 RoutedOperation::SharingCreate(Routed { id, input: SharingCreateInput { sharing_id, owner, target, permissions, state, created_at }, }) => {
                                 let created_at = created_at.unwrap_or_else(unix_time_millis);
@@ -2718,6 +4360,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "database")]
                             HandlerKind::Place => match operation {
                                 RoutedOperation::PlaceCreate(Routed { id, input: PlaceCreateInput { name, mood, public_access, created_at }, }) => {
                                 let owner_identity_id = identity_or_reject!(id, "an authenticated identity is required to create a Place");
@@ -2889,15 +4532,22 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 }
                                 let mut eligible_devices = Vec::new();
                                 for identity in &eligible_identity_ids {
-                                    let query = format!("on _devices | where identityId == {} and state == \"active\" | select identityId, deviceId | sort deviceId", query_string(identity));
+                                    let query = format!("on _devices | where identityId == {} and state == \"active\" | select identityId, deviceId, publicKey | sort deviceId", query_string(identity));
                                     if let QueryResponse::Ok { documents, .. } = execute_request(engine, QueryRequest::new(id, query)) {
                                         eligible_devices.extend(documents);
                                     }
                                 }
+                                let fabric_defaults = or_reject!(load_fabric_defaults(engine, id));
+                                let fabric_default_devices = active_devices_for_assignments(engine, id, &fabric_defaults);
+                                let fabric_can_manage = !settings.authorization_mode.is_enforced()
+                                    || authorize_connection(engine, authentication.principal(), AuthorizationAction::FabricManage, "_fabric_resources");
                                 reply!(id, serde_json::json!({
                                     "placeId": place_id,
                                     "assignments": place.resource_assignments,
                                     "eligibleDevices": eligible_devices,
+                                    "fabricDefaults": fabric_defaults,
+                                    "fabricDefaultDevices": fabric_default_devices,
+                                    "fabricCanManage": fabric_can_manage,
                                 }));
                             }
                             RoutedOperation::PlaceResourceSet(Routed { id, input: PlaceResourceSetInput { place_id, identity_id: node_identity_id, device_id: node_device_id, capability, role, service_role, storage_role } }) => {
@@ -2910,101 +4560,20 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 // A resource Node is a concrete registered Device of that Identity.
                                 // Loading the credential validates both ownership and active device state.
                                 let _node_device = or_reject!(load_device_credential(engine, id, &node_identity_id, &node_device_id));
-                                if !valid_resource_capability(&capability) {
+                                if capability == "auth" {
+                                    reject!(id, "place.resource.auth_fabric_level", "auth is fabric-level and cannot be assigned to a Place");
+                                }
+                                if !place_resource_capability_allowed(&capability) {
                                     reject!(id, "place.resource.invalid_capability", "invalid resource capability");
                                 }
 
-                                let mut assignments = place.resource_assignments.clone();
-                                let existing = assignments.iter().find(|entry| {
-                                    let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(node_identity_id.as_str());
-                                    let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-                                    let same_device = stored_device.is_none() || stored_device == Some(node_device_id.as_str());
-                                    same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability.as_str())
-                                }).cloned();
-
-                                assignments.retain(|entry| {
-                                    let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(node_identity_id.as_str());
-                                    let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-                                    let same_device = stored_device.is_none() || stored_device == Some(node_device_id.as_str());
-                                    !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability.as_str()))
-                                });
-
-                                if capability == "files" {
-                                    let mut next_service_role = existing.as_ref().and_then(resource_assignment_service_role).map(str::to_owned);
-                                    let mut next_storage_role = existing.as_ref().and_then(resource_assignment_storage_role).map(str::to_owned);
-
-                                    if let Some(role) = role.as_deref() {
-                                        match role {
-                                            "primary" | "replica" => next_service_role = Some(role.to_owned()),
-                                            "provider" | "sync" => next_storage_role = Some(role.to_owned()),
-                                            _ => reject!(id, "place.resource.invalid_role", "files role must be primary, replica, provider or sync"),
-                                        }
-                                    }
-
-                                    if let Some(service_role) = service_role.as_deref() {
-                                        match service_role {
-                                            "none" => next_service_role = None,
-                                            "primary" | "replica" => next_service_role = Some(service_role.to_owned()),
-                                            _ => reject!(id, "place.resource.invalid_service_role", "files serviceRole must be none, primary or replica"),
-                                        }
-                                    }
-
-                                    if let Some(storage_role) = storage_role.as_deref() {
-                                        match storage_role {
-                                            "none" => next_storage_role = None,
-                                            "provider" | "sync" => next_storage_role = Some(storage_role.to_owned()),
-                                            _ => reject!(id, "place.resource.invalid_storage_role", "files storageRole must be none, provider or sync"),
-                                        }
-                                    }
-
-                                    if next_service_role.as_deref() == Some("primary") {
-                                        assignments.retain(|entry| {
-                                            entry.get("capability").and_then(JsonValue::as_str) != Some("files")
-                                                || resource_assignment_service_role(entry) != Some("primary")
-                                        });
-                                    }
-
-                                    if next_service_role.is_some() || next_storage_role.is_some() {
-                                        let compatibility_role = next_service_role.as_deref()
-                                            .or(next_storage_role.as_deref())
-                                            .expect("files assignment has at least one role");
-                                        assignments.push(serde_json::json!({
-                                            "identityId": node_identity_id,
-                                            "deviceId": node_device_id,
-                                            "capability": capability,
-                                            "role": compatibility_role,
-                                            "serviceRole": next_service_role,
-                                            "storageRole": next_storage_role,
-                                            "assignedBy": owner_identity_id,
-                                            "assignedAt": unix_time_millis(),
-                                        }));
-                                    }
-                                } else {
-                                    if service_role.is_some() || storage_role.is_some() {
-                                        reject!(id, "place.resource.invalid_role_dimensions", "serviceRole and storageRole are only supported for files");
-                                    }
-                                    let Some(role) = role.as_deref() else {
-                                        reject!(id, "place.resource.role_required", "role is required for non-files resources");
-                                    };
-                                    if !matches!(role, "primary" | "replica" | "provider") {
-                                        reject!(id, "place.resource.invalid_role", "resource role must be primary, replica or provider");
-                                    }
-                                    if role == "primary" {
-                                        assignments.retain(|entry| {
-                                            entry.get("capability").and_then(JsonValue::as_str) != Some(capability.as_str())
-                                                || entry.get("role").and_then(JsonValue::as_str) != Some("primary")
-                                        });
-                                    }
-                                    assignments.push(serde_json::json!({
-                                        "identityId": node_identity_id,
-                                        "deviceId": node_device_id,
-                                        "capability": capability,
-                                        "role": role,
-                                        "assignedBy": owner_identity_id,
-                                        "assignedAt": unix_time_millis(),
-                                    }));
-                                }
-
+                                let assignments = match upsert_resource_assignment(
+                                    place.resource_assignments.clone(), owner_identity_id, &node_identity_id, &node_device_id, &capability,
+                                    role.as_deref(), service_role.as_deref(), storage_role.as_deref(),
+                                ) {
+                                    Ok(assignments) => assignments,
+                                    Err(error) => reject!(id, format!("place.{}", error.code), error.message),
+                                };
                                 let encoded = serde_json::to_string(&assignments).expect("resource assignments serialize");
                                 execute_query_or_reject!(id, format!(
                                     "on _places | where placeId == {} and state == \"active\" | set resourceAssignments = {}, updatedAt = {}",
@@ -3018,13 +4587,9 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 let owner_identity_id = identity_or_reject!(id, "an authenticated identity is required to manage Place resources");
                                 let place = or_reject!(load_place(engine, id, &place_id));
                                 place_owner_or_reject!(id, owner_identity_id, &place, "only a Place Owner may remove resource assignments");
-                                let mut assignments = place.resource_assignments.clone();
-                                assignments.retain(|entry| {
-                                    let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(node_identity_id.as_str());
-                                    let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-                                    let same_device = stored_device.is_none() || stored_device == Some(node_device_id.as_str());
-                                    !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability.as_str()))
-                                });
+                                let assignments = remove_resource_assignment(
+                                    place.resource_assignments.clone(), &node_identity_id, &node_device_id, &capability,
+                                );
                                 let encoded = serde_json::to_string(&assignments).expect("resource assignments serialize");
                                 execute_query_or_reject!(id, format!(
                                     "on _places | where placeId == {} and state == \"active\" | set resourceAssignments = {}, updatedAt = {}",
@@ -3036,6 +4601,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 _ => unreachable!("handler domain and routed variant diverged"),
                             },
+                            #[cfg(feature = "database")]
                             HandlerKind::App => match operation {
                             RoutedOperation::QueryContextResolve(Routed { id, input: QueryContextResolveInput { place_id, app_instance_id } }) => {
                                 let context = match resolve_query_execution_context(
@@ -3286,7 +4852,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     }
                                     let mode=mode.as_deref().or_else(||mapping.get("import").and_then(|v|v.get("mode")).and_then(JsonValue::as_str)).unwrap_or("append");
 
-                                    // In Gateway fabric mode the master is the control plane only. It
+                                    // In Gateway fabric mode the authority Core is the control plane only. It
                                     // authorizes Place/AppInstance/table here, but the Gateway executes
                                     // the resulting scoped mutations on the selected database provider.
                                     if plan_only {
@@ -3359,6 +4925,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
     Ok(())
 }
 
+#[cfg(any(feature = "events", test))]
 fn ensure_authenticated_keepalive_type(types: &mut Vec<String>) {
     if !types
         .iter()
@@ -3486,6 +5053,10 @@ fn valid_resource_capability(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+fn place_resource_capability_allowed(value: &str) -> bool {
+    valid_resource_capability(value) && value != "auth"
+}
+
 
 fn resource_assignment_service_role(entry: &JsonValue) -> Option<&str> {
     if let Some(role) = entry.get("serviceRole").and_then(JsonValue::as_str) {
@@ -3511,6 +5082,190 @@ fn resource_assignment_storage_role(entry: &JsonValue) -> Option<&str> {
         Some(role @ ("provider" | "sync")) => Some(role),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResourceAssignmentError {
+    code: &'static str,
+    message: &'static str,
+}
+
+fn upsert_resource_assignment(
+    mut assignments: Vec<JsonValue>,
+    assigned_by: &str,
+    identity_id: &str,
+    device_id: &str,
+    capability: &str,
+    role: Option<&str>,
+    service_role: Option<&str>,
+    storage_role: Option<&str>,
+) -> Result<Vec<JsonValue>, ResourceAssignmentError> {
+    let existing = assignments.iter().find(|entry| {
+        let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
+        let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
+        let same_device = stored_device.is_none() || stored_device == Some(device_id);
+        same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability)
+    }).cloned();
+
+    assignments.retain(|entry| {
+        let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
+        let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
+        let same_device = stored_device.is_none() || stored_device == Some(device_id);
+        !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability))
+    });
+
+    if capability == "files" {
+        let mut next_service_role = existing.as_ref().and_then(resource_assignment_service_role).map(str::to_owned);
+        let mut next_storage_role = existing.as_ref().and_then(resource_assignment_storage_role).map(str::to_owned);
+
+        if let Some(role) = role {
+            match role {
+                "primary" | "replica" => next_service_role = Some(role.to_owned()),
+                "provider" | "sync" => next_storage_role = Some(role.to_owned()),
+                _ => return Err(ResourceAssignmentError { code: "resource.invalid_role", message: "files role must be primary, replica, provider or sync" }),
+            }
+        }
+        if let Some(service_role) = service_role {
+            match service_role {
+                "none" => next_service_role = None,
+                "primary" | "replica" => next_service_role = Some(service_role.to_owned()),
+                _ => return Err(ResourceAssignmentError { code: "resource.invalid_service_role", message: "files serviceRole must be none, primary or replica" }),
+            }
+        }
+        if let Some(storage_role) = storage_role {
+            match storage_role {
+                "none" => next_storage_role = None,
+                "provider" | "sync" => next_storage_role = Some(storage_role.to_owned()),
+                _ => return Err(ResourceAssignmentError { code: "resource.invalid_storage_role", message: "files storageRole must be none, provider or sync" }),
+            }
+        }
+        if next_service_role.as_deref() == Some("primary") {
+            assignments.retain(|entry| {
+                entry.get("capability").and_then(JsonValue::as_str) != Some("files")
+                    || resource_assignment_service_role(entry) != Some("primary")
+            });
+        }
+        if next_service_role.is_some() || next_storage_role.is_some() {
+            let compatibility_role = next_service_role.as_deref()
+                .or(next_storage_role.as_deref())
+                .expect("files assignment has at least one role");
+            assignments.push(serde_json::json!({
+                "identityId": identity_id,
+                "deviceId": device_id,
+                "capability": capability,
+                "role": compatibility_role,
+                "serviceRole": next_service_role,
+                "storageRole": next_storage_role,
+                "assignedBy": assigned_by,
+                "assignedAt": unix_time_millis(),
+            }));
+        }
+        return Ok(assignments);
+    }
+
+    if service_role.is_some() || storage_role.is_some() {
+        return Err(ResourceAssignmentError { code: "resource.invalid_role_dimensions", message: "serviceRole and storageRole are only supported for files" });
+    }
+    let Some(role) = role else {
+        return Err(ResourceAssignmentError { code: "resource.role_required", message: "role is required for non-files resources" });
+    };
+    if !matches!(role, "primary" | "replica" | "provider") {
+        return Err(ResourceAssignmentError { code: "resource.invalid_role", message: "resource role must be primary, replica or provider" });
+    }
+    if role == "primary" {
+        assignments.retain(|entry| {
+            entry.get("capability").and_then(JsonValue::as_str) != Some(capability)
+                || entry.get("role").and_then(JsonValue::as_str) != Some("primary")
+        });
+    }
+    assignments.push(serde_json::json!({
+        "identityId": identity_id,
+        "deviceId": device_id,
+        "capability": capability,
+        "role": role,
+        "assignedBy": assigned_by,
+        "assignedAt": unix_time_millis(),
+    }));
+    Ok(assignments)
+}
+
+fn remove_resource_assignment(
+    mut assignments: Vec<JsonValue>,
+    identity_id: &str,
+    device_id: &str,
+    capability: &str,
+) -> Vec<JsonValue> {
+    assignments.retain(|entry| {
+        let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
+        let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
+        let same_device = stored_device.is_none() || stored_device == Some(device_id);
+        !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability))
+    });
+    assignments
+}
+
+fn load_fabric_defaults(engine: &Engine, request_id: RequestId) -> Result<Vec<JsonValue>, QueryResponse> {
+    let query = format!(
+        "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
+        query_string(FABRIC_DEFAULTS_ID),
+    );
+    match execute_request(engine, QueryRequest::new(request_id, query)) {
+        QueryResponse::Ok { documents, .. } => Ok(documents
+            .first()
+            .and_then(|document| document.get("resourceAssignments"))
+            .and_then(JsonValue::as_array)
+            .cloned()
+            .unwrap_or_default()),
+        // Older stores legitimately do not have this collection yet. Treat that
+        // as "no defaults"; the first fabric.resource.set will create the record.
+        QueryResponse::Error { .. } => Ok(Vec::new()),
+    }
+}
+
+fn save_fabric_defaults(engine: &Engine, request_id: RequestId, assignments: &[JsonValue]) -> Result<(), QueryResponse> {
+    let encoded = serde_json::to_string(assignments).expect("fabric resource assignments serialize");
+    let now = unix_time_millis();
+    let lookup = format!(
+        "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
+        query_string(FABRIC_DEFAULTS_ID),
+    );
+    let exists = matches!(
+        execute_request(engine, QueryRequest::new(request_id, lookup)),
+        QueryResponse::Ok { documents, .. } if !documents.is_empty()
+    );
+    let query = if exists {
+        format!(
+            "on _fabric_resources | where fabricId == {} and state == \"active\" | set resourceAssignments = {encoded}, updatedAt = {now}",
+            query_string(FABRIC_DEFAULTS_ID),
+        )
+    } else {
+        format!(
+            "on _fabric_resources | insert {{fabricId: {}, resourceAssignments: {encoded}, state: \"active\", createdAt: {now}, updatedAt: {now}}}",
+            query_string(FABRIC_DEFAULTS_ID),
+        )
+    };
+    match execute_request(engine, QueryRequest::new(request_id, query)) {
+        QueryResponse::Ok { .. } => Ok(()),
+        error @ QueryResponse::Error { .. } => Err(error),
+    }
+}
+
+fn active_devices_for_assignments(engine: &Engine, request_id: RequestId, assignments: &[JsonValue]) -> Vec<JsonValue> {
+    let mut devices = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for assignment in assignments {
+        let Some(identity_id) = assignment.get("identityId").or_else(|| assignment.get("nodeIdentityId")).and_then(JsonValue::as_str) else { continue; };
+        let Some(device_id) = assignment.get("deviceId").or_else(|| assignment.get("nodeDeviceId")).or_else(|| assignment.get("nodeId")).and_then(JsonValue::as_str) else { continue; };
+        if !seen.insert((identity_id.to_owned(), device_id.to_owned())) { continue; }
+        let query = format!(
+            "on _devices | where identityId == {} and deviceId == {} and state == \"active\" | select identityId, deviceId, publicKey | limit 1",
+            query_string(identity_id), query_string(device_id),
+        );
+        if let QueryResponse::Ok { documents, .. } = execute_request(engine, QueryRequest::new(request_id, query)) {
+            devices.extend(documents);
+        }
+    }
+    devices
 }
 
 #[derive(Debug, Clone)]
@@ -3910,6 +5665,7 @@ fn list_storage_collections(
     snapshot: &dyn StorageRead,
     stats: bool,
     place_id: Option<&str>,
+    app_instance_id: Option<&str>,
 ) -> Result<Vec<JsonValue>, StorageError> {
     let mut collections = Vec::new();
     for name in snapshot.collections()? {
@@ -3918,12 +5674,18 @@ fn list_storage_collections(
                 continue;
             }
             let expected_place = Value::from(place_id);
+            let expected_app_instance = app_instance_id.map(Value::from);
             let mut documents = 0u64;
             snapshot.scan_each(
                 &name,
                 ScanOptions::default(),
                 &mut |stored| {
-                    if stored.document().get(PLACE_SCOPE_FIELD) == Some(&expected_place) {
+                    let document = stored.document();
+                    let place_matches = document.get(PLACE_SCOPE_FIELD) == Some(&expected_place);
+                    let app_matches = expected_app_instance.as_ref().map_or(true, |expected| {
+                        document.get(APP_INSTANCE_SCOPE_FIELD) == Some(expected)
+                    });
+                    if place_matches && app_matches {
                         documents = documents.saturating_add(1);
                         return Ok(stats);
                     }
@@ -4417,6 +6179,7 @@ fn file_version_json(
     })
 }
 
+#[cfg(feature = "files")]
 fn list_file_versions(
     engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
 )->Result<Vec<JsonValue>,QueryResponse>{
@@ -4424,6 +6187,7 @@ fn list_file_versions(
     match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{documents,..}=>Ok(documents),error@QueryResponse::Error{..}=>Err(error)}
 }
 
+#[cfg(feature = "files")]
 fn load_file_version(
     engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str
 )->Result<JsonValue,QueryResponse>{
@@ -4434,6 +6198,7 @@ fn load_file_version(
     }
 }
 
+#[cfg(feature = "files")]
 fn delete_file_version_metadata(
     engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str
 )->Result<(),QueryResponse>{
@@ -4530,6 +6295,7 @@ fn list_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,
         .collect())
 }
 
+#[cfg(feature = "files")]
 fn list_trashed_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str)->Result<Vec<JsonValue>,QueryResponse>{
     let query=format!("on _files | where _place == {} and _app_instance == {}",query_string(place_id),query_string(instance_id));
     match execute_request(engine,QueryRequest::new(id,query)){
@@ -4567,6 +6333,7 @@ fn replace_file_entry(engine:&Engine,id:RequestId,entry:&FileEntry)->Result<Json
     let delete=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete",query_string(&entry.place_id),query_string(&entry.app_instance_id),query_string(entry.file_id.as_str()));
     match execute_request(engine,QueryRequest::new(id,delete)){QueryResponse::Ok{..}=>persist_file_entry(engine,id,entry),error@QueryResponse::Error{..}=>Err(error)}
 }
+#[cfg(feature = "files")]
 fn delete_file_metadata(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<(),QueryResponse>{
     let query=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete",query_string(place_id),query_string(instance_id),query_string(file_id));
     match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(()),error@QueryResponse::Error{..}=>Err(error)}
@@ -4639,11 +6406,13 @@ fn trash_file_entry(engine:&Engine,settings:&ConnectionSettings,id:RequestId,pla
     Ok(persisted)
 }
 
+#[cfg(feature = "files")]
 fn file_is_trashed(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<bool,QueryResponse>{
     Ok(load_file_entry_json(engine,id,place_id,instance_id,file_id)?
         .get("trashed").and_then(JsonValue::as_bool)==Some(true))
 }
 
+#[cfg(feature = "files")]
 fn restore_file_entry(
     engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
 )->Result<JsonValue,QueryResponse>{
@@ -4685,6 +6454,7 @@ fn restore_file_entry(
     Ok(persisted)
 }
 
+#[cfg(feature = "files")]
 fn purge_file_versions(
     engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
 )->Result<(),QueryResponse>{
@@ -4702,6 +6472,7 @@ fn purge_file_versions(
     Ok(())
 }
 
+#[cfg(feature = "files")]
 fn permanently_delete_file_tree(
     engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
 )->Result<(),QueryResponse>{
@@ -4720,9 +6491,11 @@ fn permanently_delete_file_tree(
     delete_file_metadata(engine,id,place_id,instance_id,file_id)
 }
 
+#[cfg(feature = "files")]
 fn child_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:&str)->Result<Vec<FileEntry>,QueryResponse>{
     list_file_children_raw(engine,id,place_id,instance_id,Some(parent_id))?.into_iter().map(|value|json_to_file_entry(&value).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))).collect()
 }
+#[cfg(feature = "files")]
 fn subtree_has_trashed_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:&str)->Result<bool,QueryResponse>{
     for child in list_file_children_raw(engine,id,place_id,instance_id,Some(parent_id))? {
         if child.get("trashed").and_then(JsonValue::as_bool)==Some(true){return Ok(true);}
@@ -4760,6 +6533,7 @@ fn sync_moved_children(engine:&Engine,id:RequestId,store:&dyn FileStore,place_id
     }
     Ok(())
 }
+#[cfg(feature = "files")]
 fn persist_copied_children(engine:&Engine,id:RequestId,store:&dyn FileStore,place_id:&str,instance_id:&str,parent:&FileEntry)->Result<(),QueryResponse>{
     let remote=store.list(Some(&parent.remote_id)).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
     for stored in remote {
@@ -4770,6 +6544,7 @@ fn persist_copied_children(engine:&Engine,id:RequestId,store:&dyn FileStore,plac
     Ok(())
 }
 
+#[cfg(feature = "files")]
 fn write_file_store_error(writer:&mut TcpStream,id:RequestId,error:FileStoreError)->Result<(),ConnectionError>{
     write_response(writer,&file_store_query_error(id,error))
 }
@@ -4790,13 +6565,25 @@ fn require_identity<'a>(
 fn ensure_routed_static_authorized(
     writer: &mut TcpStream,
     settings: &ConnectionSettings,
-    engine: &Engine,
+    engine: Option<&Engine>,
     principal: &og_core::access::auth::Principal,
     operation: &RoutedOperation,
 ) -> Result<bool, ConnectionError> {
     match operation.kind().access() {
-        AccessPolicy::Permission { action, resource } =>
-            ensure_authorized(writer, settings, engine, principal, operation.id(), action, resource),
+        AccessPolicy::Permission { action, resource } => {
+            let Some(engine) = engine else {
+                write_response(
+                    writer,
+                    &QueryResponse::request_error(
+                        operation.id(),
+                        "capability.unavailable",
+                        "this operation requires the local database engine",
+                    ),
+                )?;
+                return Ok(false);
+            };
+            ensure_authorized(writer, settings, engine, principal, operation.id(), action, resource)
+        }
         AccessPolicy::Public
         | AccessPolicy::Authenticated
         | AccessPolicy::Query
@@ -5518,10 +7305,12 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Configuration {
     bind_address: String,
     local_bind_address: Option<String>,
+    gateway_endpoints: Vec<String>,
+    gateway_directory_path: PathBuf,
     read_timeout: Duration,
     write_timeout: Duration,
     storage_backend: StorageBackend,
@@ -5544,11 +7333,11 @@ struct Configuration {
     instance_id: String,
     heartbeat_interval: Option<Duration>,
     authenticated_keepalive: bool,
-    node_identity: Option<String>,
     node_identity_file: Option<PathBuf>,
     node_identity_password: Option<String>,
     node_capabilities: ServiceCapabilities,
-    node_role: String,
+    published_capabilities: ServiceCapabilities,
+    #[cfg_attr(not(feature = "fabric"), allow(dead_code))]
     gateway_token: Option<String>,
 }
 
@@ -5558,8 +7347,34 @@ impl Configuration {
         let local_bind_address = env::var("OGD_LOCAL_BIND").ok().filter(|value| !value.trim().is_empty());
         let read_timeout = duration_from_environment("OGD_READ_TIMEOUT_MS", DEFAULT_READ_TIMEOUT_MS)?;
         let write_timeout = duration_from_environment("OGD_WRITE_TIMEOUT_MS", DEFAULT_WRITE_TIMEOUT_MS)?;
-        let storage_backend = StorageBackend::parse( &env::var("OGD_STORAGE").unwrap_or_else(|_| DEFAULT_STORAGE_BACKEND.to_owned()), )?;
+        let storage_backend = if build_profile::has_db_engine() {
+            StorageBackend::parse(&env::var("OGD_STORAGE").unwrap_or_else(|_| DEFAULT_STORAGE_BACKEND.to_owned()))?
+        } else {
+            StorageBackend::Memory
+        };
         let storage_path = PathBuf::from( env::var("OGD_STORAGE_PATH").unwrap_or_else(|_| DEFAULT_STORAGE_PATH.to_owned()), );
+        let gateway_endpoints = match env::var("OGD_GATEWAYS") {
+            Ok(raw) => {
+                let mut endpoints = Vec::new();
+                for item in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+                    let endpoint = normalize_gateway_node_endpoint(item)
+                        .ok_or_else(|| DaemonError::Runtime(format!("Invalid OGD_GATEWAYS endpoint: {item}")))?;
+                    if !endpoints.contains(&endpoint) { endpoints.push(endpoint); }
+                }
+                endpoints
+            }
+            Err(env::VarError::NotPresent) => gateway_endpoint(&bind_address).into_iter().collect(),
+            Err(source) => return Err(DaemonError::Environment { name: "OGD_GATEWAYS", source }),
+        };
+        let gateway_directory_path = env::var("OGD_GATEWAY_DIRECTORY_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                storage_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("sync/gateways.json")
+            });
         let files_path = env::var("OGD_FILES_PATH").map(PathBuf::from).unwrap_or_else(|_| {
             storage_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).join("files")
         });
@@ -5606,33 +7421,64 @@ impl Configuration {
                     .unwrap_or_else(|| Path::new("."))
                     .join("backups")
             });
-        fs::create_dir_all(&backup_path).map_err(|source| {
-            DaemonError::PrepareStorageDirectory {
-                path: backup_path.clone(),
-                source,
-            }
-        })?;
+        if build_profile::has_db_engine() {
+            fs::create_dir_all(&backup_path).map_err(|source| {
+                DaemonError::PrepareStorageDirectory {
+                    path: backup_path.clone(),
+                    source,
+                }
+            })?;
+        }
         let instance_id = load_or_create_instance_id(&storage_path)?;
         let heartbeat_enabled = boolean_from_environment("OGD_HEARTBEAT_ENABLED", true)?;
         let heartbeat_interval = heartbeat_enabled .then(|| duration_from_environment("OGD_HEARTBEAT_INTERVAL_MS", 5_000)) .transpose()?;
         let authenticated_keepalive = boolean_from_environment("OGD_AUTH_KEEPALIVE_ENABLED", true)?;
-        let node_identity = env::var("OGD_NODE_IDENTITY").ok().filter(|value| !value.trim().is_empty());
         let node_identity_file = env::var("OGD_NODE_IDENTITY_FILE").ok().filter(|value| !value.trim().is_empty()).map(PathBuf::from);
         let node_identity_password = env::var("OGD_NODE_IDENTITY_PASSWORD").ok().filter(|value| !value.is_empty());
-        let node_capabilities_raw = env::var("OGD_NODE_CAPABILITIES")
-            .unwrap_or_else(|_| DEFAULT_NODE_CAPABILITIES.to_owned());
-        let node_capabilities = ServiceCapabilities::from_names(
-            node_capabilities_raw.split(',').map(str::trim).filter(|value| !value.is_empty())
-        ).map_err(DaemonError::Runtime)?;
-        let node_role = env::var("OGD_NODE_ROLE").unwrap_or_else(|_| "master".to_owned()).trim().to_ascii_lowercase();
-        if !matches!(node_role.as_str(), "master" | "node") {
-            return Err(DaemonError::Runtime(format!("OGD_NODE_ROLE must be master or node; got {node_role:?}")));
-        }
+        let compiled_capabilities = ServiceCapabilities::compiled();
+        let node_capabilities = match env::var("OGD_NODE_CAPABILITIES") {
+            Ok(raw) => {
+                let requested = ServiceCapabilities::from_names(
+                    raw.split(',').map(str::trim).filter(|value| !value.is_empty())
+                ).map_err(DaemonError::Runtime)?;
+                let missing = requested.missing_from(compiled_capabilities);
+                if !missing.is_empty() {
+                    return Err(DaemonError::Runtime(format!(
+                        "OGD_NODE_CAPABILITIES requests capabilities not compiled into this ogd build: {} (compiled: {})",
+                        missing.names().join(","),
+                        compiled_capabilities.names().join(","),
+                    )));
+                }
+                requested
+            }
+            Err(env::VarError::NotPresent) => ServiceCapabilities::default_enabled(),
+            Err(source) => return Err(DaemonError::Environment { name: "OGD_NODE_CAPABILITIES", source }),
+        };
+        let published_capabilities = match env::var("OGD_NODE_PUBLISHED_CAPABILITIES") {
+            Ok(raw) => {
+                let requested = ServiceCapabilities::from_names(
+                    raw.split(',').map(str::trim).filter(|value| !value.is_empty())
+                ).map_err(DaemonError::Runtime)?;
+                let not_enabled = requested.missing_from(node_capabilities);
+                if !not_enabled.is_empty() {
+                    return Err(DaemonError::Runtime(format!(
+                        "OGD_NODE_PUBLISHED_CAPABILITIES may only publish enabled capabilities; not enabled: {} (enabled: {})",
+                        not_enabled.names().join(","),
+                        node_capabilities.names().join(","),
+                    )));
+                }
+                requested
+            }
+            Err(env::VarError::NotPresent) => node_capabilities,
+            Err(source) => return Err(DaemonError::Environment { name: "OGD_NODE_PUBLISHED_CAPABILITIES", source }),
+        };
         let gateway_token = env::var("OGD_GATEWAY_TOKEN").ok().filter(|value| !value.is_empty());
 
         Ok(Self {
             bind_address,
             local_bind_address,
+            gateway_endpoints,
+            gateway_directory_path,
             read_timeout,
             write_timeout,
             storage_backend,
@@ -5655,11 +7501,10 @@ impl Configuration {
             instance_id,
             heartbeat_interval,
             authenticated_keepalive,
-            node_identity,
             node_identity_file,
             node_identity_password,
             node_capabilities,
-            node_role,
+            published_capabilities,
             gateway_token,
         })
     }
@@ -5702,18 +7547,18 @@ struct FileSyncSource<'a> {
 
 impl<'a> FileSyncSource<'a> {
     fn connect(settings: &'a ConnectionSettings, engine: &'a Engine) -> Result<Self, String> {
-        let gateway = match settings.upstream_client_endpoint.as_deref() {
-            Some(endpoint) => {
-                let credential = settings.upstream_identity.as_ref()
-                    .ok_or_else(|| "Files sync needs the node Identity to read from the upstream Gateway".to_owned())?;
-                Some(connect_authenticated_gateway_client(
-                    endpoint,
-                    credential,
-                    settings.read_timeout,
-                    settings.write_timeout,
-                )?)
-            }
-            None => None,
+        let gateway = if has_upstream_gateway(settings) {
+            let credential = settings.upstream_identity.as_ref()
+                .ok_or_else(|| "Files sync needs the node Identity to read from the upstream Gateway".to_owned())?;
+            let (websocket, _endpoint) = connect_authenticated_gateway_client_any(
+                settings,
+                credential,
+                settings.read_timeout,
+                settings.write_timeout,
+            )?;
+            Some(websocket)
+        } else {
+            None
         };
         Ok(Self { settings, engine, gateway, next_request_id: 10_000 })
     }
@@ -6078,7 +7923,7 @@ impl<'a> FileSyncSource<'a> {
 impl Drop for FileSyncSource<'_> {
     fn drop(&mut self) {
         if let Some(mut websocket) = self.gateway.take() {
-            let _ = websocket.close(None);
+            close_node_websocket(&mut websocket);
         }
     }
 }
@@ -6113,6 +7958,7 @@ fn query_response_message(response: QueryResponse) -> String {
     }
 }
 
+#[cfg(feature = "fabric")]
 fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &OperationRequest, destination: &Path) -> Result<u64, String> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -6181,6 +8027,7 @@ fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &OperationRe
 }
 
 
+#[cfg(feature = "fabric")]
 fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &OperationRequest, source: &Path) -> Result<JsonValue, String> {
     // Open the local file before advertising the binary stream size. A native
     // watcher can wake reconciliation while a large file is still being copied
@@ -6238,7 +8085,7 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
                     if count == 0 {
                         // Abort the raw session explicitly. Otherwise Gateway/Core
                         // legitimately keeps waiting for the announced tail forever.
-                        let _ = websocket.close(None);
+                        close_node_websocket(websocket);
                         return Err(format!(
                             "local file changed during upload: reached EOF with {remaining} bytes still announced; the upload was aborted"
                         ));
@@ -7126,11 +8973,21 @@ fn run_file_sync_materialization(settings: &ConnectionSettings, engine: &Engine,
 
 
 
+#[cfg(not(feature = "fabric"))]
+fn gateway_raw_read_to_path(_websocket: &mut NodeWebSocket, _request: &OperationRequest, _destination: &Path) -> Result<u64, String> {
+    Err("ogd was built without the `fabric` feature".to_owned())
+}
+
+#[cfg(not(feature = "fabric"))]
+fn gateway_raw_write_from_path(_websocket: &mut NodeWebSocket, _request: &OperationRequest, _source: &Path) -> Result<JsonValue, String> {
+    Err("ogd was built without the `fabric` feature".to_owned())
+}
+
 fn start_upstream_event_relay(
     settings: Arc<ConnectionSettings>,
     event_engine: Arc<EventEngine>,
 ) -> Option<thread::JoinHandle<()>> {
-    if settings.upstream_client_endpoint.is_none()
+    if !has_upstream_gateway(&settings)
         || settings.upstream_identity.is_none()
         || !settings.service_capabilities.contains(ServiceCapability::Events)
     {
@@ -7158,16 +9015,12 @@ fn run_upstream_event_relay_session(
     settings: &ConnectionSettings,
     event_engine: &EventEngine,
 ) -> Result<(), String> {
-    let endpoint = settings
-        .upstream_client_endpoint
-        .as_deref()
-        .ok_or_else(|| "no upstream Gateway client endpoint".to_owned())?;
     let credential = settings
         .upstream_identity
         .as_ref()
         .ok_or_else(|| "no node Identity for upstream event relay".to_owned())?;
-    let mut websocket = connect_authenticated_gateway_client(
-        endpoint,
+    let (mut websocket, _endpoint) = connect_authenticated_gateway_client_any(
+        settings,
         credential,
         Duration::from_secs(120),
         settings.write_timeout,
@@ -7296,11 +9149,11 @@ fn start_file_sync_worker(
     if let Ok(mut runtime) = settings.file_sync.lock() {
         runtime.trigger = Some(trigger_tx.clone());
         runtime.worker_running = true;
-        runtime.remote_events = if settings.upstream_client_endpoint.is_some()
+        runtime.remote_events = if has_upstream_gateway(&settings)
             && settings.service_capabilities.contains(ServiceCapability::Events)
         {
             "connecting".to_owned()
-        } else if settings.upstream_client_endpoint.is_some() {
+        } else if has_upstream_gateway(&settings) {
             "disabled".to_owned()
         } else {
             "local".to_owned()
@@ -7413,6 +9266,7 @@ fn start_file_sync_worker(
         .ok()
 }
 
+#[cfg(feature = "files-watch")]
 fn run_file_sync_watcher(settings: Arc<ConnectionSettings>, sender: std::sync::mpsc::Sender<String>) {
     let callback_sender = sender.clone();
     let applying = Arc::clone(&settings.file_sync_applying);
@@ -7491,6 +9345,14 @@ fn run_file_sync_watcher(settings: Arc<ConnectionSettings>, sender: std::sync::m
     }
 }
 
+#[cfg(not(feature = "files-watch"))]
+fn run_file_sync_watcher(settings: Arc<ConnectionSettings>, _sender: std::sync::mpsc::Sender<String>) {
+    if let Ok(mut runtime) = settings.file_sync.lock() {
+        runtime.local_watcher = "not_compiled".to_owned();
+    }
+}
+
+
 #[derive(Debug)]
 struct FileSyncRuntime {
     config_path: PathBuf,
@@ -7504,6 +9366,24 @@ struct FileSyncRuntime {
     local_watcher: String,
     last_trigger: Option<String>,
     trigger: Option<std::sync::mpsc::Sender<String>>,
+}
+
+impl FileSyncRuntime {
+    fn disabled(configuration: &Configuration) -> Self {
+        Self {
+            config_path: configuration.files_sync_config_path.clone(),
+            index_path: configuration.files_sync_index_path.clone(),
+            config: None,
+            last_run_at: None,
+            last_run_error: None,
+            worker_running: false,
+            worker_pending: false,
+            remote_events: "disabled".to_owned(),
+            local_watcher: "disabled".to_owned(),
+            last_trigger: None,
+            trigger: None,
+        }
+    }
 }
 
 fn load_file_sync_runtime(configuration: &Configuration) -> Result<FileSyncRuntime, DaemonError> {
@@ -7628,6 +9508,7 @@ fn duration_from_environment( name: &'static str, default_milliseconds: u64, ) -
 #[derive(Debug, Clone, Copy)]
 struct ClassicLoginAttempt { failures: u32, retry_at: u64 }
 
+#[cfg(feature = "auth")]
 fn classic_password_hash(password: &str) -> Result<(String, String), String> {
     let mut salt = [0u8; 16];
     fs::File::open("/dev/urandom").and_then(|mut file| file.read_exact(&mut salt)).map_err(|error| error.to_string())?;
@@ -7635,6 +9516,7 @@ fn classic_password_hash(password: &str) -> Result<(String, String), String> {
     Ok((encode_base64(&salt), encode_base64(&hash)))
 }
 
+#[cfg(feature = "auth")]
 fn classic_password_hash_with_salt(password: &str, salt: &[u8]) -> Result<[u8; 32], String> {
     let params = Params::new(CLASSIC_AUTH_MEMORY_KIB, CLASSIC_AUTH_ITERATIONS, CLASSIC_AUTH_LANES, Some(32)).map_err(|error| error.to_string())?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -7643,12 +9525,21 @@ fn classic_password_hash_with_salt(password: &str, salt: &[u8]) -> Result<[u8; 3
     Ok(output)
 }
 
+#[cfg(feature = "auth")]
 fn classic_password_verify(password: &str, salt: &str, expected: &str) -> bool {
     let Ok(salt) = decode_base64(salt) else { return false; };
     let Ok(expected) = decode_base64(expected) else { return false; };
     let Ok(actual) = classic_password_hash_with_salt(password, &salt) else { return false; };
     constant_time_eq(&actual, &expected)
 }
+
+#[cfg(not(feature = "auth"))]
+fn classic_password_hash(_password: &str) -> Result<(String, String), String> {
+    Err("classic authentication is not compiled into this ogd build".to_owned())
+}
+
+#[cfg(not(feature = "auth"))]
+fn classic_password_verify(_password: &str, _salt: &str, _expected: &str) -> bool { false }
 
 fn classic_login_wait(settings: &ConnectionSettings, identifier: &str) -> Option<u64> {
     let attempts = settings.classic_auth_attempts.lock().ok()?;
@@ -7692,10 +9583,16 @@ struct ConnectionSettings {
     file_sync_applying: Arc<AtomicBool>,
     file_sync_watcher_dirty: Arc<AtomicBool>,
     service_capabilities: ServiceCapabilities,
+    published_capabilities: ServiceCapabilities,
+    #[cfg(feature = "llm")]
+    llm_service: Option<Arc<LlmService>>,
+    #[cfg(feature = "agent")]
+    agent_service: Option<Arc<AgentService>>,
     upstream: Option<String>,
-    upstream_client_endpoint: Option<String>,
+    upstream_client_endpoints: Mutex<Vec<String>>,
     upstream_identity: Option<IdentityCredential>,
     gateway_state: Mutex<&'static str>,
+    gateway_connections: Mutex<HashMap<String, bool>>,
 }
 
 #[derive(Debug)]
@@ -7772,12 +9669,14 @@ enum DaemonError {
     BootstrapAdmin(io::Error),
     BootstrapIdentity(og_core::access::identity_file::IdentityFileError),
     NodeIdentity(og_core::access::identity_file::IdentityFileError),
+    NodeIdentityMissing,
     NodeIdentityPasswordMissing,
     NodeDeviceCredentialState,
     NodeDeviceCredentialConflict { device_id: String },
     BootstrapPasswordMissing,
     BootstrapAdminState,
     BootstrapAppsState,
+    BootstrapFabricResourcesState,
     Environment {
         name: &'static str,
         source: env::VarError,
@@ -7826,6 +9725,7 @@ impl Display for DaemonError {
             }
             Self::BootstrapIdentity(source) => write!(formatter, "cannot create encrypted bootstrap identity: {source}"),
             Self::NodeIdentity(source) => write!(formatter, "cannot load node identity: {source}"),
+            Self::NodeIdentityMissing => formatter.write_str("Gateway mode requires OGD_NODE_IDENTITY_FILE and OGD_NODE_IDENTITY_PASSWORD"),
             Self::NodeIdentityPasswordMissing => formatter.write_str("OGD_NODE_IDENTITY_FILE requires OGD_NODE_IDENTITY_PASSWORD"),
             Self::NodeDeviceCredentialState => formatter.write_str("cannot persist local node device credential"),
             Self::NodeDeviceCredentialConflict { device_id } => write!(formatter, "local device credential conflicts with configured node identity for device `{device_id}`"),
@@ -7834,6 +9734,7 @@ impl Display for DaemonError {
                 formatter.write_str("cannot persist bootstrap administrator")
             }
             Self::BootstrapAppsState => formatter.write_str("cannot persist built-in Apps from apps.json"),
+            Self::BootstrapFabricResourcesState => formatter.write_str("cannot persist bootstrap fabric resource defaults"),
             Self::Environment { name, source } => {
                 write!(formatter, "cannot read {name}: {source}")
             }
@@ -7900,11 +9801,13 @@ impl Error for DaemonError {
             Self::SpawnConnectionThread(source) => Some(source),
             Self::BootstrapAdminState
             | Self::BootstrapAppsState
+            | Self::BootstrapFabricResourcesState
             | Self::InvalidBoolean { .. }
             | Self::InvalidByteSize { .. }
             | Self::ZeroDuration { .. }
             | Self::InvalidStorageBackend { .. }
             | Self::Runtime(_)
+            | Self::NodeIdentityMissing
             | Self::NodeIdentityPasswordMissing
             | Self::NodeDeviceCredentialState
             | Self::NodeDeviceCredentialConflict { .. } => None,
@@ -7924,83 +9827,20 @@ mod tests {
         Engine::new(storage, runtime, lowerer)
     }
 
+    #[cfg(feature = "fabric")] #[test] fn gateway_endpoint_normalization_supports_seeds_and_discovery_hints() { assert_eq!( normalize_gateway_node_endpoint("gw+insecure://127.0.0.1:3000").as_deref(), Some("ws://127.0.0.1:3000/node") ); assert_eq!( normalize_gateway_node_endpoint("gw://example.test").as_deref(), Some("wss://example.test/node") ); assert_eq!( normalize_gateway_node_endpoint("ws://127.0.0.1:3001").as_deref(), Some("ws://127.0.0.1:3001/node") ); assert_eq!( normalize_gateway_node_endpoint("ws://127.0.0.1:3002/peer").as_deref(), Some("ws://127.0.0.1:3002/node") ); assert_eq!( gateway_client_endpoint_from_node("ws://127.0.0.1:3000/node").as_deref(), Some("ws://127.0.0.1:3000/ws") ); }
+
+    #[test] fn node_identity_proof_is_bound_to_gateway_challenge_and_device() { let proof = node_identity_proof("nonce-a", "device-a", "identity-a", "device-a"); assert_eq!(proof, "og.node.challenge.v1\nnonce-a\ndevice-a\nidentity-a\ndevice-a"); assert_ne!(proof, node_identity_proof("nonce-b", "device-a", "identity-a", "device-a")); assert_ne!(proof, node_identity_proof("nonce-a", "device-b", "identity-a", "device-b")); }
+
+    #[test] fn fabric_device_verification_requires_known_active_exact_key() { let engine = app_bootstrap_test_engine(); let inserted = execute_request(&engine, QueryRequest::new(1, r#"on _devices | insert {identityId: "identity-a", deviceId: "device-a", publicKey: "key-a", state: "active"}"#)); assert!(inserted.is_ok()); assert!(registered_device_matches(&engine, "identity-a", "device-a", "key-a")); assert!(!registered_device_matches(&engine, "identity-a", "device-a", "key-b")); assert!(!registered_device_matches(&engine, "identity-a", "device-unknown", "key-a")); let revoked = execute_request(&engine, QueryRequest::new(2, r#"on _devices | where deviceId == "device-a" | set state = "revoked""#)); assert!(revoked.is_ok()); assert!(!registered_device_matches(&engine, "identity-a", "device-a", "key-a")); }
+
+    #[test] fn gateway_device_registration_is_idempotent_and_exact() { let engine = app_bootstrap_test_engine(); ensure_gateway_device_registration(&engine, "gateway-identity", "gateway-device", "gateway-key") .expect("Gateway enrollment persists"); ensure_gateway_device_registration(&engine, "gateway-identity", "gateway-device", "gateway-key") .expect("Gateway enrollment is idempotent"); assert!(registered_identity_matches(&engine, "gateway-identity", "gateway-key")); assert!(registered_device_matches(&engine, "gateway-identity", "gateway-device", "gateway-key")); assert!(!registered_device_matches(&engine, "gateway-identity", "gateway-device", "other-key")); }
+
+    #[cfg(feature = "fabric")] #[test] fn gateway_enrollment_hmac_matches_sha256_reference_vector() { assert_eq!( hmac_sha256_base64(b"key", b"The quick brown fox jumps over the lazy dog"), "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg=" ); }
+
     #[test] fn app_bootstrap_with_empty_manifest_is_a_noop() { let engine = app_bootstrap_test_engine(); bootstrap_apps(&engine, &[]).expect("empty App manifest bootstraps"); assert!(!app_record_exists(&engine, RequestId::Number(1), "system.files") .expect("App lookup succeeds")); }
     #[test] fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() { let engine = app_bootstrap_test_engine(); let v1 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test".to_owned(), version: "1.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test", "version": "1.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds"); let drifted = execute_request( &engine, QueryRequest::new( 2, r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#, ), ); assert!(drifted.is_ok()); let custom = execute_request( &engine, QueryRequest::new( 3, r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#, ), ); assert!(custom.is_ok()); let v2 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test v2".to_owned(), version: "2.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test v2", "version": "2.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds"); let response = execute_request( &engine, QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); }; let managed = documents.first().expect("managed App exists"); assert_eq!(managed.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(managed.get("name").and_then(JsonValue::as_str), Some("System test v2")); assert_eq!(managed.get("version").and_then(JsonValue::as_str), Some("2.0.0")); assert_eq!(managed.get("updatedBy").and_then(JsonValue::as_str), Some("system")); assert_eq!(managed.get("definition"), Some(&v2.definition)); let response = execute_request( &engine, QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); }; let unmanaged = documents.first().expect("custom App exists"); assert_eq!(unmanaged.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(unmanaged.get("name").and_then(JsonValue::as_str), Some("Custom")); assert_eq!(unmanaged.get("version").and_then(JsonValue::as_str), Some("7.0.0")); assert_eq!(unmanaged.get("createdBy").and_then(JsonValue::as_str), Some("user")); assert!(unmanaged.get("updatedBy").is_none()); }
-    #[test]
-    fn place_scoped_collection_listing_filters_and_counts_by_place() {
-        let engine = app_bootstrap_test_engine();
-        for (id, collection, place_id) in [
-            (20, "shared_items", "place-a"),
-            (21, "shared_items", "place-a"),
-            (22, "shared_items", "place-b"),
-            (23, "other_items", "place-b"),
-        ] {
-            let response = execute_request(
-                &engine,
-                QueryRequest::new(
-                    id,
-                    format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)),
-                ),
-            );
-            assert!(response.is_ok());
-        }
-        let snapshot = engine.storage().read().expect("snapshot opens");
-        let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"))
-            .expect("Place collections list succeeds");
-        assert_eq!(collections.len(), 1);
-        assert_eq!(collections[0].get("name").and_then(JsonValue::as_str), Some("shared_items"));
-        assert_eq!(collections[0].get("documents").and_then(JsonValue::as_u64), Some(2));
-    }
-
-    #[test]
-    fn place_only_query_scope_spans_instances_without_leaking_other_places() {
-        let engine = app_bootstrap_test_engine();
-        let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext {
-            principal: Principal::Anonymous,
-            place_id: place_id.to_owned(),
-            app_instance_id: app_instance_id.map(str::to_owned),
-            place_role: PlaceRole::Owner,
-            public_access: None,
-        };
-
-        for (id, place_id, app_instance_id, name) in [
-            (10, "place-a", "app-1", "one"),
-            (11, "place-a", "app-2", "two"),
-            (12, "place-b", "app-3", "other"),
-        ] {
-            let response = execute_request_scoped(
-                &engine,
-                QueryRequest::new(id, format!("on studio_scope_test | insert {{name: {}}}", query_string(name))),
-                Some(&context(place_id, Some(app_instance_id))),
-            );
-            assert!(response.is_ok());
-        }
-
-        let place_response = execute_request_scoped(
-            &engine,
-            QueryRequest::new(13, "on studio_scope_test | sort name"),
-            Some(&context("place-a", None)),
-        );
-        let QueryResponse::Ok { documents, .. } = place_response else {
-            panic!("Place scoped query must succeed");
-        };
-        assert_eq!(documents.len(), 2);
-        assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one"));
-        assert_eq!(documents[1].get("name").and_then(JsonValue::as_str), Some("two"));
-        assert!(documents.iter().all(|document| document.get("_place").and_then(JsonValue::as_str) == Some("place-a")));
-
-        let app_response = execute_request_scoped(
-            &engine,
-            QueryRequest::new(14, "on studio_scope_test | sort name"),
-            Some(&context("place-a", Some("app-1"))),
-        );
-        let QueryResponse::Ok { documents, .. } = app_response else {
-            panic!("AppInstance scoped query must succeed");
-        };
-        assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one"));
-    }
-
+    #[test] fn place_scoped_collection_listing_filters_and_counts_by_place() { let engine = app_bootstrap_test_engine(); for (id, collection, place_id) in [ (20, "shared_items", "place-a"), (21, "shared_items", "place-a"), (22, "shared_items", "place-b"), (23, "other_items", "place-b"), ] { let response = execute_request( &engine, QueryRequest::new( id, format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)), ), ); assert!(response.is_ok()); } let snapshot = engine.storage().read().expect("snapshot opens"); let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"), None) .expect("Place collections list succeeds"); assert_eq!(collections.len(), 1); assert_eq!(collections[0].get("name").and_then(JsonValue::as_str), Some("shared_items")); assert_eq!(collections[0].get("documents").and_then(JsonValue::as_u64), Some(2)); }
+    #[test] fn place_only_query_scope_spans_instances_without_leaking_other_places() { let engine = app_bootstrap_test_engine(); let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext { principal: Principal::Anonymous, place_id: place_id.to_owned(), app_instance_id: app_instance_id.map(str::to_owned), place_role: PlaceRole::Owner, public_access: None, }; for (id, place_id, app_instance_id, name) in [ (10, "place-a", "app-1", "one"), (11, "place-a", "app-2", "two"), (12, "place-b", "app-3", "other"), ] { let response = execute_request_scoped( &engine, QueryRequest::new(id, format!("on studio_scope_test | insert {{name: {}}}", query_string(name))), Some(&context(place_id, Some(app_instance_id))), ); assert!(response.is_ok()); } let place_response = execute_request_scoped( &engine, QueryRequest::new(13, "on studio_scope_test | sort name"), Some(&context("place-a", None)), ); let QueryResponse::Ok { documents, .. } = place_response else { panic!("Place scoped query must succeed"); }; assert_eq!(documents.len(), 2); assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one")); assert_eq!(documents[1].get("name").and_then(JsonValue::as_str), Some("two")); assert!(documents.iter().all(|document| document.get("_place").and_then(JsonValue::as_str) == Some("place-a"))); let app_response = execute_request_scoped( &engine, QueryRequest::new(14, "on studio_scope_test | sort name"), Some(&context("place-a", Some("app-1"))), ); let QueryResponse::Ok { documents, .. } = app_response else { panic!("AppInstance scoped query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one")); }
     #[test] fn file_sync_place_root_projection_is_definition_driven() { let declared = serde_json::json!({ "appId": "custom.files", "definition": { "id": "custom.files", "kind": "custom.anything", "files": {"projection": "place-root"} } }); assert!(file_sync_app_place_root_projection(&declared)); let serialized = serde_json::json!({ "definition": r#"{"files":{"projection":"place-root"}}"# }); assert!(file_sync_app_place_root_projection(&serialized)); let legacy_identity_only = serde_json::json!({ "appId": "system.files", "definition": {"kind": "system.files"} }); assert!(!file_sync_app_place_root_projection(&legacy_identity_only)); assert!(!file_sync_app_place_root_projection(&serde_json::json!({ "definition": {"files": {"projection": "app"}} }))); }
     #[test] fn borrowed_partial_document_encodes_large_js_safe_integers_as_numbers() { let document = Document::from_fields([ ("created_at", Value::from(1_785_680_802_608_u64)), ("small", Value::from(42_u64)), ("negative", Value::from(-5_000_000_000_i64)), ]); let response = BorrowedPlainDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id: RequestId::string("query-1").unwrap(), data: BorrowedDocument(&document), }; let payload = rmp_serde::to_vec_named(&response).unwrap(); let decoded: JsonValue = rmp_serde::from_slice(&payload).unwrap(); assert!(decoded["data"]["created_at"].is_f64()); assert!(decoded["data"]["negative"].is_f64()); assert!(decoded["data"]["small"].is_u64()); }
     #[test] fn enrollment_grants_event_subscription_permission() { let query = enrollment_events_permission_query("identity-a", 42); assert_eq!( query, r#"on _permissions | insert {identityId: "identity-a", action: "events.subscribe", resource: "*", effect: "allow", state: "active", createdAt: 42}"# ); }
@@ -8021,4 +9861,10 @@ mod tests {
     #[test] fn preserves_compound_stage_subpipelines() { let source = "from sales | pivot | rows region | columns month | values amount | aggregate sum | end"; let pipeline = parse_pipeline(source).expect("compound pipeline parses"); let stage = &pipeline.stages()[0]; assert_eq!(stage.name().as_str(), "pivot"); assert!(stage.is_compound()); assert_eq!(stage.subpipeline().expect("pivot body").len(), 4); }
     #[test] fn authenticated_keepalive_filter_is_added_once() { let mut types = vec!["sharing.*".to_owned()]; ensure_authenticated_keepalive_type(&mut types); ensure_authenticated_keepalive_type(&mut types); assert_eq!( types, vec!["sharing.*".to_owned(), "core.heartbeat".to_owned()] ); }
     #[test] fn authenticated_keepalive_filter_respects_wildcards() { for mut types in [ vec!["*".to_owned()], vec!["core.*".to_owned()], vec!["core.heartbeat".to_owned()], ] { ensure_authenticated_keepalive_type(&mut types); assert_eq!(types.len(), 1); } }
+    #[test] fn auth_is_fabric_level_not_place_assignable() { assert!(valid_resource_capability("auth")); assert!(!place_resource_capability_allowed("auth")); assert!(place_resource_capability_allowed("files")); assert!(place_resource_capability_allowed("custom.capability")); }
+
+    #[test] fn fabric_default_store_is_created_and_updated_explicitly() { let engine = app_bootstrap_test_engine(); let first = vec![serde_json::json!({ "identityId": "identity-a", "deviceId": "device-a", "capability": "database", "role": "provider" })]; save_fabric_defaults(&engine, 1.into(), &first).expect("first fabric default persists"); assert_eq!(load_fabric_defaults(&engine, 2.into()).unwrap(), first); let second = vec![serde_json::json!({ "identityId": "identity-b", "deviceId": "device-b", "capability": "database", "role": "provider" })]; save_fabric_defaults(&engine, 3.into(), &second).expect("fabric default updates"); assert_eq!(load_fabric_defaults(&engine, 4.into()).unwrap(), second); }
+
+    #[test] fn shared_resource_assignment_logic_keeps_files_axes_orthogonal() { let assignments = upsert_resource_assignment( Vec::new(), "admin", "identity-a", "device-a", "files", None, Some("primary"), Some("provider"), ).expect("files default is valid"); assert_eq!(assignments.len(), 1); assert_eq!(resource_assignment_service_role(&assignments[0]), Some("primary")); assert_eq!(resource_assignment_storage_role(&assignments[0]), Some("provider")); let updated = upsert_resource_assignment( assignments, "admin", "identity-a", "device-a", "files", None, Some("replica"), None, ).expect("service role can change without erasing storage role"); assert_eq!(resource_assignment_service_role(&updated[0]), Some("replica")); assert_eq!(resource_assignment_storage_role(&updated[0]), Some("provider")); }
+
 }
