@@ -11,9 +11,9 @@ use serde::Serialize;
 
 use crate::operation::LlmGenerateInput;
 
-pub use config::{LlmConfig, LlmConfigError};
+pub use config::{LlmConfig, LlmConfigError, LlmDevice, LlmGpuLayers, LlmThinking};
 use runtime::LlmRuntime;
-pub use runtime::{LlmError, LlmGenerationStats};
+pub use runtime::{LlmError, LlmGenerationEvent, LlmGenerationStats};
 pub use scheduler::ScheduledRun as LlmRun;
 
 pub struct LlmService {
@@ -55,6 +55,7 @@ impl LlmService {
                 max_tokens: self.config.max_tokens,
                 max_parallel: runtime.max_parallel(),
                 queue_size: runtime.queue_size(),
+                thinking: self.config.thinking.as_str(),
                 active_requests: runtime.active_requests(),
                 queued_requests: runtime.queued_requests(),
             },
@@ -67,6 +68,7 @@ impl LlmService {
                 max_tokens: self.config.max_tokens,
                 max_parallel: self.config.max_parallel,
                 queue_size: self.config.queue_size,
+                thinking: self.config.thinking.as_str(),
                 active_requests: 0,
                 queued_requests: 0,
             },
@@ -87,7 +89,7 @@ impl LlmService {
         emit: F,
     ) -> Result<LlmGenerationStats, LlmError>
     where
-        F: FnMut(&str) -> bool,
+        F: FnMut(LlmGenerationEvent) -> bool,
     {
         self.runtime
             .as_ref()
@@ -116,6 +118,7 @@ pub struct LlmStatus {
     pub max_tokens: u32,
     pub max_parallel: u32,
     pub queue_size: u32,
+    pub thinking: &'static str,
     pub active_requests: usize,
     pub queued_requests: usize,
 }
@@ -124,5 +127,5 @@ pub struct LlmStatus {
 mod tests {
     use super::*;
 
-    #[test] fn status_shape_is_stable_for_unconfigured_service() { let service = LlmService { config: LlmConfig { model_path: None, context_size: std::num::NonZeroU32::new(4096).unwrap(), threads: None, max_tokens: 512, seed: 1234, max_parallel: 1, queue_size: 16, chat_template: None, }, runtime: None, }; let status = service.status(); assert!(!status.ready); assert_eq!(status.state, "unconfigured"); assert_eq!(status.backend, "llama.cpp"); }
+    #[test] fn status_shape_is_stable_for_unconfigured_service() { let service = LlmService { config: LlmConfig { model_path: None, context_size: std::num::NonZeroU32::new(4096).unwrap(), threads: None, max_tokens: 512, seed: 1234, max_parallel: 1, queue_size: 16, chat_template: None, device: LlmDevice::Auto, gpu_layers: LlmGpuLayers::Auto, thinking: LlmThinking::Auto, prefix_cache_max_bytes: 1024 * 1024 * 1024, }, runtime: None, }; let status = service.status(); assert!(!status.ready); assert_eq!(status.state, "unconfigured"); assert_eq!(status.backend, "llama.cpp"); assert_eq!(status.thinking, "auto"); }
 }

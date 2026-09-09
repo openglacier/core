@@ -384,7 +384,10 @@ pub struct QueryExecuteInput {
     #[serde(default)]
     pub context: Option<RequestedExecutionContext>,
     /// Reject the request if the planned query may mutate storage.
-    #[serde(default)]
+    ///
+    /// The canonical wire name is `readOnly` (Gateway/public protocol).
+    /// `read_only` remains accepted for compatibility with older direct clients.
+    #[serde(default, rename = "readOnly", alias = "read_only")]
     pub read_only: bool,
 }
 
@@ -633,9 +636,49 @@ pub struct FileVersionInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmToolCallInput {
+    pub id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LlmToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LlmMessageInput {
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<LlmToolCallInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LlmToolChoice {
+    #[default]
+    Auto,
+    None,
+    Required,
+}
+
+impl LlmToolChoice {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Required => "required",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -643,9 +686,17 @@ pub struct LlmMessageInput {
 pub struct LlmGenerateInput {
     pub messages: Vec<LlmMessageInput>,
     #[serde(default)]
+    pub tools: Vec<LlmToolDefinition>,
+    #[serde(default)]
+    pub tool_choice: LlmToolChoice,
+    #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub seed: Option<u32>,
+    /// Optional ephemeral prefix-cache key. The Agent uses this to reuse llama.cpp
+    /// prompt state across LLM/tool turns inside one run.
+    #[serde(default)]
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -784,12 +835,78 @@ impl OperationPayload for LlmGenerateInput {
                     "messages must not contain NUL bytes",
                 ));
             }
+            if let Some(tool_call_id) = message.tool_call_id.as_mut() {
+                *tool_call_id = tool_call_id.trim().to_owned();
+                non_empty(operation, "messages.toolCallId", tool_call_id)?;
+                if tool_call_id.contains('\0') {
+                    return Err(invalid_payload(
+                        operation,
+                        "messages.toolCallId must not contain NUL bytes",
+                    ));
+                }
+            }
+            for tool_call in &mut message.tool_calls {
+                tool_call.id = tool_call.id.trim().to_owned();
+                tool_call.name = tool_call.name.trim().to_owned();
+                non_empty(operation, "messages.toolCalls.id", &tool_call.id)?;
+                non_empty(operation, "messages.toolCalls.name", &tool_call.name)?;
+                if tool_call.id.contains('\0') || tool_call.name.contains('\0') {
+                    return Err(invalid_payload(
+                        operation,
+                        "messages.toolCalls must not contain NUL bytes",
+                    ));
+                }
+                if !tool_call.arguments.is_object() {
+                    return Err(invalid_payload(
+                        operation,
+                        "messages.toolCalls.arguments must be an object",
+                    ));
+                }
+            }
+        }
+        for tool in &mut self.tools {
+            tool.name = tool.name.trim().to_owned();
+            non_empty(operation, "tools.name", &tool.name)?;
+            if tool.name.contains('\0') || tool.description.contains('\0') {
+                return Err(invalid_payload(
+                    operation,
+                    "tools must not contain NUL bytes",
+                ));
+            }
+            if !tool.parameters.is_object() {
+                return Err(invalid_payload(
+                    operation,
+                    "tools.parameters must be a JSON object",
+                ));
+            }
+        }
+        if self.tool_choice == LlmToolChoice::Required && self.tools.is_empty() {
+            return Err(invalid_payload(
+                operation,
+                "toolChoice required requires at least one tool",
+            ));
         }
         if matches!(self.max_tokens, Some(0)) {
             return Err(invalid_payload(
                 operation,
                 "maxTokens must be greater than zero",
             ));
+        }
+        if let Some(cache_key) = self.cache_key.as_mut() {
+            *cache_key = cache_key.trim().to_owned();
+            non_empty(operation, "cacheKey", cache_key)?;
+            if cache_key.len() > 160 {
+                return Err(invalid_payload(
+                    operation,
+                    "cacheKey must not exceed 160 bytes",
+                ));
+            }
+            if cache_key.contains('\0') {
+                return Err(invalid_payload(
+                    operation,
+                    "cacheKey must not contain NUL bytes",
+                ));
+            }
         }
         Ok(())
     }

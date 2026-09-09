@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "og-core"
-version = "0.80.1"
+version = "0.80.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1324,6 +1324,7 @@ dependencies = [
  "llama-cpp-2",
  "mmap-guard",
  "notify",
+ "og-llama-common-chat",
  "proptest",
  "ratatui",
  "rmp-serde",
@@ -1333,6 +1334,16 @@ dependencies = [
  "serde_json",
  "sha2",
  "tungstenite",
+]
+
+[[package]]
+name = "og-llama-common-chat"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "llama-cpp-sys-2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

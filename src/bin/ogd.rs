@@ -61,7 +61,7 @@ use og_core::operation::EventsSubscribeInput;
 #[cfg(feature = "data-import")]
 use og_core::operation::DataWorkerRunInput;
 #[cfg(feature = "llm")]
-use og_core::service::llm::LlmService;
+use og_core::service::llm::{LlmGenerationEvent, LlmService};
 #[cfg(feature = "agent")]
 use og_core::service::agent::{AgentCapabilityInvoker, AgentCapabilityResponse, AgentError, AgentService};
 
@@ -81,6 +81,7 @@ const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1:7878";
 const NODE_CONTROL_PROTOCOL_VERSION: u64 = 3;
 const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_WRITE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_AGENT_PROVIDER_READ_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_STORAGE_BACKEND: &str = "memory";
 const DEFAULT_STORAGE_PATH: &str = "data/ogd.glacier";
 const DEFAULT_FILES_STORE_ID: &str = "native";
@@ -273,6 +274,7 @@ fn run() -> Result<(), DaemonError> {
     let connection_settings = Arc::new(ConnectionSettings {
         read_timeout: configuration.read_timeout,
         write_timeout: configuration.write_timeout,
+        agent_provider_read_timeout: configuration.agent_provider_read_timeout,
         import_metrics: configuration.import_metrics,
         authorization_mode: configuration.authorization_mode,
         enrollment_mode: configuration.enrollment_mode.clone(),
@@ -2011,7 +2013,7 @@ fn connect_delegated_gateway_client_any(
         match connect_delegated_gateway_client(
             &endpoint,
             token,
-            settings.read_timeout,
+            settings.agent_provider_read_timeout,
             settings.write_timeout,
         ) {
             Ok(websocket) => return Ok(websocket),
@@ -2065,12 +2067,21 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                         .map_err(|error| AgentError::capability(operation, error.to_string()))?;
                     let run_id = run.run_id();
                     let mut partials = Vec::new();
-                    let statistics = service.generate(&mut run, &input, |text| {
-                        partials.push(serde_json::json!({
-                            "type":"token",
-                            "runId":run_id,
-                            "text":text,
-                        }));
+                    let statistics = service.generate(&mut run, &input, |event| {
+                        partials.push(match event {
+                            LlmGenerationEvent::Text(text) => serde_json::json!({
+                                "type":"token",
+                                "runId":run_id,
+                                "text":text,
+                            }),
+                            LlmGenerationEvent::ToolCall { id, name, arguments } => serde_json::json!({
+                                "type":"toolCall",
+                                "runId":run_id,
+                                "id":id,
+                                "name":name,
+                                "arguments":arguments,
+                            }),
+                        });
                         true
                     }).map_err(|error| AgentError::capability(operation, error.to_string()))?;
                     return Ok(AgentCapabilityResponse::stream(
@@ -2078,6 +2089,7 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                         Some(serde_json::json!({
                             "runId":run_id,
                             "promptTokens":statistics.prompt_tokens,
+                            "cachedPromptTokens":statistics.cached_prompt_tokens,
                             "completionTokens":statistics.completion_tokens,
                             "elapsedMs":statistics.elapsed_ms,
                             "finishReason":statistics.finish_reason,
@@ -2284,16 +2296,60 @@ impl AgentCapabilityInvoker for OgdAgentInvoker<'_> {
         operation: &str,
         data: JsonValue,
     ) -> Result<AgentCapabilityResponse, AgentError> {
-        match self {
+        let provider = match self {
+            Self::Local(_) => "local",
+            #[cfg(feature = "fabric")]
+            Self::Gateway(_) => "gateway",
+        };
+        let response = match self {
             Self::Local(value) => value.invoke(operation, data),
             #[cfg(feature = "fabric")]
             Self::Gateway(value) => value.invoke(operation, data),
+        }?;
+        if operation == "llm.generate" && debug::enabled(DebugTopic::Agent) {
+            let mut output = String::new();
+            let mut tool_calls = Vec::new();
+            for partial in &response.partials {
+                match partial.get("type").and_then(JsonValue::as_str) {
+                    Some("token") => {
+                        if let Some(text) = partial.get("text").and_then(JsonValue::as_str) {
+                            output.push_str(text);
+                        }
+                    }
+                    Some("toolCall") => tool_calls.push(partial.clone()),
+                    _ => {}
+                }
+            }
+            debug::log(
+                DebugTopic::Agent,
+                None,
+                format!(
+                    "llm.generate provider={provider} output={output:?} toolCalls={tool_calls:?}"
+                ),
+            );
         }
+        Ok(response)
     }
 }
 
 fn serve_connection( connection_id: u64, stream: TcpStream, engine: Option<&Engine>, operation_router: &OperationRouter, event_engine: &EventEngine, settings: &ConnectionSettings, delegation: Option<GatewayDelegation>, ) -> Result<(), ConnectionError> {
-    stream.set_read_timeout(Some(settings.read_timeout)).map_err(ConnectionError::ConfigureSocket)?;
+    // A Gateway-delegated Agent provider channel can legitimately sit idle while
+    // another capability (most notably llm.generate) is working. Reusing the
+    // ordinary 30s connection read timeout here caused the Core side of a DB/file
+    // provider channel to close while Qwen was thinking; the Gateway would then
+    // try to reuse that stale channel for the next analytical query and report
+    // `gateway.core_request_failed: The og-core connection was interrupted.`
+    //
+    // Use the dedicated Agent provider timeout on delegated channels as well as
+    // on the outbound Agent->Gateway websocket. This keeps both ends of the
+    // delegated provider session on the same lifetime policy without weakening
+    // the timeout for normal client connections.
+    let connection_read_timeout = if delegation.is_some() {
+        settings.agent_provider_read_timeout
+    } else {
+        settings.read_timeout
+    };
+    stream.set_read_timeout(Some(connection_read_timeout)).map_err(ConnectionError::ConfigureSocket)?;
     stream.set_write_timeout(Some(settings.write_timeout)).map_err(ConnectionError::ConfigureSocket)?;
     stream.set_nodelay(true).map_err(ConnectionError::ConfigureSocket)?;
 
@@ -3803,15 +3859,22 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                                     ),
                                                 )?;
                                                 let mut stream_error = None;
-                                                match service.generate(&mut run, &input, |text| {
-                                                    let response = StreamResponse::partial(
-                                                        id,
-                                                        serde_json::json!({
+                                                match service.generate(&mut run, &input, |event| {
+                                                    let partial = match event {
+                                                        LlmGenerationEvent::Text(text) => serde_json::json!({
                                                             "type":"token",
                                                             "runId":run_id,
                                                             "text":text
                                                         }),
-                                                    );
+                                                        LlmGenerationEvent::ToolCall { id: tool_call_id, name, arguments } => serde_json::json!({
+                                                            "type":"toolCall",
+                                                            "runId":run_id,
+                                                            "id":tool_call_id,
+                                                            "name":name,
+                                                            "arguments":arguments
+                                                        }),
+                                                    };
+                                                    let response = StreamResponse::partial(id, partial);
                                                     match write_stream_response(writer, &response) {
                                                         Ok(()) => true,
                                                         Err(error) => {
@@ -3829,6 +3892,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                                                 Some(serde_json::json!({
                                                                     "runId": run_id,
                                                                     "promptTokens": statistics.prompt_tokens,
+                                                                    "cachedPromptTokens": statistics.cached_prompt_tokens,
                                                                     "completionTokens": statistics.completion_tokens,
                                                                     "elapsedMs": statistics.elapsed_ms,
                                                                     "finishReason": statistics.finish_reason,
@@ -7313,6 +7377,7 @@ struct Configuration {
     gateway_directory_path: PathBuf,
     read_timeout: Duration,
     write_timeout: Duration,
+    agent_provider_read_timeout: Duration,
     storage_backend: StorageBackend,
     storage_path: PathBuf,
     files_path: PathBuf,
@@ -7347,6 +7412,10 @@ impl Configuration {
         let local_bind_address = env::var("OGD_LOCAL_BIND").ok().filter(|value| !value.trim().is_empty());
         let read_timeout = duration_from_environment("OGD_READ_TIMEOUT_MS", DEFAULT_READ_TIMEOUT_MS)?;
         let write_timeout = duration_from_environment("OGD_WRITE_TIMEOUT_MS", DEFAULT_WRITE_TIMEOUT_MS)?;
+        let agent_provider_read_timeout = duration_from_environment(
+            "OGD_AGENT_PROVIDER_READ_TIMEOUT_MS",
+            DEFAULT_AGENT_PROVIDER_READ_TIMEOUT_MS,
+        )?;
         let storage_backend = if build_profile::has_db_engine() {
             StorageBackend::parse(&env::var("OGD_STORAGE").unwrap_or_else(|_| DEFAULT_STORAGE_BACKEND.to_owned()))?
         } else {
@@ -7481,6 +7550,7 @@ impl Configuration {
             gateway_directory_path,
             read_timeout,
             write_timeout,
+            agent_provider_read_timeout,
             storage_backend,
             storage_path,
             files_path,
@@ -9567,6 +9637,7 @@ fn classic_login_success(settings: &ConnectionSettings, identifier: &str) {
 struct ConnectionSettings {
     read_timeout: Duration,
     write_timeout: Duration,
+    agent_provider_read_timeout: Duration,
     import_metrics: bool,
     authorization_mode: AuthorizationMode,
     enrollment_mode: EnrollmentMode,

@@ -28,6 +28,8 @@ pub enum DebugTopic {
     Sharing,
     Permission,
     Gateway,
+    Agent,
+    Llm,
 }
 
 impl DebugTopic {
@@ -50,6 +52,8 @@ impl DebugTopic {
             Self::Sharing => "sharing",
             Self::Permission => "permission",
             Self::Gateway => "gateway",
+            Self::Agent => "agent",
+            Self::Llm => "llm",
         }
     }
 
@@ -71,6 +75,8 @@ impl DebugTopic {
             "sharing" => Some(Self::Sharing),
             "permission" | "permissions" => Some(Self::Permission),
             "gateway" => Some(Self::Gateway),
+            "agent" => Some(Self::Agent),
+            "llm" => Some(Self::Llm),
             _ => None,
         }
     }
@@ -222,7 +228,7 @@ fn is_secret_key(key: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test] fn topics_have_stable_names() { assert_eq!(DebugTopic::Auth.as_str(), "auth"); assert_eq!(DebugTopic::Events.as_str(), "events"); }
+    #[test] fn topics_have_stable_names() { assert_eq!(DebugTopic::Auth.as_str(), "auth"); assert_eq!(DebugTopic::Events.as_str(), "events"); assert_eq!(DebugTopic::Agent.as_str(), "agent"); assert_eq!(DebugTopic::Llm.as_str(), "llm"); }
 
     #[test] fn redaction_hides_nested_secrets() { let value = serde_json::json!({ "data": {"signature": "secret", "identityId": "alice"}, "token": "bootstrap" }); let redacted = redact_json(value); assert_eq!(redacted["data"]["signature"], "<redacted>"); assert_eq!(redacted["token"], "<redacted>"); assert_eq!(redacted["data"]["identityId"], "alice"); }
 }
