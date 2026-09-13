@@ -148,7 +148,7 @@ ASSET_URL="$(
     printf '%s' "$RELEASE_JSON" |
         grep -oE '"browser_download_url":[[:space:]]*"[^"]+"' |
         sed -E 's/^"browser_download_url":[[:space:]]*"//; s/"$//' |
-        grep "/${ASSET_TARGET}\.tar\.gz$" |
+        grep -- "-${ASSET_TARGET}\.tar\.gz$" |
         head -n1 || true
 )"
 
