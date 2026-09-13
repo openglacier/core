@@ -38,6 +38,17 @@ The native persistent storage engine is called **Glacier**.
 
 # Quick start
 
+## Method 1 : Get the docker slim image :
+```bash
+docker pull openglacier/slim
+```
+
+## Method 2 : using install.sh
+```bash
+chmod a+x install.sh && ./install.sh
+```
+
+## Method 3 : From source
 Clone the repository and start `ogd`:
 
 ```bash
