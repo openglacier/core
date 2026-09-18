@@ -1,11 +1,9 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 //! Shared storage validation and mutation invariants.
 
-use super::{
-    CollectionId, DocumentId, DocumentVersion, StorageError, StorageResult, VersionPrecondition,
-};
+use super::{ CollectionId, DocumentId, DocumentVersion, StorageError, StorageResult, VersionPrecondition, };
 
-pub(crate) fn validate_collection_id(value: &str) -> StorageResult<()> {
+pub fn validate_collection_id(value: &str) -> StorageResult<()> {
     if value.is_empty() {
         return Err(StorageError::invalid_collection_id(
             value,
@@ -51,31 +49,26 @@ pub(crate) fn validate_collection_id(value: &str) -> StorageResult<()> {
     Ok(())
 }
 
-pub(crate) fn ensure_version(
-    collection: &CollectionId,
-    id: &DocumentId,
-    actual: DocumentVersion,
-    precondition: VersionPrecondition,
-) -> StorageResult<()> {
+pub fn ensure_version( collection: &CollectionId, id: &DocumentId, actual: DocumentVersion, precondition: VersionPrecondition, ) -> StorageResult<()> {
     match precondition {
         VersionPrecondition::Any => Ok(()),
         VersionPrecondition::Exact(expected) if expected == actual => Ok(()),
         VersionPrecondition::Exact(expected) => Err(StorageError::version_conflict(
             collection.clone(),
-            id.clone(),
+            *id,
             expected,
             actual,
         )),
     }
 }
 
-pub(crate) fn increment_counter(value: u64) -> StorageResult<u64> {
+pub fn increment_counter(value: u64) -> StorageResult<u64> {
     value
         .checked_add(1)
         .ok_or_else(|| StorageError::backend("storage mutation counter overflow"))
 }
 
-pub(crate) fn next_generation(generation: u64) -> StorageResult<u64> {
+pub fn next_generation(generation: u64) -> StorageResult<u64> {
     generation
         .checked_add(1)
         .ok_or_else(|| StorageError::backend("storage generation overflow"))
@@ -105,10 +98,7 @@ mod tests {
     }
 
     #[test] fn rejects_invalid_collection_segments() { assert!(matches!( validate_collection_id("users..events").unwrap_err().kind(), StorageErrorKind::InvalidCollectionId { .. } )); }
-
     #[test] fn version_precondition_accepts_current_version() { ensure_version( &collection("users"), &document_id("42"), DocumentVersion::new(2), VersionPrecondition::Exact(DocumentVersion::new(2)), ) .unwrap(); }
-
     #[test] fn version_precondition_rejects_stale_version() { assert!(matches!( ensure_version( &collection("users"), &document_id("42"), DocumentVersion::new(3), VersionPrecondition::Exact(DocumentVersion::new(2)), ) .unwrap_err() .kind(), StorageErrorKind::VersionConflict { .. } )); }
-
     #[test] fn counters_detect_overflow() { assert!(increment_counter(u64::MAX).is_err()); assert!(next_generation(u64::MAX).is_err()); }
 }

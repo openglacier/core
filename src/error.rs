@@ -83,10 +83,10 @@ pub enum ProtocolError {
     /// A server-to-client integer cannot be represented exactly by JavaScript.
     UnsafeJavaScriptInteger { value: String },
 
-    /// A MessagePack payload could not be decoded.
+    /// A `MessagePack` payload could not be decoded.
     InvalidMessagePackDecode(rmp_serde::decode::Error),
 
-    /// A value could not be encoded as MessagePack.
+    /// A value could not be encoded as `MessagePack`.
     InvalidMessagePackEncode(rmp_serde::encode::Error),
 
     /// A payload length was zero or otherwise invalid.

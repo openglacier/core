@@ -82,15 +82,7 @@ impl LlmService {
             .schedule(owner)
     }
 
-    pub fn generate<F>(
-        &self,
-        run: &mut LlmRun,
-        request: &LlmGenerateInput,
-        emit: F,
-    ) -> Result<LlmGenerationStats, LlmError>
-    where
-        F: FnMut(LlmGenerationEvent) -> bool,
-    {
+    pub fn generate<F>( &self, run: &mut LlmRun, request: &LlmGenerateInput, emit: F, ) -> Result<LlmGenerationStats, LlmError> where F: FnMut(LlmGenerationEvent) -> bool, {
         self.runtime
             .as_ref()
             .ok_or(LlmError::Unconfigured)?

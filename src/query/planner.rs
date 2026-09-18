@@ -178,12 +178,7 @@ impl PlannerStage {
 
     /// Creates a compound normalized stage.
     #[must_use]
-    pub fn with_subpipeline(
-        name: StageName,
-        arguments: impl AsRef<str>,
-        subpipeline: PlannerSubPipeline,
-        span: Span,
-    ) -> Self {
+    pub fn with_subpipeline( name: StageName, arguments: impl AsRef<str>, subpipeline: PlannerSubPipeline, span: Span, ) -> Self {
         Self {
             name,
             arguments: Arc::from(arguments.as_ref()),
@@ -396,11 +391,7 @@ impl Planner {
         })
     }
 
-    fn compile_stage(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_stage( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         match stage.name().as_str() {
             "where" => self.compile_where(location, stage),
             "near" => self.compile_near(location, stage),
@@ -451,33 +442,21 @@ impl Planner {
         }
     }
 
-    fn compile_where(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_where( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         let predicate = self.parse_stage_expression(location, stage, arguments)?;
         Ok(LogicalOperator::filter(predicate))
     }
 
-    fn compile_near(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_near( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         let name = StageName::parse("near").expect("native stage name 'near' must always be valid");
         Ok(LogicalOperator::custom(name, arguments, false))
     }
 
-    fn compile_root(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_root( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         parse_field_path(arguments)
@@ -489,11 +468,7 @@ impl Planner {
         ))
     }
 
-    fn compile_sample(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_sample( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let count = self.parse_non_negative_integer(location, stage)?;
         Ok(LogicalOperator::custom(
@@ -503,11 +478,7 @@ impl Planner {
         ))
     }
 
-    fn compile_derive(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_derive( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         let name =
@@ -515,19 +486,12 @@ impl Planner {
         Ok(LogicalOperator::custom(name, arguments, false))
     }
 
-    fn compile_set(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_set( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
-
         let assignments = split_top_level(arguments, ',')
             .map_err(|message| self.invalid_syntax(location, stage, message))?;
-
         let mut compiled = Vec::with_capacity(assignments.len());
-
         for (assignment_index, assignment) in assignments.into_iter().enumerate() {
             let (field, expression) = split_assignment(assignment).map_err(|message| {
                 PlannerError::new(
@@ -561,11 +525,7 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_lookup(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_lookup( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         let arguments = self.required_arguments(location, stage)?;
         let subpipeline = self.required_subpipeline(location, stage)?;
 
@@ -590,11 +550,7 @@ impl Planner {
         Ok(LogicalOperator::custom(name, payload, false))
     }
 
-    fn compile_union(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_union( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_no_arguments(location, stage)?;
         let subpipeline = self.required_subpipeline(location, stage)?;
 
@@ -614,11 +570,7 @@ impl Planner {
         Ok(LogicalOperator::custom(name, payload, false))
     }
 
-    fn compile_load(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_load( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         match stage.subpipeline() {
             None => {
                 let arguments = self.required_arguments(location, stage)?;
@@ -638,31 +590,19 @@ impl Planner {
         }
     }
 
-    fn compile_limit(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_limit( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let count = self.parse_non_negative_integer(location, stage)?;
         Ok(LogicalOperator::limit(count))
     }
 
-    fn compile_skip(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_skip( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let count = self.parse_non_negative_integer(location, stage)?;
         Ok(LogicalOperator::skip(count))
     }
 
-    fn compile_first(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_first( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = stage.arguments().trim();
         if !arguments.is_empty() {
@@ -676,11 +616,7 @@ impl Planner {
         ))
     }
 
-    fn compile_single(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_single( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = stage.arguments().trim();
         if !arguments.is_empty() {
@@ -694,11 +630,7 @@ impl Planner {
         ))
     }
 
-    fn compile_unwind(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_unwind( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         parse_field_path(arguments)
@@ -710,19 +642,12 @@ impl Planner {
         ))
     }
 
-    fn compile_sort(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_sort( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
-
         let items = split_top_level(arguments, ',')
             .map_err(|message| self.invalid_syntax(location, stage, message))?;
-
         let mut keys = Vec::with_capacity(items.len());
-
         for (item_index, item) in items.into_iter().enumerate() {
             let (field_text, direction) = parse_sort_item(item).map_err(|message| {
                 self.invalid_list_item(location, stage, item_index, item, message)
@@ -734,15 +659,10 @@ impl Planner {
 
             keys.push(SortKey::new(field, direction));
         }
-
         LogicalOperator::sort(keys).map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_select(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_select( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         let items = split_top_level(arguments, ',')
@@ -764,50 +684,47 @@ impl Planner {
                 ));
             }
 
-            match item.rsplit_once(" as ") {
-                Some((source_text, target_text)) => {
-                    let source_text = source_text.trim();
-                    let target_text = target_text.trim();
-                    if source_text.is_empty() || target_text.is_empty() {
-                        return Err(self.invalid_list_item(
-                            location,
-                            stage,
-                            item_index,
-                            item,
-                            select_projection_syntax(),
-                        ));
-                    }
-
-                    parse_expression(source_text).map_err(|error| {
-                        self.invalid_list_item(
-                            location,
-                            stage,
-                            item_index,
-                            item,
-                            format!("invalid projection expression {source_text:?}: {error}"),
-                        )
-                    })?;
-                    let target = parse_field_path(target_text).map_err(|message| {
-                        self.invalid_list_item(location, stage, item_index, item, message)
-                    })?;
-
-                    normalized.push(format!("{} as {}", source_text, target));
-                    requires_custom_projection = true;
+            if let Some((source_text, target_text)) = item.rsplit_once(" as ") {
+                let source_text = source_text.trim();
+                let target_text = target_text.trim();
+                if source_text.is_empty() || target_text.is_empty() {
+                    return Err(self.invalid_list_item(
+                        location,
+                        stage,
+                        item_index,
+                        item,
+                        select_projection_syntax(),
+                    ));
                 }
-                None => {
-                    let field = parse_field_path(item).map_err(|_| {
-                        self.invalid_list_item(
-                            location,
-                            stage,
-                            item_index,
-                            item,
-                            "an expression projection requires an alias, for example `price * quantity as total`"
-                                .to_owned(),
-                        )
-                    })?;
-                    normalized.push(field.to_string());
-                    plain_fields.push(field);
-                }
+
+                parse_expression(source_text).map_err(|error| {
+                    self.invalid_list_item(
+                        location,
+                        stage,
+                        item_index,
+                        item,
+                        format!("invalid projection expression {source_text:?}: {error}"),
+                    )
+                })?;
+                let target = parse_field_path(target_text).map_err(|message| {
+                    self.invalid_list_item(location, stage, item_index, item, message)
+                })?;
+
+                normalized.push(format!("{source_text} as {target}"));
+                requires_custom_projection = true;
+            } else {
+                let field = parse_field_path(item).map_err(|_| {
+                    self.invalid_list_item(
+                        location,
+                        stage,
+                        item_index,
+                        item,
+                        "an expression projection requires an alias, for example `price * quantity as total`"
+                            .to_owned(),
+                    )
+                })?;
+                normalized.push(field.to_string());
+                plain_fields.push(field);
             }
         }
 
@@ -823,11 +740,7 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_rename(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_rename( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
         let (source, target) = parse_rename_arguments(arguments)
@@ -847,16 +760,12 @@ impl Planner {
 
         Ok(LogicalOperator::custom(
             StageName::parse("rename").expect("native stage name is valid"),
-            format!("{} as {}", source, target),
+            format!("{source} as {target}"),
             false,
         ))
     }
 
-    fn compile_drop(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_drop( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let fields = self.parse_required_field_list(location, stage)?;
         let arguments = fields
@@ -872,31 +781,20 @@ impl Planner {
         ))
     }
 
-    fn compile_distinct(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_distinct( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
-
         let arguments = stage.arguments().trim();
         let fields = if arguments.is_empty() {
             Vec::new()
         } else {
             self.parse_field_list(location, stage, arguments)?
         };
-
         LogicalOperator::distinct(fields)
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_count(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_count( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
-
         let arguments = stage.arguments().trim();
         let alias = if arguments.is_empty() {
             "count"
@@ -904,43 +802,27 @@ impl Planner {
             parse_count_alias(arguments)
                 .map_err(|message| self.invalid_syntax(location, stage, message))?
         };
-
         LogicalOperator::count(alias)
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_delete(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_delete( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         self.require_no_arguments(location, stage)?;
         Ok(LogicalOperator::delete())
     }
 
-    fn compile_insert(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_insert( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_simple(location, stage)?;
         let arguments = self.required_arguments(location, stage)?;
-
         let document = InsertDocument::parse(arguments)
             .map_err(|error| self.logical_plan_error(location, stage, error))?;
-
         LogicalOperator::from_insert_document(document)
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_group(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         let mut fields = Vec::new();
-
         match stage.subpipeline() {
             None => {
                 let arguments = self.required_arguments(location, stage)?;
@@ -1074,11 +956,7 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_pivot(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<LogicalOperator> {
+    fn compile_pivot( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         self.require_no_arguments(location, stage)?;
         let subpipeline = self.required_subpipeline(location, stage)?;
         let specification = self.compile_pivot_body(location, stage, subpipeline)?;
@@ -1087,12 +965,7 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_pivot_body(
-        &self,
-        parent_location: StageLocation,
-        parent_stage: &PlannerStage,
-        subpipeline: &PlannerSubPipeline,
-    ) -> PlanningResult<PivotSpecification> {
+    fn compile_pivot_body( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &PlannerSubPipeline, ) -> PlanningResult<PivotSpecification> {
         let mut rows = None;
         let mut columns = None;
         let mut value_fields = None;
@@ -1165,12 +1038,7 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(parent_location, parent_stage, error))
     }
 
-    fn compile_lookup_body<'a>(
-        &self,
-        parent_location: StageLocation,
-        parent_stage: &PlannerStage,
-        subpipeline: &'a PlannerSubPipeline,
-    ) -> PlanningResult<CompiledLookup<'a>> {
+    fn compile_lookup_body<'a>( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &'a PlannerSubPipeline, ) -> PlanningResult<CompiledLookup<'a>> {
         let mut into = None;
         let mut compiled = Vec::new();
 
@@ -1231,12 +1099,7 @@ impl Planner {
         })
     }
 
-    fn compile_union_body<'a>(
-        &self,
-        parent_location: StageLocation,
-        parent_stage: &PlannerStage,
-        subpipeline: &'a PlannerSubPipeline,
-    ) -> PlanningResult<CompiledUnion<'a>> {
+    fn compile_union_body<'a>( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &'a PlannerSubPipeline, ) -> PlanningResult<CompiledUnion<'a>> {
         let Some(source_stage) = subpipeline.stage(0) else {
             return Err(PlannerError::new(
                 PlannerErrorKind::MissingUnionSource {
@@ -1291,12 +1154,7 @@ impl Planner {
         })
     }
 
-    fn compile_streaming_load_body(
-        &self,
-        parent_location: StageLocation,
-        parent_stage: &PlannerStage,
-        subpipeline: &PlannerSubPipeline,
-    ) -> PlanningResult<String> {
+    fn compile_streaming_load_body( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &PlannerSubPipeline, ) -> PlanningResult<String> {
         let mut mode = None;
         let mut chunks = Vec::new();
 
@@ -1378,14 +1236,8 @@ impl Planner {
         Ok(output)
     }
 
-    fn compile_nested_read_stage(
-        &self,
-        location: StageLocation,
-        parent_stage: &PlannerStage,
-        stage: &PlannerStage,
-    ) -> PlanningResult<CompiledStage> {
+    fn compile_nested_read_stage( &self, location: StageLocation, parent_stage: &PlannerStage, stage: &PlannerStage, ) -> PlanningResult<CompiledStage> {
         let operator = self.compile_stage(location, stage)?;
-
         if operator.is_mutating() || operator.is_terminal() {
             return Err(PlannerError::new(
                 PlannerErrorKind::InvalidCompoundChild {
@@ -1399,7 +1251,6 @@ impl Planner {
                 Some(stage.span()),
             ));
         }
-
         Ok(CompiledStage::from_operator(stage, operator))
     }
 
@@ -1435,11 +1286,7 @@ impl Planner {
         ))
     }
 
-    fn required_subpipeline<'a>(
-        &self,
-        location: StageLocation,
-        stage: &'a PlannerStage,
-    ) -> PlanningResult<&'a PlannerSubPipeline> {
+    fn required_subpipeline<'a>( &self, location: StageLocation, stage: &'a PlannerStage, ) -> PlanningResult<&'a PlannerSubPipeline> {
         stage.subpipeline().ok_or_else(|| {
             PlannerError::new(
                 PlannerErrorKind::MissingSubPipeline {
@@ -1451,11 +1298,7 @@ impl Planner {
         })
     }
 
-    fn required_arguments<'a>(
-        &self,
-        location: StageLocation,
-        stage: &'a PlannerStage,
-    ) -> PlanningResult<&'a str> {
+    fn required_arguments<'a>( &self, location: StageLocation, stage: &'a PlannerStage, ) -> PlanningResult<&'a str> {
         let arguments = stage.arguments().trim();
 
         if arguments.is_empty() {
@@ -1471,11 +1314,7 @@ impl Planner {
         Ok(arguments)
     }
 
-    fn require_no_arguments(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<()> {
+    fn require_no_arguments( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<()> {
         let arguments = stage.arguments().trim();
 
         if arguments.is_empty() {
@@ -1492,13 +1331,8 @@ impl Planner {
         ))
     }
 
-    fn parse_non_negative_integer(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<usize> {
+    fn parse_non_negative_integer( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<usize> {
         let arguments = self.required_arguments(location, stage)?;
-
         if arguments.split_whitespace().count() != 1 {
             return Err(self.invalid_syntax(
                 location,
@@ -1516,26 +1350,16 @@ impl Planner {
         })
     }
 
-    fn parse_required_field_list(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-    ) -> PlanningResult<Vec<ExpressionFieldPath>> {
+    fn parse_required_field_list( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<ExpressionFieldPath>> {
         let arguments = self.required_arguments(location, stage)?;
         self.parse_field_list(location, stage, arguments)
     }
 
-    fn parse_field_list(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-        arguments: &str,
-    ) -> PlanningResult<Vec<ExpressionFieldPath>> {
+    fn parse_field_list( &self, location: StageLocation, stage: &PlannerStage, arguments: &str, ) -> PlanningResult<Vec<ExpressionFieldPath>> {
         let items = split_top_level(arguments, ',')
             .map_err(|message| self.invalid_syntax(location, stage, message))?;
 
         let mut fields = Vec::with_capacity(items.len());
-
         for (item_index, item) in items.into_iter().enumerate() {
             let field = parse_field_path(item).map_err(|message| {
                 self.invalid_list_item(location, stage, item_index, item, message)
@@ -1543,16 +1367,10 @@ impl Planner {
 
             fields.push(field);
         }
-
         Ok(fields)
     }
 
-    fn parse_stage_expression(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-        expression: &str,
-    ) -> PlanningResult<super::Expression> {
+    fn parse_stage_expression( &self, location: StageLocation, stage: &PlannerStage, expression: &str, ) -> PlanningResult<super::Expression> {
         parse_expression(expression).map_err(|error| {
             PlannerError::new(
                 PlannerErrorKind::InvalidExpression {
@@ -1566,12 +1384,7 @@ impl Planner {
         })
     }
 
-    fn invalid_syntax(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-        message: impl Into<Arc<str>>,
-    ) -> PlannerError {
+    fn invalid_syntax( &self, location: StageLocation, stage: &PlannerStage, message: impl Into<Arc<str>>, ) -> PlannerError {
         PlannerError::new(
             PlannerErrorKind::InvalidStageSyntax {
                 location,
@@ -1582,14 +1395,7 @@ impl Planner {
         )
     }
 
-    fn invalid_list_item(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-        item_index: usize,
-        item: &str,
-        message: impl Into<Arc<str>>,
-    ) -> PlannerError {
+    fn invalid_list_item( &self, location: StageLocation, stage: &PlannerStage, item_index: usize, item: &str, message: impl Into<Arc<str>>, ) -> PlannerError {
         PlannerError::new(
             PlannerErrorKind::InvalidStageItem {
                 location,
@@ -1602,13 +1408,7 @@ impl Planner {
         )
     }
 
-    fn invalid_child_stage(
-        &self,
-        location: StageLocation,
-        parent: &PlannerStage,
-        child: &PlannerStage,
-        message: impl Into<Arc<str>>,
-    ) -> PlannerError {
+    fn invalid_child_stage( &self, location: StageLocation, parent: &PlannerStage, child: &PlannerStage, message: impl Into<Arc<str>>, ) -> PlannerError {
         PlannerError::new(
             PlannerErrorKind::InvalidCompoundChild {
                 location,
@@ -1620,12 +1420,7 @@ impl Planner {
         )
     }
 
-    fn duplicate_directive(
-        &self,
-        location: StageLocation,
-        parent: &PlannerStage,
-        directive: &PlannerStage,
-    ) -> PlannerError {
+    fn duplicate_directive( &self, location: StageLocation, parent: &PlannerStage, directive: &PlannerStage, ) -> PlannerError {
         PlannerError::new(
             PlannerErrorKind::DuplicateCompoundDirective {
                 location,
@@ -1636,12 +1431,7 @@ impl Planner {
         )
     }
 
-    fn missing_directive(
-        &self,
-        location: StageLocation,
-        parent: &PlannerStage,
-        directive: &'static str,
-    ) -> PlannerError {
+    fn missing_directive( &self, location: StageLocation, parent: &PlannerStage, directive: &'static str, ) -> PlannerError {
         PlannerError::new(
             PlannerErrorKind::MissingCompoundDirective {
                 location,
@@ -1652,12 +1442,7 @@ impl Planner {
         )
     }
 
-    fn logical_plan_error(
-        &self,
-        location: StageLocation,
-        stage: &PlannerStage,
-        error: LogicalPlanError,
-    ) -> PlannerError {
+    fn logical_plan_error( &self, location: StageLocation, stage: &PlannerStage, error: LogicalPlanError, ) -> PlannerError {
         PlannerError::new(
             PlannerErrorKind::LogicalPlan {
                 location: Some(location),
@@ -1731,7 +1516,7 @@ impl StageLocation {
     }
 
     #[must_use]
-    pub fn index(self, depth: usize) -> Option<usize> {
+    pub const fn index(self, depth: usize) -> Option<usize> {
         if depth < self.depth() {
             Some(self.path[depth])
         } else {

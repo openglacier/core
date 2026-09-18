@@ -139,12 +139,7 @@ fn strict_boolean(value: &Value) -> EvaluationResult<bool> {
         .ok_or_else(|| EvaluationError::non_boolean(format!("{value:?}")))
 }
 
-fn compare_expression(
-    expression: &Expression,
-    left: SemanticValue<Value>,
-    right: SemanticValue<Value>,
-    missing_policy: MissingPolicy,
-) -> EvaluationResult<bool> {
+fn compare_expression( expression: &Expression, left: SemanticValue<Value>, right: SemanticValue<Value>, missing_policy: MissingPolicy, ) -> EvaluationResult<bool> {
     let operator = match expression.ungrouped().view() {
         ExpressionView::Binary { operator, .. } if operator.is_comparison() => operator,
         _ => return Err(EvaluationError::backend("expected a comparison expression")),
@@ -173,12 +168,7 @@ fn compare_expression(
     })
 }
 
-fn normalize_missing(
-    left: SemanticValue<Value>,
-    right: SemanticValue<Value>,
-    operator: BinaryOperator,
-    policy: MissingPolicy,
-) -> EvaluationResult<(Value, Value)> {
+fn normalize_missing( left: SemanticValue<Value>, right: SemanticValue<Value>, operator: BinaryOperator, policy: MissingPolicy, ) -> EvaluationResult<(Value, Value)> {
     match (left, right, policy) {
         (SemanticValue::Present(left), SemanticValue::Present(right), _) => Ok((left, right)),
         (SemanticValue::Missing, _, MissingPolicy::Error)
@@ -205,11 +195,7 @@ fn normalize_missing(
     }
 }
 
-fn assign(
-    assignment: &SetAssignment,
-    value: SemanticValue<Value>,
-    document: &Document,
-) -> EvaluationResult<Document> {
+fn assign( assignment: &SetAssignment, value: SemanticValue<Value>, document: &Document, ) -> EvaluationResult<Document> {
     let value = value.into_present()?;
     let segments = assignment.field().iter().collect::<Vec<_>>();
     let mut result = document.clone();
@@ -250,7 +236,7 @@ trait EvaluationErrorContext {
 
 impl EvaluationErrorContext for EvaluationError {
     fn with_backend_context(self, source: impl std::fmt::Display) -> Self {
-        EvaluationError::backend(format!("{self}: {source}"))
+        Self::backend(format!("{self}: {source}"))
     }
 }
 
@@ -260,10 +246,7 @@ mod tests {
     use crate::query::parse_expression;
 
     #[test] fn equality_predicate_filters_values() { let evaluator = value_expression_model().unwrap().into_evaluator(); let expression = parse_expression("a == 2").unwrap(); let mut matching = Document::new(); matching.insert("a", Value::signed(2)); let mut different = Document::new(); different.insert("a", Value::signed(3)); assert!(evaluator .evaluate_predicate(&expression, &matching) .unwrap()); assert!(!evaluator .evaluate_predicate(&expression, &different) .unwrap()); }
-
     #[test] fn nested_field_predicate_is_resolved() { let evaluator = value_expression_model().unwrap().into_evaluator(); let expression = parse_expression("user.age >= 18").unwrap(); let mut user = Document::new(); user.insert("age", Value::signed(20)); let mut document = Document::new(); document.insert("user", Value::object(user)); assert!(evaluator .evaluate_predicate(&expression, &document) .unwrap()); }
-
     #[test] fn resolved_predicate_uses_native_semantics_without_document_materialization() { struct Resolver; impl super::super::ExpressionFieldResolver<Value> for Resolver { fn resolve_field( &self, field: &super::super::ExpressionFieldPath, ) -> SemanticValue<Value> { match field.to_string().as_str() { "a" => SemanticValue::Present(Value::signed(2)), "b" => SemanticValue::Present(Value::signed(3)), _ => SemanticValue::Missing, } } } let runtime = value_expression_runtime().unwrap(); let expression = parse_expression("a == 2 and b > 1").unwrap(); assert!(super::super::ExecutionRuntime::evaluate_resolved_predicate( &runtime, &expression, &Resolver, ) .unwrap()); }
-
     #[test] fn non_boolean_predicate_is_rejected() { let evaluator = value_expression_model().unwrap().into_evaluator(); let expression = parse_expression("a").unwrap(); let mut document = Document::new(); document.insert("a", Value::signed(2)); assert!(evaluator .evaluate_predicate(&expression, &document) .is_err()); }
 }

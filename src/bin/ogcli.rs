@@ -1,4 +1,4 @@
-//! Thin shell for an ogd daemon.
+//! Thin shell for ogd daemon.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
     env,
@@ -7,11 +7,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-        Arc,
-    },
+    sync::{ atomic::{AtomicBool, Ordering}, mpsc, Arc, },
     thread,
     time::Duration,
 };
@@ -19,9 +15,7 @@ use std::{
 use og_core::{
     access::identity_file::{self, IdentityCredential},
     helpers::decode_base64,
-    operation::{
-        operation_by_name, OperationRequest, TransportKind, AUTH_BEGIN, AUTH_COMPLETE, QUERY_EXECUTE,
-    },
+    operation::{ operation_by_name, OperationRequest, TransportKind, AUTH_BEGIN, AUTH_COMPLETE, QUERY_EXECUTE, },
     protocol::{
         decode_stream_response, encode_message, ensure_payload_size, MessageKind, RequestId,
         StreamResponse, LENGTH_PREFIX_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -170,13 +164,7 @@ fn repl(mut config: Config) -> Result<ExitCode> {
     }
 }
 
-fn spawn_background_line(
-    config: Config,
-    line: String,
-    job_id: u64,
-    output: mpsc::Sender<String>,
-    failed: Arc<AtomicBool>,
-) {
+fn spawn_background_line( config: Config, line: String, job_id: u64, output: mpsc::Sender<String>, failed: Arc<AtomicBool>, ) {
     thread::spawn(move || {
         let _ = output.send(format!("[{job_id}] started"));
         let result = execute_background_line(&config, &line, |message| {
@@ -200,11 +188,7 @@ fn spawn_background_line(
     });
 }
 
-fn execute_background_line(
-    config: &Config,
-    line: &str,
-    mut emit: impl FnMut(String) -> Result<()>,
-) -> Result<ExitCode> {
+fn execute_background_line( config: &Config, line: &str, mut emit: impl FnMut(String) -> Result<()>, ) -> Result<ExitCode> {
     let mut client = Client::connect(config)?;
     if let Some(operation) = line.strip_prefix('.') {
         let (op, data) = parse_operation(operation)?;
@@ -340,7 +324,7 @@ impl Client {
         if let Some(error) = response.get("error") {
             let code = error.get("code").and_then(Value::as_str).unwrap_or("operation.error");
             let message = error.get("message").and_then(Value::as_str).unwrap_or("operation rejected");
-            return Err(io::Error::new(io::ErrorKind::Other, format!("{code}: {message}")).into());
+            return Err(io::Error::other(format!("{code}: {message}")).into());
         }
         Ok(response.get("data").cloned().unwrap_or(Value::Null))
     }
@@ -376,13 +360,7 @@ impl Client {
         }
     }
 
-    fn stream_operation_emit(
-        &mut self,
-        op: &str,
-        data: Value,
-        output: Output,
-        emit: &mut impl FnMut(String) -> Result<()>,
-    ) -> Result<ExitCode> {
+    fn stream_operation_emit( &mut self, op: &str, data: Value, output: Output, emit: &mut impl FnMut(String) -> Result<()>, ) -> Result<ExitCode> {
         let expected = self.send(op, data)?;
         let mut message = Vec::with_capacity(4096);
         loop {
@@ -424,12 +402,7 @@ impl Client {
         }
     }
 
-    fn query_stream_emit(
-        &mut self,
-        query: &str,
-        output: Output,
-        emit: &mut impl FnMut(String) -> Result<()>,
-    ) -> Result<ExitCode> {
+    fn query_stream_emit( &mut self, query: &str, output: Output, emit: &mut impl FnMut(String) -> Result<()>, ) -> Result<ExitCode> {
         if query.trim().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "query cannot be empty").into());
         }
@@ -620,7 +593,7 @@ impl Config {
             && self
                 .password
                 .as_deref()
-                .map_or(true, |value| value.is_empty());
+                .is_none_or(|value| value.is_empty());
         if needs_prompt && io::stdin().is_terminal() {
             self.password = Some(rpassword::prompt_password("Identity password: ")?);
         }

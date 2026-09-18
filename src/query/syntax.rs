@@ -1,3 +1,5 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
+
 use super::SortDirection;
 
 pub(super) fn parse_sort_item(text: &str) -> Result<(&str, SortDirection), String> {

@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::protocol::{RequestId, PROTOCOL_VERSION};
 
 /// Generic response for future non-query operations.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationResponse {
     pub kind: String,

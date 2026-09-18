@@ -272,11 +272,7 @@ impl StoredDocument {
     ///
     /// Returns an error when `version` is zero.
     #[inline]
-    pub fn new(
-        id: DocumentId,
-        version: DocumentVersion,
-        document: Arc<Document>,
-    ) -> StorageResult<Self> {
+    pub fn new( id: DocumentId, version: DocumentVersion, document: Arc<Document>, ) -> StorageResult<Self> {
         if version.is_none() {
             return Err(StorageError::invalid_committed_version());
         }
@@ -672,7 +668,7 @@ pub trait StorageRead {
         ) -> StorageResult<bool>,
     ) -> StorageResult<()> {
         self.scan_projected_unordered_each(collection, options, fields, &mut |stored| {
-            let id = stored.id().clone();
+            let id = *stored.id();
             let version = stored.version();
             let values = fields
                 .iter()
@@ -788,7 +784,7 @@ pub trait StorageRead {
             );
             let _ = gate_field_count;
             if gate(&projected)? {
-                visitor(stored.id().clone(), stored.version(), &projected)
+                visitor(*stored.id(), stored.version(), &projected)
             } else {
                 Ok(true)
             }
@@ -1030,19 +1026,11 @@ impl<B: StorageBackend> StorageEngine for BackendStorage<B> {
         self.backend.begin()
     }
 
-    fn apply_batch_atomic(
-        &self,
-        collection: &CollectionId,
-        mutations: Vec<StorageMutation>,
-    ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
+    fn apply_batch_atomic( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
         self.backend.apply_batch_atomic(collection, mutations)
     }
 
-    fn apply_batch_atomic_summary(
-        &self,
-        collection: &CollectionId,
-        mutations: Vec<StorageMutation>,
-    ) -> StorageResult<CommitResult> {
+    fn apply_batch_atomic_summary( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<CommitResult> {
         self.backend
             .apply_batch_atomic_summary(collection, mutations)
     }
@@ -1064,11 +1052,7 @@ pub trait StorageEngine: Send + Sync {
     /// Backends should override this method when they can validate and commit a
     /// batch without cloning a full transactional snapshot. The default keeps
     /// existing backends compatible.
-    fn apply_batch_atomic(
-        &self,
-        collection: &CollectionId,
-        mutations: Vec<StorageMutation>,
-    ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
+    fn apply_batch_atomic( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
         let mut transaction = self.begin()?;
         let stored = transaction.apply_batch(collection, mutations)?;
         let commit = transaction.commit()?;
@@ -1079,11 +1063,7 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// Import paths should prefer this method when only commit counters are
     /// required. The default preserves backend compatibility.
-    fn apply_batch_atomic_summary(
-        &self,
-        collection: &CollectionId,
-        mutations: Vec<StorageMutation>,
-    ) -> StorageResult<CommitResult> {
+    fn apply_batch_atomic_summary( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<CommitResult> {
         self.apply_batch_atomic(collection, mutations)
             .map(|(_, commit)| commit)
     }
@@ -1184,29 +1164,29 @@ impl StorageError {
         })
     }
 
-    fn invalid_committed_version() -> Self {
+    const fn invalid_committed_version() -> Self {
         Self::new(StorageErrorKind::InvalidCommittedVersion)
     }
 
-    fn version_overflow() -> Self {
+    const fn version_overflow() -> Self {
         Self::new(StorageErrorKind::VersionOverflow)
     }
 
     /// Creates a duplicate-document error.
     #[must_use]
-    pub fn document_already_exists(collection: CollectionId, id: DocumentId) -> Self {
+    pub const fn document_already_exists(collection: CollectionId, id: DocumentId) -> Self {
         Self::new(StorageErrorKind::DocumentAlreadyExists { collection, id })
     }
 
     /// Creates a missing-document error.
     #[must_use]
-    pub fn document_not_found(collection: CollectionId, id: DocumentId) -> Self {
+    pub const fn document_not_found(collection: CollectionId, id: DocumentId) -> Self {
         Self::new(StorageErrorKind::DocumentNotFound { collection, id })
     }
 
     /// Creates an optimistic version conflict.
     #[must_use]
-    pub fn version_conflict(
+    pub const fn version_conflict(
         collection: CollectionId,
         id: DocumentId,
         expected: DocumentVersion,
@@ -1340,40 +1320,22 @@ mod tests {
     use super::*;
 
     #[test] fn parses_collection_identifier() { let id = CollectionId::parse("users").unwrap(); assert_eq!(id.as_str(), "users"); assert_eq!(id.segment_count(), 1); assert!(!id.is_system()); }
-
     #[test] fn parses_system_collection_identifier() { let id = CollectionId::parse("_og.events").unwrap(); assert_eq!(id.segments().collect::<Vec<_>>(), vec!["_og", "events"]); assert!(id.is_system()); }
-
     #[test] fn rejects_empty_collection_identifier() { let error = CollectionId::parse("").unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::InvalidCollectionId { .. } )); }
-
     #[test] fn rejects_empty_collection_segment() { let error = CollectionId::parse("_og..events").unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::InvalidCollectionId { .. } )); }
-
     #[test] fn rejects_invalid_collection_start() { let error = CollectionId::parse("2users").unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::InvalidCollectionId { .. } )); }
-
     #[test] fn rejects_invalid_collection_character() { let error = CollectionId::parse("user-data").unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::InvalidCollectionId { .. } )); }
-
     #[test] fn parses_document_identifier() { let text = "01890f4c-0000-7000-8000-000000000001"; let id = DocumentId::parse(text).unwrap(); assert_eq!(id.to_string(), text); }
-
     #[test] fn rejects_empty_document_identifier() { let error = DocumentId::parse("").unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::InvalidDocumentId { .. } )); }
-
     #[test] fn rejects_control_character_in_document_identifier() { let error = DocumentId::parse("user\n42").unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::InvalidDocumentId { .. } )); }
-
     #[test] fn increments_document_version() { assert_eq!( DocumentVersion::INITIAL.next().unwrap(), DocumentVersion::new(2) ); }
-
     #[test] fn detects_document_version_overflow() { let error = DocumentVersion::new(u64::MAX).next().unwrap_err(); assert_eq!(error.kind(), &StorageErrorKind::VersionOverflow); }
-
     #[test] fn exact_version_precondition_matches_only_expected_version() { let precondition = VersionPrecondition::Exact(DocumentVersion::new(7)); assert!(precondition.matches(DocumentVersion::new(7))); assert!(!precondition.matches(DocumentVersion::new(8))); }
-
     #[test] fn any_version_precondition_matches_every_version() { assert!(VersionPrecondition::Any.matches(DocumentVersion::INITIAL)); assert!(VersionPrecondition::Any.matches(DocumentVersion::new(99))); }
-
     #[test] fn scan_options_default_to_forward_without_limit() { let options = ScanOptions::default(); assert_eq!(options.limit(), None); assert_eq!(options.direction(), ScanDirection::Forward); }
-
     #[test] fn configures_scan_options() { let options = ScanOptions::new() .with_limit(25) .with_direction(ScanDirection::Reverse); assert_eq!(options.limit(), Some(25)); assert_eq!(options.direction(), ScanDirection::Reverse); }
-
     #[test] fn commit_result_reports_totals() { let result = CommitResult::new(2, 3, 4); assert_eq!(result.inserted(), 2); assert_eq!(result.replaced(), 3); assert_eq!(result.deleted(), 4); assert_eq!(result.total(), 9); assert!(!result.is_empty()); }
-
     #[test] fn empty_commit_result_is_empty() { assert!(CommitResult::default().is_empty()); }
-
     #[test] fn storage_traits_are_object_safe() { fn accept_engine(_: &dyn StorageEngine) {} fn accept_read(_: &dyn StorageRead) {} fn accept_transaction(_: &mut dyn StorageTransaction) {} let _ = accept_engine; let _ = accept_read; let _ = accept_transaction; }
-
     #[test] fn public_storage_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<CollectionId>(); assert_send_and_sync::<DocumentId>(); assert_send_and_sync::<DocumentVersion>(); assert_send_and_sync::<StoredDocument>(); assert_send_and_sync::<StorageError>(); assert_send_and_sync::<CommitResult>(); assert_send_and_sync::<ScanOptions>(); }
 }

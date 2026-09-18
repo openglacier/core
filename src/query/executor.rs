@@ -32,7 +32,7 @@ pub struct DocumentScope {
 }
 
 impl DocumentScope {
-    /// Creates a Place + AppInstance scope.
+    /// Creates a Place + `AppInstance` scope.
     #[must_use]
     pub fn new(place_id: impl Into<Arc<str>>, app_instance_id: impl Into<Arc<str>>) -> Self {
         Self {
@@ -41,7 +41,7 @@ impl DocumentScope {
         }
     }
 
-    /// Creates a Place-wide scope without restricting documents to one AppInstance.
+    /// Creates a Place-wide scope without restricting documents to one `AppInstance`.
     #[must_use]
     pub fn for_place(place_id: impl Into<Arc<str>>) -> Self {
         Self {
@@ -60,17 +60,14 @@ impl DocumentScope {
     }
 
     fn enforce(&self, document: &Document) -> Arc<Document> {
-        match self.app_instance_id.as_deref() {
-            Some(app_instance_id) => Arc::new(enforce_document_scope(
-                document,
-                &self.place_id,
-                app_instance_id,
-            )),
-            None => {
-                let mut scoped = document.clone();
-                scoped.insert(PLACE_SCOPE_FIELD, self.place_id.as_ref());
-                Arc::new(scoped)
-            }
+        if let Some(app_instance_id) = self.app_instance_id.as_deref() { Arc::new(enforce_document_scope(
+            document,
+            &self.place_id,
+            app_instance_id,
+        )) } else {
+            let mut scoped = document.clone();
+            scoped.insert(PLACE_SCOPE_FIELD, self.place_id.as_ref());
+            Arc::new(scoped)
         }
     }
 }
@@ -170,12 +167,12 @@ pub enum StreamingLoadMutation {
 
 impl StreamingLoadMutation {
     #[must_use]
-    pub fn insert(id: DocumentId, document: Arc<Document>) -> Self {
+    pub const fn insert(id: DocumentId, document: Arc<Document>) -> Self {
         Self::Insert { id, document }
     }
 
     #[must_use]
-    pub fn replace(
+    pub const fn replace(
         id: DocumentId,
         document: Arc<Document>,
         precondition: VersionPrecondition,
@@ -256,10 +253,7 @@ pub trait IncrementalGroupAccumulator: Send {
     ///
     /// Runtimes that implement this capability let the engine spill one bounded
     /// aggregate state per group instead of retaining complete source rows.
-    fn finish_partial(
-        self: Box<Self>,
-        _ordinal: u64,
-    ) -> ExecutionResult<Option<SyntheticDocument>> {
+    fn finish_partial( self: Box<Self>, _ordinal: u64, ) -> ExecutionResult<Option<SyntheticDocument>> {
         Ok(None)
     }
 
@@ -295,18 +289,10 @@ pub trait IncrementalGroupAccumulator: Send {
 
 pub trait ExecutionRuntime: Send + Sync {
     /// Evaluates a filter predicate.
-    fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-    ) -> ExecutionResult<bool>;
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, ) -> ExecutionResult<bool>;
 
     /// Evaluates a predicate directly from a field resolver when supported.
-    fn evaluate_resolved_predicate(
-        &self,
-        expression: &Expression,
-        resolver: &dyn ExpressionFieldResolver<Value>,
-    ) -> ExecutionResult<bool> {
+    fn evaluate_resolved_predicate( &self, expression: &Expression, resolver: &dyn ExpressionFieldResolver<Value>, ) -> ExecutionResult<bool> {
         let _ = (expression, resolver);
         Err(ExecutionError::unsupported_operator(
             "filter",
@@ -315,37 +301,21 @@ pub trait ExecutionRuntime: Send + Sync {
     }
 
     /// Applies one complete `set` operator.
-    fn apply_set(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-    ) -> ExecutionResult<Arc<Document>>;
+    fn apply_set( &self, assignments: &[SetAssignment], document: &Document, ) -> ExecutionResult<Arc<Document>>;
 
     /// Evaluates a predicate inside a lookup sub-pipeline.
     ///
     /// `outer` is the document currently being enriched. `inner_alias` is the
     /// alias declared by the lookup header, when present. The default
     /// implementation evaluates the predicate against the inner document only.
-    fn evaluate_lookup_predicate(
-        &self,
-        expression: &Expression,
-        outer: &Document,
-        inner_alias: Option<&str>,
-        inner: &Document,
-    ) -> ExecutionResult<bool> {
+    fn evaluate_lookup_predicate( &self, expression: &Expression, outer: &Document, inner_alias: Option<&str>, inner: &Document, ) -> ExecutionResult<bool> {
         let _ = (outer, inner_alias);
         self.evaluate_predicate(expression, inner)
     }
 
     /// Attaches the result of a lookup to the outer document.
-    fn apply_lookup(
-        &self,
-        into: &str,
-        outer: &Document,
-        matches: &LookupDocuments,
-    ) -> ExecutionResult<Arc<Document>> {
+    fn apply_lookup( &self, into: &str, outer: &Document, matches: &LookupDocuments, ) -> ExecutionResult<Arc<Document>> {
         let _ = (outer, matches);
-
         Err(ExecutionError::unsupported_operator(
             "lookup",
             format!("lookup target {into:?} has no runtime implementation"),
@@ -357,15 +327,8 @@ pub trait ExecutionRuntime: Send + Sync {
     /// The runtime owns parsing, validation, merge semantics, and optimistic
     /// concurrency decisions. The executor only applies the returned mutations
     /// atomically inside the current transaction.
-    fn prepare_streaming_load(
-        &self,
-        collection: &crate::storage::CollectionId,
-        storage: &dyn StorageRead,
-        mode: PhysicalLoadMode,
-        chunks: &[Arc<str>],
-    ) -> ExecutionResult<Vec<StreamingLoadMutation>> {
+    fn prepare_streaming_load( &self, collection: &crate::storage::CollectionId, storage: &dyn StorageRead, mode: PhysicalLoadMode, chunks: &[Arc<str>], ) -> ExecutionResult<Vec<StreamingLoadMutation>> {
         let _ = (collection, storage, chunks);
-
         Err(ExecutionError::unsupported_operator(
             "streaming-load",
             format!("streaming load mode {mode} has no runtime implementation"),
@@ -375,7 +338,6 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Applies a load operator.
     fn apply_load(&self, target: &str, document: &Document) -> ExecutionResult<Arc<Document>> {
         let _ = document;
-
         Err(ExecutionError::unsupported_operator(
             "load",
             format!("load target {target:?} has no runtime implementation"),
@@ -383,14 +345,8 @@ pub trait ExecutionRuntime: Send + Sync {
     }
 
     /// Compares two documents using an ordered list of sort keys.
-    fn compare_documents(
-        &self,
-        keys: &[SortKey],
-        left: &Document,
-        right: &Document,
-    ) -> ExecutionResult<Ordering> {
+    fn compare_documents( &self, keys: &[SortKey], left: &Document, right: &Document, ) -> ExecutionResult<Ordering> {
         let _ = (keys, left, right);
-
         Err(ExecutionError::unsupported_operator(
             "sort",
             "document comparison has no runtime implementation",
@@ -408,24 +364,14 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Compares two rows whose values are aligned one-for-one with `keys`.
     ///
     /// Returning `None` asks the engine to preserve the full-document path.
-    fn compare_projected_values(
-        &self,
-        keys: &[SortKey],
-        left: &[Option<Value>],
-        right: &[Option<Value>],
-    ) -> ExecutionResult<Option<Ordering>> {
+    fn compare_projected_values( &self, keys: &[SortKey], left: &[Option<Value>], right: &[Option<Value>], ) -> ExecutionResult<Option<Ordering>> {
         let _ = (keys, left, right);
         Ok(None)
     }
 
     /// Projects a document to the requested fields.
-    fn apply_select(
-        &self,
-        fields: &[ExpressionFieldPath],
-        document: &Document,
-    ) -> ExecutionResult<Arc<Document>> {
+    fn apply_select( &self, fields: &[ExpressionFieldPath], document: &Document, ) -> ExecutionResult<Arc<Document>> {
         let _ = (fields, document);
-
         Err(ExecutionError::unsupported_operator(
             "select",
             "document projection has no runtime implementation",
@@ -435,13 +381,8 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Returns a deterministic equality key for `distinct`.
     ///
     /// An empty field list means the complete document.
-    fn distinct_key(
-        &self,
-        fields: &[ExpressionFieldPath],
-        document: &Document,
-    ) -> ExecutionResult<Arc<[u8]>> {
+    fn distinct_key( &self, fields: &[ExpressionFieldPath], document: &Document, ) -> ExecutionResult<Arc<[u8]>> {
         let _ = (fields, document);
-
         Err(ExecutionError::unsupported_operator(
             "distinct",
             "distinct-key extraction has no runtime implementation",
@@ -458,12 +399,7 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Encodes the same key as `distinct_key` into `key` and returns `true` when
     /// the capability is available. Returning `false` preserves the Arc-returning
     /// compatibility path.
-    fn write_distinct_key(
-        &self,
-        fields: &[ExpressionFieldPath],
-        document: &Document,
-        key: &mut Vec<u8>,
-    ) -> ExecutionResult<bool> {
+    fn write_distinct_key( &self, fields: &[ExpressionFieldPath], document: &Document, key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
         let _ = (fields, document, key);
         Ok(false)
     }
@@ -479,13 +415,7 @@ pub trait ExecutionRuntime: Send + Sync {
     /// `indexes` maps `fields` into `values`. Implementations write into the reusable
     /// caller-owned `key` buffer and return `true`; returning `false` selects the
     /// established full-document fallback.
-    fn write_projected_distinct_key(
-        &self,
-        fields: &[ExpressionFieldPath],
-        values: &[Option<ProjectedValueRef<'_>>],
-        indexes: &[usize],
-        key: &mut Vec<u8>,
-    ) -> ExecutionResult<bool> {
+    fn write_projected_distinct_key( &self, fields: &[ExpressionFieldPath], values: &[Option<ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
         let _ = (fields, values, indexes, key);
         Ok(false)
     }
@@ -493,7 +423,6 @@ pub trait ExecutionRuntime: Send + Sync {
     /// Creates the single result document emitted by `count`.
     fn count_document(&self, alias: &str, count: u64) -> ExecutionResult<Arc<Document>> {
         let _ = count;
-
         Err(ExecutionError::unsupported_operator(
             "count",
             format!("count result alias {alias:?} has no runtime implementation"),
@@ -508,21 +437,13 @@ pub trait ExecutionRuntime: Send + Sync {
     ///
     /// Returning `None` preserves compatibility with runtimes that only expose
     /// the legacy materializing group handler.
-    fn incremental_group_accumulator(
-        &self,
-        keys: &[ExpressionFieldPath],
-    ) -> ExecutionResult<Option<Box<dyn IncrementalGroupAccumulator>>> {
+    fn incremental_group_accumulator( &self, keys: &[ExpressionFieldPath], ) -> ExecutionResult<Option<Box<dyn IncrementalGroupAccumulator>>> {
         let _ = keys;
         Ok(None)
     }
 
-    fn group_documents(
-        &self,
-        keys: &[ExpressionFieldPath],
-        documents: &[Arc<Document>],
-    ) -> ExecutionResult<Vec<SyntheticDocument>> {
+    fn group_documents( &self, keys: &[ExpressionFieldPath], documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
         let _ = (keys, documents);
-
         Err(ExecutionError::unsupported_operator(
             "group",
             "group aggregation has no runtime implementation",
@@ -531,10 +452,7 @@ pub trait ExecutionRuntime: Send + Sync {
 
     /// Converts one validated logical insert document into the storage-specific
     /// document representation and chooses its immutable identifier.
-    fn prepare_insert(
-        &self,
-        document: &LogicalInsertDocument,
-    ) -> ExecutionResult<PreparedInsertDocument> {
+    fn prepare_insert( &self, document: &LogicalInsertDocument, ) -> ExecutionResult<PreparedInsertDocument> {
         let _ = document;
 
         Err(ExecutionError::unsupported_operator(
@@ -547,13 +465,8 @@ pub trait ExecutionRuntime: Send + Sync {
     ///
     /// The runtime owns value extraction, aggregate semantics, column naming,
     /// and the representation of synthetic pivot result documents.
-    fn pivot_documents(
-        &self,
-        specification: &PivotSpecification,
-        documents: &[Arc<Document>],
-    ) -> ExecutionResult<Vec<SyntheticDocument>> {
+    fn pivot_documents( &self, specification: &PivotSpecification, documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
         let _ = (specification, documents);
-
         Err(ExecutionError::unsupported_operator(
             "pivot",
             "pivot aggregation has no runtime implementation",
@@ -561,15 +474,8 @@ pub trait ExecutionRuntime: Send + Sync {
     }
 
     /// Applies a custom operator.
-    fn apply_custom(
-        &self,
-        stage: &StageName,
-        arguments: &str,
-        writes: bool,
-        document: &Document,
-    ) -> ExecutionResult<CustomOperatorResult> {
+    fn apply_custom( &self, stage: &StageName, arguments: &str, writes: bool, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
         let _ = (arguments, writes, document);
-
         Err(ExecutionError::unsupported_operator(
             stage.as_str(),
             "custom operator has no runtime implementation",
@@ -636,12 +542,7 @@ impl Executor {
     ///
     /// This avoids constructing a result vector that callers immediately
     /// discard when only mutation counters are needed.
-    pub fn execute_compact(
-        &self,
-        storage: &dyn StorageEngine,
-        runtime: &dyn ExecutionRuntime,
-        plan: &PhysicalPlan,
-    ) -> ExecutionResult<ExecutionOutput> {
+    pub fn execute_compact( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, ) -> ExecutionResult<ExecutionOutput> {
         if let Some((mode, chunks)) = streaming_load_specification(plan) {
             return execute_streaming_load_compact(
                 storage,
@@ -652,28 +553,16 @@ impl Executor {
                 &self.memory_governor,
             );
         }
-
         self.execute(storage, runtime, plan)
     }
 
     /// Executes a physical plan.
-    pub fn execute(
-        &self,
-        storage: &dyn StorageEngine,
-        runtime: &dyn ExecutionRuntime,
-        plan: &PhysicalPlan,
-    ) -> ExecutionResult<ExecutionOutput> {
+    pub fn execute( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, ) -> ExecutionResult<ExecutionOutput> {
         self.execute_scoped(storage, runtime, plan, None)
     }
 
     /// Executes a physical plan under an optional trusted document scope.
-    pub fn execute_scoped(
-        &self,
-        storage: &dyn StorageEngine,
-        runtime: &dyn ExecutionRuntime,
-        plan: &PhysicalPlan,
-        scope: Option<&DocumentScope>,
-    ) -> ExecutionResult<ExecutionOutput> {
+    pub fn execute_scoped( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
         if scope.is_some() && plan.is_streaming_load() {
             return Err(ExecutionError::unsupported_operator(
                 "scoped-streaming-load",
@@ -687,15 +576,8 @@ impl Executor {
         }
     }
 
-    fn execute_read(
-        &self,
-        storage: &dyn StorageEngine,
-        runtime: &dyn ExecutionRuntime,
-        plan: &PhysicalPlan,
-        scope: Option<&DocumentScope>,
-    ) -> ExecutionResult<ExecutionOutput> {
+    fn execute_read( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
         let snapshot = storage.read().map_err(ExecutionError::storage)?;
-
         if scope.is_none() {
             if let Some(alias) = simple_count_alias(plan) {
                 let count = snapshot
@@ -722,7 +604,6 @@ impl Executor {
 
         let source_rows = scan_source(snapshot.as_ref(), plan, scope)?;
         let scanned = usize_to_u64(source_rows.len())?;
-
         let mut state = PipelineState::from_stored(source_rows);
         state.strategies = state.strategies.with(match plan.source().access() {
             PhysicalAccess::CollectionScan { .. } => ExecutionStrategy::CollectionScan,
@@ -737,7 +618,6 @@ impl Executor {
             &self.memory_governor,
             scope,
         )?;
-
         let returned = usize_to_u64(state.rows.len())?;
         let statistics = ExecutionStatistics {
             scanned,
@@ -746,7 +626,6 @@ impl Executor {
             strategies: state.strategies,
             ..ExecutionStatistics::default()
         };
-
         Ok(ExecutionOutput {
             rows: state.rows,
             statistics,
@@ -754,13 +633,7 @@ impl Executor {
         })
     }
 
-    fn execute_write(
-        &self,
-        storage: &dyn StorageEngine,
-        runtime: &dyn ExecutionRuntime,
-        plan: &PhysicalPlan,
-        scope: Option<&DocumentScope>,
-    ) -> ExecutionResult<ExecutionOutput> {
+    fn execute_write( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
         if let Some((mode, chunks)) = streaming_load_specification(plan) {
             return execute_streaming_load(
                 storage,
@@ -771,16 +644,12 @@ impl Executor {
                 &self.memory_governor,
             );
         }
-
         let mut transaction = storage.begin().map_err(ExecutionError::storage)?;
-
         if let Some(document) = insert_document(plan) {
             return execute_insert(transaction, runtime, plan, document, scope);
         }
-
         let source_rows = scan_source(transaction.as_ref(), plan, scope)?;
         let scanned = usize_to_u64(source_rows.len())?;
-
         let mut state = PipelineState::from_stored(source_rows);
         state.strategies = state.strategies.with(match plan.source().access() {
             PhysicalAccess::CollectionScan { .. } => ExecutionStrategy::CollectionScan,
@@ -795,16 +664,13 @@ impl Executor {
             &self.memory_governor,
             scope,
         )?;
-
         if contains_delete(plan) {
             delete_rows(transaction.as_mut(), plan, &state.rows)?;
         } else {
             replace_changed_rows(transaction.as_mut(), plan, &mut state.rows, scope)?;
         }
-
         let commit = transaction.commit().map_err(ExecutionError::storage)?;
         let returned = usize_to_u64(state.rows.len())?;
-
         let statistics = ExecutionStatistics {
             scanned,
             filtered: state.filtered,
@@ -814,7 +680,6 @@ impl Executor {
             deleted: commit.deleted(),
             strategies: state.strategies,
         };
-
         Ok(ExecutionOutput {
             rows: if contains_delete(plan) {
                 Vec::new()
@@ -830,27 +695,18 @@ impl Executor {
     }
 }
 
-fn execute_insert(
-    mut transaction: Box<dyn StorageTransaction + '_>,
-    runtime: &dyn ExecutionRuntime,
-    plan: &PhysicalPlan,
-    document: &LogicalInsertDocument,
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<ExecutionOutput> {
+fn execute_insert( mut transaction: Box<dyn StorageTransaction + '_>, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, document: &LogicalInsertDocument, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
     let prepared = runtime.prepare_insert(document)?;
     let (id, mut document) = prepared.into_parts();
     if let Some(scope) = scope {
         document = scope.enforce(document.as_ref());
     }
-
     let result = transaction
         .insert(plan.source().collection(), id, document)
         .map_err(ExecutionError::storage)?;
-
     let mut row = ExecutionRow::from_stored(result.into_stored());
     row.document = Arc::new(row.evaluation_document());
     let commit = transaction.commit().map_err(ExecutionError::storage)?;
-
     Ok(ExecutionOutput {
         rows: vec![row],
         statistics: ExecutionStatistics {
@@ -866,21 +722,13 @@ fn execute_insert(
     })
 }
 
-fn execute_streaming_load_compact(
-    storage: &dyn StorageEngine,
-    runtime: &dyn ExecutionRuntime,
-    plan: &PhysicalPlan,
-    mode: PhysicalLoadMode,
-    chunks: &[Arc<str>],
-    memory_governor: &MemoryGovernor,
-) -> ExecutionResult<ExecutionOutput> {
+fn execute_streaming_load_compact( storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, mode: PhysicalLoadMode, chunks: &[Arc<str>], memory_governor: &MemoryGovernor, ) -> ExecutionResult<ExecutionOutput> {
     let chunk_bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
     let _reservation = reserve_import_memory(memory_governor, chunk_bytes.saturating_mul(2))?;
     let read = storage.read().map_err(ExecutionError::storage)?;
     let prepared =
         runtime.prepare_streaming_load(plan.source().collection(), read.as_ref(), mode, chunks)?;
     let mut mutations = Vec::with_capacity(prepared.len());
-
     for mutation in prepared {
         mutations.push(match mutation {
             StreamingLoadMutation::Insert { id, document } => StorageMutation::insert(id, document),
@@ -891,11 +739,9 @@ fn execute_streaming_load_compact(
             } => StorageMutation::replace(id, document, precondition),
         });
     }
-
     let commit = storage
         .apply_batch_atomic_summary(plan.source().collection(), mutations)
         .map_err(ExecutionError::storage)?;
-
     Ok(ExecutionOutput {
         rows: Vec::new(),
         statistics: ExecutionStatistics {
@@ -911,21 +757,13 @@ fn execute_streaming_load_compact(
     })
 }
 
-fn execute_streaming_load(
-    storage: &dyn StorageEngine,
-    runtime: &dyn ExecutionRuntime,
-    plan: &PhysicalPlan,
-    mode: PhysicalLoadMode,
-    chunks: &[Arc<str>],
-    memory_governor: &MemoryGovernor,
-) -> ExecutionResult<ExecutionOutput> {
+fn execute_streaming_load( storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, mode: PhysicalLoadMode, chunks: &[Arc<str>], memory_governor: &MemoryGovernor, ) -> ExecutionResult<ExecutionOutput> {
     let chunk_bytes = chunks.iter().map(|chunk| chunk.len()).sum::<usize>();
     let _reservation = reserve_import_memory(memory_governor, chunk_bytes.saturating_mul(3))?;
     let read = storage.read().map_err(ExecutionError::storage)?;
     let prepared =
         runtime.prepare_streaming_load(plan.source().collection(), read.as_ref(), mode, chunks)?;
     let mut mutations = Vec::with_capacity(prepared.len());
-
     for mutation in prepared {
         mutations.push(match mutation {
             StreamingLoadMutation::Insert { id, document } => StorageMutation::insert(id, document),
@@ -1003,14 +841,14 @@ impl ExecutionOutput {
     /// Returns whether no row was emitted.
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
 
     /// Returns the number of emitted rows.
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.rows.len()
     }
 }
@@ -1075,7 +913,7 @@ impl ExecutionRow {
         }
     }
 
-    fn from_spill(
+    const fn from_spill(
         id: DocumentId,
         version: DocumentVersion,
         document: Arc<Document>,
@@ -1162,7 +1000,7 @@ impl ExecutionRow {
 /// access vector. It is intentionally sufficient to hydrate the committed row
 /// later without retaining a `Document`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ProjectedRowLocator {
+pub struct ProjectedRowLocator {
     id: DocumentId,
     version: DocumentVersion,
 }
@@ -1188,7 +1026,7 @@ impl ProjectedRowLocator {
 /// one flat buffer rather than allocating one `Vec` per source row. Consumers
 /// keep only the fields they actually need plus a locator for late hydration.
 #[derive(Debug)]
-pub(crate) struct ProjectedRowSet {
+pub struct ProjectedRowSet {
     width: usize,
     locators: Vec<ProjectedRowLocator>,
     values: Vec<Option<Value>>,
@@ -1196,7 +1034,7 @@ pub(crate) struct ProjectedRowSet {
 
 impl ProjectedRowSet {
     #[must_use]
-    pub(crate) fn new(width: usize) -> Self {
+    pub(crate) const fn new(width: usize) -> Self {
         Self {
             width,
             locators: Vec::new(),
@@ -1205,17 +1043,11 @@ impl ProjectedRowSet {
     }
 
     #[must_use]
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.locators.len()
     }
 
-    pub(crate) fn push_refs(
-        &mut self,
-        id: DocumentId,
-        version: DocumentVersion,
-        source: &[Option<ProjectedValueRef<'_>>],
-        slots: &[usize],
-    ) -> ExecutionResult<()> {
+    pub(crate) fn push_refs( &mut self, id: DocumentId, version: DocumentVersion, source: &[Option<ProjectedValueRef<'_>>], slots: &[usize], ) -> ExecutionResult<()> {
         if slots.len() != self.width || slots.iter().any(|slot| *slot >= source.len()) {
             return Err(ExecutionError::evaluation(
                 "projected row slots do not match the blocking-consumer layout",
@@ -1248,10 +1080,7 @@ impl ProjectedRowSet {
 /// locator storage, flattened value capacity and stable-sort index workspace.
 /// It deliberately overcharges small scalar rows so the governor remains the
 /// authority even when `Vec` capacities temporarily grow geometrically.
-pub(crate) fn projected_row_working_bytes_refs(
-    values: &[Option<ProjectedValueRef<'_>>],
-    slots: &[usize],
-) -> usize {
+pub fn projected_row_working_bytes_refs( values: &[Option<ProjectedValueRef<'_>>], slots: &[usize], ) -> usize {
     let payload = slots.iter().fold(0usize, |bytes, slot| {
         let value = values.get(*slot).and_then(Option::as_ref);
         bytes.saturating_add(projected_ref_payload_bytes(value))
@@ -1263,12 +1092,10 @@ pub(crate) fn projected_row_working_bytes_refs(
 
 fn projected_ref_payload_bytes(value: Option<&ProjectedValueRef<'_>>) -> usize {
     match value {
-        None
-        | Some(ProjectedValueRef::Null)
-        | Some(ProjectedValueRef::Bool(_))
-        | Some(ProjectedValueRef::Signed(_))
-        | Some(ProjectedValueRef::Unsigned(_))
-        | Some(ProjectedValueRef::Float(_)) => 0,
+        None |
+Some(ProjectedValueRef::Null | ProjectedValueRef::Bool(_) |
+ProjectedValueRef::Signed(_) | ProjectedValueRef::Unsigned(_) |
+ProjectedValueRef::Float(_)) => 0,
         Some(ProjectedValueRef::String(value)) => value.len(),
         Some(ProjectedValueRef::Owned(value)) => spill_value_encoded_len(value),
     }
@@ -1278,12 +1105,7 @@ fn projected_ref_payload_bytes(value: Option<&ProjectedValueRef<'_>>) -> usize {
 /// remains the owner of value-comparison semantics; the identifier tie-break
 /// reconstructs the deterministic collection-scan source order because the
 /// storage cursor itself is allowed to be physically unordered.
-pub(crate) fn stable_projected_order(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[SortKey],
-    rows: &ProjectedRowSet,
-    direction: crate::storage::ScanDirection,
-) -> ExecutionResult<Vec<usize>> {
+pub fn stable_projected_order( runtime: &dyn ExecutionRuntime, keys: &[SortKey], rows: &ProjectedRowSet, direction: crate::storage::ScanDirection, ) -> ExecutionResult<Vec<usize>> {
     let mut order = (0..rows.len()).collect::<Vec<_>>();
     let mut failure = None;
     order.sort_by(|left_index, right_index| {
@@ -1436,12 +1258,7 @@ impl ExecutionStatistics {
 
     /// Builds statistics for a streamed read-only pipeline.
     #[must_use]
-    pub fn streamed_pipeline(
-        scanned: u64,
-        filtered: u64,
-        returned: u64,
-        strategy: ExecutionStrategy,
-    ) -> Self {
+    pub fn streamed_pipeline( scanned: u64, filtered: u64, returned: u64, strategy: ExecutionStrategy, ) -> Self {
         Self {
             scanned,
             filtered,
@@ -1455,12 +1272,7 @@ impl ExecutionStatistics {
 
     /// Builds statistics for a streamed execution using several physical strategies.
     #[must_use]
-    pub fn streamed_with_strategies(
-        scanned: u64,
-        filtered: u64,
-        returned: u64,
-        strategies: ExecutionStrategies,
-    ) -> Self {
+    pub const fn streamed_with_strategies( scanned: u64, filtered: u64, returned: u64, strategies: ExecutionStrategies, ) -> Self {
         Self {
             scanned,
             filtered,
@@ -1544,7 +1356,7 @@ impl ExecutionError {
 
     /// Wraps a storage error.
     #[must_use]
-    pub fn storage(error: StorageError) -> Self {
+    pub const fn storage(error: StorageError) -> Self {
         Self::new(ExecutionErrorKind::Storage(error))
     }
 
@@ -1566,17 +1378,14 @@ impl ExecutionError {
 
     /// Creates an unsupported-operator error.
     #[must_use]
-    pub fn unsupported_operator(
-        operator: impl Into<Arc<str>>,
-        reason: impl Into<Arc<str>>,
-    ) -> Self {
+    pub fn unsupported_operator( operator: impl Into<Arc<str>>, reason: impl Into<Arc<str>>, ) -> Self {
         Self::new(ExecutionErrorKind::UnsupportedOperator {
             operator: operator.into(),
             reason: reason.into(),
         })
     }
 
-    fn counter_overflow() -> Self {
+    const fn counter_overflow() -> Self {
         Self::new(ExecutionErrorKind::CounterOverflow)
     }
 
@@ -1719,11 +1528,7 @@ fn simple_count_alias(plan: &PhysicalPlan) -> Option<&str> {
     }
 }
 
-fn scan_source(
-    storage: &dyn StorageRead,
-    plan: &PhysicalPlan,
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<Vec<StoredDocument>> {
+fn scan_source( storage: &dyn StorageRead, plan: &PhysicalPlan, scope: Option<&DocumentScope>, ) -> ExecutionResult<Vec<StoredDocument>> {
     let rows = match plan.source().access() {
         PhysicalAccess::CollectionScan { options } => storage
             .scan(plan.source().collection(), *options)
@@ -1742,15 +1547,7 @@ fn scan_source(
     })
 }
 
-fn execute_pipeline(
-    storage: &dyn StorageRead,
-    runtime: &dyn ExecutionRuntime,
-    operators: &[PhysicalOperator],
-    mut state: PipelineState,
-    lookup_context: Option<LookupContext<'_>>,
-    memory_governor: &MemoryGovernor,
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<PipelineState> {
+fn execute_pipeline( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, operators: &[PhysicalOperator], mut state: PipelineState, lookup_context: Option<LookupContext<'_>>, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<PipelineState> {
     let mut cursor = 0usize;
 
     while cursor < operators.len() {
@@ -1812,15 +1609,7 @@ fn is_set_level_operator(operator: &PhysicalOperator) -> bool {
     )
 }
 
-fn execute_row_segment(
-    storage: &dyn StorageRead,
-    runtime: &dyn ExecutionRuntime,
-    operators: &[PhysicalOperator],
-    state: &mut PipelineState,
-    lookup_context: Option<LookupContext<'_>>,
-    memory_governor: &MemoryGovernor,
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<()> {
+fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, operators: &[PhysicalOperator], state: &mut PipelineState, lookup_context: Option<LookupContext<'_>>, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<()> {
     let mut retained = Vec::with_capacity(state.rows.len());
     let mut removed = 0usize;
 
@@ -1932,16 +1721,7 @@ fn execute_row_segment(
     state.add_filtered(removed)
 }
 
-fn execute_lookup(
-    storage: &dyn StorageRead,
-    runtime: &dyn ExecutionRuntime,
-    collection: &crate::storage::CollectionId,
-    alias: Option<&str>,
-    pipeline: &PhysicalSubPipeline,
-    outer: &Document,
-    memory_governor: &MemoryGovernor,
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<LookupDocuments> {
+fn execute_lookup( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, collection: &crate::storage::CollectionId, alias: Option<&str>, pipeline: &PhysicalSubPipeline, outer: &Document, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<LookupDocuments> {
     let rows = storage
         .scan(collection, ScanOptions::default())
         .map_err(ExecutionError::storage)?;
@@ -1974,15 +1754,7 @@ fn execute_lookup(
     ))
 }
 
-fn execute_set_level_operator(
-    storage: &dyn StorageRead,
-    runtime: &dyn ExecutionRuntime,
-    operator: &PhysicalOperator,
-    state: &mut PipelineState,
-    lookup_context: Option<LookupContext<'_>>,
-    memory_governor: &MemoryGovernor,
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<()> {
+fn execute_set_level_operator( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, operator: &PhysicalOperator, state: &mut PipelineState, lookup_context: Option<LookupContext<'_>>, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<()> {
     match operator {
         PhysicalOperator::Union {
             collection,
@@ -2216,15 +1988,10 @@ fn sample_seed() -> u64 {
     (nanos as u64) ^ ((nanos >> 64) as u64) ^ u64::from(std::process::id())
 }
 
-fn execute_distinct(
-    runtime: &dyn ExecutionRuntime,
-    fields: &[ExpressionFieldPath],
-    state: &mut PipelineState,
-) -> ExecutionResult<()> {
+fn execute_distinct( runtime: &dyn ExecutionRuntime, fields: &[ExpressionFieldPath], state: &mut PipelineState, ) -> ExecutionResult<()> {
     let mut keys = Vec::<Arc<[u8]>>::new();
     let mut retained = Vec::with_capacity(state.rows.len());
     let mut removed = 0usize;
-
     for row in state.rows.drain(..) {
         let key = runtime.distinct_key(fields, row.document())?;
 
@@ -2240,19 +2007,18 @@ fn execute_distinct(
             retained.push(row);
         }
     }
-
     state.rows = retained;
     state.add_filtered(removed)
 }
 
 const ESTIMATED_ROW_WORKING_BYTES: usize = 256;
 
-pub(crate) fn estimated_rows_bytes(rows: usize) -> usize {
+pub fn estimated_rows_bytes(rows: usize) -> usize {
     rows.saturating_mul(ESTIMATED_ROW_WORKING_BYTES.max(size_of::<ExecutionRow>()))
 }
 
 #[inline]
-fn estimated_sort_workspace_bytes(rows: usize) -> usize {
+const fn estimated_sort_workspace_bytes(rows: usize) -> usize {
     // Rust's stable slice sort may allocate O(n) element scratch, but the elements
     // are ExecutionRow handles; Arc<Document> payloads stay shared and are not copied.
     rows.saturating_mul(size_of::<ExecutionRow>())
@@ -2262,20 +2028,13 @@ fn estimated_top_n_bytes(limit: usize) -> usize {
     limit.saturating_mul(ESTIMATED_ROW_WORKING_BYTES.max(size_of::<ExecutionRow>()))
 }
 
-pub(crate) fn reserve_query_memory(
-    governor: &MemoryGovernor,
-    operator: &'static str,
-    bytes: usize,
-) -> ExecutionResult<MemoryReservation> {
+pub fn reserve_query_memory( governor: &MemoryGovernor, operator: &'static str, bytes: usize, ) -> ExecutionResult<MemoryReservation> {
     governor
         .reserve(MemoryClass::Query, bytes)
         .map_err(|error| ExecutionError::memory_limit(operator, error))
 }
 
-fn reserve_import_memory(
-    governor: &MemoryGovernor,
-    bytes: usize,
-) -> ExecutionResult<MemoryReservation> {
+fn reserve_import_memory( governor: &MemoryGovernor, bytes: usize, ) -> ExecutionResult<MemoryReservation> {
     governor
         .reserve(MemoryClass::Import, bytes)
         .map_err(|error| ExecutionError::memory_limit("streaming import", error))
@@ -2295,7 +2054,7 @@ struct TopNEntry {
 /// current worst triggers an O(N) rescan. This avoids the previous O(N) insertion
 /// walk on every source row while keeping memory strictly bounded by `limit`.
 #[derive(Debug)]
-pub(crate) struct BoundedTopN {
+pub struct BoundedTopN {
     limit: usize,
     entries: Vec<TopNEntry>,
     worst_index: Option<usize>,
@@ -2316,7 +2075,7 @@ impl BoundedTopN {
     }
 
     #[must_use]
-    pub(crate) fn live_bytes(&self) -> usize {
+    pub(crate) const fn live_bytes(&self) -> usize {
         self.live_bytes
     }
 
@@ -2398,11 +2157,7 @@ impl BoundedTopN {
         self.recompute_worst(runtime, keys)
     }
 
-    fn recompute_worst(
-        &mut self,
-        runtime: &dyn ExecutionRuntime,
-        keys: &[SortKey],
-    ) -> ExecutionResult<()> {
+    fn recompute_worst( &mut self, runtime: &dyn ExecutionRuntime, keys: &[SortKey], ) -> ExecutionResult<()> {
         let mut worst = 0usize;
         for index in 1..self.entries.len() {
             let ordering = runtime.compare_documents(
@@ -2421,11 +2176,7 @@ impl BoundedTopN {
         Ok(())
     }
 
-    pub(crate) fn into_sorted_rows(
-        mut self,
-        runtime: &dyn ExecutionRuntime,
-        keys: &[SortKey],
-    ) -> ExecutionResult<Vec<ExecutionRow>> {
+    pub(crate) fn into_sorted_rows( mut self, runtime: &dyn ExecutionRuntime, keys: &[SortKey], ) -> ExecutionResult<Vec<ExecutionRow>> {
         // Restore source order first so the stable sort preserves the original
         // order among equal keys even though replacements happen in-place.
         self.entries.sort_unstable_by_key(|entry| entry.sequence);
@@ -2437,7 +2188,7 @@ impl BoundedTopN {
 
 /// One retained projected row for late materialization.
 #[derive(Debug)]
-pub(crate) struct ProjectedTopNWinner {
+pub struct ProjectedTopNWinner {
     id: DocumentId,
     version: DocumentVersion,
     values: Vec<Option<Value>>,
@@ -2445,7 +2196,7 @@ pub(crate) struct ProjectedTopNWinner {
 
 impl ProjectedTopNWinner {
     #[must_use]
-    pub(crate) fn id(&self) -> &DocumentId {
+    pub(crate) const fn id(&self) -> &DocumentId {
         &self.id
     }
 
@@ -2474,7 +2225,7 @@ struct ProjectedTopNEntry {
 /// This makes late materialization a reusable query primitive rather than a
 /// special case tied to one physical stage.
 #[derive(Debug)]
-pub(crate) struct BoundedProjectedTopN {
+pub struct BoundedProjectedTopN {
     limit: usize,
     entries: Vec<ProjectedTopNEntry>,
     worst_index: Option<usize>,
@@ -2492,14 +2243,7 @@ impl BoundedProjectedTopN {
         }
     }
 
-    pub(crate) fn push_refs(
-        &mut self,
-        keys: &[SortKey],
-        slots: &[usize],
-        id: DocumentId,
-        version: DocumentVersion,
-        values: &[Option<ProjectedValueRef<'_>>],
-    ) -> ExecutionResult<()> {
+    pub(crate) fn push_refs( &mut self, keys: &[SortKey], slots: &[usize], id: DocumentId, version: DocumentVersion, values: &[Option<ProjectedValueRef<'_>>], ) -> ExecutionResult<()> {
         let sequence = self.next_sequence;
         self.next_sequence = self.next_sequence.saturating_add(1);
         if self.limit == 0 {
@@ -2583,10 +2327,7 @@ impl BoundedProjectedTopN {
         Ok(())
     }
 
-    pub(crate) fn into_sorted_winners(
-        mut self,
-        keys: &[SortKey],
-    ) -> ExecutionResult<Vec<ProjectedTopNWinner>> {
+    pub(crate) fn into_sorted_winners( mut self, keys: &[SortKey], ) -> ExecutionResult<Vec<ProjectedTopNWinner>> {
         // Restore source order first; the fallible insertion sort below is stable
         // on equal keys and N is deliberately bounded/small.
         self.entries.sort_unstable_by_key(|entry| entry.sequence);
@@ -2609,10 +2350,7 @@ impl BoundedProjectedTopN {
     }
 }
 
-fn materialize_projected_slots(
-    values: &[Option<ProjectedValueRef<'_>>],
-    slots: &[usize],
-) -> Vec<Option<Value>> {
+fn materialize_projected_slots( values: &[Option<ProjectedValueRef<'_>>], slots: &[usize], ) -> Vec<Option<Value>> {
     slots
         .iter()
         .map(|slot| {
@@ -2624,12 +2362,7 @@ fn materialize_projected_slots(
         .collect()
 }
 
-fn compare_projected_refs_to_owned(
-    keys: &[SortKey],
-    slots: &[usize],
-    left: &[Option<ProjectedValueRef<'_>>],
-    right: &[Option<Value>],
-) -> ExecutionResult<Ordering> {
+fn compare_projected_refs_to_owned( keys: &[SortKey], slots: &[usize], left: &[Option<ProjectedValueRef<'_>>], right: &[Option<Value>], ) -> ExecutionResult<Ordering> {
     for (index, key) in keys.iter().enumerate() {
         let ordering = compare_projected_ref_value(
             slots
@@ -2646,11 +2379,7 @@ fn compare_projected_refs_to_owned(
     Ok(Ordering::Equal)
 }
 
-fn compare_owned_projected_rows(
-    keys: &[SortKey],
-    left: &[Option<Value>],
-    right: &[Option<Value>],
-) -> ExecutionResult<Ordering> {
+fn compare_owned_projected_rows( keys: &[SortKey], left: &[Option<Value>], right: &[Option<Value>], ) -> ExecutionResult<Ordering> {
     for (index, key) in keys.iter().enumerate() {
         let ordering = compare_optional_values(
             left.get(index).and_then(Option::as_ref),
@@ -2664,11 +2393,7 @@ fn compare_owned_projected_rows(
     Ok(Ordering::Equal)
 }
 
-fn compare_projected_ref_value(
-    left: Option<&ProjectedValueRef<'_>>,
-    right: Option<&Value>,
-    key: &SortKey,
-) -> ExecutionResult<Ordering> {
+fn compare_projected_ref_value( left: Option<&ProjectedValueRef<'_>>, right: Option<&Value>, key: &SortKey, ) -> ExecutionResult<Ordering> {
     let ordering = match (left, right) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
@@ -2722,11 +2447,7 @@ fn compare_projected_ref_value(
     })
 }
 
-fn compare_optional_values(
-    left: Option<&Value>,
-    right: Option<&Value>,
-    key: &SortKey,
-) -> ExecutionResult<Ordering> {
+fn compare_optional_values( left: Option<&Value>, right: Option<&Value>, key: &SortKey, ) -> ExecutionResult<Ordering> {
     let ordering = match (left, right) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
@@ -2743,12 +2464,7 @@ fn compare_optional_values(
     })
 }
 
-fn execute_top_n(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[SortKey],
-    limit: usize,
-    state: &mut PipelineState,
-) -> ExecutionResult<()> {
+fn execute_top_n( runtime: &dyn ExecutionRuntime, keys: &[SortKey], limit: usize, state: &mut PipelineState, ) -> ExecutionResult<()> {
     if limit == 0 {
         let removed = state.rows.len();
         state.rows.clear();
@@ -2764,12 +2480,12 @@ fn execute_top_n(
     state.add_filtered(original_len.saturating_sub(state.rows.len()))
 }
 
-pub(crate) fn execution_row_encoded_len(row: &ExecutionRow) -> usize {
+pub fn execution_row_encoded_len(row: &ExecutionRow) -> usize {
     const ROW_HEADER_BYTES: usize = 16 + 8 + 1 + 1;
     ROW_HEADER_BYTES.saturating_add(spill_document_encoded_len(row.document()))
 }
 
-pub(crate) fn execution_row_working_bytes(row: &ExecutionRow) -> ExecutionResult<usize> {
+pub fn execution_row_working_bytes(row: &ExecutionRow) -> ExecutionResult<usize> {
     Ok(execution_row_encoded_len(row).saturating_add(64))
 }
 
@@ -2796,11 +2512,7 @@ fn spill_value_encoded_len(value: &Value) -> usize {
     }
 }
 
-pub(crate) fn stable_sort(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[SortKey],
-    rows: &mut [ExecutionRow],
-) -> ExecutionResult<()> {
+pub fn stable_sort( runtime: &dyn ExecutionRuntime, keys: &[SortKey], rows: &mut [ExecutionRow], ) -> ExecutionResult<()> {
     let mut failure = None;
     rows.sort_by(|left, right| {
         if failure.is_some() {
@@ -2817,17 +2529,12 @@ pub(crate) fn stable_sort(
     failure.map_or(Ok(()), Err)
 }
 
-fn external_sort(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[SortKey],
-    state: &mut PipelineState,
-    governor: &MemoryGovernor,
-) -> ExecutionResult<()> {
+fn external_sort( runtime: &dyn ExecutionRuntime, keys: &[SortKey], state: &mut PipelineState, governor: &MemoryGovernor, ) -> ExecutionResult<()> {
     let snapshot = governor.snapshot();
     let available = snapshot.available_bytes.unwrap_or(64 * 1024 * 1024);
     let chunk_budget = available
         .saturating_div(2)
-        .clamp(1 * 1024 * 1024, 64 * 1024 * 1024);
+        .clamp(1024 * 1024, 64 * 1024 * 1024);
     let rows_per_chunk = (chunk_budget / size_of::<ExecutionRow>().max(1)).max(1);
     let spill = SpillEngine::default();
     let mut runs = Vec::<SpillRun>::new();
@@ -2901,10 +2608,7 @@ fn read_next_spilled_row(reader: &mut SpillRunReader) -> ExecutionResult<Option<
         .transpose()
 }
 
-pub(crate) fn encode_execution_row_into(
-    row: &ExecutionRow,
-    output: &mut Vec<u8>,
-) -> ExecutionResult<()> {
+pub fn encode_execution_row_into( row: &ExecutionRow, output: &mut Vec<u8>, ) -> ExecutionResult<()> {
     output.clear();
     output.extend_from_slice(row.id().as_bytes());
     output.extend_from_slice(&row.version().get().to_le_bytes());
@@ -2917,7 +2621,7 @@ pub(crate) fn encode_execution_row_into(
     encode_spill_document(output, row.document())
 }
 
-pub(crate) fn decode_execution_row(bytes: &[u8]) -> ExecutionResult<ExecutionRow> {
+pub fn decode_execution_row(bytes: &[u8]) -> ExecutionResult<ExecutionRow> {
     let mut input = SpillDecoder::new(bytes);
     let id = DocumentId::from_bytes(input.array_16()?);
     let version = DocumentVersion::new(input.u64()?);
@@ -2941,7 +2645,7 @@ pub(crate) fn decode_execution_row(bytes: &[u8]) -> ExecutionResult<ExecutionRow
 
 fn encode_spill_document(output: &mut Vec<u8>, document: &Document) -> ExecutionResult<()> {
     put_spill_len(output, document.len())?;
-    for (name, value) in document.iter() {
+    for (name, value) in document {
         put_spill_string(output, name.as_str())?;
         encode_spill_value(output, value)?;
     }
@@ -3032,7 +2736,7 @@ struct SpillDecoder<'a> {
     position: usize,
 }
 impl<'a> SpillDecoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
+    const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, position: 0 }
     }
     fn take(&mut self, count: usize) -> ExecutionResult<&'a [u8]> {
@@ -3081,17 +2785,11 @@ impl<'a> SpillDecoder<'a> {
     }
 }
 
-fn replace_changed_rows(
-    transaction: &mut dyn StorageTransaction,
-    plan: &PhysicalPlan,
-    rows: &mut [ExecutionRow],
-    scope: Option<&DocumentScope>,
-) -> ExecutionResult<()> {
+fn replace_changed_rows( transaction: &mut dyn StorageTransaction, plan: &PhysicalPlan, rows: &mut [ExecutionRow], scope: Option<&DocumentScope>, ) -> ExecutionResult<()> {
     for row in rows {
         if !row.changed() || !row.is_stored() {
             continue;
         }
-
         let document = match scope {
             Some(scope) => scope.enforce(row.document()),
             None => row.shared_document(),
@@ -3111,20 +2809,14 @@ fn replace_changed_rows(
         row.document = document;
         row.changed = false;
     }
-
     Ok(())
 }
 
-fn delete_rows(
-    transaction: &mut dyn StorageTransaction,
-    plan: &PhysicalPlan,
-    rows: &[ExecutionRow],
-) -> ExecutionResult<()> {
+fn delete_rows( transaction: &mut dyn StorageTransaction, plan: &PhysicalPlan, rows: &[ExecutionRow], ) -> ExecutionResult<()> {
     for row in rows {
         if !row.is_stored() {
             continue;
         }
-
         transaction
             .delete(
                 plan.source().collection(),
@@ -3133,7 +2825,6 @@ fn delete_rows(
             )
             .map_err(ExecutionError::storage)?;
     }
-
     Ok(())
 }
 
@@ -3188,7 +2879,6 @@ mod tests {
     };
 
     #[test] fn execution_row_exposes_id_as_virtual_evaluation_field() { let id = DocumentId::parse("019fb7ae-9588-7057-830a-01bdb143b7ce").unwrap(); let row = ExecutionRow { id, version: DocumentVersion::INITIAL, document: Arc::new(Document::from_fields([("name", Value::from("Alice"))])), changed: false, origin: ExecutionRowOrigin::Stored, }; let evaluation = row.evaluation_document(); assert_eq!( evaluation.get("_id"), Some(&Value::from("019fb7ae-9588-7057-830a-01bdb143b7ce")), ); assert!(!row.document().contains_key("_id")); }
-
     #[test] fn replacing_a_row_never_persists_virtual_id_metadata() { let id = DocumentId::parse("019fb7ae-9588-7057-830a-01bdb143b7ce").unwrap(); let mut row = ExecutionRow { id, version: DocumentVersion::INITIAL, document: Arc::new(Document::default()), changed: false, origin: ExecutionRowOrigin::Stored, }; let mut replacement = row.evaluation_document(); replacement.insert("active", true); row.replace_document(Arc::new(replacement), true); assert!(!row.document().contains_key("_id")); assert_eq!(row.document().get("active"), Some(&Value::from(true))); }
 
     #[derive(Debug, Default)]
@@ -3218,34 +2908,19 @@ mod tests {
     }
 
     #[test] fn executes_empty_read_scan() { let storage = MemoryStorage::new(); let plan = PhysicalPlan::new(source(), []).unwrap(); let output = Executor::new() .execute(&storage, &NeverCalledRuntime, &plan) .unwrap(); assert!(output.is_empty()); assert!(!output.committed()); assert_eq!(output.statistics().scanned(), 0); assert_eq!(output.statistics().returned(), 0); assert!(output .statistics() .strategies() .contains(ExecutionStrategy::CollectionScan)); }
-
     #[test] fn executes_empty_write_plan_and_commits() { let storage = MemoryStorage::new(); let stage = StageName::parse("archive").unwrap(); let operator = PhysicalOperator::custom(stage, "", true, false).unwrap(); let plan = PhysicalPlan::new(source(), [operator]).unwrap(); let output = Executor::new() .execute(&storage, &NeverCalledRuntime, &plan) .unwrap(); assert!(output.is_empty()); assert!(output.committed()); assert_eq!(output.commit(), Some(CommitResult::default())); assert_eq!(output.statistics().mutated(), 0); }
-
     #[test] fn empty_delete_commits_no_mutations() { let storage = MemoryStorage::new(); let plan = PhysicalPlan::new(source(), [PhysicalOperator::delete()]).unwrap(); let output = Executor::new() .execute(&storage, &NeverCalledRuntime, &plan) .unwrap(); assert!(output.is_empty()); assert!(output.committed()); assert_eq!(output.statistics().deleted(), 0); }
-
     #[test] fn empty_limit_and_skip_do_not_call_runtime() { let storage = MemoryStorage::new(); let plan = PhysicalPlan::new( source(), [PhysicalOperator::skip(10), PhysicalOperator::limit(5)], ) .unwrap(); let output = Executor::new() .execute(&storage, &NeverCalledRuntime, &plan) .unwrap(); assert!(output.is_empty()); assert_eq!(output.statistics().filtered(), 0); }
-
     #[test] fn simple_count_uses_storage_count_without_scanning() { #[derive(Debug)] struct CountOnlyStorage; #[derive(Debug)] struct CountOnlyRead; impl StorageRead for CountOnlyRead { fn get( &self, _collection: &CollectionId, _id: &DocumentId, ) -> crate::storage::StorageResult<Option<StoredDocument>> { unreachable!() } fn scan( &self, _collection: &CollectionId, _options: ScanOptions, ) -> crate::storage::StorageResult<Vec<StoredDocument>> { panic!("simple count must not scan documents") } fn count(&self, _collection: &CollectionId) -> crate::storage::StorageResult<u64> { Ok(5_000_000) } fn collection_exists( &self, _collection: &CollectionId, ) -> crate::storage::StorageResult<bool> { Ok(true) } fn collections(&self) -> crate::storage::StorageResult<Vec<CollectionId>> { Ok(vec![CollectionId::parse("users").unwrap()]) } } impl StorageEngine for CountOnlyStorage { fn read(&self) -> crate::storage::StorageResult<Box<dyn StorageRead + '_>> { Ok(Box::new(CountOnlyRead)) } fn begin(&self) -> crate::storage::StorageResult<Box<dyn StorageTransaction + '_>> { panic!("read-only count must not begin a transaction") } } #[derive(Debug)] struct CountRuntime; impl ExecutionRuntime for CountRuntime { fn evaluate_predicate( &self, _expression: &Expression, _document: &Document, ) -> ExecutionResult<bool> { unreachable!("fast count must not evaluate predicates") } fn apply_set( &self, _assignments: &[SetAssignment], _document: &Document, ) -> ExecutionResult<Arc<Document>> { unreachable!("fast count must not apply transformations") } fn count_document(&self, alias: &str, count: u64) -> ExecutionResult<Arc<Document>> { assert_eq!(alias, "total"); assert_eq!(count, 5_000_000); Ok(Arc::new(Document::from_fields([( alias, crate::Value::unsigned(count), )]))) } } let plan = PhysicalPlan::new(source(), [PhysicalOperator::count("total").unwrap()]).unwrap(); let output = Executor::new() .execute(&CountOnlyStorage, &CountRuntime, &plan) .unwrap(); assert_eq!(output.statistics().scanned(), 0); assert_eq!(output.statistics().returned(), 1); assert_eq!( output.rows()[0].document().get("total"), Some(&crate::Value::unsigned(5_000_000)) ); }
-
     #[test] fn count_on_empty_collection_calls_count_runtime() { #[derive(Debug)] struct CountRuntime; impl ExecutionRuntime for CountRuntime { fn evaluate_predicate( &self, _expression: &Expression, _document: &Document, ) -> ExecutionResult<bool> { unreachable!() } fn apply_set( &self, _assignments: &[SetAssignment], _document: &Document, ) -> ExecutionResult<Arc<Document>> { unreachable!() } fn count_document(&self, alias: &str, count: u64) -> ExecutionResult<Arc<Document>> { assert_eq!(alias, "total"); assert_eq!(count, 0); Err(ExecutionError::evaluation("test sentinel")) } } let storage = MemoryStorage::new(); let plan = PhysicalPlan::new(source(), [PhysicalOperator::count("total").unwrap()]).unwrap(); let error = Executor::new() .execute(&storage, &CountRuntime, &plan) .unwrap_err(); assert!(matches!( error.kind(), ExecutionErrorKind::Evaluation { .. } )); }
-
     #[test] fn union_on_empty_secondary_collection_is_a_noop() { let storage = MemoryStorage::new(); let nested = PhysicalSubPipeline::empty(); let union = PhysicalOperator::union( CollectionId::parse("archived_users").unwrap(), None::<&str>, nested, ) .unwrap(); let plan = PhysicalPlan::new(source(), [union]).unwrap(); let output = Executor::new() .execute(&storage, &NeverCalledRuntime, &plan) .unwrap(); assert!(output.is_empty()); assert!(!output.committed()); }
-
     #[test] fn lookup_on_empty_input_does_not_call_runtime() { let storage = MemoryStorage::new(); let lookup = PhysicalOperator::lookup( CollectionId::parse("workspace").unwrap(), Some("w"), "public", PhysicalSubPipeline::empty(), ) .unwrap(); let plan = PhysicalPlan::new(source(), [lookup]).unwrap(); let output = Executor::new() .execute(&storage, &NeverCalledRuntime, &plan) .unwrap(); assert!(output.is_empty()); }
-
     #[test] fn typed_insert_is_forwarded_to_runtime() { #[derive(Debug)] struct InsertRuntime; impl ExecutionRuntime for InsertRuntime { fn evaluate_predicate( &self, _expression: &Expression, _document: &Document, ) -> ExecutionResult<bool> { unreachable!() } fn apply_set( &self, _assignments: &[SetAssignment], _document: &Document, ) -> ExecutionResult<Arc<Document>> { unreachable!() } fn prepare_insert( &self, document: &LogicalInsertDocument, ) -> ExecutionResult<PreparedInsertDocument> { assert_eq!(document.object().fields().count(), 1); Err(ExecutionError::evaluation("insert test sentinel")) } } let storage = MemoryStorage::new(); let document = LogicalInsertDocument::parse(r#"{name:"Alice"}"#).unwrap(); let plan = PhysicalPlan::new(source(), [PhysicalOperator::insert(document)]).unwrap(); let error = Executor::new() .execute(&storage, &InsertRuntime, &plan) .unwrap_err(); assert!(matches!( error.kind(), ExecutionErrorKind::Evaluation { .. } )); }
-
     #[test] fn streaming_load_calls_runtime_and_commits_empty_mutation_list() { #[derive(Debug)] struct StreamingRuntime; impl ExecutionRuntime for StreamingRuntime { fn evaluate_predicate( &self, _expression: &Expression, _document: &Document, ) -> ExecutionResult<bool> { unreachable!() } fn apply_set( &self, _assignments: &[SetAssignment], _document: &Document, ) -> ExecutionResult<Arc<Document>> { unreachable!() } fn prepare_streaming_load( &self, collection: &crate::storage::CollectionId, _storage: &dyn StorageRead, mode: PhysicalLoadMode, chunks: &[Arc<str>], ) -> ExecutionResult<Vec<StreamingLoadMutation>> { assert_eq!(collection.as_str(), "users"); assert_eq!(mode, PhysicalLoadMode::Merge); assert_eq!(chunks.len(), 2); Ok(Vec::new()) } } let storage = MemoryStorage::new(); let operator = PhysicalOperator::streaming_load(PhysicalLoadMode::Merge, ["batch1", "batch2"]) .unwrap(); let plan = PhysicalPlan::new(source(), [operator]).unwrap(); let output = Executor::new() .execute(&storage, &StreamingRuntime, &plan) .unwrap(); assert!(output.committed()); assert_eq!(output.statistics().mutated(), 0); assert_eq!(output.statistics().scanned(), 0); }
-
     #[test] fn pivot_calls_runtime_on_empty_collection() { use crate::query::logical_plan::{PivotAggregate, PivotSpecification, PivotValue}; #[derive(Debug)] struct PivotRuntime; impl ExecutionRuntime for PivotRuntime { fn evaluate_predicate( &self, _expression: &Expression, _document: &Document, ) -> ExecutionResult<bool> { unreachable!() } fn apply_set( &self, _assignments: &[SetAssignment], _document: &Document, ) -> ExecutionResult<Arc<Document>> { unreachable!() } fn pivot_documents( &self, specification: &PivotSpecification, documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> { assert_eq!(specification.rows().len(), 1); assert_eq!(specification.columns().len(), 1); assert_eq!(specification.values().len(), 1); assert!(documents.is_empty()); Err(ExecutionError::evaluation("pivot test sentinel")) } } let specification = PivotSpecification::new( [ExpressionFieldPath::new(["region"]).unwrap()], [ExpressionFieldPath::new(["month"]).unwrap()], [PivotValue::new( ExpressionFieldPath::new(["revenue"]).unwrap(), PivotAggregate::Sum, None::<&str>, ) .unwrap()], ) .unwrap(); let storage = MemoryStorage::new(); let plan = PhysicalPlan::new(source(), [PhysicalOperator::pivot(specification)]).unwrap(); let error = Executor::new() .execute(&storage, &PivotRuntime, &plan) .unwrap_err(); assert!(matches!( error.kind(), ExecutionErrorKind::Evaluation { .. } )); }
-
     #[test] fn document_scope_matches_only_its_place_and_app_instance() { let scope = DocumentScope::new("place-a", "app-1"); let matching = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-1")), ]); let other_instance = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-2")), ]); assert!(scope.matches(&matching)); assert!(!scope.matches(&other_instance)); assert!(!scope.matches(&Document::new())); }
-
     #[test] fn document_scope_overwrites_untrusted_scope_fields() { let scope = DocumentScope::new("place-a", "app-1"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-evil")), ("name", Value::from("item")), ]); let scoped = scope.enforce(&document); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-1"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
-
     #[test] fn place_document_scope_matches_all_instances_in_the_place() { let scope = DocumentScope::for_place("place-a"); let app_one = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-1")), ]); let app_two = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-2")), ]); let place_only = Document::from_fields([("_place", Value::from("place-a"))]); let other_place = Document::from_fields([ ("_place", Value::from("place-b")), ("_app_instance", Value::from("app-1")), ]); assert!(scope.matches(&app_one)); assert!(scope.matches(&app_two)); assert!(scope.matches(&place_only)); assert!(!scope.matches(&other_place)); }
-
     #[test] fn place_document_scope_forces_place_without_overwriting_app_instance() { let scope = DocumentScope::for_place("place-a"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-2")), ("name", Value::from("item")), ]); let scoped = scope.enforce(&document); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-2"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
-
     #[test] fn execution_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Executor>(); assert_send_and_sync::<DocumentScope>(); assert_send_and_sync::<ExecutionOutput>(); assert_send_and_sync::<ExecutionRow>(); assert_send_and_sync::<ExecutionRowOrigin>(); assert_send_and_sync::<ExecutionError>(); assert_send_and_sync::<ExecutionStatistics>(); assert_send_and_sync::<PreparedInsertDocument>(); assert_send_and_sync::<SyntheticDocument>(); assert_send_and_sync::<LookupDocuments>(); assert_send_and_sync::<StreamingLoadMutation>(); }
 }

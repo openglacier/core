@@ -1,5 +1,5 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
-//! Stateless Agent orchestration over OpenGlacier capabilities.
+//! Stateless Agent orchestration over openglacier capabilities.
 //!
 //! The Agent owns the reasoning/tool loop, but deliberately does not own any
 //! backend. LLM, database and files access are provided by the host through
@@ -48,7 +48,7 @@ const DESCRIBE_MAX_NESTING_DEPTH: usize = 4;
 
 static AGENT_LLM_CACHE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-const SYSTEM_PROMPT: &str = r#"You are the OpenGlacier Agent. You are stateless: only the messages in this request and tool results in this run exist.
+const SYSTEM_PROMPT: &str = r#"You are the openglacier Agent. You are stateless: only the messages in this request and tool results in this run exist.
 
 The Place/AppInstance scope is inherited from the request and is never a tool argument. Never invent or request a placeId, appInstanceId or instanceId.
 
@@ -380,15 +380,7 @@ impl AgentService {
         }
     }
 
-    pub fn run<F>(
-        &self,
-        input: &AgentRunInput,
-        invoker: &mut dyn AgentCapabilityInvoker,
-        mut emit: F,
-    ) -> Result<AgentRunStats, AgentError>
-    where
-        F: FnMut(JsonValue) -> bool,
-    {
+    pub fn run<F>( &self, input: &AgentRunInput, invoker: &mut dyn AgentCapabilityInvoker, mut emit: F, ) -> Result<AgentRunStats, AgentError> where F: FnMut(JsonValue) -> bool, {
         let max_steps = input.max_steps.unwrap_or(self.config.max_steps);
         if max_steps == 0 || max_steps > self.config.max_steps {
             return Err(AgentError::Configuration(format!(
@@ -698,11 +690,7 @@ fn new_agent_llm_cache_key() -> String {
     format!("agent-{}-{unix_nanos}-{sequence}", std::process::id())
 }
 
-fn messages_with_database_evidence(
-    messages: &[LlmMessageInput],
-    evidence: &[String],
-    turn_directive: Option<&str>,
-) -> Vec<LlmMessageInput> {
+fn messages_with_database_evidence( messages: &[LlmMessageInput], evidence: &[String], turn_directive: Option<&str>, ) -> Vec<LlmMessageInput> {
     let mut projected = if evidence.is_empty() {
         messages.to_vec()
     } else {
@@ -749,16 +737,7 @@ fn push_database_evidence(evidence: &mut Vec<String>, entry: String) {
     }
 }
 
-fn invoke_llm_with_adaptive_budget(
-    invoker: &mut dyn AgentCapabilityInvoker,
-    messages: &[LlmMessageInput],
-    tools: &[LlmToolDefinition],
-    tool_choice: LlmToolChoice,
-    max_tokens: u32,
-    adaptive: bool,
-    cache_key: &str,
-    stats: &mut AgentRunStats,
-) -> Result<AgentCapabilityResponse, AgentError> {
+fn invoke_llm_with_adaptive_budget( invoker: &mut dyn AgentCapabilityInvoker, messages: &[LlmMessageInput], tools: &[LlmToolDefinition], tool_choice: LlmToolChoice, max_tokens: u32, adaptive: bool, cache_key: &str, stats: &mut AgentRunStats, ) -> Result<AgentCapabilityResponse, AgentError> {
     let mut budget = max_tokens;
     let mut working_messages = messages.to_vec();
     let mut emergency_level = 0usize;
@@ -832,11 +811,7 @@ fn reduced_context_budget(error: &AgentError, current_budget: u32) -> Option<u32
     (reduced < current_budget).then_some(reduced)
 }
 
-fn compact_database_context_for_retry(
-    messages: &mut [LlmMessageInput],
-    max_evidence_bytes: usize,
-    max_tool_bytes: usize,
-) -> bool {
+fn compact_database_context_for_retry( messages: &mut [LlmMessageInput], max_evidence_bytes: usize, max_tool_bytes: usize, ) -> bool {
     let mut changed = false;
 
     if let Some(system) = messages.first_mut() {
@@ -990,10 +965,7 @@ fn explicit_required_tool(messages: &[LlmMessageInput]) -> Option<&'static str> 
     }
 }
 
-fn emit_or_cancel<F>(emit: &mut F, value: JsonValue) -> Result<(), AgentError>
-where
-    F: FnMut(JsonValue) -> bool,
-{
+fn emit_or_cancel<F>(emit: &mut F, value: JsonValue) -> Result<(), AgentError> where F: FnMut(JsonValue) -> bool, {
     if emit(value) {
         Ok(())
     } else {
@@ -1071,11 +1043,7 @@ fn agent_tools() -> Vec<LlmToolDefinition> {
     ]
 }
 
-fn invoke_agent_tool(
-    invoker: &mut dyn AgentCapabilityInvoker,
-    name: &str,
-    arguments: JsonValue,
-) -> Result<JsonValue, AgentError> {
+fn invoke_agent_tool( invoker: &mut dyn AgentCapabilityInvoker, name: &str, arguments: JsonValue, ) -> Result<JsonValue, AgentError> {
     if name == "database.describe" {
         return describe_collection(invoker, &arguments);
     }
@@ -1083,10 +1051,7 @@ fn invoke_agent_tool(
     Ok(invoker.invoke(operation, data)?.tool_value())
 }
 
-fn describe_collection(
-    invoker: &mut dyn AgentCapabilityInvoker,
-    arguments: &JsonValue,
-) -> Result<JsonValue, AgentError> {
+fn describe_collection( invoker: &mut dyn AgentCapabilityInvoker, arguments: &JsonValue, ) -> Result<JsonValue, AgentError> {
     let collection = arguments
         .get("collection")
         .and_then(JsonValue::as_str)
@@ -1210,13 +1175,7 @@ fn observed_fields(documents: &[&JsonValue]) -> (Vec<JsonValue>, Vec<String>) {
     (fields, system_fields.into_iter().collect())
 }
 
-fn observe_json_value(
-    path: &str,
-    value: &JsonValue,
-    depth: usize,
-    seen: &mut BTreeSet<String>,
-    fields: &mut BTreeMap<String, ObservedField>,
-) {
+fn observe_json_value( path: &str, value: &JsonValue, depth: usize, seen: &mut BTreeSet<String>, fields: &mut BTreeMap<String, ObservedField>, ) {
     let entry = fields.entry(path.to_owned()).or_default();
     entry.types.insert(json_type_name(value));
     if seen.insert(path.to_owned()) {
@@ -1267,10 +1226,7 @@ fn json_type_name(value: &JsonValue) -> &'static str {
     }
 }
 
-fn tool_operation(
-    name: &str,
-    arguments: JsonValue,
-) -> Result<(&'static str, JsonValue), AgentError> {
+fn tool_operation( name: &str, arguments: JsonValue, ) -> Result<(&'static str, JsonValue), AgentError> {
     match name {
         "database.collections" => Ok(("collections.list", json!({"stats": false}))),
         "database.query" => {
@@ -1447,69 +1403,37 @@ mod tests {
     }
 
     #[test] fn status_is_ready_and_stateless() { let service = AgentService { config: AgentConfig::default(), }; let status = service.status(); assert!(status.ready); assert!(status.stateless); assert!(status.tools.contains(&"database.query")); }
-
     #[test] fn direct_answer_needs_only_one_llm_call() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![vec![json!({"type":"token","text":"Hello"})]], llm_requests: Vec::new(), }; let mut events = Vec::new(); let stats = service .run(&request(), &mut invoker, |event| { events.push(event); true }) .unwrap(); assert_eq!(stats.llm_calls, 1); assert_eq!(stats.tool_calls, 0); assert_eq!(invoker.calls, vec!["llm.generate"]); assert!(events.iter().any(|event| { event.get("type").and_then(JsonValue::as_str) == Some("message") && event.get("content").and_then(JsonValue::as_str) == Some("Hello") })); }
-
     #[test] fn native_tool_call_round_trips_as_assistant_and_tool_messages() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | limit 1"} })], vec![json!({"type":"token","text":"Ada"})], ], llm_requests: Vec::new(), }; let stats = service.run(&request(), &mut invoker, |_| true).unwrap(); assert_eq!(stats.llm_calls, 2); assert_eq!(stats.tool_calls, 1); assert_eq!( invoker.calls, vec!["llm.generate", "query.execute", "llm.generate"] ); let first = &invoker.llm_requests[0]; assert_eq!( first.get("tools").and_then(JsonValue::as_array).map(Vec::len), Some(4) ); let first_cache_key = first.get("cacheKey").and_then(JsonValue::as_str).unwrap(); assert!(first_cache_key.starts_with("agent-")); let second = &invoker.llm_requests[1]; assert_eq!( second.get("cacheKey").and_then(JsonValue::as_str), Some(first_cache_key) ); assert_eq!( second.get("toolChoice").and_then(JsonValue::as_str), Some("auto") ); assert_eq!( second.get("tools").and_then(JsonValue::as_array).map(Vec::len), Some(2) ); assert_eq!( second.get("maxTokens").and_then(JsonValue::as_u64), Some(u64::from(DEFAULT_LLM_MAX_TOKENS)) ); let second_messages = second .get("messages") .and_then(JsonValue::as_array) .unwrap(); let assistant = &second_messages[second_messages.len() - 2]; assert_eq!( assistant.get("role").and_then(JsonValue::as_str), Some("assistant") ); assert_eq!( assistant .get("toolCalls") .and_then(JsonValue::as_array) .and_then(|calls| calls.first()) .and_then(|call| call.get("id")) .and_then(JsonValue::as_str), Some("call-1") ); let tool = &second_messages[second_messages.len() - 1]; assert_eq!(tool.get("role").and_then(JsonValue::as_str), Some("tool")); assert_eq!( tool.get("toolCallId").and_then(JsonValue::as_str), Some("call-1") ); }
-
     #[test] fn database_query_uses_gateway_canonical_read_only_payload() { let (operation, data) = tool_operation("database.query", json!({"query":"on people | limit 1"})).unwrap(); assert_eq!(operation, "query.execute"); assert_eq!(data.get("query").and_then(JsonValue::as_str), Some("on people | limit 1")); assert_eq!(data.get("readOnly").and_then(JsonValue::as_bool), Some(true)); assert!(data.get("read_only").is_none()); }
-
     #[test] fn mutating_query_is_denied_before_capability_call() { let error = tool_operation("database.query", json!({"query":"on people | delete"})) .unwrap_err(); assert!(matches!(error, AgentError::ToolDenied(_))); }
-
     #[test] fn sample_query_is_denied_before_capability_call() { let error = tool_operation("database.query", json!({"query":"on people | sample 5"})) .unwrap_err(); assert!(matches!(error, AgentError::ToolDenied(_))); assert!(error.to_string().contains("limit N")); }
-
     #[test] fn database_query_tool_teaches_native_pipeline_syntax() { let tool = agent_tools() .into_iter() .find(|tool| tool.name == "database.query") .expect("database.query tool"); assert!(tool.description.contains("NOT SQL")); assert!(tool.description.contains("on <collection>")); let query_description = tool .parameters .get("properties") .and_then(|value| value.get("query")) .and_then(|value| value.get("description")) .and_then(JsonValue::as_str) .expect("query parameter description"); assert!(query_description.contains("on data_mtpzvkpt_fam | limit 20")); assert!(query_description.contains("Do not send SQL")); }
-
     #[test] fn invalid_query_is_returned_to_model_for_retry() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"{'select': ['*'], 'from': 'people'}"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on people | limit 20"} })], vec![json!({"type":"token","text":"Ada"})], ], llm_requests: Vec::new(), }; let stats = service.run(&request(), &mut invoker, |_| true).unwrap(); assert_eq!(stats.llm_calls, 3); assert_eq!(stats.tool_calls, 2); assert_eq!( invoker.calls, vec!["llm.generate", "llm.generate", "query.execute", "llm.generate"] ); let retry_messages = invoker.llm_requests[1] .get("messages") .and_then(JsonValue::as_array) .expect("retry messages"); let tool_message = retry_messages.last().expect("tool error message"); assert_eq!(tool_message.get("role").and_then(JsonValue::as_str), Some("tool")); let content = tool_message .get("content") .and_then(JsonValue::as_str) .expect("tool error content"); assert!(content.contains("native OpenGlacier pipeline DSL")); assert!(content.contains("database.describe")); }
-
     #[test] fn summary_request_requires_collection_description_first() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Fais moi une synthèse de la table data_people".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })]], llm_requests: Vec::new(), }; let result = service.run(&input, &mut invoker, |event| { event.get("type").and_then(JsonValue::as_str) != Some("toolCall") }); assert!(matches!(result, Err(AgentError::Cancelled))); assert_eq!( invoker.llm_requests[0].get("toolChoice").and_then(JsonValue::as_str), Some("required") ); assert_eq!( invoker.llm_requests[0] .get("tools") .and_then(JsonValue::as_array) .and_then(|tools| tools.first()) .and_then(|tool| tool.get("name")) .and_then(JsonValue::as_str), Some("database.describe") ); }
-
     #[test] fn database_analysis_requirement_is_model_agnostic_and_intent_based() { let mut input = request(); input.messages[0].content = "Quels champs sont présents dans la table data_people ?".to_owned(); assert_eq!(minimum_database_queries_for_request(&input.messages), 0); input.messages[0].content = "Fais moi une synthèse de la table data_people".to_owned(); assert_eq!(minimum_database_queries_for_request(&input.messages), 1); input.messages[0].content = "Quelles données sont présentes dans data_people ? Avec valeurs et statistiques ?".to_owned(); assert_eq!(minimum_database_queries_for_request(&input.messages), 2); input.messages[0].content = "Give me statistics about France".to_owned(); assert_eq!(minimum_database_queries_for_request(&input.messages), 0); }
-
     #[test] fn schema_only_request_describes_then_synthesizes() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Quels champs sont présents dans la table data_people ?".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({"type":"token","text":"name, country, score"})], ], llm_requests: Vec::new(), }; service.run(&input, &mut invoker, |_| true).unwrap(); assert_eq!(invoker.llm_requests.len(), 2); assert_eq!(invoker.llm_requests[0].get("toolChoice").and_then(JsonValue::as_str), Some("required")); assert_eq!(invoker.llm_requests[1].get("toolChoice").and_then(JsonValue::as_str), Some("none")); assert_eq!(invoker.llm_requests[1].get("tools").and_then(JsonValue::as_array).map(Vec::len), Some(0)); }
-
     #[test] fn summary_requires_one_successful_query_before_auto_answer() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Fais moi une synthèse de la table data_people".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on data_people | group country | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; service.run(&input, &mut invoker, |_| true).unwrap(); assert_eq!(invoker.llm_requests.len(), 3); assert_eq!(invoker.llm_requests[1].get("toolChoice").and_then(JsonValue::as_str), Some("required")); let required_names = invoker.llm_requests[1].get("tools").and_then(JsonValue::as_array).unwrap().iter().filter_map(|tool| tool.get("name").and_then(JsonValue::as_str)).collect::<Vec<_>>(); assert_eq!(required_names, vec!["database.query"]); assert_eq!(invoker.llm_requests[2].get("toolChoice").and_then(JsonValue::as_str), Some("auto")); let auto_names = invoker.llm_requests[2].get("tools").and_then(JsonValue::as_array).unwrap().iter().filter_map(|tool| tool.get("name").and_then(JsonValue::as_str)).collect::<Vec<_>>(); assert_eq!(auto_names, vec!["database.query"]); }
-
     #[test] fn detailed_statistics_require_two_successful_queries_before_auto_answer() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Quelles données sont présentes dans data_people ? Avec valeurs et statistiques ?".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on data_people | group country | sort count desc | limit 20"} })], vec![json!({ "type":"toolCall", "id":"call-3", "name":"database.query", "arguments":{"query":"on data_people | distinct name | limit 20"} })], vec![json!({"type":"token","text":"Detailed statistics"})], ], llm_requests: Vec::new(), }; service.run(&input, &mut invoker, |_| true).unwrap(); assert_eq!(invoker.llm_requests.len(), 4); for request in &invoker.llm_requests[1..=2] { assert_eq!(request.get("toolChoice").and_then(JsonValue::as_str), Some("required")); let names = request.get("tools").and_then(JsonValue::as_array).unwrap().iter().filter_map(|tool| tool.get("name").and_then(JsonValue::as_str)).collect::<Vec<_>>(); assert_eq!(names, vec!["database.query"]); } assert_eq!(invoker.llm_requests[3].get("toolChoice").and_then(JsonValue::as_str), Some("auto")); let final_names = invoker.llm_requests[3].get("tools").and_then(JsonValue::as_array).unwrap().iter().filter_map(|tool| tool.get("name").and_then(JsonValue::as_str)).collect::<Vec<_>>(); assert_eq!(final_names, vec!["database.query"]); }
-
     #[test] fn prose_during_required_query_phase_is_not_accepted_and_is_retried() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Fais moi une synthèse de la table data_people".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({"type":"token","text":"You could run a group query."})], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on data_people | group country | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"Summary from actual evidence"})], ], llm_requests: Vec::new(), }; let mut events = Vec::new(); service.run(&input, &mut invoker, |event| { events.push(event); true }).unwrap(); assert_eq!(invoker.llm_requests.len(), 4); assert_eq!(invoker.llm_requests[1].get("toolChoice").and_then(JsonValue::as_str), Some("required")); assert_eq!(invoker.llm_requests[2].get("toolChoice").and_then(JsonValue::as_str), Some("required")); let retry_messages = invoker.llm_requests[2].get("messages").and_then(JsonValue::as_array).unwrap(); assert_eq!(retry_messages.last().and_then(|message| message.get("role")).and_then(JsonValue::as_str), Some("user")); assert_eq!(retry_messages.last().and_then(|message| message.get("content")).and_then(JsonValue::as_str), Some(REQUIRED_DATABASE_QUERY_RETRY_DIRECTIVE)); assert!(!events.iter().any(|event| event.get("type").and_then(JsonValue::as_str) == Some("message") && event.get("content").and_then(JsonValue::as_str) == Some("You could run a group query."))); assert!(events.iter().any(|event| event.get("type").and_then(JsonValue::as_str) == Some("message") && event.get("content").and_then(JsonValue::as_str) == Some("Summary from actual evidence"))); }
-
     #[test] fn observed_fields_reports_types_coverage_and_nested_paths() { let documents = vec![ json!({ "_id":"1", "name":"Ada", "active":true, "score":12, "address":{"country":"FR"} }), json!({ "_id":"2", "name":"Grace", "score":null, "address":{"country":"US"} }), ]; let refs = documents.iter().collect::<Vec<_>>(); let (fields, system_fields) = observed_fields(&refs); assert_eq!(system_fields, vec!["_id".to_owned()]); let name = fields .iter() .find(|field| field.get("path").and_then(JsonValue::as_str) == Some("name")) .expect("name field"); assert_eq!(name.get("coverage").and_then(JsonValue::as_f64), Some(1.0)); assert_eq!(name["types"], json!(["string"])); let active = fields .iter() .find(|field| field.get("path").and_then(JsonValue::as_str) == Some("active")) .expect("active field"); assert_eq!(active.get("coverage").and_then(JsonValue::as_f64), Some(0.5)); assert!(fields.iter().any(|field| { field.get("path").and_then(JsonValue::as_str) == Some("address.country") })); let score = fields .iter() .find(|field| field.get("path").and_then(JsonValue::as_str) == Some("score")) .expect("score field"); assert_eq!(score["types"], json!(["null", "number"])); }
-
     #[test] fn database_describe_uses_count_and_streaming_observation() { let mut invoker = FakeInvoker::default(); let value = invoke_agent_tool( &mut invoker, "database.describe", json!({"collection":"data_people"}), ) .unwrap(); assert_eq!(invoker.calls, vec!["query.execute", "query.execute"]); assert_eq!(value.get("collection").and_then(JsonValue::as_str), Some("data_people")); assert_eq!(value.get("documents").and_then(JsonValue::as_u64), Some(2)); assert_eq!(value.get("observedDocuments").and_then(JsonValue::as_u64), Some(2)); assert_eq!(value.get("observationLimit").and_then(JsonValue::as_u64), Some(128)); assert_eq!(value.get("observationStrategy").and_then(JsonValue::as_str), Some("streaming-prefix")); assert_eq!(value.get("schemaKind").and_then(JsonValue::as_str), Some("observed")); let fields = value.get("fields").and_then(JsonValue::as_array).unwrap(); assert!(fields.iter().any(|field| { field.get("path").and_then(JsonValue::as_str) == Some("country") })); }
-
     #[test] fn database_analysis_can_issue_multiple_queries_before_answering() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | count"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on people | group country | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"There are people in several countries."})], ], llm_requests: Vec::new(), }; let stats = service.run(&request(), &mut invoker, |_| true).unwrap(); assert_eq!(stats.tool_calls, 2); assert_eq!(stats.llm_calls, 3); assert_eq!( invoker.calls, vec![ "llm.generate", "query.execute", "llm.generate", "query.execute", "llm.generate", ] ); for request in &invoker.llm_requests[1..] { assert_eq!( request.get("toolChoice").and_then(JsonValue::as_str), Some("auto") ); let names = request .get("tools") .and_then(JsonValue::as_array) .expect("database tools") .iter() .filter_map(|tool| tool.get("name").and_then(JsonValue::as_str)) .collect::<Vec<_>>(); assert_eq!(names, vec!["database.describe", "database.query"]); } }
-
     #[test] fn database_query_limit_forces_a_tool_free_synthesis_turn() { let service = AgentService { config: AgentConfig { max_database_queries: 2, ..AgentConfig::default() }, }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | count"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on people | group country"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; service.run(&request(), &mut invoker, |_| true).unwrap(); let final_request = invoker.llm_requests.last().expect("final request"); assert_eq!( final_request.get("toolChoice").and_then(JsonValue::as_str), Some("none") ); assert_eq!( final_request .get("tools") .and_then(JsonValue::as_array) .map(Vec::len), Some(0) ); assert_eq!( final_request.get("maxTokens").and_then(JsonValue::as_u64), Some(u64::from(DEFAULT_SYNTHESIS_MAX_TOKENS)) ); }
-
-
     #[test] fn database_analysis_compacts_older_tool_pairs_into_evidence() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | group country | sort count desc | limit 20"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on people | group city | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; service.run(&request(), &mut invoker, |_| true).unwrap(); let third = &invoker.llm_requests[2]; let messages = third .get("messages") .and_then(JsonValue::as_array) .expect("messages"); let system = messages .first() .and_then(|message| message.get("content")) .and_then(JsonValue::as_str) .expect("system content"); assert!(system.contains(DATABASE_EVIDENCE_PREFIX.trim())); assert!(system.contains("group country")); assert!(!system.contains("call-1")); let tool_messages = messages .iter() .filter(|message| message.get("role").and_then(JsonValue::as_str) == Some("tool")) .count(); assert_eq!(tool_messages, 1); let latest_tool = messages .iter() .rev() .find(|message| message.get("role").and_then(JsonValue::as_str) == Some("tool")) .expect("latest tool"); assert_eq!( latest_tool.get("toolCallId").and_then(JsonValue::as_str), Some("call-2") ); }
-
     #[test] fn database_evidence_ledger_stays_bounded() { let mut evidence = Vec::new(); for index in 0..10 { push_database_evidence( &mut evidence, format!("- query-{index}: {}", "x".repeat(DATABASE_EVIDENCE_ENTRY_BYTES)), ); } assert!(evidence.iter().map(String::len).sum::<usize>() <= DATABASE_EVIDENCE_TOTAL_BYTES); assert!(!evidence.is_empty()); }
-
     #[test] fn database_tool_context_is_smaller_than_general_tool_context() { assert_eq!(DATABASE_ACTIVE_TOOL_BYTES, 2 * 1024); assert!(DATABASE_ACTIVE_TOOL_BYTES < AgentConfig::default().max_tool_bytes); }
-
     #[test] fn malformed_semantic_tool_call_is_rejected() { let response = AgentCapabilityResponse::stream( vec![json!({ "type":"toolCall", "name":"database.query", "arguments":{"query":"on people | limit 1"} })], None, ); let error = response.generated_turn().unwrap_err(); assert!(matches!(error, AgentError::InvalidToolCall(_))); }
-
     #[test] fn multiple_tool_calls_in_one_turn_are_rejected() { let response = AgentCapabilityResponse::stream( vec![ json!({"type":"toolCall","id":"1","name":"files.list","arguments":{}}), json!({"type":"toolCall","id":"2","name":"files.list","arguments":{}}), ], None, ); let error = response.generated_turn().unwrap_err(); assert!(matches!(error, AgentError::InvalidToolCall(_))); }
-
     #[test] fn explicit_collection_listing_requires_a_tool_on_first_turn() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Montre moi les collections disponibles".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.collections", "arguments":{} })], vec![json!({"type":"token","text":"people"})], ], llm_requests: Vec::new(), }; service.run(&input, &mut invoker, |_| true).unwrap(); assert_eq!( invoker.llm_requests[0].get("toolChoice").and_then(JsonValue::as_str), Some("required") ); assert_eq!( invoker.llm_requests[0] .get("tools") .and_then(JsonValue::as_array) .map(Vec::len), Some(1) ); assert_eq!( invoker.llm_requests[0] .get("tools") .and_then(JsonValue::as_array) .and_then(|tools| tools.first()) .and_then(|tool| tool.get("name")) .and_then(JsonValue::as_str), Some("database.collections") ); assert_eq!( invoker.llm_requests[1].get("toolChoice").and_then(JsonValue::as_str), Some("none") ); assert_eq!( invoker.llm_requests[1] .get("tools") .and_then(JsonValue::as_array) .map(Vec::len), Some(0) ); }
-
     #[test] fn general_request_keeps_tool_choice_auto() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![vec![json!({"type":"token","text":"Out of scope"})]], llm_requests: Vec::new(), }; service.run(&request(), &mut invoker, |_| true).unwrap(); assert_eq!( invoker.llm_requests[0].get("toolChoice").and_then(JsonValue::as_str), Some("auto") ); }
-
     #[test] fn default_tool_context_budget_is_eight_kib() { assert_eq!(AgentConfig::default().max_tool_bytes, 8 * 1024); }
-
     #[test] fn bounded_tool_text_is_actually_bounded_and_marks_truncation() { let value = json!({"items": ["x".repeat(20_000)]}); let text = bounded_tool_text(&value, 8 * 1024); assert!(text.len() <= 8 * 1024); assert!(text.contains("truncated for LLM context")); assert!(text.contains("originalBytes=")); }
-
     #[test] fn default_synthesis_budget_is_larger_than_planning_budget() { let service = AgentService { config: AgentConfig::default() }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | count"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; let mut req = request(); req.max_tokens = None; let mut cfg = service.config; cfg.max_database_queries = 1; let service = AgentService { config: cfg }; service.run(&req, &mut invoker, |_| true).unwrap(); let final_request = invoker.llm_requests.last().expect("final request"); assert_eq!( final_request.get("maxTokens").and_then(JsonValue::as_u64), Some(u64::from(DEFAULT_SYNTHESIS_MAX_TOKENS)) ); }
     #[test] fn explicit_max_tokens_caps_synthesis_too() { let mut req = request(); req.max_tokens = Some(333); let service = AgentService { config: AgentConfig { max_database_queries: 1, ..AgentConfig::default() } }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | count"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; service.run(&req, &mut invoker, |_| true).unwrap(); let final_request = invoker.llm_requests.last().expect("final request"); assert_eq!( final_request.get("maxTokens").and_then(JsonValue::as_u64), Some(333) ); }
     #[test] fn synthesis_context_overflow_reduces_generation_budget() { let error = AgentError::capability( "llm.generate", r#"{"code":"llm.invalid_request","message":"prompt plus generation budget requires 4213 tokens but context size is 4096"}"#, ); assert_eq!(reduced_context_budget(&error, 256), Some(131)); }
-
     #[test] fn unrelated_llm_errors_do_not_trigger_budget_retry() { let error = AgentError::capability("llm.generate", "provider unavailable"); assert_eq!(reduced_context_budget(&error, 256), None); }
-
     #[test] fn prompt_overflow_can_trigger_database_context_compaction() { let mut messages = vec![ LlmMessageInput { role: "system".to_owned(), content: format!("{SYSTEM_PROMPT}\n\n{DATABASE_EVIDENCE_PREFIX}{}", "e".repeat(4000)), tool_calls: Vec::new(), tool_call_id: None, }, LlmMessageInput { role: "assistant".to_owned(), content: String::new(), tool_calls: vec![LlmToolCallInput { id: "call-1".to_owned(), name: "database.query".to_owned(), arguments: json!({"query":"on data_people | distinct country | limit 20"}), }], tool_call_id: None, }, LlmMessageInput { role: "tool".to_owned(), content: "x".repeat(4000), tool_calls: Vec::new(), tool_call_id: Some("call-1".to_owned()), }, ]; assert!(compact_database_context_for_retry(&mut messages, 512, 768)); assert!(messages[0].content.len() < SYSTEM_PROMPT.len() + 1024); assert!(messages[2].content.len() <= 768); }
-
     #[test] fn prompt_only_overflow_is_detected_even_when_budget_cannot_be_reduced() { let error = AgentError::capability( "llm.generate", r#"{"code":"llm.invalid_request","message":"prompt plus generation budget requires 5567 tokens but context size is 4096"}"#, ); assert_eq!(context_overflow(&error), Some((5567, 4096))); assert_eq!(reduced_context_budget(&error, 512), None); }
-
     #[test] fn system_prompt_contains_policy_not_a_model_output_protocol() { assert!(SYSTEM_PROMPT.contains("READ-ONLY")); assert!(SYSTEM_PROMPT.contains("database.describe")); assert!(!SYSTEM_PROMPT.contains("Return exactly ONE JSON")); assert!(!SYSTEM_PROMPT.contains("Markdown fences")); assert_eq!(agent_tools().len(), 4); }
 }

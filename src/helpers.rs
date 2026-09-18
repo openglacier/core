@@ -17,11 +17,7 @@ pub fn document_scope_matches(document: &Document, place_id: &str, app_instance_
 }
 
 #[must_use]
-pub fn enforce_document_scope(
-    document: &Document,
-    place_id: &str,
-    app_instance_id: &str,
-) -> Document {
+pub fn enforce_document_scope( document: &Document, place_id: &str, app_instance_id: &str, ) -> Document {
     let mut scoped = document.clone();
     scoped.insert(PLACE_SCOPE_FIELD, place_id);
     scoped.insert(APP_INSTANCE_SCOPE_FIELD, app_instance_id);
@@ -93,8 +89,7 @@ fn number_to_json(number: Number) -> JsonValue {
         Number::Signed(v) => JsonValue::Number(v.into()),
         Number::Unsigned(v) => JsonValue::Number(v.into()),
         Number::Float(v) => serde_json::Number::from_f64(v)
-            .map(JsonValue::Number)
-            .unwrap_or(JsonValue::Null),
+            .map_or(JsonValue::Null, JsonValue::Number),
     }
 }
 
@@ -125,7 +120,7 @@ pub fn encode_base64(input: &[u8]) -> String {
 
 /// Decodes standard RFC 4648 Base64, accepting ASCII whitespace.
 pub fn decode_base64(input: &str) -> Result<Vec<u8>, Base64DecodeError> {
-    fn value(byte: u8) -> Option<u8> {
+    const fn value(byte: u8) -> Option<u8> {
         match byte {
             b'A'..=b'Z' => Some(byte - b'A'),
             b'a'..=b'z' => Some(byte - b'a' + 26),
@@ -140,13 +135,13 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, Base64DecodeError> {
         .bytes()
         .filter(|byte| !byte.is_ascii_whitespace())
         .collect();
-    if clean.is_empty() || clean.len() % 4 != 0 {
+    if clean.is_empty() || !clean.len().is_multiple_of(4) {
         return Err(Base64DecodeError);
     }
 
     let chunk_count = clean.len() / 4;
     let mut output = Vec::with_capacity(chunk_count * 3);
-    for (index, chunk) in clean.chunks_exact(4).enumerate() {
+    for (index, chunk) in clean.as_chunks::<4>().0.iter().enumerate() {
         let last = index + 1 == chunk_count;
         let padding = usize::from(chunk[3] == b'=') + usize::from(chunk[2] == b'=');
         if (!last && padding != 0) || (chunk[2] == b'=' && chunk[3] != b'=') || padding > 2 {
@@ -179,13 +174,21 @@ pub fn decode_base64(input: &str) -> Result<Vec<u8>, Base64DecodeError> {
     Ok(output)
 }
 
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(DIGITS[(byte >> 4) as usize] as char);
+        output.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test] fn base64_round_trip_is_stable() { let input = b"openglacier authentication"; assert_eq!(decode_base64(&encode_base64(input)).unwrap(), input); }
-
     #[test] fn standard_vectors_are_stable() { assert_eq!(encode_base64(b""), ""); assert_eq!(encode_base64(b"f"), "Zg=="); assert_eq!(encode_base64(b"fo"), "Zm8="); assert_eq!(encode_base64(b"foo"), "Zm9v"); assert_eq!(decode_base64("Zm9v").unwrap(), b"foo"); }
-
     #[test] fn malformed_padding_is_rejected() { assert!(decode_base64("Zg=a").is_err()); assert!(decode_base64("Zg==AAAA").is_err()); assert!(decode_base64("Zh==").is_err()); }
 }

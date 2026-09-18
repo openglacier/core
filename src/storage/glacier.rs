@@ -1,16 +1,10 @@
 //! Public native Glacier storage engine.
-
+#![cfg_attr(rustfmt, rustfmt_skip)]
 use std::path::Path;
-
-use super::{
-    backend::glacier::{
-        GlacierBackend, GlacierCollectionMetadata, GlacierFormatInfo, GlacierWriteMetricsSnapshot,
-    },
-    BackendStorage, StorageResult,
-};
+use super::{ backend::glacier::{ GlacierBackend, GlacierCollectionMetadata, GlacierFormatInfo, GlacierWriteMetricsSnapshot, }, BackendStorage, StorageResult, };
 use crate::MemoryGovernor;
 
-/// Native OpenGlacier storage façade.
+/// Native `OpenGlacier` storage façade.
 pub type GlacierStorage = BackendStorage<GlacierBackend>;
 
 impl BackendStorage<GlacierBackend> {
@@ -46,7 +40,7 @@ impl BackendStorage<GlacierBackend> {
     }
 
     /// Returns the current Glacier WAL file size.
-    pub fn wal_bytes(&self) -> StorageResult<u64> {
+    pub const fn wal_bytes(&self) -> StorageResult<u64> {
         self.backend().wal_bytes()
     }
 
@@ -61,10 +55,7 @@ impl BackendStorage<GlacierBackend> {
     }
 
     /// Returns capability-aware metadata for one persistent collection.
-    pub fn collection_metadata(
-        &self,
-        collection: &super::CollectionId,
-    ) -> StorageResult<Option<GlacierCollectionMetadata>> {
+    pub fn collection_metadata( &self, collection: &super::CollectionId, ) -> StorageResult<Option<GlacierCollectionMetadata>> {
         self.backend().collection_metadata(collection)
     }
 

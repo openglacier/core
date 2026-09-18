@@ -140,34 +140,19 @@ impl NativeSemanticFunctions {
             .into_runtime()
     }
 
-    fn evaluate_predicate_inner(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<bool> {
+    fn evaluate_predicate_inner( &self, expression: &Expression, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<bool> {
         session.charge()?;
         (self.predicate)(expression, document, session)
     }
 
-    fn apply_assignment_inner(
-        &self,
-        index: usize,
-        assignment: &SetAssignment,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<Document> {
+    fn apply_assignment_inner( &self, index: usize, assignment: &SetAssignment, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<Document> {
         session.charge()?;
 
         (self.assignment)(index, assignment, document, session)
             .map_err(|error| contextualize_assignment_error(index, error))
     }
 
-    fn handle_panic<T>(
-        &self,
-        operation: &'static str,
-        result: std::thread::Result<EvaluationResult<T>>,
-    ) -> EvaluationResult<T> {
+    fn handle_panic<T>( &self, operation: &'static str, result: std::thread::Result<EvaluationResult<T>>, ) -> EvaluationResult<T> {
         match result {
             Ok(result) => result,
             Err(payload) if self.options.catch_panics => Err(EvaluationError::backend(format!(
@@ -191,12 +176,7 @@ impl fmt::Debug for NativeSemanticFunctions {
 }
 
 impl NativeSemantics for NativeSemanticFunctions {
-    fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<bool> {
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<bool> {
         let mut operation = || self.evaluate_predicate_inner(expression, document, session);
 
         if self.options.catch_panics {
@@ -209,12 +189,7 @@ impl NativeSemantics for NativeSemanticFunctions {
         }
     }
 
-    fn apply_assignments(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<Document> {
+    fn apply_assignments( &self, assignments: &[SetAssignment], document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<Document> {
         if assignments.is_empty() {
             return Err(EvaluationError::new(EvaluationErrorKind::EmptyAssignments));
         }
@@ -423,14 +398,9 @@ mod tests {
     use super::*;
 
     #[test] fn options_have_safe_defaults() { let options = NativeSemanticOptions::default(); assert_eq!( options.max_assignments(), NativeSemanticOptions::DEFAULT_MAX_ASSIGNMENTS ); assert!(options.catches_panics()); }
-
     #[test] fn zero_assignment_limit_is_normalized() { let options = NativeSemanticOptions::new().with_max_assignments(0); assert_eq!(options.max_assignments(), 1); }
-
     #[test] fn builder_requires_predicate_first() { let error = NativeSemanticBuilder::new().build().unwrap_err(); assert_eq!(error, NativeSemanticBuildError::MissingPredicate); }
-
     #[test] fn builder_requires_assignment() { let error = NativeSemanticBuilder::new() .predicate(|_, _, _| Ok(true)) .build() .unwrap_err(); assert_eq!(error, NativeSemanticBuildError::MissingAssignment); }
-
     #[test] fn adapter_builds_native_runtime() { let runtime = NativeSemanticFunctions::new( |_, _, _| Ok(true), |_, _, document, _| Ok(document.clone()), ) .into_runtime(); assert!(!runtime.supports_load()); assert!(!runtime.supports_sort()); assert!(!runtime.supports_select()); assert!(!runtime.supports_distinct()); assert!(!runtime.supports_count()); assert!(!runtime.supports_group()); assert!(!runtime.supports_insert()); assert!(!runtime.supports_custom()); }
-
     #[test] fn builder_is_cloneable() { let builder = NativeSemanticBuilder::new() .predicate(|_, _, _| Ok(true)) .assignment(|_, _, document, _| Ok(document.clone())); let _clone = builder.clone(); }
 }

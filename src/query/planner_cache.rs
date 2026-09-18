@@ -16,6 +16,7 @@ pub struct PlannerCacheStats {
     pub evictions: u64,
 }
 impl PlannerCacheStats {
+    #[must_use]
     pub fn hit_rate(self) -> f64 {
         let n = self.hits.saturating_add(self.misses);
         if n == 0 {
@@ -49,10 +50,12 @@ pub struct PlannerCache {
     state: Mutex<State>,
 }
 impl PlannerCache {
+    #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self::new_governed(capacity, usize::MAX, MemoryGovernor::unlimited())
     }
 
+    #[must_use]
     pub fn new_governed(capacity: usize, max_bytes: usize, governor: MemoryGovernor) -> Self {
         Self {
             capacity: capacity.max(1),

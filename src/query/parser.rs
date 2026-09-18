@@ -226,24 +226,14 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Erreur du pipeline complet de lecture d'une requête.
-///
-/// Elle distingue volontairement :
-///
-/// - les erreurs lexicales ;
-/// - les erreurs syntaxiques.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueryParseError {
-    /// Erreur produite par le lexer.
     Lex(LexError),
-
-    /// Erreur produite par le parser.
     Parse(ParseError),
 }
 
 impl QueryParseError {
-    /// Retourne l'erreur lexicale lorsqu'elle existe.
     #[must_use]
     pub const fn as_lex_error(&self) -> Option<&LexError> {
         match self {
@@ -252,7 +242,6 @@ impl QueryParseError {
         }
     }
 
-    /// Retourne l'erreur syntaxique lorsqu'elle existe.
     #[must_use]
     pub const fn as_parse_error(&self) -> Option<&ParseError> {
         match self {
@@ -261,7 +250,6 @@ impl QueryParseError {
         }
     }
 
-    /// Retourne le span de l'erreur.
     #[must_use]
     #[inline]
     pub const fn span(&self) -> Span {
@@ -303,11 +291,6 @@ impl From<ParseError> for QueryParseError {
     }
 }
 
-/// Parser d'un flux de tokens OG.
-///
-/// Le parser emprunte le [`TokenStream`]. L'AST résultant ne conserve aucune
-/// référence vers ce flux : il contient uniquement des spans et des types
-/// syntaxiques possédés.
 #[derive(Debug)]
 pub struct Parser<'stream, 'source> {
     stream: &'stream TokenStream<'source>,
@@ -315,26 +298,23 @@ pub struct Parser<'stream, 'source> {
 }
 
 impl<'stream, 'source> Parser<'stream, 'source> {
-    /// Construit un parser au début d'un flux.
+    /// Build a parser at the beginning of the strteam.
     #[must_use]
     #[inline]
     pub const fn new(stream: &'stream TokenStream<'source>) -> Self {
         Self { stream, cursor: 0 }
     }
 
-    /// Retourne le flux analysé.
     #[must_use]
     pub const fn stream(&self) -> &'stream TokenStream<'source> {
         self.stream
     }
 
-    /// Retourne l'index du token courant.
     #[must_use]
     pub const fn position(&self) -> usize {
         self.cursor
     }
 
-    /// Analyse un pipeline racine complet.
     pub fn parse_pipeline(mut self) -> ParseResult<PipelineAst> {
         let source = self.parse_source()?;
         let mut stages = Vec::new();
@@ -363,26 +343,18 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         Ok(PipelineAst::new(source, stages, span))
     }
 
-    /// Analyse une valeur complète et exige la fin du flux juste après elle.
-    ///
-    /// Cette entrée est indépendante du parsing de pipeline et permet aux
-    /// couches spécialisées d'analyser le contenu d'un span d'arguments.
     pub fn parse_value(mut self) -> ParseResult<ValueAst> {
         let value = self.parse_value_node()?;
-
         if !self.is_at_end() {
             return Err(self.error_current(ParseErrorKind::UnexpectedToken {
                 found: self.current().kind(),
             }));
         }
-
         Ok(value)
     }
 
-    /// Analyse une valeur récursive à la position courante.
     fn parse_value_node(&mut self) -> ParseResult<ValueAst> {
         let token = self.current();
-
         match token.kind() {
             TokenKind::String => {
                 self.advance();
@@ -421,7 +393,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Analyse un tableau, avec virgule finale facultative.
     fn parse_array(&mut self) -> ParseResult<ValueAst> {
         let opening = self.consume(TokenKind::LeftBracket)?;
         let mut values = Vec::new();
@@ -504,8 +475,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Analyse un objet, avec clés identifiantes ou chaînes et virgule finale
-    /// facultative.
     fn parse_object(&mut self) -> ParseResult<ValueAst> {
         let opening = self.consume(TokenKind::LeftBrace)?;
         let mut fields = Vec::new();
@@ -521,7 +490,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
                 span,
             )));
         }
-
         loop {
             if self.is_at_end() {
                 return Err(ParseError::new(
@@ -589,7 +557,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
 
                 continue;
             }
-
             if self.check(TokenKind::RightBrace) {
                 let closing = self.advance();
                 let span = opening.span().join(closing.span());
@@ -601,7 +568,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
                     span,
                 )));
             }
-
             if self.is_at_end() {
                 return Err(ParseError::new(
                     ParseErrorKind::UnclosedObject {
@@ -619,7 +585,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Analyse la source initiale du pipeline.
     fn parse_source(&mut self) -> ParseResult<SourceAst> {
         let keyword_token = self.current();
 
@@ -672,81 +637,53 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Analyse un nom de collection éventuellement qualifié.
-    ///
-    /// Exemples :
-    ///
-    /// ```text
-    /// users
-    /// _og.operations
-    /// namespace.users.archive
-    /// ```
-    ///
-    /// L'AST conserve le nom qualifié comme un unique [`NameAst`] couvrant
-    /// l'ensemble du texte.
     fn parse_qualified_collection_name(&mut self) -> ParseResult<NameAst> {
         let first = self.current();
-
         if first.kind() != TokenKind::Identifier {
             return Err(self.error_current(ParseErrorKind::ExpectedCollectionName {
                 found: first.kind(),
             }));
         }
-
         self.advance();
-
         let mut span = first.span();
-
         while self.check(TokenKind::Dot) {
             self.advance();
-
             let segment = self.current();
-
             if segment.kind() != TokenKind::Identifier {
                 return Err(self.error_current(ParseErrorKind::ExpectedNameAfterDot {
                     found: segment.kind(),
                 }));
             }
-
             span = span.join(segment.span());
             self.advance();
         }
-
         Ok(NameAst::new(span))
     }
 
     /// Analyse un stage simple ou composé.
     fn parse_stage(&mut self) -> ParseResult<StageAst> {
         let pipe = self.consume(TokenKind::Pipe)?;
-
         let name_token = self.current();
-
         if name_token.kind() == TokenKind::EndKeyword {
             return Err(ParseError::new(
                 ParseErrorKind::UnexpectedEndKeyword,
                 name_token.span(),
             ));
         }
-
         if !is_stage_name(name_token.kind()) {
             return Err(self.error_current(ParseErrorKind::ExpectedStageName {
                 found: name_token.kind(),
             }));
         }
-
         self.advance();
-
         let name = NameAst::new(name_token.span());
         let (arguments_span, last_argument_span) =
             self.parse_stage_arguments(name_token.span().end())?;
-
         let header_end = last_argument_span.map_or(name_token.span().end(), Span::end);
         let header_span = Span::new(pipe.span().start(), header_end);
-
         if self.stage_opens_subpipeline(name_token.kind(), arguments_span) {
             let subpipeline = self.parse_subpipeline(header_span)?;
             let stage_span = Span::new(pipe.span().start(), subpipeline.span().end());
-
             Ok(StageAst::with_subpipeline(
                 pipe.span(),
                 name,
@@ -765,12 +702,8 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Analyse le corps d'un stage composé jusqu'au `| end` correspondant.
-    ///
-    /// Les stages composés peuvent être imbriqués sans limite syntaxique fixe.
     fn parse_subpipeline(&mut self, opening_stage_span: Span) -> ParseResult<SubPipelineAst> {
         let mut stages = Vec::new();
-
         loop {
             if self.is_at_end() {
                 return Err(ParseError::new(
@@ -780,13 +713,11 @@ impl<'stream, 'source> Parser<'stream, 'source> {
                     self.current().span(),
                 ));
             }
-
             if !self.check(TokenKind::Pipe) {
                 return Err(self.error_current(ParseErrorKind::ExpectedPipe {
                     found: self.current().kind(),
                 }));
             }
-
             if self.check_next(TokenKind::EndKeyword) {
                 let end = self.parse_end_marker()?;
 
@@ -802,7 +733,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Analyse une fermeture canonique `| end`.
     fn parse_end_marker(&mut self) -> ParseResult<EndAst> {
         let pipe = self.consume(TokenKind::Pipe)?;
         let keyword = self.consume(TokenKind::EndKeyword)?;
@@ -811,19 +741,7 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         Ok(EndAst::new(pipe.span(), keyword.span(), span))
     }
 
-    /// Trouve les limites des arguments d'un stage.
-    ///
-    /// Un pipe termine le stage uniquement lorsqu'il apparaît au niveau zéro
-    /// des parenthèses :
-    ///
-    /// ```text
-    /// | where active and (country == "FR" | custom)
-    ///                                       ^ argument interne
-    /// ```
-    fn parse_stage_arguments(
-        &mut self,
-        empty_position: usize,
-    ) -> ParseResult<(Span, Option<Span>)> {
+    fn parse_stage_arguments( &mut self, empty_position: usize, ) -> ParseResult<(Span, Option<Span>)> {
         let mut opening_parentheses = Vec::new();
         let mut opening_braces = Vec::new();
         let mut opening_brackets = Vec::new();
@@ -845,7 +763,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
                 TokenKind::LeftParen => {
                     opening_parentheses.push(token.span());
                 }
-
                 TokenKind::RightParen => {
                     if opening_parentheses.pop().is_none() {
                         return Err(ParseError::new(
@@ -854,11 +771,9 @@ impl<'stream, 'source> Parser<'stream, 'source> {
                         ));
                     }
                 }
-
                 TokenKind::LeftBrace => {
                     opening_braces.push(token.span());
                 }
-
                 TokenKind::RightBrace => {
                     if opening_braces.pop().is_none() {
                         return Err(ParseError::new(
@@ -867,26 +782,22 @@ impl<'stream, 'source> Parser<'stream, 'source> {
                         ));
                     }
                 }
-
                 TokenKind::LeftBracket => {
                     opening_brackets.push(token.span());
                 }
-
-                TokenKind::RightBracket => {
-                    if opening_brackets.pop().is_none() {
+                TokenKind::RightBracket
+                    if opening_brackets.pop().is_none() => {
                         return Err(ParseError::new(
                             ParseErrorKind::UnexpectedRightBracket,
                             token.span(),
                         ));
                     }
-                }
 
                 _ => {}
             }
 
             first_span.get_or_insert(token.span());
             last_span = Some(token.span());
-
             self.advance();
         }
 
@@ -928,7 +839,7 @@ impl<'stream, 'source> Parser<'stream, 'source> {
     /// `lookup`, `union` et `pivot` sont toujours composés. `load` n'est composé
     /// que lorsque son en-tête est vide ; une forme compacte conserve ses
     /// arguments dans le stage simple.
-    fn stage_opens_subpipeline(&self, kind: TokenKind, arguments_span: Span) -> bool {
+    const fn stage_opens_subpipeline(&self, kind: TokenKind, arguments_span: Span) -> bool {
         match kind {
             TokenKind::Lookup | TokenKind::Join | TokenKind::Union | TokenKind::Pivot => true,
 
@@ -951,86 +862,63 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         }
     }
 
-    /// Retourne le token courant.
-    ///
-    /// Un [`TokenStream`] valide contient toujours un token terminal. La valeur
-    /// de secours protège néanmoins le parser contre un flux incorrect.
     fn current(&self) -> Token {
         self.stream
             .get(self.cursor)
             .unwrap_or_else(|| Token::end(self.stream.source().len()))
     }
 
-    /// Retourne le token suivant sans avancer.
     fn next_token(&self) -> Token {
         self.stream
             .get(self.cursor.saturating_add(1))
             .unwrap_or_else(|| Token::end(self.stream.source().len()))
     }
 
-    /// Vérifie la catégorie du token courant.
     fn check(&self, kind: TokenKind) -> bool {
         self.current().kind() == kind
     }
 
-    /// Vérifie la catégorie du token suivant.
     fn check_next(&self, kind: TokenKind) -> bool {
         self.next_token().kind() == kind
     }
 
-    /// Indique si le parser se trouve sur le token terminal.
     fn is_at_end(&self) -> bool {
         self.check(TokenKind::End)
     }
 
-    /// Avance d'un token sans dépasser la fin.
     fn advance(&mut self) -> Token {
         let token = self.current();
-
         if !token.is_end() {
             self.cursor += 1;
         }
-
         token
     }
 
-    /// Construit une erreur sur le token courant.
     fn error_current(&self, kind: ParseErrorKind) -> ParseError {
         ParseError::new(kind, self.current().span())
     }
 }
 
-/// Analyse un flux déjà tokenisé.
 pub fn parse_tokens(stream: &TokenStream<'_>) -> ParseResult<PipelineAst> {
     Parser::new(stream).parse_pipeline()
 }
 
-/// Tokenise puis analyse une requête OG.
 pub fn parse(source: &str) -> QueryParseResult<PipelineAst> {
     let stream = lex(source)?;
     let pipeline = parse_tokens(&stream)?;
-
     Ok(pipeline)
 }
 
-/// Analyse une valeur depuis un flux déjà tokenisé.
 pub fn parse_value_tokens(stream: &TokenStream<'_>) -> ParseResult<ValueAst> {
     Parser::new(stream).parse_value()
 }
 
-/// Tokenise puis analyse une valeur autonome.
 pub fn parse_value_source(source: &str) -> QueryParseResult<ValueAst> {
     let stream = lex(source)?;
     let value = parse_value_tokens(&stream)?;
-
     Ok(value)
 }
 
-/// Indique si une catégorie peut être utilisée comme nom de stage.
-///
-/// Les stages natifs ont leur propre token réservé. Les stages externes et
-/// futurs restent des identifiants ordinaires. `from` et `on` sont admis comme
-/// noms de stages internes afin que `union` puisse porter sa propre source.
 const fn is_stage_name(kind: TokenKind) -> bool {
     matches!(
         kind,
@@ -1085,13 +973,9 @@ mod tests {
     }
 
     #[test] fn parses_scalar_values() { assert!(matches!(parse_value_ok(r#""John""#), ValueAst::String(_))); assert!(matches!(parse_value_ok("42"), ValueAst::Number(_))); assert!(matches!( parse_value_ok("true"), ValueAst::Boolean(value) if value.value() )); assert!(matches!( parse_value_ok("false"), ValueAst::Boolean(value) if !value.value() )); assert!(matches!(parse_value_ok("null"), ValueAst::Null(_))); assert!(matches!( parse_value_ok("workspace"), ValueAst::Identifier(_) )); }
-
     #[test] fn parses_empty_structured_values() { let array = parse_value_ok("[]"); let object = parse_value_ok("{}"); assert!(matches!(array, ValueAst::Array(ref value) if value.is_empty())); assert!(matches!(object, ValueAst::Object(ref value) if value.is_empty())); }
-
     #[test] fn parses_array_with_trailing_comma() { let source = r#"["rust", 42, true, null,]"#; let ValueAst::Array(array) = parse_value_ok(source) else { panic!("expected array"); }; assert_eq!(array.len(), 4); assert_eq!(array.span().slice(source), Some(source)); assert!(matches!(array.value(0), Some(ValueAst::String(_)))); assert!(matches!(array.value(1), Some(ValueAst::Number(_)))); assert!(matches!(array.value(2), Some(ValueAst::Boolean(_)))); assert!(matches!(array.value(3), Some(ValueAst::Null(_)))); }
-
     #[test] fn parses_object_with_identifier_and_string_keys() { let source = r#"{name: "John", "display-name": "Johnny",}"#; let ValueAst::Object(object) = parse_value_ok(source) else { panic!("expected object"); }; assert_eq!(object.len(), 2); assert_eq!( object.field(0).and_then(|field| field.key_text(source)), Some("name"), ); assert_eq!( object.field(1).and_then(|field| field.key_text(source)), Some(r#""display-name""#), ); }
-
     #[test] fn parses_nested_object_and_array() { let source = r#"{
             user: {
                 name: "John",
@@ -1100,65 +984,35 @@ mod tests {
             },
             active: true,
         }"#; let value = parse_value_ok(source); assert!(value.is_object()); assert_eq!(value.text(source), Some(source)); }
-
     #[test] fn rejects_missing_object_colon() { let error = parse_value_error(r#"{name "John"}"#); assert!(matches!( error.kind(), ParseErrorKind::ExpectedColonAfterObjectKey { found: TokenKind::String } )); }
-
     #[test] fn rejects_missing_array_comma() { let error = parse_value_error("[1 2]"); assert!(matches!( error.kind(), ParseErrorKind::ExpectedCommaOrArrayEnd { found: TokenKind::Number } )); }
-
     #[test] fn rejects_missing_object_comma() { let error = parse_value_error("{a: 1 b: 2}"); assert!(matches!( error.kind(), ParseErrorKind::ExpectedCommaOrObjectEnd { found: TokenKind::Identifier } )); }
-
     #[test] fn rejects_unclosed_array_value() { let error = parse_value_error("[1, 2"); assert!(matches!(error.kind(), ParseErrorKind::UnclosedArray { .. })); }
-
     #[test] fn rejects_unclosed_object_value() { let error = parse_value_error("{name: \"John\""); assert!(matches!( error.kind(), ParseErrorKind::UnclosedObject { .. } )); }
-
     #[test] fn rejects_trailing_tokens_after_value() { let error = parse_value_error("42 true"); assert!(matches!( error.kind(), ParseErrorKind::UnexpectedToken { found: TokenKind::True } )); }
-
     #[test] fn parses_minimal_from_query() { let source = "from users"; let pipeline = parse_ok(source); assert_eq!(pipeline.source().keyword(), SourceKeyword::From); assert_eq!(pipeline.source().collection_name(source), Some("users")); assert_eq!(pipeline.stage_count(), 0); assert!(pipeline.is_source_only()); assert_eq!(pipeline.span(), Span::new(0, 10)); assert_eq!(pipeline.text(source), Some(source)); }
-
     #[test] fn parses_minimal_on_query() { let source = "on users"; let pipeline = parse_ok(source); assert_eq!(pipeline.source().keyword(), SourceKeyword::On); assert_eq!(pipeline.source().collection_name(source), Some("users")); }
-
     #[test] fn parses_source_alias() { let source = "on users as u"; let pipeline = parse_ok(source); assert!(pipeline.source().has_alias()); assert_eq!(pipeline.source().alias_name(source), Some("u")); assert_eq!(pipeline.source().span(), Span::new(0, 13)); }
-
     #[test] fn preserves_source_keyword_in_ast() { let from = parse_ok("from users"); let on = parse_ok("on users"); assert_ne!(from.source().keyword(), on.source().keyword()); }
-
     #[test] fn parses_system_collection() { let source = "from _og.operations"; let pipeline = parse_ok(source); assert_eq!( pipeline.source().collection_name(source), Some("_og.operations"), ); assert_eq!(pipeline.source().collection().span(), Span::new(5, 19)); }
-
     #[test] fn parses_deeply_qualified_collection() { let source = "from tenant.analytics.events"; let pipeline = parse_ok(source); assert_eq!( pipeline.source().collection_name(source), Some("tenant.analytics.events"), ); }
-
     #[test] fn parses_where_stage() { let source = "from users | where age > 18"; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 1); let stage = pipeline.stage(0).unwrap(); assert_eq!(stage.name_text(source), Some("where")); assert_eq!(stage.arguments_text(source), Some("age > 18")); assert_eq!(stage.pipe_span(), Span::new(11, 12)); assert_eq!(stage.span(), Span::new(11, 27)); assert!(!stage.is_composite()); }
-
     #[test] fn parses_set_stage() { let source = "from users | set active = true"; let pipeline = parse_ok(source); let stage = pipeline.stage(0).unwrap(); assert_eq!(stage.name_text(source), Some("set")); assert_eq!(stage.arguments_text(source), Some("active = true")); }
-
     #[test] fn parses_compact_load_stage() { let source = "from users | load profile with replace"; let pipeline = parse_ok(source); let stage = pipeline.stage(0).unwrap(); assert_eq!(stage.name_text(source), Some("load")); assert_eq!(stage.arguments_text(source), Some("profile with replace"),); assert!(!stage.is_composite()); }
-
     #[test] fn parses_custom_stage() { let source = "from users | inspect verbose"; let pipeline = parse_ok(source); let stage = pipeline.stage(0).unwrap(); assert_eq!(stage.name_text(source), Some("inspect")); assert_eq!(stage.arguments_text(source), Some("verbose")); }
-
     #[test] fn parses_stage_without_arguments() { let source = "from users | inspect"; let pipeline = parse_ok(source); let stage = pipeline.stage(0).unwrap(); assert_eq!(stage.name_text(source), Some("inspect")); assert_eq!(stage.arguments_text(source), Some("")); assert!(!stage.has_arguments()); assert_eq!(stage.arguments_span(), Span::at(source.len())); }
-
     #[test] fn parses_multiple_stages() { let source = "from users | where age > 18 | set active = true"; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); let where_stage = pipeline.stage(0).unwrap(); let set_stage = pipeline.stage(1).unwrap(); assert_eq!(where_stage.name_text(source), Some("where")); assert_eq!(where_stage.arguments_text(source), Some("age > 18")); assert_eq!(set_stage.name_text(source), Some("set")); assert_eq!(set_stage.arguments_text(source), Some("active = true")); }
-
     #[test] fn parses_lookup_subpipeline() { let source = concat!( "on users as u\n", "| lookup workspace as w\n", "    | where u._id in w.share\n", "    | where w.public == true\n", "    | into public\n", "| end", ); let pipeline = parse_ok(source); let lookup = pipeline.stage(0).expect("lookup stage"); assert_eq!(lookup.name_text(source), Some("lookup")); assert_eq!(lookup.arguments_text(source), Some("workspace as w")); assert!(lookup.is_composite()); assert_eq!(lookup.header_span(), Span::new(14, 37)); assert_eq!(lookup.span(), Span::new(14, source.len())); let body = lookup.subpipeline().expect("lookup body"); assert_eq!(body.stage_count(), 3); assert_eq!(body.stage(0).unwrap().name_text(source), Some("where")); assert_eq!(body.stage(1).unwrap().name_text(source), Some("where")); assert_eq!(body.stage(2).unwrap().name_text(source), Some("into")); assert_eq!( body.stage(2).unwrap().arguments_text(source), Some("public"), ); assert_eq!(body.end().text(source), Some("| end")); }
-
     #[test] fn parses_union_subpipeline_with_internal_source() { let source = concat!( "on users\n", "| union\n", "    | on archived_users\n", "    | where active == true\n", "| end", ); let pipeline = parse_ok(source); let union = pipeline.stage(0).expect("union stage"); assert_eq!(union.name_text(source), Some("union")); assert!(!union.has_arguments()); assert!(union.is_composite()); let body = union.subpipeline().expect("union body"); assert_eq!(body.stage_count(), 2); assert_eq!(body.stage(0).unwrap().name_text(source), Some("on")); assert_eq!( body.stage(0).unwrap().arguments_text(source), Some("archived_users"), ); assert_eq!(body.stage(1).unwrap().name_text(source), Some("where")); }
-
     #[test] fn parses_streaming_load_subpipeline() { let source = concat!( "on users\n", "| load\n", "    | with replace\n", "    | chunk batch1\n", "    | chunk batch2\n", "| end", ); let pipeline = parse_ok(source); let load = pipeline.stage(0).expect("load stage"); assert_eq!(load.name_text(source), Some("load")); assert!(!load.has_arguments()); assert!(load.is_composite()); let body = load.subpipeline().expect("load body"); assert_eq!(body.stage_count(), 3); assert_eq!(body.stage(0).unwrap().name_text(source), Some("with")); assert_eq!( body.stage(0).unwrap().arguments_text(source), Some("replace"), ); assert_eq!(body.stage(1).unwrap().name_text(source), Some("chunk")); assert_eq!(body.stage(2).unwrap().name_text(source), Some("chunk")); }
-
     #[test] fn parses_empty_union_subpipeline() { let source = "on users | union | end"; let pipeline = parse_ok(source); let union = pipeline.stage(0).expect("union"); let body = union.subpipeline().expect("union body"); assert!(body.is_empty()); assert_eq!(body.stage_count(), 0); assert_eq!(body.end().text(source), Some("| end")); }
-
     #[test] fn parses_nested_compound_stages() { let source = concat!( "on users\n", "| union\n", "    | on archived_users\n", "    | lookup workspace\n", "        | into workspaces\n", "    | end\n", "| end", ); let pipeline = parse_ok(source); let union = pipeline.stage(0).expect("union"); let union_body = union.subpipeline().expect("union body"); let lookup = union_body.stage(1).expect("lookup"); assert!(lookup.is_composite()); assert_eq!(lookup.name_text(source), Some("lookup")); let lookup_body = lookup.subpipeline().expect("lookup body"); assert_eq!(lookup_body.stage_count(), 1); assert_eq!( lookup_body.stage(0).unwrap().name_text(source), Some("into"), ); }
-
     #[test] fn stage_after_compound_stage_remains_at_root() { let source = concat!( "on users\n", "| lookup workspace\n", "    | into workspaces\n", "| end\n", "| where active == true", ); let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert!(pipeline.stage(0).unwrap().is_composite()); assert_eq!(pipeline.stage(1).unwrap().name_text(source), Some("where"),); }
-
     #[test] fn ignores_whitespace_between_pipeline_elements() { let source = " \n from   users \n |   where   age > 18 \n"; let pipeline = parse_ok(source); assert_eq!(pipeline.source().collection_name(source), Some("users")); let stage = pipeline.stage(0).unwrap(); assert_eq!(stage.name_text(source), Some("where")); assert_eq!(stage.arguments_text(source), Some("age > 18")); assert_eq!( pipeline.text(source), Some("from   users \n |   where   age > 18"), ); }
-
     #[test] fn stage_arguments_end_before_next_pipe() { let source = "from users | first alpha beta | second gamma"; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some("alpha beta"), ); assert_eq!( pipeline.stage(1).unwrap().arguments_text(source), Some("gamma"), ); }
-
     #[test] fn pipe_inside_parentheses_does_not_end_stage() { let source = "from users | custom (left | right) | inspect"; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some("(left | right)"), ); assert_eq!( pipeline.stage(1).unwrap().name_text(source), Some("inspect"), ); }
-
     #[test] fn handles_nested_parentheses() { let source = "from users | where (active and (age > 18))"; let pipeline = parse_ok(source); let stage = pipeline.stage(0).unwrap(); assert_eq!( stage.arguments_text(source), Some("(active and (age > 18))"), ); }
-
     #[test] fn pipe_in_string_does_not_end_stage() { let source = r#"from users | where value == "left | right" | inspect"#; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some(r#"value == "left | right""#), ); }
-
     #[test] fn parses_insert_document_as_complete_stage_arguments() { let source = r#"from users | insert {
             _id: "u1",
             name: "John",
@@ -1168,63 +1022,34 @@ mod tests {
             name: "John",
             tags: ["rust", "database"],
         }"#, ), ); assert_eq!( pipeline.stage(1).unwrap().name_text(source), Some("inspect") ); }
-
     #[test] fn balances_braces_and_brackets_in_stage_arguments() { let source = r#"from users | custom {items: [{value: 1}, {value: 2}]} | inspect"#; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some("{items: [{value: 1}, {value: 2}]}"), ); }
-
     #[test] fn rejects_unclosed_brace_in_stage_arguments() { let source = "from users | insert {name: \"John\""; let error = parse_error(source); assert!(matches!(error.kind(), ParseErrorKind::UnclosedBrace { .. })); }
-
     #[test] fn rejects_unclosed_bracket_in_stage_arguments() { let source = "from users | custom [1, 2"; let error = parse_error(source); assert!(matches!( error.kind(), ParseErrorKind::UnclosedBracket { .. } )); }
-
     #[test] fn preserves_exact_literal_arguments() { let first_source = "from users | where age > 18"; let second_source = "from users | where age > 42"; let first = parse_ok(first_source); let second = parse_ok(second_source); assert_eq!( first.stage(0).unwrap().name_text(first_source), second.stage(0).unwrap().name_text(second_source), ); assert_ne!( first.stage(0).unwrap().arguments_text(first_source), second.stage(0).unwrap().arguments_text(second_source), ); }
-
     #[test] fn rejects_empty_query() { let error = parse_error(""); assert_eq!( error.kind(), &ParseErrorKind::ExpectedSourceKeyword { found: TokenKind::End, }, ); assert_eq!(error.span(), Span::at(0)); }
-
     #[test] fn rejects_query_without_source_keyword() { let error = parse_error("users"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedSourceKeyword { found: TokenKind::Identifier, }, ); assert_eq!(error.span(), Span::new(0, 5)); }
-
     #[test] fn rejects_missing_collection() { let error = parse_error("from"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedCollectionName { found: TokenKind::End, }, ); assert_eq!(error.span(), Span::at(4)); }
-
     #[test] fn rejects_missing_alias_name() { let source = "on users as"; let error = parse_error(source); assert_eq!( error.kind(), &ParseErrorKind::ExpectedAliasName { found: TokenKind::End, }, ); assert_eq!(error.span(), Span::at(source.len())); }
-
     #[test] fn rejects_keyword_as_alias_name() { let error = parse_error("on users as where"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedAliasName { found: TokenKind::Where, }, ); }
-
     #[test] fn rejects_literal_collection_name() { let error = parse_error("from \"users\""); assert_eq!( error.kind(), &ParseErrorKind::ExpectedCollectionName { found: TokenKind::String, }, ); }
-
     #[test] fn rejects_collection_ending_with_dot() { let error = parse_error("from _og."); assert_eq!( error.kind(), &ParseErrorKind::ExpectedNameAfterDot { found: TokenKind::End, }, ); }
-
     #[test] fn rejects_empty_collection_segment() { let error = parse_error("from _og..operations"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedNameAfterDot { found: TokenKind::Dot, }, ); }
-
     #[test] fn rejects_tokens_between_source_and_stage() { let error = parse_error("from users where age > 18"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedPipe { found: TokenKind::Where, }, ); }
-
     #[test] fn rejects_trailing_pipe() { let error = parse_error("from users |"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedStageName { found: TokenKind::End, }, ); }
-
     #[test] fn rejects_pipe_followed_by_literal() { let error = parse_error("from users | 18"); assert_eq!( error.kind(), &ParseErrorKind::ExpectedStageName { found: TokenKind::Number, }, ); }
-
     #[test] fn rejects_end_at_root() { let error = parse_error("from users | end"); assert_eq!(error.kind(), &ParseErrorKind::UnexpectedEndKeyword); assert_eq!(error.span(), Span::new(13, 16)); }
-
     #[test] fn parses_join_as_lookup_alias() { let source = concat!( "on users as u\n", "| join workspace as w\n", "    | where u._id in w.share\n", "    | into public\n", "| end", ); let pipeline = parse_ok(source); let join = pipeline.stage(0).expect("join stage"); assert_eq!(join.name_text(source), Some("join")); assert_eq!(join.arguments_text(source), Some("workspace as w")); assert!(join.is_composite()); let body = join.subpipeline().expect("join body"); assert_eq!(body.stage_count(), 2); assert_eq!(body.stage(0).unwrap().name_text(source), Some("where")); assert_eq!(body.stage(1).unwrap().name_text(source), Some("into")); }
-
     #[test] fn rejects_unclosed_lookup_subpipeline() { let source = "on users | lookup workspace | into public"; let error = parse_error(source); assert_eq!( error.kind(), &ParseErrorKind::UnclosedSubPipeline { stage_span: Span::new(9, 27), }, ); assert_eq!(error.span(), Span::at(source.len())); }
-
     #[test] fn rejects_unclosed_nested_subpipeline() { let source = concat!( "on users\n", "| union\n", "    | lookup workspace\n", "        | into public\n", "| end", ); let error = parse_error(source); assert!(matches!( error.kind(), ParseErrorKind::UnclosedSubPipeline { .. }, )); }
-
     #[test] fn rejects_unexpected_right_parenthesis() { let error = parse_error("from users | where age > 18)"); assert_eq!(error.kind(), &ParseErrorKind::UnexpectedRightParenthesis); assert_eq!(error.span(), Span::new(27, 28)); }
-
     #[test] fn rejects_unclosed_parenthesis() { let source = "from users | where (age > 18"; let error = parse_error(source); assert_eq!( error.kind(), &ParseErrorKind::UnclosedParenthesis { opening_span: Span::new(19, 20), }, ); assert_eq!(error.span(), Span::at(source.len())); }
-
     #[test] fn reports_lexical_errors_separately() { let error = parse("from users @").unwrap_err(); assert!(error.as_lex_error().is_some()); assert!(error.as_parse_error().is_none()); assert!(matches!(error, QueryParseError::Lex(_))); }
-
     #[test] fn reports_parse_errors_separately() { let error = parse("users").unwrap_err(); assert!(error.as_lex_error().is_none()); assert!(error.as_parse_error().is_some()); assert!(matches!(error, QueryParseError::Parse(_))); }
-
     #[test] fn parses_previously_lexed_stream() { let source = "from users | where active == true"; let stream = lex(source).unwrap(); let pipeline = parse_tokens(&stream).unwrap(); assert_eq!(pipeline.source().collection_name(source), Some("users")); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some("active == true"), ); }
-
     #[test] fn parser_position_starts_at_zero() { let stream = lex("from users").unwrap(); let parser = Parser::new(&stream); assert_eq!(parser.position(), 0); assert_eq!(parser.stream().source(), "from users"); }
-
     #[test] fn parse_error_display_is_compact() { let error = ParseError::new( ParseErrorKind::ExpectedPipe { found: TokenKind::Where, }, Span::new(11, 16), ); assert_eq!( error.to_string(), "expected `|` before next stage, found `where` at 11..16", ); }
-
     #[test] fn unclosed_subpipeline_error_mentions_opening_stage() { let error = ParseError::new( ParseErrorKind::UnclosedSubPipeline { stage_span: Span::new(9, 27), }, Span::at(42), ); assert_eq!( error.to_string(), "sub-pipeline opened by stage at 9..27 is missing `| end` at 42..42", ); }
-
     #[test] fn query_parse_error_display_distinguishes_layer() { let error = parse("users").unwrap_err(); assert_eq!( error.to_string(), "parse error: expected `from` or `on`, found identifier at 0..5", ); }
-
     #[test] fn parses_pivot_subpipeline() { let source = r#"on sales
 | pivot
     | rows region

@@ -1122,7 +1122,7 @@ impl OperationPayload for IdentityOpenInput {
 
 impl OperationPayload for IdentityRenewInput {
     fn validate(&mut self, operation: &str) -> Result<()> {
-        if self.password.as_deref().map_or(true, str::is_empty) {
+        if self.password.as_deref().is_none_or(str::is_empty) {
             non_empty(
                 operation,
                 "deviceId",

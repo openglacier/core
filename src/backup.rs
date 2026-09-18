@@ -79,11 +79,7 @@ enum Record {
 
 pub use crate::error::BackupError;
 
-pub fn create(
-    storage: &dyn StorageEngine,
-    path: &Path,
-    metadata: BackupMetadata,
-) -> Result<BackupSummary, BackupError> {
+pub fn create( storage: &dyn StorageEngine, path: &Path, metadata: BackupMetadata, ) -> Result<BackupSummary, BackupError> {
     let snapshot = storage.read()?;
     let collections = snapshot
         .collections()?
@@ -181,12 +177,10 @@ pub fn inspect(path: &Path) -> Result<BackupInfo, BackupError> {
     }
 }
 
-pub fn restore(
-    storage: &dyn StorageEngine,
-    path: &Path,
-    replace: bool,
-) -> Result<BackupSummary, BackupError> {
-    if !replace {
+pub fn restore( storage: &dyn StorageEngine, path: &Path, replace: bool, ) -> Result<BackupSummary, BackupError> {
+    if replace {
+        clear_persistent(storage)?;
+    } else {
         let read = storage.read()?;
         for collection in read.collections()? {
             if !is_virtual(collection.as_str()) && read.count(&collection)? != 0 {
@@ -195,8 +189,6 @@ pub fn restore(
                 ));
             }
         }
-    } else {
-        clear_persistent(storage)?;
     }
     let mut reader = open_reader(path)?;
     let mut current: Option<CollectionId> = None;
@@ -277,11 +269,7 @@ fn clear_persistent(storage: &dyn StorageEngine) -> Result<(), BackupError> {
         }
     }
 }
-fn flush_batch(
-    storage: &dyn StorageEngine,
-    collection: Option<&CollectionId>,
-    batch: &mut Vec<StorageMutation>,
-) -> Result<(), BackupError> {
+fn flush_batch( storage: &dyn StorageEngine, collection: Option<&CollectionId>, batch: &mut Vec<StorageMutation>, ) -> Result<(), BackupError> {
     if batch.is_empty() {
         return Ok(());
     }

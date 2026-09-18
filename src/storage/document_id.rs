@@ -1,16 +1,8 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 //! Backend-independent, time-ordered document identifiers.
 
-use std::{
-    fmt,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
-
+use std::{ fmt, sync::{ atomic::{AtomicU64, Ordering}, Arc, }, };
 use crate::helpers::{u64_to_usize_saturating, unix_time_millis};
-
 use super::{StorageError, StorageResult};
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -111,7 +103,7 @@ impl DocumentId {
     }
 }
 
-fn decode_hex(value: u8) -> Option<u8> {
+const fn decode_hex(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
         b'a'..=b'f' => Some(value - b'a' + 10),
@@ -273,7 +265,7 @@ fn build_uuid_v7(timestamp: u64, sequence: u64, node: u64) -> DocumentId {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     DocumentId(bytes)
 }
-fn mix64(mut value: u64) -> u64 {
+const fn mix64(mut value: u64) -> u64 {
     value ^= value >> 30;
     value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value ^= value >> 27;
@@ -293,7 +285,7 @@ fn random_node() -> u64 {
         return u64::from_le_bytes(bytes);
     }
     let pid = u64::from(std::process::id());
-    unix_time_millis().rotate_left(17) ^ pid.rotate_left(31) ^ (&bytes as *const _ as usize as u64)
+    unix_time_millis().rotate_left(17) ^ pid.rotate_left(31) ^ (&raw const bytes as usize as u64)
 }
 
 #[cfg(test)]

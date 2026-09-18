@@ -38,7 +38,7 @@ impl LogicalPlan {
 
     /// Starts building a plan from a collection.
     #[must_use]
-    pub fn builder(source: LogicalSource) -> LogicalPlanBuilder {
+    pub const fn builder(source: LogicalSource) -> LogicalPlanBuilder {
         LogicalPlanBuilder::new(source)
     }
 
@@ -76,6 +76,7 @@ impl LogicalPlan {
     }
 
     #[inline]
+    #[must_use]
     pub fn operators(&self) -> impl ExactSizeIterator<Item = &LogicalOperator> {
         self.operators.iter()
     }
@@ -397,7 +398,7 @@ pub enum LogicalValue {
     Boolean(bool),
     Null,
     Identifier(Arc<str>),
-    Array(Arc<[LogicalValue]>),
+    Array(Arc<[Self]>),
     Object(LogicalObject),
 }
 
@@ -430,7 +431,7 @@ impl LogicalValue {
                 output.push(')');
             }
             Self::Boolean(value) => {
-                output.push_str(if *value { "bool(true)" } else { "bool(false)" })
+                output.push_str(if *value { "bool(true)" } else { "bool(false)" });
             }
             Self::Null => output.push_str("null"),
             Self::Identifier(value) => {
@@ -441,7 +442,7 @@ impl LogicalValue {
             Self::Array(values) => {
                 output.push_str("array(");
                 write_joined(output, values, |output, value| {
-                    value.write_canonical(output)
+                    value.write_canonical(output);
                 });
                 output.push(')');
             }
@@ -520,6 +521,7 @@ impl LogicalObject {
         self.fields.get(index)
     }
 
+    #[must_use]
     pub fn fields(&self) -> impl ExactSizeIterator<Item = &LogicalObjectField> {
         self.fields.iter()
     }
@@ -746,7 +748,7 @@ pub enum LogicalOperator {
 
 impl LogicalOperator {
     #[must_use]
-    pub fn filter(predicate: Expression) -> Self {
+    pub const fn filter(predicate: Expression) -> Self {
         Self::Filter { predicate }
     }
 
@@ -839,7 +841,7 @@ impl LogicalOperator {
         Self::from_insert_document(InsertDocument::parse(specification)?)
     }
 
-    pub fn from_insert_document(document: InsertDocument) -> LogicalPlanResult<Self> {
+    pub const fn from_insert_document(document: InsertDocument) -> LogicalPlanResult<Self> {
         Ok(Self::Insert { document })
     }
 
@@ -855,7 +857,7 @@ impl LogicalOperator {
         })
     }
 
-    pub fn pivot(specification: PivotSpecification) -> LogicalPlanResult<Self> {
+    pub const fn pivot(specification: PivotSpecification) -> LogicalPlanResult<Self> {
         Ok(Self::Pivot { specification })
     }
 
@@ -1156,13 +1158,13 @@ impl LogicalPlanBuilder {
 
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.operators.len()
     }
 
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.operators.is_empty()
     }
 
@@ -1173,6 +1175,7 @@ impl LogicalPlanBuilder {
     }
 
     #[inline]
+    #[must_use]
     pub fn operators(&self) -> impl ExactSizeIterator<Item = &LogicalOperator> {
         self.operators.iter()
     }
@@ -1291,19 +1294,19 @@ impl LogicalPlanError {
         &self.kind
     }
 
-    fn empty_collection_name() -> Self {
+    const fn empty_collection_name() -> Self {
         Self::new(LogicalPlanErrorKind::EmptyCollectionName)
     }
 
-    fn empty_collection_segment(index: usize) -> Self {
+    const fn empty_collection_segment(index: usize) -> Self {
         Self::new(LogicalPlanErrorKind::EmptyCollectionSegment { index })
     }
 
-    fn invalid_identifier_start(context: IdentifierContext, character: char) -> Self {
+    const fn invalid_identifier_start(context: IdentifierContext, character: char) -> Self {
         Self::new(LogicalPlanErrorKind::InvalidIdentifierStart { context, character })
     }
 
-    fn invalid_identifier_character(
+    const fn invalid_identifier_character(
         context: IdentifierContext,
         index: usize,
         character: char,
@@ -1315,31 +1318,31 @@ impl LogicalPlanError {
         })
     }
 
-    fn empty_set_assignments() -> Self {
+    const fn empty_set_assignments() -> Self {
         Self::new(LogicalPlanErrorKind::EmptySetAssignments)
     }
 
-    fn duplicate_set_assignment(field: ExpressionFieldPath) -> Self {
+    const fn duplicate_set_assignment(field: ExpressionFieldPath) -> Self {
         Self::new(LogicalPlanErrorKind::DuplicateSetAssignment { field })
     }
 
-    fn empty_load_specification() -> Self {
+    const fn empty_load_specification() -> Self {
         Self::new(LogicalPlanErrorKind::EmptyLoadSpecification)
     }
 
-    fn empty_sort_keys() -> Self {
+    const fn empty_sort_keys() -> Self {
         Self::new(LogicalPlanErrorKind::EmptySortKeys)
     }
 
-    fn duplicate_sort_key(field: ExpressionFieldPath) -> Self {
+    const fn duplicate_sort_key(field: ExpressionFieldPath) -> Self {
         Self::new(LogicalPlanErrorKind::DuplicateSortKey { field })
     }
 
-    fn empty_field_list(context: FieldListContext) -> Self {
+    const fn empty_field_list(context: FieldListContext) -> Self {
         Self::new(LogicalPlanErrorKind::EmptyFieldList { context })
     }
 
-    fn duplicate_field(context: FieldListContext, field: ExpressionFieldPath) -> Self {
+    const fn duplicate_field(context: FieldListContext, field: ExpressionFieldPath) -> Self {
         Self::new(LogicalPlanErrorKind::DuplicateField { context, field })
     }
 
@@ -1349,7 +1352,7 @@ impl LogicalPlanError {
         })
     }
 
-    fn empty_insert_specification() -> Self {
+    const fn empty_insert_specification() -> Self {
         Self::new(LogicalPlanErrorKind::EmptyInsertSpecification)
     }
 
@@ -1359,11 +1362,11 @@ impl LogicalPlanError {
         })
     }
 
-    fn insert_document_not_object() -> Self {
+    const fn insert_document_not_object() -> Self {
         Self::new(LogicalPlanErrorKind::InsertDocumentMustBeObject)
     }
 
-    fn empty_value_source() -> Self {
+    const fn empty_value_source() -> Self {
         Self::new(LogicalPlanErrorKind::EmptyValueSource)
     }
 
@@ -1373,7 +1376,7 @@ impl LogicalPlanError {
         })
     }
 
-    fn invalid_value_span() -> Self {
+    const fn invalid_value_span() -> Self {
         Self::new(LogicalPlanErrorKind::InvalidValueSpan)
     }
 
@@ -1387,7 +1390,7 @@ impl LogicalPlanError {
         Self::new(LogicalPlanErrorKind::DuplicateObjectField { name: name.into() })
     }
 
-    fn duplicate_pivot_value(field: ExpressionFieldPath) -> Self {
+    const fn duplicate_pivot_value(field: ExpressionFieldPath) -> Self {
         Self::new(LogicalPlanErrorKind::DuplicatePivotValue { field })
     }
 
@@ -1397,23 +1400,23 @@ impl LogicalPlanError {
         })
     }
 
-    fn overlapping_pivot_axis(field: ExpressionFieldPath) -> Self {
+    const fn overlapping_pivot_axis(field: ExpressionFieldPath) -> Self {
         Self::new(LogicalPlanErrorKind::OverlappingPivotAxis { field })
     }
 
-    fn load_not_first(index: usize) -> Self {
+    const fn load_not_first(index: usize) -> Self {
         Self::new(LogicalPlanErrorKind::LoadMustBeFirst { index })
     }
 
-    fn insert_not_only(index: usize) -> Self {
+    const fn insert_not_only(index: usize) -> Self {
         Self::new(LogicalPlanErrorKind::InsertMustBeOnlyOperator { index })
     }
 
-    fn duplicate_operator(kind: LogicalOperatorKind, index: usize) -> Self {
+    const fn duplicate_operator(kind: LogicalOperatorKind, index: usize) -> Self {
         Self::new(LogicalPlanErrorKind::DuplicateOperator { kind, index })
     }
 
-    fn operator_after_terminal(index: usize) -> Self {
+    const fn operator_after_terminal(index: usize) -> Self {
         Self::new(LogicalPlanErrorKind::OperatorAfterTerminal { index })
     }
 }
@@ -1738,10 +1741,7 @@ impl LogicalOperator {
     }
 }
 
-fn non_empty_text<'a>(
-    text: &'a str,
-    error: fn() -> LogicalPlanError,
-) -> LogicalPlanResult<&'a str> {
+fn non_empty_text( text: &str, error: fn() -> LogicalPlanError, ) -> LogicalPlanResult<&str> {
     let text = text.trim();
     if text.is_empty() {
         return Err(error());
@@ -1751,7 +1751,6 @@ fn non_empty_text<'a>(
 
 fn validate_identifier(identifier: &str, context: IdentifierContext) -> LogicalPlanResult<()> {
     let mut characters = identifier.char_indices();
-
     let Some((_, first)) = characters.next() else {
         return match context {
             IdentifierContext::CountAlias => Err(LogicalPlanError::invalid_count_alias(
@@ -1825,10 +1824,7 @@ fn validate_unique_sort_keys(keys: &[SortKey]) -> LogicalPlanResult<()> {
     Ok(())
 }
 
-fn validate_optional_unique_fields(
-    fields: &[ExpressionFieldPath],
-    context: FieldListContext,
-) -> LogicalPlanResult<()> {
+fn validate_optional_unique_fields( fields: &[ExpressionFieldPath], context: FieldListContext, ) -> LogicalPlanResult<()> {
     for (index, field) in fields.iter().enumerate() {
         if fields[..index].iter().any(|previous| previous == field) {
             return Err(LogicalPlanError::duplicate_field(context, field.clone()));
@@ -1837,10 +1833,7 @@ fn validate_optional_unique_fields(
     Ok(())
 }
 
-fn validate_unique_fields(
-    fields: &[ExpressionFieldPath],
-    context: FieldListContext,
-) -> LogicalPlanResult<()> {
+fn validate_unique_fields( fields: &[ExpressionFieldPath], context: FieldListContext, ) -> LogicalPlanResult<()> {
     if fields.is_empty() {
         return Err(LogicalPlanError::empty_field_list(context));
     }
@@ -1887,10 +1880,7 @@ fn validate_pivot_values(values: &[PivotValue]) -> LogicalPlanResult<()> {
     Ok(())
 }
 
-fn validate_disjoint_fields(
-    rows: &[ExpressionFieldPath],
-    columns: &[ExpressionFieldPath],
-) -> LogicalPlanResult<()> {
+fn validate_disjoint_fields( rows: &[ExpressionFieldPath], columns: &[ExpressionFieldPath], ) -> LogicalPlanResult<()> {
     for field in rows {
         if columns.iter().any(|column| column == field) {
             return Err(LogicalPlanError::overlapping_pivot_axis(field.clone()));
@@ -2019,10 +2009,7 @@ fn validate_operators(operators: &[LogicalOperator]) -> LogicalPlanResult<()> {
     Ok(())
 }
 
-fn validate_next_operator(
-    existing: &[LogicalOperator],
-    next: &LogicalOperator,
-) -> LogicalPlanResult<()> {
+fn validate_next_operator( existing: &[LogicalOperator], next: &LogicalOperator, ) -> LogicalPlanResult<()> {
     let next_index = existing.len();
 
     if matches!(next, LogicalOperator::Load { .. }) && next_index != 0 {
@@ -2154,7 +2141,7 @@ fn write_literal(output: &mut String, literal: &Literal) {
     }
 }
 
-fn canonical_unary_operator(operator: UnaryOperator) -> &'static str {
+const fn canonical_unary_operator(operator: UnaryOperator) -> &'static str {
     match operator {
         UnaryOperator::Not => "not",
         UnaryOperator::Negate => "negate",
@@ -2162,7 +2149,7 @@ fn canonical_unary_operator(operator: UnaryOperator) -> &'static str {
     }
 }
 
-fn canonical_binary_operator(operator: BinaryOperator) -> &'static str {
+const fn canonical_binary_operator(operator: BinaryOperator) -> &'static str {
     match operator {
         BinaryOperator::Or => "or",
         BinaryOperator::And => "and",
@@ -2205,15 +2192,10 @@ mod tests {
     }
 
     #[test] fn supports_complete_native_stage_set() { let mut plan = LogicalPlan::builder(users_source()); plan.filter(parse_expression("active == true").unwrap()) .unwrap(); plan.sort([ SortKey::descending(field(&["age"])), SortKey::ascending(field(&["name"])), ]) .unwrap(); plan.skip(10).unwrap(); plan.limit(20).unwrap(); plan.select([field(&["name"]), field(&["age"])]).unwrap(); plan.distinct([field(&["name"])]).unwrap(); let plan = plan.finish().unwrap(); assert_eq!(plan.len(), 6); assert!(plan.has_filter()); assert!(plan.has_sort()); assert!(plan.has_skip()); assert!(plan.has_limit()); assert!(plan.has_select()); assert!(plan.has_distinct()); assert!(plan.is_read_only()); }
-
     #[test] fn supports_group_as_chainable_and_count_as_terminal() { let group = LogicalPlan::builder(users_source()) .group([field(&["country"])]) .unwrap() .finish() .unwrap(); assert!(group.has_group()); assert!(!group.operator(0).unwrap().is_terminal()); let chained = LogicalPlan::builder(users_source()) .group([field(&["country"])]) .unwrap() .sort([SortKey::descending(field(&["count"]))]) .unwrap() .finish() .unwrap(); assert_eq!(chained.len(), 2); assert!(chained.has_group()); assert!(chained.has_sort()); let count = LogicalPlan::builder(users_source()) .count("total") .unwrap() .finish() .unwrap(); assert!(count.has_count()); assert_eq!(count.operator(0).unwrap().count_alias(), Some("total")); }
-
     #[test] fn supports_delete_and_insert_mutations() { let delete = LogicalPlan::builder(users_source()) .delete() .unwrap() .finish() .unwrap(); assert!(delete.has_delete()); assert!(delete.is_mutating()); let insert = LogicalPlan::builder(users_source()) .insert("{name:\"Alice\"}") .unwrap() .finish() .unwrap(); assert!(insert.has_insert()); assert!(insert.is_mutating()); }
-
     #[test] fn retains_existing_filter_set_and_load_apis() { let filter = LogicalPlan::builder(users_source()) .filter(parse_expression("age >= 18").unwrap()) .unwrap() .finish() .unwrap(); assert!(filter.has_filter()); let set = LogicalPlan::builder(users_source()) .set([assignment(&["enabled"], "true")]) .unwrap() .finish() .unwrap(); assert!(set.has_set()); let load = LogicalPlan::builder(users_source()) .load("profile") .unwrap() .finish() .unwrap(); assert!(load.has_load()); }
-
     #[test] fn validates_operator_arguments() { assert!(matches!( LogicalOperator::sort([]).unwrap_err().kind(), LogicalPlanErrorKind::EmptySortKeys )); assert!(matches!( LogicalOperator::select([]).unwrap_err().kind(), LogicalPlanErrorKind::EmptyFieldList { context: FieldListContext::Select } )); assert!(matches!( LogicalOperator::group([]).unwrap_err().kind(), LogicalPlanErrorKind::EmptyFieldList { context: FieldListContext::Group } )); assert!(matches!( LogicalOperator::insert(" ").unwrap_err().kind(), LogicalPlanErrorKind::EmptyInsertSpecification )); }
-
     #[test] fn validates_nested_insert_object() { let operator = LogicalOperator::insert( r#"{
                 _id: "u1",
                 active: true,
@@ -2222,14 +2204,9 @@ mod tests {
             }"#, ) .unwrap(); assert!(operator.insert_document().is_some()); }
 
     #[test] fn rejects_non_object_insert_values() { assert!(matches!( LogicalOperator::insert(r#""Alice""#).unwrap_err().kind(), LogicalPlanErrorKind::InsertDocumentMustBeObject )); assert!(matches!( LogicalOperator::insert("[{name: \"Alice\"}]") .unwrap_err() .kind(), LogicalPlanErrorKind::InsertDocumentMustBeObject )); }
-
     #[test] fn rejects_malformed_insert_document() { assert!(matches!( LogicalOperator::insert(r#"{name "Alice"}"#) .unwrap_err() .kind(), LogicalPlanErrorKind::InvalidInsertDocument { .. } )); }
-
     #[test] fn rejects_duplicate_field_arguments() { let repeated = field(&["country"]); assert!(matches!( LogicalOperator::sort([ SortKey::ascending(repeated.clone()), SortKey::descending(repeated.clone()), ]) .unwrap_err() .kind(), LogicalPlanErrorKind::DuplicateSortKey { .. } )); assert!(matches!( LogicalOperator::select([repeated.clone(), repeated]) .unwrap_err() .kind(), LogicalPlanErrorKind::DuplicateField { context: FieldListContext::Select, .. } )); }
-
     #[test] fn enforces_terminal_and_unique_operators() { let mut builder = LogicalPlan::builder(users_source()); builder.limit(10).unwrap(); assert!(matches!( builder.limit(20).unwrap_err().kind(), LogicalPlanErrorKind::DuplicateOperator { kind: LogicalOperatorKind::Limit, .. } )); let mut builder = LogicalPlan::builder(users_source()); builder.count("count").unwrap(); assert!(matches!( builder.limit(1).unwrap_err().kind(), LogicalPlanErrorKind::OperatorAfterTerminal { .. } )); }
-
     #[test] fn supports_typed_pivot() { let specification = PivotSpecification::new( [field(&["region"])], [field(&["month"])], [PivotValue::new(field(&["revenue"]), PivotAggregate::Sum, None::<&str>).unwrap()], ) .unwrap(); let plan = LogicalPlan::builder(users_source()) .pivot(specification) .unwrap() .finish() .unwrap(); assert!(plan.has_pivot()); assert!(plan.is_read_only()); assert_eq!( plan.operator(0) .unwrap() .pivot_specification() .unwrap() .values() .len(), 1 ); }
-
     #[test] fn canonical_plan_covers_all_native_operators() { let plan = LogicalPlan::builder(users_source()) .sort([SortKey::descending(field(&["age"]))]) .unwrap() .skip(2) .unwrap() .limit(5) .unwrap() .select([field(&["name"])]) .unwrap() .distinct([]) .unwrap() .finish() .unwrap(); assert_eq!( plan.canonical_string(), "scan(5:users);sort(field(3:age):desc);skip(2);limit(5);select(field(4:name));distinct(document)", ); }
 }

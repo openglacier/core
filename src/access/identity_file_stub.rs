@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Compile-time stub for builds without portable node identity support.
 //!
 //! The type surface is kept available because the daemon composition layer is
@@ -77,19 +78,11 @@ pub fn load(_path: &Path, _password: &[u8]) -> Result<IdentityCredential, Identi
     Err(IdentityFileError::FeatureDisabled)
 }
 
-pub fn save(
-    _path: &Path,
-    _credential: &IdentityCredential,
-    _password: &[u8],
-) -> Result<(), IdentityFileError> {
+pub fn save( _path: &Path, _credential: &IdentityCredential, _password: &[u8], ) -> Result<(), IdentityFileError> {
     Err(IdentityFileError::FeatureDisabled)
 }
 
-pub fn stage(
-    _destination: &Path,
-    _credential: &IdentityCredential,
-    _password: &[u8],
-) -> Result<PathBuf, IdentityFileError> {
+pub fn stage( _destination: &Path, _credential: &IdentityCredential, _password: &[u8], ) -> Result<PathBuf, IdentityFileError> {
     Err(IdentityFileError::FeatureDisabled)
 }
 
@@ -97,24 +90,14 @@ pub fn commit(_staged: &Path, _destination: &Path) -> Result<(), IdentityFileErr
     Err(IdentityFileError::FeatureDisabled)
 }
 
-pub fn copy_encrypted(
-    _source: &Path,
-    _destination: &Path,
-    _password: &[u8],
-) -> Result<(), IdentityFileError> {
+pub fn copy_encrypted( _source: &Path, _destination: &Path, _password: &[u8], ) -> Result<(), IdentityFileError> {
     Err(IdentityFileError::FeatureDisabled)
 }
 
-pub fn encrypt_bytes(
-    _credential: &IdentityCredential,
-    _password: &[u8],
-) -> Result<Vec<u8>, IdentityFileError> {
+pub fn encrypt_bytes( _credential: &IdentityCredential, _password: &[u8], ) -> Result<Vec<u8>, IdentityFileError> {
     Err(IdentityFileError::FeatureDisabled)
 }
 
-pub fn decrypt_bytes(
-    _bytes: &[u8],
-    _password: &[u8],
-) -> Result<IdentityCredential, IdentityFileError> {
+pub fn decrypt_bytes( _bytes: &[u8], _password: &[u8], ) -> Result<IdentityCredential, IdentityFileError> {
     Err(IdentityFileError::FeatureDisabled)
 }

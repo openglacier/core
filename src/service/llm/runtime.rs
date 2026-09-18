@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
     collections::HashMap,
     error::Error,
@@ -162,15 +163,7 @@ impl LlmRuntime {
         self.scheduler.cancel(run_id, owner)
     }
 
-    pub fn generate<F>(
-        &self,
-        run: &mut ScheduledRun,
-        request: &LlmGenerateInput,
-        mut emit: F,
-    ) -> Result<LlmGenerationStats, LlmError>
-    where
-        F: FnMut(LlmGenerationEvent) -> bool,
-    {
+    pub fn generate<F>( &self, run: &mut ScheduledRun, request: &LlmGenerateInput, mut emit: F, ) -> Result<LlmGenerationStats, LlmError> where F: FnMut(LlmGenerationEvent) -> bool, {
         let started = Instant::now();
         if !run.wait_until_active()? {
             return Ok(LlmGenerationStats {
@@ -835,12 +828,7 @@ impl PromptPrefixCache {
         }
     }
 
-    fn plan(
-        &mut self,
-        key: &str,
-        prompt_tokens: &[LlamaToken],
-        allow_capture: bool,
-    ) -> PrefixCachePlan {
+    fn plan( &mut self, key: &str, prompt_tokens: &[LlamaToken], allow_capture: bool, ) -> PrefixCachePlan {
         if self.max_bytes == 0 {
             return PrefixCachePlan::Disabled;
         }
@@ -878,13 +866,7 @@ impl PromptPrefixCache {
         }
     }
 
-    fn store(
-        &mut self,
-        key: String,
-        reference_tokens: Vec<LlamaToken>,
-        prefix_tokens: usize,
-        state: Arc<SeqState>,
-    ) -> PrefixCacheStoreResult {
+    fn store( &mut self, key: String, reference_tokens: Vec<LlamaToken>, prefix_tokens: usize, state: Arc<SeqState>, ) -> PrefixCacheStoreResult {
         let state_bytes = state.byte_len();
         self.remove(&key);
         if self.max_bytes == 0 || state_bytes > self.max_bytes {
@@ -943,11 +925,7 @@ impl PromptPrefixCache {
     }
 }
 
-fn cache_capture_length(
-    prompt_tokens: usize,
-    common_prefix_tokens: usize,
-    allow_capture: bool,
-) -> usize {
+fn cache_capture_length( prompt_tokens: usize, common_prefix_tokens: usize, allow_capture: bool, ) -> usize {
     if !allow_capture || prompt_tokens < MIN_PREFIX_CACHE_TOKENS {
         return 0;
     }
@@ -967,20 +945,14 @@ fn common_prefix_len(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
         .count()
 }
 
-fn capture_sequence_state(
-    context: &llama_cpp_2::context::LlamaContext<'_>,
-) -> Result<Arc<SeqState>, String> {
+fn capture_sequence_state( context: &llama_cpp_2::context::LlamaContext<'_>, ) -> Result<Arc<SeqState>, String> {
     context
         .state_seq_get(0, LlamaStateSeqFlags::empty())
         .map(Arc::new)
         .map_err(|error| error.to_string())
 }
 
-fn add_tokens_at(
-    batch: &mut LlamaBatch<'_>,
-    tokens: &[LlamaToken],
-    start_position: usize,
-) -> Result<(), LlmError> {
+fn add_tokens_at( batch: &mut LlamaBatch<'_>, tokens: &[LlamaToken], start_position: usize, ) -> Result<(), LlmError> {
     for (offset, token) in tokens.iter().enumerate() {
         let absolute = start_position
             .checked_add(offset)
@@ -1005,10 +977,7 @@ struct SelectedGpu {
     memory_free: usize,
 }
 
-fn model_params_for_config(
-    backend: &LlamaBackend,
-    config: &LlmConfig,
-) -> Result<(LlamaModelParams, Option<SelectedGpu>), LlmError> {
+fn model_params_for_config( backend: &LlamaBackend, config: &LlmConfig, ) -> Result<(LlamaModelParams, Option<SelectedGpu>), LlmError> {
     let mut params = LlamaModelParams::default();
     let cuda_device = list_llama_ggml_backend_devices()
         .into_iter()
@@ -1086,11 +1055,7 @@ fn selected_gpu(device: &llama_cpp_2::LlamaBackendDevice) -> SelectedGpu {
     }
 }
 
-fn log_device_selection(
-    backend: &LlamaBackend,
-    config: &LlmConfig,
-    selected: Option<&SelectedGpu>,
-) {
+fn log_device_selection( backend: &LlamaBackend, config: &LlmConfig, selected: Option<&SelectedGpu>, ) {
     eprintln!(
         "[llm] backend.cuda.compiled={} backend.gpuOffload={}",
         cfg!(feature = "cuda"),
@@ -1200,28 +1165,6 @@ impl Error for LlmError {}
 mod tests {
     use super::*;
 
-    #[test]
-    fn common_prefix_stops_at_first_difference() {
-        let left = [
-            LlamaToken::new(1),
-            LlamaToken::new(2),
-            LlamaToken::new(3),
-            LlamaToken::new(4),
-        ];
-        let right = [
-            LlamaToken::new(1),
-            LlamaToken::new(2),
-            LlamaToken::new(9),
-            LlamaToken::new(4),
-        ];
-        assert_eq!(common_prefix_len(&left, &right), 2);
-    }
-
-    #[test]
-    fn cache_capture_prefers_stable_common_prefix() {
-        assert_eq!(cache_capture_length(1000, 0, true), 1000);
-        assert_eq!(cache_capture_length(1000, 650, true), 650);
-        assert_eq!(cache_capture_length(1000, 64, true), 1000);
-        assert_eq!(cache_capture_length(1000, 650, false), 0);
-    }
+    #[test] fn common_prefix_stops_at_first_difference() { let left = [ LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(3), LlamaToken::new(4), ]; let right = [ LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(9), LlamaToken::new(4), ]; assert_eq!(common_prefix_len(&left, &right), 2); }
+    #[test] fn cache_capture_prefers_stable_common_prefix() { assert_eq!(cache_capture_length(1000, 0, true), 1000); assert_eq!(cache_capture_length(1000, 650, true), 650); assert_eq!(cache_capture_length(1000, 64, true), 1000); assert_eq!(cache_capture_length(1000, 650, false), 0); }
 }

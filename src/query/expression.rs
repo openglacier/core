@@ -38,7 +38,7 @@ impl Expression {
 
     /// Creates a unary expression.
     #[must_use]
-    pub fn unary(operator: UnaryOperator, operand: Expression, span: Span) -> Self {
+    pub fn unary(operator: UnaryOperator, operand: Self, span: Span) -> Self {
         Self::new(
             ExpressionKind::Unary {
                 operator,
@@ -51,9 +51,9 @@ impl Expression {
     /// Creates a binary expression.
     #[must_use]
     pub fn binary(
-        left: Expression,
+        left: Self,
         operator: BinaryOperator,
-        right: Expression,
+        right: Self,
         span: Span,
     ) -> Self {
         Self::new(
@@ -68,7 +68,7 @@ impl Expression {
 
     /// Creates an explicit parenthesized group.
     #[must_use]
-    pub fn group(expression: Expression, span: Span) -> Self {
+    pub fn group(expression: Self, span: Span) -> Self {
         Self::new(ExpressionKind::Group(Box::new(expression)), span)
     }
 
@@ -149,7 +149,7 @@ impl Expression {
 
     /// Returns the unary operator and operand when applicable.
     #[must_use]
-    pub fn as_unary(&self) -> Option<(UnaryOperator, &Expression)> {
+    pub fn as_unary(&self) -> Option<(UnaryOperator, &Self)> {
         match &self.kind {
             ExpressionKind::Unary { operator, operand } => Some((*operator, operand.as_ref())),
             ExpressionKind::Literal(_)
@@ -161,7 +161,7 @@ impl Expression {
 
     /// Returns the binary operands and operator when applicable.
     #[must_use]
-    pub fn as_binary(&self) -> Option<(&Expression, BinaryOperator, &Expression)> {
+    pub fn as_binary(&self) -> Option<(&Self, BinaryOperator, &Self)> {
         match &self.kind {
             ExpressionKind::Binary {
                 left,
@@ -177,7 +177,7 @@ impl Expression {
 
     /// Returns the inner expression of an explicit group.
     #[must_use]
-    pub fn as_group(&self) -> Option<&Expression> {
+    pub fn as_group(&self) -> Option<&Self> {
         match &self.kind {
             ExpressionKind::Group(expression) => Some(expression.as_ref()),
             ExpressionKind::Literal(_)
@@ -193,7 +193,7 @@ impl Expression {
     /// integration can use this accessor when parentheses must not affect
     /// evaluation.
     #[must_use]
-    pub fn ungrouped(&self) -> &Expression {
+    pub fn ungrouped(&self) -> &Self {
         let mut expression = self;
 
         while let ExpressionKind::Group(inner) = expression.kind() {
@@ -615,7 +615,7 @@ impl fmt::Display for BinaryOperator {
 /// unexpected token.
 pub fn parse_expression(source: &str) -> ExpressionResult<Expression> {
     let trimmed = source.trim();
-    if matches!(trimmed.as_bytes().first(), Some(b'{') | Some(b'[')) {
+    if matches!(trimmed.as_bytes().first(), Some(b'{' | b'[')) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
             if value.is_object() || value.is_array() {
                 let canonical =
@@ -642,7 +642,7 @@ impl<'source> ExpressionParser<'source> {
     /// Creates an expression parser.
     #[must_use]
     #[inline]
-    pub fn new(source: &'source str) -> Self {
+    pub const fn new(source: &'source str) -> Self {
         Self {
             source,
             lexer: ExpressionLexer::new(source),
@@ -924,7 +924,7 @@ impl<'source> ExpressionParser<'source> {
     }
 }
 
-fn binary_operator(kind: ExpressionTokenKind) -> Option<BinaryOperator> {
+const fn binary_operator(kind: ExpressionTokenKind) -> Option<BinaryOperator> {
     match kind {
         ExpressionTokenKind::OrOr => Some(BinaryOperator::Or),
 
@@ -1018,7 +1018,7 @@ impl ExpressionToken {
         Self::new(ExpressionTokenKind::End, Span::at(offset))
     }
 
-    fn text<'source>(self, source: &'source str) -> &'source str {
+    fn text(self, source: &str) -> &str {
         source.get(self.span.start()..self.span.end()).unwrap_or("")
     }
 }
@@ -1452,26 +1452,26 @@ impl ExpressionError {
         self.span
     }
 
-    fn empty_expression() -> Self {
+    const fn empty_expression() -> Self {
         Self::new(ExpressionErrorKind::EmptyExpression, Span::at(0))
     }
 
-    fn empty_group(span: Span) -> Self {
+    const fn empty_group(span: Span) -> Self {
         Self::new(ExpressionErrorKind::EmptyGroup, span)
     }
 
-    fn empty_field_path() -> Self {
+    const fn empty_field_path() -> Self {
         Self::new(ExpressionErrorKind::EmptyFieldPath, Span::at(0))
     }
 
-    fn empty_field_segment(index: usize) -> Self {
+    const fn empty_field_segment(index: usize) -> Self {
         Self::new(
             ExpressionErrorKind::EmptyFieldSegment { index },
             Span::at(0),
         )
     }
 
-    fn unexpected_end(span: Span, expected: &'static str) -> Self {
+    const fn unexpected_end(span: Span, expected: &'static str) -> Self {
         Self::new(ExpressionErrorKind::UnexpectedEnd { expected }, span)
     }
 
@@ -1485,31 +1485,31 @@ impl ExpressionError {
         )
     }
 
-    fn invalid_character(character: char, span: Span) -> Self {
+    const fn invalid_character(character: char, span: Span) -> Self {
         Self::new(ExpressionErrorKind::InvalidCharacter { character }, span)
     }
 
-    fn invalid_number(span: Span) -> Self {
+    const fn invalid_number(span: Span) -> Self {
         Self::new(ExpressionErrorKind::InvalidNumber, span)
     }
 
-    fn unterminated_string(span: Span) -> Self {
+    const fn unterminated_string(span: Span) -> Self {
         Self::new(ExpressionErrorKind::UnterminatedString, span)
     }
 
-    fn invalid_escape(character: char, span: Span) -> Self {
+    const fn invalid_escape(character: char, span: Span) -> Self {
         Self::new(ExpressionErrorKind::InvalidStringEscape { character }, span)
     }
 
-    fn single_equal(span: Span) -> Self {
+    const fn single_equal(span: Span) -> Self {
         Self::new(ExpressionErrorKind::SingleEqual, span)
     }
 
-    fn single_ampersand(span: Span) -> Self {
+    const fn single_ampersand(span: Span) -> Self {
         Self::new(ExpressionErrorKind::SingleAmpersand, span)
     }
 
-    fn single_pipe(span: Span) -> Self {
+    const fn single_pipe(span: Span) -> Self {
         Self::new(ExpressionErrorKind::SinglePipe, span)
     }
 }
@@ -1544,11 +1544,11 @@ impl fmt::Display for ExpressionError {
             }
 
             ExpressionErrorKind::UnexpectedToken { found, expected } => {
-                write!(formatter, "unexpected token {found:?}; expected {expected}",)
+                write!(formatter, "unexpected token {found:?}; expected {expected}")
             }
 
             ExpressionErrorKind::InvalidCharacter { character } => {
-                write!(formatter, "invalid expression character {character:?}",)
+                write!(formatter, "invalid expression character {character:?}")
             }
 
             ExpressionErrorKind::InvalidNumber => formatter.write_str("invalid numeric literal"),
@@ -1558,7 +1558,7 @@ impl fmt::Display for ExpressionError {
             }
 
             ExpressionErrorKind::InvalidStringEscape { character } => {
-                write!(formatter, "invalid string escape \\{character}",)
+                write!(formatter, "invalid string escape \\{character}")
             }
 
             ExpressionErrorKind::SingleEqual => formatter

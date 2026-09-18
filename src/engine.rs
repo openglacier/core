@@ -13,10 +13,6 @@ use std::{
 };
 
 const DEFAULT_PLANNER_CACHE_BYTES: usize = 8 * 1024 * 1024;
-
-// .29 diagnostics: external-group spill is intentionally instrumented at the
-// execution layer so `_memory` can expose where bounded execution spends its
-// disk and merge budget without coupling Storage to Query internals.
 static EXTERNAL_GROUP_FLUSHES: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_PARTIALS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
@@ -24,7 +20,6 @@ static EXTERNAL_GROUP_FLUSH_US: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_PARTIALS_MERGED: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_MERGE_US: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH: AtomicU64 = AtomicU64::new(0);
-// .30 microscope: account for the CPU and memory phases surrounding spill.
 static EXTERNAL_GROUP_SOURCE_US: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_ROWS_CONSUMED: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_CONSUME_SAMPLES: AtomicU64 = AtomicU64::new(0);
@@ -91,11 +86,7 @@ use crate::{
 };
 
 #[inline]
-fn reusable_projected_scan_options(
-    options: ScanOptions,
-    plan: &PhysicalPlan,
-    projected: &ProjectedValuePipeline,
-) -> ScanOptions {
+const fn reusable_projected_scan_options( options: ScanOptions, plan: &PhysicalPlan, projected: &ProjectedValuePipeline, ) -> ScanOptions {
     if matches!(
         (plan.source_projection_reuse(), projected.projection_reuse()),
         (
@@ -109,20 +100,14 @@ fn reusable_projected_scan_options(
     }
 }
 
-fn storage_engine_error(error: StorageError) -> EngineError {
-    EngineError::execution(ExecutionError::storage(error))
-}
+const fn storage_engine_error(error: StorageError) -> EngineError { EngineError::execution(ExecutionError::storage(error)) }
 #[inline]
-fn backend_storage_error(error: impl fmt::Display) -> StorageError {
-    StorageError::backend(error.to_string())
-}
+fn backend_storage_error(error: impl fmt::Display) -> StorageError { StorageError::backend(error.to_string()) }
 #[inline]
-fn engine_spill_error(error: io::Error) -> EngineError {
-    EngineError::execution(spill_engine_error(error))
-}
+fn engine_spill_error(error: io::Error) -> EngineError { EngineError::execution(spill_engine_error(error)) }
 
 #[inline]
-fn group_state_estimate(key_len: usize, field_count: usize) -> usize {
+const fn group_state_estimate(key_len: usize, field_count: usize) -> usize {
     key_len
         .saturating_mul(2)
         .saturating_add(field_count.saturating_mul(64))
@@ -131,16 +116,7 @@ fn group_state_estimate(key_len: usize, field_count: usize) -> usize {
 
 type GroupAccumulator = Box<dyn crate::query::IncrementalGroupAccumulator>;
 
-fn admit_bounded_hash_group(
-    groups: &mut HashMap<Arc<[u8]>, GroupAccumulator>,
-    frontier: &mut Option<Arc<[u8]>>,
-    estimated_bytes: &mut usize,
-    key: &[u8],
-    state_estimate: usize,
-    field_count: usize,
-    budget: usize,
-    limit: usize,
-) -> Result<bool, StorageError> {
+fn admit_bounded_hash_group( groups: &mut HashMap<Arc<[u8]>, GroupAccumulator>, frontier: &mut Option<Arc<[u8]>>, estimated_bytes: &mut usize, key: &[u8], state_estimate: usize, field_count: usize, budget: usize, limit: usize, ) -> Result<bool, StorageError> {
     if groups.len() >= limit {
         let largest = frontier.as_ref().expect("bounded group frontier exists");
         if key >= largest.as_ref() {
@@ -159,7 +135,7 @@ fn admit_bounded_hash_group(
     Ok(true)
 }
 
-fn is_bounded_secondary_row_operator(operator: &PhysicalOperator) -> bool {
+const fn is_bounded_secondary_row_operator(operator: &PhysicalOperator) -> bool {
     matches!(
         operator,
         PhysicalOperator::Filter { .. }
@@ -184,11 +160,7 @@ pub type EngineResult<T> = std::result::Result<T, EngineError>;
 /// [`Engine`] callers.
 pub trait PlanLowerer: Send + Sync {
     /// Lowers one logical plan.
-    fn lower(
-        &self,
-        logical: &LogicalPlan,
-        physical_planner: &PhysicalPlanner,
-    ) -> Result<PhysicalPlan, PhysicalPlanError>;
+    fn lower( &self, logical: &LogicalPlan, physical_planner: &PhysicalPlanner, ) -> Result<PhysicalPlan, PhysicalPlanError>;
 }
 
 /// High-level OG database engine.
@@ -208,11 +180,7 @@ impl Engine {
     /// Creates an engine with default logical and physical planner options.
     #[must_use]
     #[inline]
-    pub fn new(
-        storage: Arc<dyn StorageEngine>,
-        runtime: Arc<dyn ExecutionRuntime>,
-        lowerer: Arc<dyn PlanLowerer>,
-    ) -> Self {
+    pub fn new( storage: Arc<dyn StorageEngine>, runtime: Arc<dyn ExecutionRuntime>, lowerer: Arc<dyn PlanLowerer>, ) -> Self {
         let memory_governor = MemoryGovernor::unlimited();
         Self {
             storage,
@@ -233,14 +201,7 @@ impl Engine {
 
     /// Creates an engine from explicitly configured components.
     #[must_use]
-    pub fn with_components(
-        storage: Arc<dyn StorageEngine>,
-        runtime: Arc<dyn ExecutionRuntime>,
-        lowerer: Arc<dyn PlanLowerer>,
-        planner: Planner,
-        physical_planner: PhysicalPlanner,
-        executor: Executor,
-    ) -> Self {
+    pub fn with_components( storage: Arc<dyn StorageEngine>, runtime: Arc<dyn ExecutionRuntime>, lowerer: Arc<dyn PlanLowerer>, planner: Planner, physical_planner: PhysicalPlanner, executor: Executor, ) -> Self {
         let memory_governor = MemoryGovernor::unlimited();
         Self {
             storage,
@@ -259,31 +220,26 @@ impl Engine {
         }
     }
 
-    /// Returns the configured storage engine.
     #[must_use]
     pub fn storage(&self) -> &dyn StorageEngine {
         self.storage.as_ref()
     }
-
-    /// Returns the configured execution runtime.
+    
     #[must_use]
     pub fn runtime(&self) -> &dyn ExecutionRuntime {
         self.runtime.as_ref()
     }
 
-    /// Returns the configured logical planner.
     #[must_use]
     pub const fn planner(&self) -> &Planner {
         &self.planner
     }
 
-    /// Returns the configured physical planner.
     #[must_use]
     pub const fn physical_planner(&self) -> &PhysicalPlanner {
         &self.physical_planner
     }
 
-    /// Returns the configured executor.
     #[must_use]
     pub const fn executor(&self) -> &Executor {
         &self.executor
@@ -305,7 +261,6 @@ impl Engine {
     pub fn plan(&self, pipeline: &PlannerPipeline) -> EngineResult<PlannedQuery> {
         let logical = self.plan_logical(pipeline)?;
         let physical = self.plan_physical(&logical)?;
-
         Ok(PlannedQuery { logical, physical })
     }
 
@@ -361,11 +316,7 @@ impl Engine {
     ///
     /// Returns `Ok(None)` when the physical plan contains an operator that
     /// requires set-level materialization or performs writes.
-    pub fn stream_read_pipeline(
-        &self,
-        physical: &PhysicalPlan,
-        visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>,
-    ) -> EngineResult<Option<ExecutionStatistics>> {
+    pub fn stream_read_pipeline( &self, physical: &PhysicalPlan, visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         if self.system_collection_storage(physical)?.is_some() || !physical.is_memory_streaming() {
             return Ok(None);
         }
@@ -480,9 +431,7 @@ impl Engine {
             })
             .collect::<Vec<_>>();
 
-        if limit_remaining
-            .iter()
-            .any(|remaining| *remaining == Some(0))
+        if limit_remaining.contains(&Some(0))
         {
             let strategy = match physical.source().access() {
                 crate::query::PhysicalAccess::CollectionScan { .. } => {
@@ -913,11 +862,7 @@ impl Engine {
     }
 
     /// Compatibility alias for source-only callers.
-    pub fn stream_source_only(
-        &self,
-        physical: &PhysicalPlan,
-        visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>,
-    ) -> EngineResult<Option<ExecutionStatistics>> {
+    pub fn stream_source_only( &self, physical: &PhysicalPlan, visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         self.stream_read_pipeline(physical, visitor)
     }
 
@@ -941,12 +886,8 @@ impl Engine {
         Ok(output)
     }
 
-    /// Executes a physical plan under a trusted Place or AppInstance document scope.
-    pub fn execute_physical_scoped(
-        &self,
-        physical: &PhysicalPlan,
-        scope: &crate::query::DocumentScope,
-    ) -> EngineResult<ExecutionOutput> {
+    /// Executes a physical plan under a trusted Place or `AppInstance` document scope.
+    pub fn execute_physical_scoped( &self, physical: &PhysicalPlan, scope: &crate::query::DocumentScope, ) -> EngineResult<ExecutionOutput> {
         let started = Instant::now();
         if physical.source().collection().as_str().starts_with('_') {
             return Err(EngineError::execution(
@@ -979,14 +920,7 @@ impl Engine {
     /// for both compound operators.  LOOKUP may provide an outer document so
     /// nested predicates keep their alias-aware semantics without materializing
     /// the secondary collection.
-    fn stream_bounded_secondary_pipeline(
-        &self,
-        collection: &CollectionId,
-        pipeline: &PhysicalSubPipeline,
-        lookup_context: Option<(&Document, Option<&str>)>,
-        union_origin: bool,
-        visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-    ) -> EngineResult<ExecutionStatistics> {
+    fn stream_bounded_secondary_pipeline( &self, collection: &CollectionId, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>)>, union_origin: bool, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
         let read = self.storage.read().map_err(storage_engine_error)?;
         let operators = pipeline.operators();
         if !operators.iter().all(is_bounded_secondary_row_operator) {
@@ -1013,9 +947,7 @@ impl Engine {
         let mut filtered = 0u64;
         let mut returned = 0u64;
 
-        if limit_remaining
-            .iter()
-            .any(|remaining| *remaining == Some(0))
+        if limit_remaining.contains(&Some(0))
         {
             return Ok(ExecutionStatistics::streamed_pipeline(
                 0,
@@ -1287,13 +1219,7 @@ impl Engine {
     /// Hydrates one retained locator from the same storage snapshot and
     /// reapplies any pre-blocking Select stage that was deferred by the
     /// projected access vector.
-    fn hydrate_projected_locator(
-        &self,
-        read: &dyn StorageRead,
-        collection: &CollectionId,
-        locator: ProjectedRowLocator,
-        projected: &ProjectedValuePipeline,
-    ) -> EngineResult<Option<ExecutionRow>> {
+    fn hydrate_projected_locator( &self, read: &dyn StorageRead, collection: &CollectionId, locator: ProjectedRowLocator, projected: &ProjectedValuePipeline, ) -> EngineResult<Option<ExecutionRow>> {
         let Some(stored) = read
             .get(collection, &locator.id())
             .map_err(storage_engine_error)?
@@ -1319,12 +1245,7 @@ impl Engine {
     /// Executes the native `near -> sort _distance -> limit` shape from projected
     /// values and hydrates only retained winners. The query vector is parsed once
     /// for the scan instead of once per source document.
-    fn try_projected_near_top_n(
-        &self,
-        prefix: &PhysicalPlan,
-        keys: &[crate::query::SortKey],
-        limit: usize,
-    ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
+    fn try_projected_near_top_n( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], limit: usize, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
         if limit == 0
             || keys.len() != 1
             || keys[0].field().to_string() != "_distance"
@@ -1440,7 +1361,6 @@ impl Engine {
                 },
             )?
         };
-
         let winners = top
             .into_sorted_winners(keys)
             .map_err(EngineError::execution)?;
@@ -1462,7 +1382,6 @@ impl Engine {
                 hydrated.push(row);
             }
         }
-
         let returned = hydrated.len() as u64;
         Ok(Some((
             hydrated,
@@ -1483,12 +1402,7 @@ impl Engine {
     /// hydrates only retained winners. Filter prefixes compose on the same
     /// borrowed scalar row, so combinations inherit late materialization
     /// without adding stage-specific execution paths.
-    fn try_projected_top_n(
-        &self,
-        prefix: &PhysicalPlan,
-        keys: &[crate::query::SortKey],
-        limit: usize,
-    ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
+    fn try_projected_top_n( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], limit: usize, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
         if limit == 0
             || prefix
                 .operators()
@@ -1562,13 +1476,7 @@ impl Engine {
     /// Executes a complete blocking sort from projected values when the compact
     /// locator+key working set fits the governed budget. If it does not fit, the
     /// caller falls back to the established external Document sort.
-    fn try_projected_in_memory_sort(
-        &self,
-        prefix: &PhysicalPlan,
-        keys: &[crate::query::SortKey],
-        budget: usize,
-        visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-    ) -> EngineResult<Option<ExecutionStatistics>> {
+    fn try_projected_in_memory_sort( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], budget: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         if keys.is_empty() || !self.runtime.supports_projected_sort() {
             return Ok(None);
         }
@@ -1651,14 +1559,7 @@ impl Engine {
     /// canonical key remains owned by the runtime; the engine retains only one
     /// source locator per key and hydrates winners after deduplication. A trailing
     /// limit bounds the retained key frontier without changing key-order output.
-    fn try_projected_in_memory_distinct(
-        &self,
-        prefix: &PhysicalPlan,
-        fields: &[crate::query::ExpressionFieldPath],
-        budget: usize,
-        output_limit: Option<usize>,
-        visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-    ) -> EngineResult<Option<ExecutionStatistics>> {
+    fn try_projected_in_memory_distinct( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], budget: usize, output_limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         if fields.is_empty() || !self.runtime.supports_projected_distinct() {
             return Ok(None);
         }
@@ -1699,7 +1600,6 @@ impl Engine {
                 if output_limit == Some(0) {
                     return Ok(true);
                 }
-
                 let locator = ProjectedRowLocator::new(id, version);
                 if let Some((retained, _)) = rows.get_mut(key_buffer.as_slice()) {
                     let earlier = match options.direction() {
@@ -1717,7 +1617,6 @@ impl Engine {
                     exceeded.set(true);
                     return Ok(false);
                 }
-
                 if let Some(limit) = output_limit {
                     if rows.len() >= limit {
                         let keep = rows
@@ -1734,7 +1633,6 @@ impl Engine {
                     exceeded.set(true);
                     return Ok(false);
                 }
-
                 if estimated_bytes.saturating_add(estimate) > budget {
                     exceeded.set(true);
                     return Ok(false);
@@ -1771,13 +1669,7 @@ impl Engine {
         )))
     }
 
-    fn try_in_memory_distinct(
-        &self,
-        prefix: &PhysicalPlan,
-        fields: &[crate::query::ExpressionFieldPath],
-        budget: usize,
-        output_limit: Option<usize>,
-    ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
+    fn try_in_memory_distinct( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], budget: usize, output_limit: Option<usize>, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
         let mut rows: BTreeMap<Arc<[u8]>, (ExecutionRow, usize)> = BTreeMap::new();
         let mut estimated_bytes = 0usize;
         let exceeded = std::cell::Cell::new(false);
@@ -1809,7 +1701,7 @@ impl Engine {
                 };
                 let key_bytes = owned_key
                     .as_deref()
-                    .unwrap_or_else(|| key_buffer.as_slice());
+                    .unwrap_or(key_buffer.as_slice());
 
                 if output_limit == Some(0) {
                     return Ok(());
@@ -1872,13 +1764,7 @@ impl Engine {
         }
     }
 
-    fn try_in_memory_incremental_group(
-        &self,
-        prefix: &PhysicalPlan,
-        keys: &[crate::query::ExpressionFieldPath],
-        budget: usize,
-        group_limit: Option<usize>,
-    ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
+    fn try_in_memory_incremental_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], budget: usize, group_limit: Option<usize>, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
         if self
             .runtime
             .incremental_group_accumulator(keys)
@@ -1901,7 +1787,7 @@ impl Engine {
                     .map_err(EngineError::execution)?
             {
                 let layout = value_pipeline.layout();
-                let group_layout = ProjectedValueLayout::new(required_input_fields.clone())
+                let group_layout = ProjectedValueLayout::new(required_input_fields)
                     .map_err(EngineError::execution)?;
                 let group_source_slots = layout
                     .slots(group_layout.fields())
@@ -2230,13 +2116,7 @@ impl Engine {
     /// Spills standard incremental GROUP states directly from the shared projected-value
     /// scanner. This is the external counterpart of `try_in_memory_incremental_group`:
     /// compatible collection/filter prefixes never fall back to full-document pointer scans.
-    fn try_projected_external_group_runs(
-        &self,
-        prefix: &PhysicalPlan,
-        keys: &[crate::query::ExpressionFieldPath],
-        budget: usize,
-        spill: &SpillEngine,
-    ) -> EngineResult<Option<(Vec<SpillRun>, ExecutionStatistics)>> {
+    fn try_projected_external_group_runs( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], budget: usize, spill: &SpillEngine, ) -> EngineResult<Option<(Vec<SpillRun>, ExecutionStatistics)>> {
         if self
             .runtime
             .incremental_group_accumulator(keys)
@@ -2435,11 +2315,7 @@ impl Engine {
     /// A downstream linear bound is consumed generically; concrete sort, distinct and group
     /// algorithms remain local to the executor. External runs keep blocking work inside the
     /// governed memory budget.
-    pub fn stream_governed_blocking_pipeline(
-        &self,
-        physical: &PhysicalPlan,
-        visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-    ) -> EngineResult<Option<ExecutionStatistics>> {
+    pub fn stream_governed_blocking_pipeline( &self, physical: &PhysicalPlan, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         if !self.supports_governed_blocking_streaming(physical) {
             return Ok(None);
         }
@@ -2498,7 +2374,7 @@ impl Engine {
         let snapshot = self.memory_governor.snapshot();
         let query_budget = self.memory_governor.profile().query_budget_bytes;
         let available = snapshot.available_bytes.unwrap_or(query_budget);
-        let working_budget = available.min(query_budget).max(1 * 1024 * 1024);
+        let working_budget = available.min(query_budget).max(1024 * 1024);
 
         // UNION and LOOKUP are bounded at the compound-stage boundary. UNION
         // streams both branches directly; LOOKUP only retains the matches for
@@ -2661,7 +2537,7 @@ impl Engine {
                     self.runtime.as_ref(),
                     distinct_fields,
                     limit,
-                    chunk.into_iter(),
+                    chunk,
                     visitor,
                 )?
             } else {
@@ -2947,7 +2823,9 @@ impl Engine {
                     if let Some(started) = lookup_started {
                         ext_lookup_ns = ext_lookup_ns.saturating_add(elapsed_nanos(started));
                     }
-                    if !exists {
+                    if exists {
+                        ext_hits = ext_hits.saturating_add(1);
+                    } else {
                         ext_misses = ext_misses.saturating_add(1);
                         let estimate = group_state_estimate(key.len(), group_keys.len());
                         if !partial_groups.is_empty()
@@ -2982,8 +2860,6 @@ impl Engine {
                             usize_to_u64_saturating(partial_bytes),
                         );
                         partial_groups.insert(key.clone(), accumulator);
-                    } else {
-                        ext_hits = ext_hits.saturating_add(1);
                     }
                     let accumulate_started = sampled.then(Instant::now);
                     let result = partial_groups
@@ -3567,7 +3443,9 @@ impl Engine {
                         if let Some(started) = lookup_started {
                             ext_lookup_ns = ext_lookup_ns.saturating_add(elapsed_nanos(started));
                         }
-                        if !exists {
+                        if exists {
+                            ext_hits = ext_hits.saturating_add(1);
+                        } else {
                             ext_misses = ext_misses.saturating_add(1);
                             let estimate = group_state_estimate(key.len(), keys.len());
                             if !partial_groups.is_empty()
@@ -3602,8 +3480,6 @@ impl Engine {
                                 usize_to_u64_saturating(partial_bytes),
                             );
                             partial_groups.insert(key.clone(), accumulator);
-                        } else {
-                            ext_hits = ext_hits.saturating_add(1);
                         }
                         let accumulate_started = sampled.then(Instant::now);
                         let result = partial_groups
@@ -3662,10 +3538,7 @@ impl Engine {
     }
 
     /// Executes a physical plan while suppressing streaming-load result rows.
-    pub fn execute_physical_compact(
-        &self,
-        physical: &PhysicalPlan,
-    ) -> EngineResult<ExecutionOutput> {
+    pub fn execute_physical_compact( &self, physical: &PhysicalPlan, ) -> EngineResult<ExecutionOutput> {
         let started = Instant::now();
         let output = if let Some(storage) = self.system_collection_storage(physical)? {
             self.executor
@@ -3684,10 +3557,7 @@ impl Engine {
         Ok(output)
     }
 
-    fn system_collection_storage(
-        &self,
-        physical: &PhysicalPlan,
-    ) -> EngineResult<Option<MemoryStorage>> {
+    fn system_collection_storage( &self, physical: &PhysicalPlan, ) -> EngineResult<Option<MemoryStorage>> {
         let collection = physical.source().collection();
         let storage = match collection.as_str() {
             vcollections::INDEX_OBSERVATIONS => self.index_observations_storage()?,
@@ -3801,7 +3671,7 @@ impl Engine {
             ),
             (
                 "non_anonymous_rss_bytes",
-                optional_usize_value(process.map(|p| p.non_anonymous_rss_bytes()))?,
+                optional_usize_value(process.map(super::memory::ProcessMemorySnapshot::non_anonymous_rss_bytes))?,
             ),
             (
                 "process_pressure_bytes",
@@ -4374,11 +4244,7 @@ impl QueryOutput {
     }
 }
 
-fn emit_streaming_count(
-    visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>,
-    alias: &str,
-    count: u64,
-) -> EngineResult<()> {
+fn emit_streaming_count( visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, alias: &str, count: u64, ) -> EngineResult<()> {
     let document = Arc::new(Document::from_fields([(alias, Value::from(count))]));
     let stored = StoredDocument::new(
         DocumentId::synthetic(0x0063_6f75_6e74, 1),
@@ -4412,17 +4278,7 @@ fn bounded_sort_input_budget(working_budget: usize) -> usize {
     working_budget.saturating_div(2).max(512 * 1024)
 }
 
-fn push_bounded_sort_row(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[SortKey],
-    spill: &SpillEngine,
-    row: ExecutionRow,
-    budget: usize,
-    chunk: &mut Vec<ExecutionRow>,
-    chunk_bytes: &mut usize,
-    runs: &mut Vec<SpillRun>,
-    oversized_message: &'static str,
-) -> EngineResult<()> {
+fn push_bounded_sort_row( runtime: &dyn ExecutionRuntime, keys: &[SortKey], spill: &SpillEngine, row: ExecutionRow, budget: usize, chunk: &mut Vec<ExecutionRow>, chunk_bytes: &mut usize, runs: &mut Vec<SpillRun>, oversized_message: &'static str, ) -> EngineResult<()> {
     let estimated = execution_row_working_bytes(&row).map_err(EngineError::execution)?;
     if estimated > budget {
         return Err(EngineError::execution(ExecutionError::evaluation(
@@ -4457,13 +4313,7 @@ fn flush_sorted_run(
     Ok(())
 }
 
-fn emit_distinct_limited_rows(
-    runtime: &dyn ExecutionRuntime,
-    fields: &[crate::query::ExpressionFieldPath],
-    limit: usize,
-    rows: impl IntoIterator<Item = ExecutionRow>,
-    visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-) -> EngineResult<u64> {
+fn emit_distinct_limited_rows( runtime: &dyn ExecutionRuntime, fields: &[crate::query::ExpressionFieldPath], limit: usize, rows: impl IntoIterator<Item = ExecutionRow>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     if limit == 0 {
         return Ok(0);
     }
@@ -4489,14 +4339,7 @@ fn emit_distinct_limited_rows(
     Ok(returned)
 }
 
-fn merge_sorted_distinct_limited_runs(
-    runtime: &dyn ExecutionRuntime,
-    sort_keys: &[crate::query::SortKey],
-    distinct_fields: &[crate::query::ExpressionFieldPath],
-    runs: &[SpillRun],
-    limit: usize,
-    visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-) -> EngineResult<u64> {
+fn merge_sorted_distinct_limited_runs( runtime: &dyn ExecutionRuntime, sort_keys: &[crate::query::SortKey], distinct_fields: &[crate::query::ExpressionFieldPath], runs: &[SpillRun], limit: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     if limit == 0 {
         return Ok(0);
     }
@@ -4556,13 +4399,7 @@ fn merge_sorted_distinct_limited_runs(
     Ok(returned)
 }
 
-fn merge_sorted_runs(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[crate::query::SortKey],
-    runs: &[SpillRun],
-    limit: Option<usize>,
-    visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-) -> EngineResult<u64> {
+fn merge_sorted_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::SortKey], runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     let mut readers = runs
         .iter()
         .map(SpillRun::reader)
@@ -4613,13 +4450,7 @@ fn read_spilled_row(reader: &mut SpillRunReader) -> Result<Option<ExecutionRow>,
         .transpose()
 }
 
-fn flush_partial_group_run(
-    _runtime: &dyn ExecutionRuntime,
-    _keys: &[crate::query::ExpressionFieldPath],
-    spill: &SpillEngine,
-    groups: &mut HashMap<Arc<[u8]>, Box<dyn crate::query::IncrementalGroupAccumulator>>,
-    runs: &mut Vec<SpillRun>,
-) -> EngineResult<()> {
+fn flush_partial_group_run( _runtime: &dyn ExecutionRuntime, _keys: &[crate::query::ExpressionFieldPath], spill: &SpillEngine, groups: &mut HashMap<Arc<[u8]>, Box<dyn crate::query::IncrementalGroupAccumulator>>, runs: &mut Vec<SpillRun>, ) -> EngineResult<()> {
     let started = Instant::now();
     let group_count = usize_to_u64_saturating(groups.len());
     update_atomic_peak(&EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH, group_count);
@@ -4660,7 +4491,7 @@ fn flush_partial_group_run(
     let mut block = Vec::with_capacity(GROUP_SPILL_BLOCK_BYTES);
     let mut previous_key = Vec::<u8>::new();
     let mut payload_scratch = Vec::<u8>::new();
-    for record in chunk.iter() {
+    for record in &chunk {
         append_group_spill_block_record(
             &mut block,
             &mut previous_key,
@@ -4726,12 +4557,7 @@ fn take_group_varint(bytes: &[u8], position: &mut usize) -> Result<usize, Execut
     Err(ExecutionError::evaluation("group spill varint overflow"))
 }
 
-fn append_group_spill_block_record(
-    block: &mut Vec<u8>,
-    previous_key: &mut Vec<u8>,
-    payload_scratch: &mut Vec<u8>,
-    record: &GroupSpillRecord,
-) -> Result<(), ExecutionError> {
+fn append_group_spill_block_record( block: &mut Vec<u8>, previous_key: &mut Vec<u8>, payload_scratch: &mut Vec<u8>, record: &GroupSpillRecord, ) -> Result<(), ExecutionError> {
     if block.is_empty() {
         block.push(GROUP_SPILL_BLOCK_TAG);
     }
@@ -4760,10 +4586,7 @@ fn append_group_spill_block_record(
     Ok(())
 }
 
-fn decode_group_spill_partial(
-    tag: u8,
-    payload: &[u8],
-) -> Result<GroupSpillPartial, ExecutionError> {
+fn decode_group_spill_partial( tag: u8, payload: &[u8], ) -> Result<GroupSpillPartial, ExecutionError> {
     match tag {
         0 => Ok(GroupSpillPartial::Document(decode_execution_row(payload)?)),
         1 => Ok(GroupSpillPartial::Compact(payload.to_vec())),
@@ -4856,15 +4679,11 @@ impl GroupSpillRunReader {
     }
 }
 
-fn read_group_spill_record(
-    reader: &mut GroupSpillRunReader,
-) -> Result<Option<GroupSpillRecord>, ExecutionError> {
+fn read_group_spill_record( reader: &mut GroupSpillRunReader, ) -> Result<Option<GroupSpillRecord>, ExecutionError> {
     reader.next_record()
 }
 
-fn group_merge_heads(
-    runs: &[SpillRun],
-) -> EngineResult<(Vec<GroupSpillRunReader>, Vec<Option<GroupSpillRecord>>)> {
+fn group_merge_heads( runs: &[SpillRun], ) -> EngineResult<(Vec<GroupSpillRunReader>, Vec<Option<GroupSpillRecord>>)> {
     let mut readers = runs
         .iter()
         .map(GroupSpillRunReader::new)
@@ -4887,11 +4706,7 @@ fn smallest_group_head(heads: &[Option<GroupSpillRecord>]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn flush_keyed_run(
-    spill: &SpillEngine,
-    chunk: &mut Vec<KeyedRow>,
-    runs: &mut Vec<SpillRun>,
-) -> EngineResult<u64> {
+fn flush_keyed_run( spill: &SpillEngine, chunk: &mut Vec<KeyedRow>, runs: &mut Vec<SpillRun>, ) -> EngineResult<u64> {
     chunk.sort_by(|left, right| left.key.cmp(&right.key));
     let mut writer = spill.create_run().map_err(engine_spill_error)?;
     let mut encoded = Vec::new();
@@ -4908,11 +4723,7 @@ fn flush_keyed_run(
     Ok(bytes)
 }
 
-fn encode_keyed_row_into(
-    keyed: &KeyedRow,
-    output: &mut Vec<u8>,
-    row_output: &mut Vec<u8>,
-) -> Result<(), ExecutionError> {
+fn encode_keyed_row_into( keyed: &KeyedRow, output: &mut Vec<u8>, row_output: &mut Vec<u8>, ) -> Result<(), ExecutionError> {
     let key_len = u32::try_from(keyed.key.len())
         .map_err(|_| ExecutionError::evaluation("blocking key exceeds u32"))?;
     encode_execution_row_into(&keyed.row, row_output)?;
@@ -4950,9 +4761,7 @@ fn read_keyed_row(reader: &mut SpillRunReader) -> Result<Option<KeyedRow>, Execu
         .transpose()
 }
 
-fn keyed_merge_heads(
-    runs: &[SpillRun],
-) -> EngineResult<(Vec<SpillRunReader>, Vec<Option<KeyedRow>>)> {
+fn keyed_merge_heads( runs: &[SpillRun], ) -> EngineResult<(Vec<SpillRunReader>, Vec<Option<KeyedRow>>)> {
     let mut readers = runs
         .iter()
         .map(SpillRun::reader)
@@ -4975,11 +4784,7 @@ fn smallest_keyed_head(heads: &[Option<KeyedRow>]) -> Option<usize> {
         .map(|(index, _)| index)
 }
 
-fn merge_distinct_runs(
-    runs: &[SpillRun],
-    limit: Option<usize>,
-    visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-) -> EngineResult<u64> {
+fn merge_distinct_runs( runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     let (mut readers, mut heads) = keyed_merge_heads(runs)?;
     let mut previous: Option<Arc<[u8]>> = None;
     let mut returned = 0u64;
@@ -4998,14 +4803,7 @@ fn merge_distinct_runs(
     Ok(returned)
 }
 
-fn merge_group_runs(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[crate::query::ExpressionFieldPath],
-    group_budget: usize,
-    runs: &[SpillRun],
-    limit: Option<usize>,
-    visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-) -> EngineResult<u64> {
+fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::ExpressionFieldPath], group_budget: usize, runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     // Capability-driven runtimes expose an incremental accumulator. In that
     // mode one group retains only its keys, counters and aggregate states;
     // source rows are never materialized regardless of group cardinality.
@@ -5114,7 +4912,7 @@ fn merge_group_runs(
             }
         }
 
-        if limit.map_or(true, |limit| (returned as usize) < limit) {
+        if limit.is_none_or(|limit| (returned as usize) < limit) {
             if let Some(state) = accumulator.take() {
                 let finish_started = Instant::now();
                 let ordinal = returned.saturating_add(1);
@@ -5178,14 +4976,7 @@ fn merge_group_runs(
     Ok(returned)
 }
 
-fn emit_group_documents(
-    runtime: &dyn ExecutionRuntime,
-    keys: &[crate::query::ExpressionFieldPath],
-    limit: Option<usize>,
-    documents: &mut Vec<Arc<Document>>,
-    returned: &mut u64,
-    visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>,
-) -> EngineResult<()> {
+fn emit_group_documents( runtime: &dyn ExecutionRuntime, keys: &[crate::query::ExpressionFieldPath], limit: Option<usize>, documents: &mut Vec<Arc<Document>>, returned: &mut u64, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<()> {
     if documents.is_empty() || limit.is_some_and(|limit| *returned as usize >= limit) {
         documents.clear();
         return Ok(());
@@ -5215,35 +5006,30 @@ pub struct EngineError {
 }
 
 impl EngineError {
-    /// Creates an engine error.
     #[must_use]
     #[inline]
     pub const fn new(kind: EngineErrorKind) -> Self {
         Self { kind }
     }
 
-    /// Returns the detailed error category.
     #[must_use]
     #[inline]
     pub const fn kind(&self) -> &EngineErrorKind {
         &self.kind
     }
 
-    /// Wraps a semantic planning error.
     #[must_use]
-    pub fn planning(error: PlannerError) -> Self {
+    pub const fn planning(error: PlannerError) -> Self {
         Self::new(EngineErrorKind::Planning(error))
     }
 
-    /// Wraps a physical planning error.
     #[must_use]
-    pub fn physical_planning(error: PhysicalPlanError) -> Self {
+    pub const fn physical_planning(error: PhysicalPlanError) -> Self {
         Self::new(EngineErrorKind::PhysicalPlanning(error))
     }
 
-    /// Wraps an execution error.
     #[must_use]
-    pub fn execution(error: ExecutionError) -> Self {
+    pub const fn execution(error: ExecutionError) -> Self {
         Self::new(EngineErrorKind::Execution(error))
     }
 }
@@ -5281,10 +5067,8 @@ impl StdError for EngineError {
 pub enum EngineErrorKind {
     /// Semantic planning failed.
     Planning(PlannerError),
-
     /// Logical-to-physical lowering failed.
     PhysicalPlanning(PhysicalPlanError),
-
     /// Physical execution failed.
     Execution(ExecutionError),
 }

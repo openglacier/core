@@ -10,15 +10,16 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-0.80.2-blue)
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
+[![Audit](https://github.com/openglacier/core/actions/workflows/audit.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/audit.yml)
 ![Architectures](https://img.shields.io/badge/release_targets-19-informational)
 
 </p>
 
-> **Yes — openglacier Core is a database engine.**
+> **True — openglacier Core is a database engine.**
 >
 > It includes its own query language, planner, execution engine, transactional storage abstraction and native persistent storage backend.
 >
@@ -31,6 +32,23 @@ openglacier Core provides three closely related pieces:
 - **`ogcli`** — a thin interactive and command-line client.
 
 The native persistent storage engine is called **Glacier**.
+
+## 🔥 antaa palaa — First stable release
+>
+> **openglacier Core v1.0 is here, code name `antaa palaa`.**
+>
+> **`antaa palaa` means the core architecture is now stable enough to build on.**
+>
+> This milestone comes after an extended period of real-world use and hostile testing: continuous fuzzing, sustained read/write workloads, failure injection, storage corruption and I/O failure testing, crash recovery, backup and restore validation, and a large integration test suite.
+>
+> It has also been exercised extensively across architectures and generations of hardware — from **Raspberry Pi 3 and 4 to the Odroid XU4, a Fairphone 2, and even my beloved Intel Core m7 (I know).**
+>
+> **Resources are valuable.** openglacier is deliberately built to remain useful on modest and older hardware — keeping the core portable, predictable and economical in its use of CPU, memory, storage and power.
+>
+> v1.0 is not a claim that the project is finished. It is a commitment that its foundations are stable enough to be used, relied upon, and built upon.
+>
+> Start exploring with the [Quick Start](#quick-start) below.
+
 
 > *Small core, long life.*
 

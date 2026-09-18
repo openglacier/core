@@ -155,7 +155,6 @@ impl EventEngine {
         let worker_subscribers = Arc::clone(&subscribers);
         let worker_delivered = Arc::clone(&delivered);
         let worker_dropped = Arc::clone(&dropped);
-
         thread::Builder::new()
             .name("og-event-worker".to_owned())
             .spawn(move || {
@@ -197,6 +196,7 @@ impl EventEngine {
         }
     }
 
+    #[must_use]
     pub fn publish(&self, event: Event) -> bool {
         let event_type = event.event_type.clone();
         let event_id = event.id.clone();
@@ -237,6 +237,7 @@ impl EventEngine {
         }
     }
 
+    #[must_use]
     pub fn publish_to(&self, audience: Audience, event_type: &str, payload: Value) -> bool {
         let sequence = self.next_event.fetch_add(1, Ordering::Relaxed);
         self.publish(Event::new(
@@ -248,6 +249,7 @@ impl EventEngine {
         ))
     }
 
+    #[must_use]
     pub fn publish_global(&self, event_type: &str, payload: Value) -> bool {
         self.publish_to(Audience::Global, event_type, payload)
     }

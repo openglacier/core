@@ -2,19 +2,16 @@
 //! Dense operation registry and router.
 
 use std::collections::BTreeMap;
-
 use serde::Deserialize;
-
 use crate::protocol::RequestId;
 
 #[cfg(test)]
 use crate::access::place::{PlaceRole, RequestedExecutionContext};
 
 use crate::error::{Error, Result};
-
-use super::catalog::*;
+use super::catalog::{ExecutionMode, HandlerKind, TransportKind, ConnectionKind, ServiceCapabilities, operation_by_name, CORE_HEALTH, CORE_OPERATIONS, NODE_STATUS, PING, LLM_STATUS, LLM_GENERATE, LLM_CANCEL, AGENT_STATUS, AGENT_RUN, QUERY_EXECUTE, QUERY_CONTEXT_RESOLVE, AUTH_BEGIN, AUTH_COMPLETE, AUTH_ENROLL_BEGIN, AUTH_ENROLL_COMPLETE, AUTH_CLASSIC_REGISTER, AUTH_CLASSIC_LOGIN, EVENTS_SUBSCRIBE, IDENTITY_REGISTER, IDENTITY_OPEN, IDENTITY_GET, IDENTITY_RENEW, DEVICE_REGISTER, DEVICE_LIST, DEVICE_RENAME, DEVICE_REVOKE, DEVICE_IDENTIFY, PERMISSION_GRANT, PERMISSION_REVOKE, SHARING_CREATE, SHARING_UPDATE, SHARING_DELETE, PLACE_CREATE, PLACE_LIST, PLACE_GET, PLACE_UPDATE, PLACE_DELETE, PLACE_ACCESS_LIST, PLACE_ACCESS_SET, PLACE_ACCESS_REMOVE, PLACE_PUBLIC_SET, PLACE_RESOURCE_LIST, PLACE_RESOURCE_SET, PLACE_RESOURCE_REMOVE, FABRIC_RESOURCE_LIST, FABRIC_RESOURCE_SET, FABRIC_RESOURCE_REMOVE, APP_CREATE, APP_LIST, APP_GET, APP_UPDATE, APP_DELETE, APP_INSTANCE_CREATE, APP_INSTANCE_LIST, APP_INSTANCE_REMOVE, DATA_ANALYZE, DATA_IMPORT, DATA_WORKER_RUN, DATA_MAPPING_SAVE, DATA_MAPPING_LIST, DATA_MAPPING_UPDATE, DATA_MAPPING_DELETE, FILE_CAPABILITIES, FILE_SYNC_CONFIG_GET, FILE_SYNC_CONFIG_SET, FILE_SYNC_SELECTION_SET, FILE_SYNC_SELECTION_REMOVE, FILE_SYNC_STATUS, FILE_SYNC_RUN, FILE_SYNC_FOLDERS, FILE_LIST, FILE_STAT, FILE_MKDIR, FILE_MOVE, FILE_COPY, FILE_DELETE, FILE_TRASH_LIST, FILE_RESTORE, FILE_DELETE_PERMANENT, FILE_TRASH_EMPTY, FILE_READ, FILE_WRITE, FILE_VERSIONS, FILE_VERSION_READ, FILE_VERSION_RESTORE, FILE_VERSION_DELETE, COLLECTIONS_LIST, STORAGE_STATS, BACKUP_CREATE, BACKUP_INSPECT, BACKUP_RESTORE};
 use super::definition::operation_definitions;
-use super::payload::*;
+use super::payload::{UncheckedInput, EmptyInput, LlmGenerateInput, LlmCancelInput, AgentRunInput, QueryExecuteInput, QueryContextResolveInput, AuthBeginInput, ChallengeSignatureInput, AuthEnrollBeginInput, ClassicAuthRegisterInput, ClassicAuthLoginInput, EventsSubscribeInput, IdentityRegisterInput, IdentityOpenInput, PasswordInput, IdentityRenewInput, DeviceRegisterInput, DeviceRenameInput, DeviceRevokeInput, PermissionGrantInput, PermissionRevokeInput, SharingCreateInput, SharingUpdateInput, SharingDeleteInput, PlaceCreateInput, PlaceIdInput, PlaceUpdateInput, PlaceDeleteInput, PlaceAccessSetInput, PlaceAccessRemoveInput, PlacePublicSetInput, PlaceResourceSetInput, PlaceResourceRemoveInput, FabricResourceSetInput, FabricResourceRemoveInput, AppCreateInput, AppIdInput, AppUpdateInput, AppDeleteInput, AppInstanceCreateInput, AppInstanceRemoveInput, DataAnalyzeInput, DataImportInput, DataWorkerRunInput, DataMappingSaveInput, DataMappingListInput, DataMappingUpdateInput, DataMappingDeleteInput, FileScopeInput, FileSyncConfigSetInput, FileSyncSelectionSetInput, FileSyncSelectionRemoveInput, FileListInput, FileEntryInput, FileMkdirInput, FileMoveInput, FileReadInput, FileWriteInput, FileVersionReadInput, FileVersionInput, CollectionsListInput, BackupNameInput, BackupRestoreInput, OperationPayload};
 use super::{catalog::OperationKind, OperationRequest};
 
 /// Request metadata paired with one validated typed payload.
@@ -88,7 +85,7 @@ impl Default for OperationRouter {
 impl OperationRouter {
     /// Creates an empty router, mainly for tests and embedding.
     #[must_use]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             operations: BTreeMap::new(),
             builtins: false,
@@ -98,7 +95,7 @@ impl OperationRouter {
 
     /// Creates the built-in router gated by the services enabled on this node.
     #[must_use]
-    pub fn for_capabilities(service_capabilities: ServiceCapabilities) -> Self {
+    pub const fn for_capabilities(service_capabilities: ServiceCapabilities) -> Self {
         Self {
             operations: BTreeMap::new(),
             builtins: true,
@@ -131,7 +128,7 @@ impl OperationRouter {
             || (self.builtins && operation_by_name(&name).is_some())
         {
             return Err(Error::OperationAlreadyRegistered {
-                operation: name.to_owned(),
+                operation: name,
             });
             /*return Err(OperationError::new(OperationErrorKind::AlreadyRegistered {
                 operation: name,
@@ -194,20 +191,14 @@ impl OperationRouter {
     }
 }
 
-fn decode_payload<T>(operation: &str, data: serde_json::Value) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
+fn decode_payload<T>(operation: &str, data: serde_json::Value) -> Result<T> where T: for<'de> Deserialize<'de>, {
     serde_json::from_value(data).map_err(|error| Error::InvalidOperationPayload {
         operation: operation.to_owned(),
         reason: error.to_string(),
     })
 }
 
-fn decode_routed<T>(operation: &str, id: RequestId, data: serde_json::Value) -> Result<Routed<T>>
-where
-    T: for<'de> Deserialize<'de> + OperationPayload,
-{
+fn decode_routed<T>(operation: &str, id: RequestId, data: serde_json::Value) -> Result<Routed<T>> where T: for<'de> Deserialize<'de> + OperationPayload, {
     let mut input = decode_payload::<T>(operation, data)?;
     input.validate(operation)?;
     Ok(Routed::new(id, input))
@@ -218,6 +209,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::operation::catalog::ServiceCapability;
 
     #[test] fn default_router_exposes_builtin_operations() { let router = OperationRouter::default(); for operation in [ QUERY_EXECUTE, AUTH_BEGIN, AUTH_COMPLETE, EVENTS_SUBSCRIBE, IDENTITY_REGISTER, IDENTITY_OPEN, IDENTITY_GET, IDENTITY_RENEW, DEVICE_REGISTER, DEVICE_REVOKE, PERMISSION_GRANT, PERMISSION_REVOKE, SHARING_CREATE, SHARING_UPDATE, SHARING_DELETE, PLACE_CREATE, PLACE_LIST, PLACE_GET, PLACE_DELETE, PLACE_PUBLIC_SET, APP_CREATE, APP_LIST, APP_GET, APP_UPDATE, APP_DELETE, APP_INSTANCE_CREATE, APP_INSTANCE_LIST, APP_INSTANCE_REMOVE, ] { assert!(router.contains(operation)); } }
     #[test] fn capability_gated_router_rejects_disabled_services() { let router = OperationRouter::for_capabilities( ServiceCapabilities::NONE .with(ServiceCapability::Auth) .with(ServiceCapability::Database) .with(ServiceCapability::Events), ); assert!(router.is_available(QUERY_EXECUTE)); assert!(!router.is_available(FILE_LIST)); let error = router .route(OperationRequest::new( 9, FILE_LIST, serde_json::json!({"placeId":"p","instanceId":"i"}), )) .unwrap_err(); assert_eq!(error.code(), "capability.unavailable"); }

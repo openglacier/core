@@ -7,7 +7,6 @@
 //! collection using stable permission tokens.
 
 use serde::{Deserialize, Serialize};
-
 use crate::access::auth::Principal;
 
 /// Untrusted Place/App instance context requested by a client operation.
@@ -32,7 +31,7 @@ pub struct RequestedExecutionContext {
 pub struct ExecutionContext {
     pub principal: Principal,
     pub place_id: String,
-    /// Optional AppInstance sub-scope. `None` means the whole Place.
+    /// Optional `AppInstance` sub-scope. `None` means the whole Place.
     pub app_instance_id: Option<String>,
     pub place_role: PlaceRole,
     /// Public access mode used when an anonymous connection enters a public Place.
@@ -141,8 +140,6 @@ mod tests {
     use super::*;
 
     #[test] fn place_role_rights_are_monotonic() { assert!(PlaceRole::Owner.can_manage()); assert!(PlaceRole::Owner.can_write()); assert!(!PlaceRole::Resident.can_manage()); assert!(PlaceRole::Resident.can_write()); assert!(!PlaceRole::Member.can_manage()); assert!(!PlaceRole::Member.can_write()); }
-
     #[test] fn public_access_maps_to_place_capabilities() { assert!(!PublicAccess::Readonly.can_write()); assert!(PublicAccess::Readwrite.can_write()); assert_eq!(PublicAccess::Readonly.place_role(), PlaceRole::Member); assert_eq!(PublicAccess::Readwrite.place_role(), PlaceRole::Resident); }
-
     #[test] fn sharing_tokens_round_trip() { let token = sharing_permission("workshop", PlaceRole::Resident); assert_eq!(token, "place:workshop:resident"); assert_eq!( parse_sharing_permission(&token), Some(("workshop", PlaceRole::Resident)) ); let owner_token = sharing_permission("workshop", PlaceRole::Owner); assert_eq!(owner_token, "place:workshop:owner"); assert_eq!( parse_sharing_permission(&owner_token), Some(("workshop", PlaceRole::Owner)) ); assert!(parse_sharing_permission("files.read").is_none()); }
 }

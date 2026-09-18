@@ -532,19 +532,11 @@ impl fmt::Debug for QueryRuntime {
 }
 
 impl ExecutionRuntime for QueryRuntime {
-    fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-    ) -> ExecutionResult<bool> {
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, ) -> ExecutionResult<bool> {
         (self.predicate)(expression, document)
     }
 
-    fn evaluate_resolved_predicate(
-        &self,
-        expression: &Expression,
-        resolver: &dyn ExpressionFieldResolver<Value>,
-    ) -> ExecutionResult<bool> {
+    fn evaluate_resolved_predicate( &self, expression: &Expression, resolver: &dyn ExpressionFieldResolver<Value>, ) -> ExecutionResult<bool> {
         match &self.resolved_predicate {
             Some(predicate) => predicate(expression, resolver),
             None => Err(ExecutionError::unsupported_operator(
@@ -554,33 +546,18 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn evaluate_lookup_predicate(
-        &self,
-        expression: &Expression,
-        outer: &Document,
-        inner_alias: Option<&str>,
-        inner: &Document,
-    ) -> ExecutionResult<bool> {
+    fn evaluate_lookup_predicate( &self, expression: &Expression, outer: &Document, inner_alias: Option<&str>, inner: &Document, ) -> ExecutionResult<bool> {
         match &self.lookup_predicate {
             Some(predicate) => predicate(expression, outer, inner_alias, inner),
             None => (self.predicate)(expression, inner),
         }
     }
 
-    fn apply_set(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-    ) -> ExecutionResult<Arc<Document>> {
+    fn apply_set( &self, assignments: &[SetAssignment], document: &Document, ) -> ExecutionResult<Arc<Document>> {
         (self.set)(assignments, document)
     }
 
-    fn apply_lookup(
-        &self,
-        into: &str,
-        outer: &Document,
-        matches: &LookupDocuments,
-    ) -> ExecutionResult<Arc<Document>> {
+    fn apply_lookup( &self, into: &str, outer: &Document, matches: &LookupDocuments, ) -> ExecutionResult<Arc<Document>> {
         match &self.lookup {
             Some(lookup) => lookup(into, outer, matches),
             None => Err(ExecutionError::unsupported_operator(
@@ -590,13 +567,7 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn prepare_streaming_load(
-        &self,
-        collection: &CollectionId,
-        storage: &dyn StorageRead,
-        mode: PhysicalLoadMode,
-        chunks: &[Arc<str>],
-    ) -> ExecutionResult<Vec<StreamingLoadMutation>> {
+    fn prepare_streaming_load( &self, collection: &CollectionId, storage: &dyn StorageRead, mode: PhysicalLoadMode, chunks: &[Arc<str>], ) -> ExecutionResult<Vec<StreamingLoadMutation>> {
         match &self.streaming_load {
             Some(load) => load(collection, storage, mode, chunks),
             None => Err(ExecutionError::unsupported_operator(
@@ -616,12 +587,7 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn compare_documents(
-        &self,
-        keys: &[SortKey],
-        left: &Document,
-        right: &Document,
-    ) -> ExecutionResult<Ordering> {
+    fn compare_documents( &self, keys: &[SortKey], left: &Document, right: &Document, ) -> ExecutionResult<Ordering> {
         match &self.compare {
             Some(compare) => compare(keys, left, right),
             None => Err(ExecutionError::unsupported_operator(
@@ -635,23 +601,14 @@ impl ExecutionRuntime for QueryRuntime {
         self.projected_compare.is_some()
     }
 
-    fn compare_projected_values(
-        &self,
-        keys: &[SortKey],
-        left: &[Option<Value>],
-        right: &[Option<Value>],
-    ) -> ExecutionResult<Option<Ordering>> {
+    fn compare_projected_values( &self, keys: &[SortKey], left: &[Option<Value>], right: &[Option<Value>], ) -> ExecutionResult<Option<Ordering>> {
         match &self.projected_compare {
             Some(compare) => compare(keys, left, right).map(Some),
             None => Ok(None),
         }
     }
 
-    fn apply_select(
-        &self,
-        fields: &[ExpressionFieldPath],
-        document: &Document,
-    ) -> ExecutionResult<Arc<Document>> {
+    fn apply_select( &self, fields: &[ExpressionFieldPath], document: &Document, ) -> ExecutionResult<Arc<Document>> {
         match &self.select {
             Some(select) => select(fields, document),
             None => Err(ExecutionError::unsupported_operator(
@@ -661,11 +618,7 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn distinct_key(
-        &self,
-        fields: &[ExpressionFieldPath],
-        document: &Document,
-    ) -> ExecutionResult<Arc<[u8]>> {
+    fn distinct_key( &self, fields: &[ExpressionFieldPath], document: &Document, ) -> ExecutionResult<Arc<[u8]>> {
         match &self.distinct {
             Some(distinct) => distinct(fields, document),
             None => Err(ExecutionError::unsupported_operator(
@@ -679,12 +632,7 @@ impl ExecutionRuntime for QueryRuntime {
         self.buffered_distinct.is_some()
     }
 
-    fn write_distinct_key(
-        &self,
-        fields: &[ExpressionFieldPath],
-        document: &Document,
-        key: &mut Vec<u8>,
-    ) -> ExecutionResult<bool> {
+    fn write_distinct_key( &self, fields: &[ExpressionFieldPath], document: &Document, key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
         match &self.buffered_distinct {
             Some(distinct) => {
                 distinct(fields, document, key)?;
@@ -698,13 +646,7 @@ impl ExecutionRuntime for QueryRuntime {
         self.projected_distinct.is_some()
     }
 
-    fn write_projected_distinct_key(
-        &self,
-        fields: &[ExpressionFieldPath],
-        values: &[Option<ProjectedValueRef<'_>>],
-        indexes: &[usize],
-        key: &mut Vec<u8>,
-    ) -> ExecutionResult<bool> {
+    fn write_projected_distinct_key( &self, fields: &[ExpressionFieldPath], values: &[Option<ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
         match &self.projected_distinct {
             Some(distinct) => {
                 distinct(fields, values, indexes, key)?;
@@ -724,21 +666,14 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn incremental_group_accumulator(
-        &self,
-        keys: &[ExpressionFieldPath],
-    ) -> ExecutionResult<Option<Box<dyn IncrementalGroupAccumulator>>> {
+    fn incremental_group_accumulator( &self, keys: &[ExpressionFieldPath], ) -> ExecutionResult<Option<Box<dyn IncrementalGroupAccumulator>>> {
         match &self.incremental_group {
             Some(group) => group(keys).map(Some),
             None => Ok(None),
         }
     }
 
-    fn group_documents(
-        &self,
-        keys: &[ExpressionFieldPath],
-        documents: &[Arc<Document>],
-    ) -> ExecutionResult<Vec<SyntheticDocument>> {
+    fn group_documents( &self, keys: &[ExpressionFieldPath], documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
         match &self.group {
             Some(group) => group(keys, documents),
             None => Err(ExecutionError::unsupported_operator(
@@ -748,10 +683,7 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn prepare_insert(
-        &self,
-        document: &LogicalInsertDocument,
-    ) -> ExecutionResult<PreparedInsertDocument> {
+    fn prepare_insert( &self, document: &LogicalInsertDocument, ) -> ExecutionResult<PreparedInsertDocument> {
         match &self.insert {
             Some(insert) => insert(document),
             None => Err(ExecutionError::unsupported_operator(
@@ -761,11 +693,7 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn pivot_documents(
-        &self,
-        specification: &PivotSpecification,
-        documents: &[Arc<Document>],
-    ) -> ExecutionResult<Vec<SyntheticDocument>> {
+    fn pivot_documents( &self, specification: &PivotSpecification, documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
         match &self.pivot {
             Some(pivot) => pivot(specification, documents),
             None => Err(ExecutionError::unsupported_operator(
@@ -775,13 +703,7 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn apply_custom(
-        &self,
-        stage: &StageName,
-        arguments: &str,
-        writes: bool,
-        document: &Document,
-    ) -> ExecutionResult<CustomOperatorResult> {
+    fn apply_custom( &self, stage: &StageName, arguments: &str, writes: bool, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
         match &self.custom {
             Some(custom) => custom(stage, arguments, writes, document),
             None => Err(ExecutionError::unsupported_operator(
@@ -1077,26 +999,15 @@ mod tests {
     use crate::storage::StorageEngine;
 
     #[test] fn unsupported_runtime_has_no_optional_handlers() { let runtime = QueryRuntime::unsupported(); assert!(!runtime.supports_lookup_predicate()); assert!(!runtime.supports_lookup()); assert!(!runtime.supports_streaming_load()); assert!(!runtime.supports_load()); assert!(!runtime.supports_sort()); assert!(!runtime.supports_projected_sort()); assert!(!runtime.supports_select()); assert!(!runtime.supports_distinct()); assert!(!runtime.supports_buffered_distinct()); assert!(!runtime.supports_projected_distinct()); assert!(!runtime.supports_count()); assert!(!runtime.supports_group()); assert!(!runtime.supports_pivot()); assert!(!runtime.supports_insert()); assert!(!runtime.supports_custom()); }
-
     #[test] fn builder_requires_predicate_handler_first() { let error = QueryRuntimeBuilder::new().build().unwrap_err(); assert_eq!(error, QueryRuntimeBuildError::MissingPredicateHandler); }
-
     #[test] fn builder_requires_set_handler() { let error = QueryRuntimeBuilder::new() .predicate(|_, _| Ok(true)) .build() .unwrap_err(); assert_eq!(error, QueryRuntimeBuildError::MissingSetHandler); }
-
     #[test] fn builder_accepts_required_handlers() { let runtime = QueryRuntimeBuilder::new() .predicate(|_, _| Ok(true)) .set(|_, document| Ok(Arc::new(document.clone()))) .build() .unwrap(); assert!(!runtime.supports_lookup_predicate()); assert!(!runtime.supports_lookup()); assert!(!runtime.supports_streaming_load()); assert!(!runtime.supports_load()); assert!(!runtime.supports_sort()); assert!(!runtime.supports_projected_sort()); assert!(!runtime.supports_select()); assert!(!runtime.supports_distinct()); assert!(!runtime.supports_buffered_distinct()); assert!(!runtime.supports_projected_distinct()); assert!(!runtime.supports_count()); assert!(!runtime.supports_group()); assert!(!runtime.supports_pivot()); assert!(!runtime.supports_insert()); assert!(!runtime.supports_custom()); }
-
     #[test] fn optional_handlers_are_reported() { let runtime = QueryRuntimeBuilder::new() .predicate(|_, _| Ok(true)) .set(|_, document| Ok(Arc::new(document.clone()))) .lookup_predicate(|_, _, _, _| Ok(true)) .lookup(|_, document, _| Ok(Arc::new(document.clone()))) .streaming_load(|_, _, _, _| Ok(Vec::new())) .load(|_, document| Ok(Arc::new(document.clone()))) .compare(|_, _, _| Ok(Ordering::Equal)) .select(|_, document| Ok(Arc::new(document.clone()))) .distinct(|_, _| Ok(Arc::<[u8]>::from([]))) .count(|_, _| Err(ExecutionError::evaluation("count test"))) .group(|_, _| Ok(Vec::new())) .pivot(|_, _| Ok(Vec::new())) .insert(|_| Err(ExecutionError::mutation("insert test"))) .custom(|_, _, _, _| Ok(CustomOperatorResult::Keep)) .build() .unwrap(); assert!(runtime.supports_lookup_predicate()); assert!(runtime.supports_lookup()); assert!(runtime.supports_streaming_load()); assert!(runtime.supports_load()); assert!(runtime.supports_sort()); assert!(runtime.supports_select()); assert!(runtime.supports_distinct()); assert!(runtime.supports_count()); assert!(runtime.supports_group()); assert!(runtime.supports_pivot()); assert!(runtime.supports_insert()); assert!(runtime.supports_custom()); }
-
     #[test] fn fluent_runtime_configuration_reports_handlers() { let runtime = QueryRuntime::new( |_, _| Ok(true), |_, document| Ok(Arc::new(document.clone())), ) .with_lookup_predicate(|_, _, _, _| Ok(true)) .with_lookup(|_, document, _| Ok(Arc::new(document.clone()))) .with_streaming_load(|_, _, _, _| Ok(Vec::new())) .with_load(|_, document| Ok(Arc::new(document.clone()))) .with_compare(|_, _, _| Ok(Ordering::Equal)) .with_select(|_, document| Ok(Arc::new(document.clone()))) .with_distinct(|_, _| Ok(Arc::<[u8]>::from([]))) .with_count(|_, _| Err(ExecutionError::evaluation("count test"))) .with_group(|_, _| Ok(Vec::new())) .with_pivot(|_, _| Ok(Vec::new())) .with_insert(|_| Err(ExecutionError::mutation("insert test"))) .with_custom(|_, _, _, _| Ok(CustomOperatorResult::Keep)); assert!(runtime.supports_lookup_predicate()); assert!(runtime.supports_lookup()); assert!(runtime.supports_streaming_load()); assert!(runtime.supports_load()); assert!(runtime.supports_sort()); assert!(runtime.supports_select()); assert!(runtime.supports_distinct()); assert!(runtime.supports_count()); assert!(runtime.supports_group()); assert!(runtime.supports_pivot()); assert!(runtime.supports_insert()); assert!(runtime.supports_custom()); }
-
     #[test] fn lookup_predicate_falls_back_to_regular_predicate() { let runtime = QueryRuntime::new( |_, _| Ok(true), |_, document| Ok(Arc::new(document.clone())), ); assert!(!runtime.supports_lookup_predicate()); }
-
     #[test] fn absent_lookup_handler_returns_structured_error() { let runtime = QueryRuntime::unsupported(); assert!(!runtime.supports_lookup()); }
-
     #[test] fn absent_streaming_load_handler_returns_structured_error() { let runtime = QueryRuntime::unsupported(); let chunks = [Arc::<str>::from("batch")]; let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = crate::storage::CollectionId::parse("data").unwrap(); let error = runtime .prepare_streaming_load( &collection, read.as_ref(), PhysicalLoadMode::Replace, &chunks, ) .unwrap_err(); assert!(matches!( error.kind(), super::super::ExecutionErrorKind::UnsupportedOperator { .. } )); }
-
     #[test] fn absent_pivot_handler_returns_structured_error() { use crate::query::logical_plan::{PivotAggregate, PivotSpecification, PivotValue}; let runtime = QueryRuntime::unsupported(); let specification = PivotSpecification::new( [ExpressionFieldPath::new(["region"]).unwrap()], [ExpressionFieldPath::new(["month"]).unwrap()], [PivotValue::new( ExpressionFieldPath::new(["revenue"]).unwrap(), PivotAggregate::Sum, None::<&str>, ) .unwrap()], ) .unwrap(); let error = runtime.pivot_documents(&specification, &[]).unwrap_err(); assert!(matches!( error.kind(), super::super::ExecutionErrorKind::UnsupportedOperator { .. } )); }
-
     #[test] fn absent_optional_handler_returns_structured_error() { let runtime = QueryRuntime::unsupported(); let error = runtime.count_document("total", 0).unwrap_err(); assert!(matches!( error.kind(), super::super::ExecutionErrorKind::UnsupportedOperator { .. } )); }
-
     #[test] fn runtime_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<QueryRuntime>(); assert_send_and_sync::<QueryRuntimeBuilder>(); assert_send_and_sync::<QueryRuntimeBuildError>(); }
 }

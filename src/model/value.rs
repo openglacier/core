@@ -12,7 +12,7 @@ pub enum Value {
     Bool(bool),
     Number(Number),
     String(Arc<str>),
-    Array(Arc<[Value]>),
+    Array(Arc<[Self]>),
     Object(Arc<Document>),
 }
 
@@ -35,7 +35,7 @@ impl Value {
     pub fn string(value: impl Into<Arc<str>>) -> Self { Self::String(value.into()) }
 
     #[must_use]
-    pub fn array(values: impl IntoIterator<Item = Value>) -> Self {
+    pub fn array(values: impl IntoIterator<Item = Self>) -> Self {
         Self::Array(Arc::from(values.into_iter().collect::<Vec<_>>()))
     }
 
@@ -67,19 +67,19 @@ impl Value {
     pub fn as_str(&self) -> Option<&str> { match self { Self::String(v) => Some(v), _ => None } }
 
     #[must_use]
-    pub fn as_string_arc(&self) -> Option<&Arc<str>> { match self { Self::String(v) => Some(v), _ => None } }
+    pub const fn as_string_arc(&self) -> Option<&Arc<str>> { match self { Self::String(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn into_string(self) -> Option<Arc<str>> { match self { Self::String(v) => Some(v), _ => None } }
 
     #[must_use]
-    pub fn as_array(&self) -> Option<&[Value]> { match self { Self::Array(v) => Some(v), _ => None } }
+    pub fn as_array(&self) -> Option<&[Self]> { match self { Self::Array(v) => Some(v), _ => None } }
 
     #[must_use]
-    pub fn as_array_arc(&self) -> Option<&Arc<[Value]>> { match self { Self::Array(v) => Some(v), _ => None } }
+    pub const fn as_array_arc(&self) -> Option<&Arc<[Self]>> { match self { Self::Array(v) => Some(v), _ => None } }
 
     #[must_use]
-    pub fn into_array(self) -> Option<Arc<[Value]>> { match self { Self::Array(v) => Some(v), _ => None } }
+    pub fn into_array(self) -> Option<Arc<[Self]>> { match self { Self::Array(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn object(document: Document) -> Self { Self::Object(Arc::new(document)) }
@@ -88,7 +88,7 @@ impl Value {
     pub fn as_object(&self) -> Option<&Document> { match self { Self::Object(v) => Some(v.as_ref()), _ => None } }
 
     #[must_use]
-    pub fn as_object_arc(&self) -> Option<&Arc<Document>> { match self { Self::Object(v) => Some(v), _ => None } }
+    pub const fn as_object_arc(&self) -> Option<&Arc<Document>> { match self { Self::Object(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn into_object(self) -> Option<Arc<Document>> { match self { Self::Object(v) => Some(v), _ => None } }
@@ -248,10 +248,10 @@ impl TryFrom<f64> for Value { type Error = Error; fn try_from(v: f64) -> Result<
 impl From<&str> for Value { fn from(v: &str) -> Self { Self::string(v) } }
 impl From<String> for Value { fn from(v: String) -> Self { Self::string(v) } }
 impl From<Arc<str>> for Value { fn from(v: Arc<str>) -> Self { Self::String(v) } }
-impl From<Vec<Value>> for Value { fn from(v: Vec<Value>) -> Self { Self::Array(Arc::from(v)) } }
-impl From<Box<[Value]>> for Value { fn from(v: Box<[Value]>) -> Self { Self::Array(Arc::from(v)) } }
-impl From<Arc<[Value]>> for Value { fn from(v: Arc<[Value]>) -> Self { Self::Array(v) } }
-impl<const LENGTH: usize> From<[Value; LENGTH]> for Value { fn from(v: [Value; LENGTH]) -> Self { Self::Array(Arc::from(v)) } }
+impl From<Vec<Self>> for Value { fn from(v: Vec<Self>) -> Self { Self::Array(Arc::from(v)) } }
+impl From<Box<[Self]>> for Value { fn from(v: Box<[Self]>) -> Self { Self::Array(Arc::from(v)) } }
+impl From<Arc<[Self]>> for Value { fn from(v: Arc<[Self]>) -> Self { Self::Array(v) } }
+impl<const LENGTH: usize> From<[Self; LENGTH]> for Value { fn from(v: [Self; LENGTH]) -> Self { Self::Array(Arc::from(v)) } }
 
 #[cfg(test)]
 mod tests {

@@ -229,6 +229,5 @@ mod tests {
     use super::*;
 
     #[test] fn topics_have_stable_names() { assert_eq!(DebugTopic::Auth.as_str(), "auth"); assert_eq!(DebugTopic::Events.as_str(), "events"); assert_eq!(DebugTopic::Agent.as_str(), "agent"); assert_eq!(DebugTopic::Llm.as_str(), "llm"); }
-
     #[test] fn redaction_hides_nested_secrets() { let value = serde_json::json!({ "data": {"signature": "secret", "identityId": "alice"}, "token": "bootstrap" }); let redacted = redact_json(value); assert_eq!(redacted["data"]["signature"], "<redacted>"); assert_eq!(redacted["token"], "<redacted>"); assert_eq!(redacted["data"]["identityId"], "alice"); }
 }

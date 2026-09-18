@@ -12,9 +12,8 @@ use crate::{
 use super::{
     BinaryOperator, ExecutionError, ExecutionResult, Expression, ExpressionFieldPath,
     ExpressionFieldResolver, ExpressionView, Literal, PhysicalOperator, SemanticValue,
-    UnaryOperator,
+    UnaryOperator, Fields, ProjectionReuse
 };
-use super::{Fields, ProjectionReuse};
 
 /// Row representation used by stages that can consume projected field values
 /// without materializing a full document.
@@ -143,7 +142,7 @@ impl ProjectedValuePipeline {
         I: IntoIterator<Item = ExpressionFieldPath>,
     {
         let downstream_fields = downstream_fields.into_iter().collect::<Vec<_>>();
-        let mut required = downstream_fields.clone();
+        let mut required = downstream_fields;
         let projection_reuse = if operators
             .iter()
             .all(|operator| operator.execution_properties().reuses_projection())
@@ -292,15 +291,12 @@ impl ProjectedValuePipeline {
         let mut fallback_row = None;
         for stage in self.stages.iter() {
             if let ProjectedValueStage::Filter(predicate) = stage {
-                let accepted = match predicate.accepts_refs(values) {
-                    Some(accepted) => accepted,
-                    None => {
-                        let row = fallback_row.get_or_insert_with(|| {
-                            ProjectedValueRefRow::new(&self.layout, values)
-                                .expect("projected row length checked above")
-                        });
-                        evaluate(predicate.expression(), row)?
-                    }
+                let accepted = if let Some(accepted) = predicate.accepts_refs(values) { accepted } else {
+                    let row = fallback_row.get_or_insert_with(|| {
+                        ProjectedValueRefRow::new(&self.layout, values)
+                            .expect("projected row length checked above")
+                    });
+                    evaluate(predicate.expression(), row)?
                 };
                 if !accepted {
                     return Ok(false);
@@ -364,13 +360,9 @@ impl ProjectedPredicate {
     /// Every referenced field must already be present in the layout. This is
     /// intentionally independent of the expression evaluator so projected
     /// execution cannot drift from the language's normal predicate semantics.
-    pub fn compile(
-        expression: &Expression,
-        layout: &ProjectedValueLayout,
-    ) -> ExecutionResult<Self> {
+    pub fn compile( expression: &Expression, layout: &ProjectedValueLayout, ) -> ExecutionResult<Self> {
         let mut required = Vec::<ExpressionFieldPath>::new();
         collect_expression_fields(expression, &mut required);
-
         for field in required {
             if layout.slot(&field).is_none() {
                 return Err(ExecutionError::evaluation(format!(
@@ -378,7 +370,6 @@ impl ProjectedPredicate {
                 )));
             }
         }
-
         Ok(Self {
             expression: expression.clone(),
             fast: CompiledPredicate::compile(expression, layout),
@@ -437,10 +428,10 @@ impl CompiledPredicate {
         match self {
             Self::And(left, right) => {
                 let left = left.evaluate(values)?;
-                if !left {
-                    Some(false)
-                } else {
+                if left {
                     right.evaluate(values)
+                } else {
+                    Some(false)
                 }
             }
             Self::Or(left, right) => {
@@ -507,11 +498,7 @@ enum FastScalar<'a> {
     Literal(&'a Value),
 }
 
-fn compare_fast_scalars(
-    left: FastScalar<'_>,
-    right: FastScalar<'_>,
-    operator: BinaryOperator,
-) -> Option<bool> {
+fn compare_fast_scalars( left: FastScalar<'_>, right: FastScalar<'_>, operator: BinaryOperator, ) -> Option<bool> {
     if let (Some(left), Some(right)) = (fast_str(left), fast_str(right)) {
         return Some(match operator {
             BinaryOperator::Equal => left == right,
@@ -592,7 +579,7 @@ impl<'a> ProjectedValueRow<'a> {
 
     /// Raw values in stable slot order.
     #[must_use]
-    pub fn values(&self) -> &'a [Option<crate::Value>] {
+    pub const fn values(&self) -> &'a [Option<crate::Value>] {
         self.values
     }
 
@@ -657,17 +644,11 @@ mod tests {
     use super::*;
 
     #[test] fn layout_deduplicates_fields_and_resolves_slots() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone(), revenue.clone(), period.clone()]).unwrap(); assert_eq!(layout.fields(), &[period.clone(), revenue.clone()]); assert_eq!(layout.slot(&period), Some(0)); assert_eq!(layout.slot(&revenue), Some(1)); assert!(layout.is_top_level()); }
-
     #[test] fn projected_row_reads_values_by_field() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone()]).unwrap(); let values = [Some(crate::Value::string("12-2025"))]; let row = ProjectedValueRow::new(&layout, &values).unwrap(); assert_eq!(row.get(&period), Some(&crate::Value::string("12-2025"))); }
     #[test] fn projected_pipeline_unions_filter_and_downstream_fields() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap(); let operators = [PhysicalOperator::Filter { predicate }]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert_eq!(pipeline.layout().slot(&period), Some(0)); assert_eq!(pipeline.layout().slot(&revenue), Some(1)); assert_eq!(pipeline.projection_reuse(), ProjectionReuse::Reusable); }
-
     #[test] fn projected_pipeline_accepts_select_as_slot_visibility_boundary() { let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([revenue.clone()]), }]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert_eq!(pipeline.layout().slot(&revenue), Some(0)); }
-
     #[test] fn projected_pipeline_composes_filter_before_select() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap(); let operators = [ PhysicalOperator::Filter { predicate }, PhysicalOperator::Select { fields: Arc::from([revenue.clone()]), }, ]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert!(pipeline.layout().slot(&period).is_some()); assert!(pipeline.layout().slot(&revenue).is_some()); }
-
     #[test] fn projected_pipeline_select_does_not_force_unused_fields() { let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([revenue]), }]; let pipeline = ProjectedValuePipeline::compile(&operators, std::iter::empty::<ExpressionFieldPath>()) .unwrap() .unwrap(); assert!(pipeline.layout().fields().is_empty()); assert_eq!(pipeline.gate_field_count(), 0); }
-
     #[test] fn projected_pipeline_rejects_downstream_field_removed_by_select() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([period]), }]; assert!(ProjectedValuePipeline::compile(&operators, [revenue]) .unwrap() .is_none()); }
-
     #[test] fn predicate_compiles_against_projected_layout() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone(), revenue.clone()]).unwrap(); let values = [ Some(crate::Value::string("12-2025")), Some(crate::Value::float(12.5).unwrap()), ]; let row = ProjectedValueRow::new(&layout, &values).unwrap(); assert_eq!( row.resolve_field(&period), SemanticValue::Present(crate::Value::string("12-2025")) ); }
 }

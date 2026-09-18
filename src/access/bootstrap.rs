@@ -1,7 +1,6 @@
 //! Bootstrap administrator creation isolated from daemon wiring.
-
+#![cfg_attr(rustfmt, rustfmt_skip)]
 use std::path::Path;
-
 use crate::helpers::unix_time_millis;
 
 use super::{
@@ -36,11 +35,7 @@ impl BootstrapAdmin {
         ]
     }
 
-    pub fn stage(
-        &self,
-        path: &Path,
-        password: &[u8],
-    ) -> Result<std::path::PathBuf, IdentityFileError> {
+    pub fn stage( &self, path: &Path, password: &[u8], ) -> Result<std::path::PathBuf, IdentityFileError> {
         identity_file::stage(path, &self.credential, password)
     }
 

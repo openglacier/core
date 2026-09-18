@@ -4,7 +4,7 @@ use crate::{Document, Number, Value};
 
 use super::{ExecutionError, ExecutionResult};
 
-pub(crate) fn parse_json_literal(source: &str) -> ExecutionResult<Value> {
+pub fn parse_json_literal(source: &str) -> ExecutionResult<Value> {
     let json: serde_json::Value = serde_json::from_str(source).map_err(|error| {
         ExecutionError::evaluation(format!("invalid structured JSON literal: {error}"))
     })?;

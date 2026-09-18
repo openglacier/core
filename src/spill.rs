@@ -79,9 +79,7 @@ pub struct SpillEngine { directory: PathBuf, }
 
 impl Default for SpillEngine {
     fn default() -> Self {
-        let directory = std::env::var_os("OGD_TEMP_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+        let directory = std::env::var_os("OGD_TEMP_PATH").map_or_else(std::env::temp_dir, PathBuf::from)
             .join("ogd-spill");
         Self { directory }
     }

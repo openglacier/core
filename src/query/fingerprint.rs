@@ -451,50 +451,27 @@ mod tests {
     use super::*;
 
     #[test] fn text_fingerprint_is_deterministic() { let source = "from users | where age >= 18"; assert_eq!( QueryTextFingerprint::new(source), QueryTextFingerprint::new(source), ); }
-
     #[test] fn text_fingerprint_preserves_whitespace() { let compact = QueryTextFingerprint::new("from users|where age>=18"); let formatted = QueryTextFingerprint::new("from users | where age >= 18"); assert_ne!(compact, formatted); }
-
     #[test] fn text_fingerprint_preserves_literal_spelling() { let first = QueryTextFingerprint::new("from users | where age >= 18"); let second = QueryTextFingerprint::new("from users | where age >= 018"); assert_ne!(first, second); }
-
     #[test] fn syntax_fingerprint_ignores_whitespace() { let compact = SyntaxFingerprint::from_source("from users|where age>=18").unwrap(); let formatted = SyntaxFingerprint::from_source("from users | where age >= 18").unwrap(); assert_eq!(compact, formatted); }
-
     #[test] fn syntax_fingerprint_preserves_literal_values() { let first = SyntaxFingerprint::from_source("from users | where age >= 18").unwrap(); let second = SyntaxFingerprint::from_source("from users | where age >= 42").unwrap(); assert_ne!(first, second); }
-
     #[test] fn syntax_fingerprint_preserves_identifiers() { let first = SyntaxFingerprint::from_source("from users | where age >= 18").unwrap(); let second = SyntaxFingerprint::from_source("from users | where score >= 18").unwrap(); assert_ne!(first, second); }
-
     #[test] fn syntax_fingerprint_preserves_source_alias() { let from = SyntaxFingerprint::from_source("from users | where age >= 18").unwrap(); let on = SyntaxFingerprint::from_source("on users | where age >= 18").unwrap(); assert_ne!(from, on); }
-
     #[test] fn shape_fingerprint_ignores_numeric_literal_values() { let first = QueryShapeFingerprint::from_source("from users | where age >= 18").unwrap(); let second = QueryShapeFingerprint::from_source("from users | where age >= 42").unwrap(); assert_eq!(first, second); }
-
     #[test] fn shape_fingerprint_ignores_string_literal_values() { let first = QueryShapeFingerprint::from_source(r#"from users | where country == "FR""#).unwrap(); let second = QueryShapeFingerprint::from_source(r#"from users | where country == "DE""#).unwrap(); assert_eq!(first, second); }
-
     #[test] fn shape_fingerprint_ignores_boolean_literal_values() { let true_query = QueryShapeFingerprint::from_source("from users | where active == true").unwrap(); let false_query = QueryShapeFingerprint::from_source("from users | where active == false").unwrap(); assert_ne!(true_query, false_query); }
-
     #[test] fn shape_fingerprint_preserves_literal_categories() { let number = QueryShapeFingerprint::from_source("from users | where age == 18").unwrap(); let string = QueryShapeFingerprint::from_source(r#"from users | where age == "18""#).unwrap(); assert_ne!(number, string); }
-
     #[test] fn shape_fingerprint_preserves_collection_names() { let users = QueryShapeFingerprint::from_source("from users | where id == 18").unwrap(); let orders = QueryShapeFingerprint::from_source("from orders | where id == 18").unwrap(); assert_ne!(users, orders); }
-
     #[test] fn shape_fingerprint_preserves_field_names() { let age = QueryShapeFingerprint::from_source("from users | where age >= 18").unwrap(); let score = QueryShapeFingerprint::from_source("from users | where score >= 18").unwrap(); assert_ne!(age, score); }
-
     #[test] fn shape_fingerprint_preserves_operators() { let greater = QueryShapeFingerprint::from_source("from users | where age > 18").unwrap(); let greater_equal = QueryShapeFingerprint::from_source("from users | where age >= 18").unwrap(); assert_ne!(greater, greater_equal); }
-
     #[test] fn shape_fingerprint_preserves_stage_names() { let filter = QueryShapeFingerprint::from_source("from users | where age >= 18").unwrap(); let custom = QueryShapeFingerprint::from_source("from users | inspect age >= 18").unwrap(); assert_ne!(filter, custom); }
-
     #[test] fn fingerprint_helpers_match_associated_functions() { let source = "from users | where age >= 18"; assert_eq!( fingerprint_query_text(source), QueryTextFingerprint::new(source), ); assert_eq!( fingerprint_syntax(source).unwrap(), SyntaxFingerprint::from_source(source).unwrap(), ); assert_eq!( fingerprint_query_shape(source).unwrap(), QueryShapeFingerprint::from_source(source).unwrap(), ); }
-
     #[test] fn logical_plan_fingerprint_is_deterministic() { let canonical = b"scan(users);filter(gte(field(age),parameter(number)))"; assert_eq!( LogicalPlanFingerprint::from_canonical_bytes(canonical), LogicalPlanFingerprint::from_canonical_bytes(canonical), ); }
-
     #[test] fn logical_plan_fingerprint_changes_with_canonical_plan() { let users = LogicalPlanFingerprint::from_canonical_str( "scan(users);filter(gte(field(age),parameter(number)))", ); let orders = LogicalPlanFingerprint::from_canonical_str( "scan(orders);filter(gte(field(age),parameter(number)))", ); assert_ne!(users, orders); }
-
     #[test] fn fingerprints_use_separate_domains() { let text = QueryTextFingerprint::new("from users").value(); let syntax = SyntaxFingerprint::from_source("from users") .unwrap() .value(); let shape = QueryShapeFingerprint::from_source("from users") .unwrap() .value(); let logical = LogicalPlanFingerprint::from_canonical_str("from users").value(); assert_ne!(text, syntax); assert_ne!(text, shape); assert_ne!(text, logical); assert_ne!(syntax, shape); assert_ne!(syntax, logical); assert_ne!(shape, logical); }
-
     #[test] fn display_is_fixed_width_lowercase_hexadecimal() { let fingerprint = QueryTextFingerprint::from_value(0x00ab_cdef); assert_eq!(fingerprint.to_string(), "0000000000abcdef"); }
-
     #[test] fn debug_includes_fingerprint_type() { let fingerprint = QueryTextFingerprint::from_value(0x1234); assert_eq!( format!("{fingerprint:?}"), "QueryTextFingerprint(0000000000001234)", ); }
-
     #[test] fn raw_value_round_trip() { let original = QueryShapeFingerprint::from_value(0x1234_5678_90ab_cdef); assert_eq!( QueryShapeFingerprint::from_value(original.value()), original, ); assert_eq!(u64::from_be_bytes(original.to_be_bytes()), original.value(),); assert_eq!(u64::from_le_bytes(original.to_le_bytes()), original.value(),); }
-
     #[test] fn fingerprint_types_are_compact() { assert_eq!( std::mem::size_of::<QueryTextFingerprint>(), std::mem::size_of::<u64>(), ); assert_eq!( std::mem::size_of::<SyntaxFingerprint>(), std::mem::size_of::<u64>(), ); assert_eq!( std::mem::size_of::<QueryShapeFingerprint>(), std::mem::size_of::<u64>(), ); assert_eq!( std::mem::size_of::<LogicalPlanFingerprint>(), std::mem::size_of::<u64>(), ); }
-
     #[test] fn invalid_source_returns_lexer_error() { assert!(SyntaxFingerprint::from_source("from users @").is_err()); assert!(QueryShapeFingerprint::from_source("from users @").is_err()); }
 }

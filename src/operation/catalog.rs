@@ -179,7 +179,6 @@ impl ServiceCapabilities {
         }
     }
 
-    #[must_use]
     pub fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Result<Self, String> {
         let mut result = Self::NONE;
         for name in names {
@@ -220,27 +219,13 @@ const fn service_capability_bit(capability: ServiceCapability) -> u8 {
     }
 }
 
-const AUTH: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::AUTH,
-};
-const DATABASE: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::DATABASE,
-};
-const FILES: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::FILES,
-};
-const EVENTS: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::EVENTS,
-};
-const CAP_DATA_IMPORT: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::DATA_IMPORT,
-};
-const LLM: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::LLM,
-};
-const AGENT: ServiceCapabilities = ServiceCapabilities {
-    bits: ServiceCapabilities::AGENT,
-};
+const AUTH: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::AUTH, };
+const DATABASE: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::DATABASE, };
+const FILES: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::FILES, };
+const EVENTS: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::EVENTS, };
+const CAP_DATA_IMPORT: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::DATA_IMPORT, };
+const LLM: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::LLM, };
+const AGENT: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::AGENT, };
 
 /// Transport/execution family for one operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,10 +476,8 @@ macro_rules! define_operations {
             pub const fn requires_db_engine(self) -> bool {
                 matches!(
                     self.provider_capability(),
-                    Some(ServiceCapability::Database)
-                        | Some(ServiceCapability::Auth)
-                        | Some(ServiceCapability::Files)
-                        | Some(ServiceCapability::Events)
+                    Some(ServiceCapability::Database | ServiceCapability::Auth |
+ServiceCapability::Files | ServiceCapability::Events)
                 )
             }
 

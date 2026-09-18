@@ -13,29 +13,15 @@ use super::{
     NativeSemanticFunctions, NativeSemanticOptions, QueryRuntime, SemanticValue, SetAssignment,
 };
 
-type ClassifyFunction =
-    dyn for<'a> Fn(&'a Expression) -> EvaluationResult<ExpressionNode<'a>> + Send + Sync;
-
+type ClassifyFunction = dyn for<'a> Fn(&'a Expression) -> EvaluationResult<ExpressionNode<'a>> + Send + Sync;
 type LiteralFunction<V> = dyn Fn(&Expression) -> EvaluationResult<V> + Send + Sync;
-
-type FieldFunction<V> =
-    dyn Fn(&Expression, &Document) -> EvaluationResult<SemanticValue<V>> + Send + Sync;
-
+type FieldFunction<V> = dyn Fn(&Expression, &Document) -> EvaluationResult<SemanticValue<V>> + Send + Sync;
 type StrictBooleanFunction<V> = dyn Fn(&V) -> EvaluationResult<bool> + Send + Sync;
-
 type BooleanValueFunction<V> = dyn Fn(bool) -> V + Send + Sync;
-
-type CompareFunction<V> = dyn Fn(&Expression, SemanticValue<V>, SemanticValue<V>, MissingPolicy) -> EvaluationResult<bool>
-    + Send
-    + Sync;
-
-type AssignmentExpressionFunction =
-    dyn for<'a> Fn(&'a SetAssignment) -> EvaluationResult<&'a Expression> + Send + Sync;
-
+type CompareFunction<V> = dyn Fn(&Expression, SemanticValue<V>, SemanticValue<V>, MissingPolicy) -> EvaluationResult<bool> + Send + Sync;
+type AssignmentExpressionFunction = dyn for<'a> Fn(&'a SetAssignment) -> EvaluationResult<&'a Expression> + Send + Sync;
 type AssignmentFieldFunction = dyn Fn(&SetAssignment) -> Arc<str> + Send + Sync;
-
-type AssignFunction<V> =
-    dyn Fn(&SetAssignment, SemanticValue<V>, &Document) -> EvaluationResult<Document> + Send + Sync;
+type AssignFunction<V> = dyn Fn(&SetAssignment, SemanticValue<V>, &Document) -> EvaluationResult<Document> + Send + Sync;
 
 /// Function-backed production implementation of [`ExpressionModel`].
 pub struct NativeExpressionModel<V>
@@ -178,11 +164,7 @@ where
     }
 
     #[inline]
-    fn field(
-        &self,
-        expression: &Expression,
-        document: &Document,
-    ) -> EvaluationResult<SemanticValue<Self::Value>> {
+    fn field( &self, expression: &Expression, document: &Document, ) -> EvaluationResult<SemanticValue<Self::Value>> {
         (self.field)(expression, document)
     }
 
@@ -194,20 +176,11 @@ where
         (self.boolean_value)(value)
     }
 
-    fn compare(
-        &self,
-        expression: &Expression,
-        left: SemanticValue<Self::Value>,
-        right: SemanticValue<Self::Value>,
-        missing_policy: MissingPolicy,
-    ) -> EvaluationResult<bool> {
+    fn compare( &self, expression: &Expression, left: SemanticValue<Self::Value>, right: SemanticValue<Self::Value>, missing_policy: MissingPolicy, ) -> EvaluationResult<bool> {
         (self.compare)(expression, left, right, missing_policy)
     }
 
-    fn assignment_expression<'a>(
-        &self,
-        assignment: &'a SetAssignment,
-    ) -> EvaluationResult<&'a Expression> {
+    fn assignment_expression<'a>( &self, assignment: &'a SetAssignment, ) -> EvaluationResult<&'a Expression> {
         (self.assignment_expression)(assignment)
     }
 
@@ -215,12 +188,7 @@ where
         (self.assignment_field)(assignment)
     }
 
-    fn assign(
-        &self,
-        assignment: &SetAssignment,
-        value: SemanticValue<Self::Value>,
-        document: &Document,
-    ) -> EvaluationResult<Document> {
+    fn assign( &self, assignment: &SetAssignment, value: SemanticValue<Self::Value>, document: &Document, ) -> EvaluationResult<Document> {
         (self.assign)(assignment, value, document)
     }
 }
@@ -471,20 +439,13 @@ where
     }
 }
 
-fn required<T>(
-    value: Option<T>,
-    error: NativeExpressionModelBuildError,
-) -> Result<T, NativeExpressionModelBuildError> {
+fn required<T>( value: Option<T>, error: NativeExpressionModelBuildError, ) -> Result<T, NativeExpressionModelBuildError> {
     value.ok_or(error)
 }
 
 /// Converts a model integration failure to a backend evaluation error.
-#[must_use]
-pub fn model_backend_error(
-    operation: impl fmt::Display,
-    message: impl fmt::Display,
-) -> EvaluationError {
-    EvaluationError::backend(format!("expression model {operation} failed: {message}",))
+#[must_use] pub fn model_backend_error( operation: impl fmt::Display, message: impl fmt::Display, ) -> EvaluationError {
+    EvaluationError::backend(format!("expression model {operation} failed: {message}"))
 }
 
 #[cfg(test)]
@@ -492,12 +453,8 @@ mod tests {
     use super::*;
 
     #[test] fn builder_reports_completeness() { let builder = NativeExpressionModelBuilder::<bool>::new(); assert!(!builder.is_complete()); assert_eq!( builder.first_missing_operation(), Some(NativeExpressionModelBuildError::MissingClassify), ); }
-
     #[test] fn builder_is_cloneable() { let builder = NativeExpressionModelBuilder::<bool>::new(); let clone = builder.clone(); assert_eq!( clone.first_missing_operation(), Some(NativeExpressionModelBuildError::MissingClassify), ); }
-
     #[test] fn empty_builder_reports_first_missing_operation() { let error = NativeExpressionModelBuilder::<bool>::new() .build() .unwrap_err(); assert_eq!(error, NativeExpressionModelBuildError::MissingClassify,); }
-
     #[test] fn build_error_has_actionable_message() { let error = NativeExpressionModelBuildError::MissingStrictBoolean; assert_eq!(error.operation(), "strict boolean conversion"); assert!(error.to_string().contains(error.operation())); }
-
     #[test] fn public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<NativeExpressionModel<bool>>(); assert_send_and_sync::<NativeExpressionModelBuilder<bool>>(); assert_send_and_sync::<NativeExpressionModelBuildError>(); }
 }

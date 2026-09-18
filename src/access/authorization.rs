@@ -85,7 +85,6 @@ impl QueryAccess {
                 .map(str::to_ascii_lowercase)
                 .is_some_and(|name| matches!(name.as_str(), "insert" | "set" | "delete" | "load"))
         });
-
         Ok(Self {
             collection,
             action: if mutating {

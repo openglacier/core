@@ -7,10 +7,10 @@ use serde_json::Value;
 /// Current wire-protocol version.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Maximum MessagePack payload size accepted on the TCP listener.
+/// Maximum `MessagePack` payload size accepted on the TCP listener.
 pub const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
-/// Maximum MessagePack payload size emitted on the TCP listener.
+/// Maximum `MessagePack` payload size emitted on the TCP listener.
 pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Size of the big-endian length prefix used by the TCP protocol.
@@ -20,12 +20,12 @@ pub const LENGTH_PREFIX_BYTES: usize = 4;
 pub const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const JS_MIN_SAFE_INTEGER: i64 = -9_007_199_254_740_991;
 
-/// Serializes an unsigned integer without ever producing a MessagePack uint64 for JS-safe values.
+/// Serializes an unsigned integer without ever producing a `MessagePack` uint64 for JS-safe values.
 pub fn serialize_js_safe_u64<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    if *value <= u64::from(u32::MAX) {
+    if u32::try_from(*value).is_ok() {
         return serializer.serialize_u64(*value);
     }
     if *value > JS_MAX_SAFE_INTEGER {
@@ -34,12 +34,12 @@ where
     serializer.serialize_f64(*value as f64)
 }
 
-/// Serializes a signed integer without ever producing a MessagePack int64 for JS-safe values.
+/// Serializes a signed integer without ever producing a `MessagePack` int64 for JS-safe values.
 pub fn serialize_js_safe_i64<S>(value: &i64, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
 {
-    if *value >= i64::from(i32::MIN) && *value <= i64::from(i32::MAX) {
+    if i32::try_from(*value).is_ok() {
         return serializer.serialize_i64(*value);
     }
     if *value < JS_MIN_SAFE_INTEGER || *value > JS_MAX_SAFE_INTEGER as i64 {
@@ -130,8 +130,8 @@ impl Display for RequestId {
     }
 }
 
-/// One bounded MessagePack response in a streamed query result.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// One bounded `MessagePack` response in a streamed query result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum StreamResponse {
     Partial { kind: String, version: u16, id: RequestId, data: Value },
@@ -174,7 +174,7 @@ impl QueryRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum QueryResponse {
     /// The query completed successfully.
@@ -237,19 +237,14 @@ impl QueryResponse {
     #[must_use] pub const fn is_ok(&self) -> bool { matches!(self, Self::Ok { .. }) }
 }
 
-/// Error information exposed on the wire.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireError {
-    /// Stable machine-readable error code.
     pub code: String,
-
-    /// Human-readable error message.
     pub message: String,
 }
 
 impl WireError {
-    /// Creates wire error information.
     #[must_use]
     #[inline]
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -260,17 +255,15 @@ impl WireError {
     }
 }
 
-/// Protocol errors and diagnostic message kinds are defined in `error.rs`
-/// and re-exported here to preserve the existing public protocol API.
 pub use crate::error::{MessageKind, ProtocolError};
 
-/// Encodes a request as one length-prefixed MessagePack message.
+/// Encodes a request as one length-prefixed `MessagePack` message.
 pub fn encode_request(request: &QueryRequest) -> Result<Vec<u8>, ProtocolError> {
     request.validate()?;
     encode_message(request, MessageKind::Request, MAX_REQUEST_BYTES)
 }
 
-/// Decodes and validates one MessagePack request payload.
+/// Decodes and validates one `MessagePack` request payload.
 pub fn decode_request(payload: &[u8]) -> Result<QueryRequest, ProtocolError> {
     ensure_payload_size(MessageKind::Request, payload.len(), MAX_REQUEST_BYTES)?;
     let request: QueryRequest = rmp_serde::from_slice(payload)
@@ -279,12 +272,12 @@ pub fn decode_request(payload: &[u8]) -> Result<QueryRequest, ProtocolError> {
     Ok(request)
 }
 
-/// Encodes one streamed response as length-prefixed MessagePack.
+/// Encodes one streamed response as length-prefixed `MessagePack`.
 pub fn encode_stream_response(response: &StreamResponse) -> Result<Vec<u8>, ProtocolError> {
     encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
 }
 
-/// Decodes one streamed MessagePack response payload.
+/// Decodes one streamed `MessagePack` response payload.
 pub fn decode_stream_response(payload: &[u8]) -> Result<StreamResponse, ProtocolError> {
     ensure_payload_size(MessageKind::Response, payload.len(), MAX_RESPONSE_BYTES)?;
     let response: StreamResponse = rmp_serde::from_slice(payload)
@@ -309,12 +302,12 @@ pub fn decode_stream_response(payload: &[u8]) -> Result<StreamResponse, Protocol
     Ok(response)
 }
 
-/// Encodes a complete response as length-prefixed MessagePack.
+/// Encodes a complete response as length-prefixed `MessagePack`.
 pub fn encode_response(response: &QueryResponse) -> Result<Vec<u8>, ProtocolError> {
     encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
 }
 
-/// Decodes one complete MessagePack response payload.
+/// Decodes one complete `MessagePack` response payload.
 pub fn decode_response(payload: &[u8]) -> Result<QueryResponse, ProtocolError> {
     ensure_payload_size(MessageKind::Response, payload.len(), MAX_RESPONSE_BYTES)?;
     let response: QueryResponse = rmp_serde::from_slice(payload)
@@ -323,7 +316,7 @@ pub fn decode_response(payload: &[u8]) -> Result<QueryResponse, ProtocolError> {
     Ok(response)
 }
 
-/// Encodes any serializable value as a named MessagePack map with a 4-byte prefix.
+/// Encodes any serializable value as a named `MessagePack` map with a 4-byte prefix.
 pub fn encode_message<T>(
     value: &T,
     kind: MessageKind,
@@ -387,11 +380,7 @@ fn normalize_js_safe_numbers(value: &mut Value) -> Result<(), ProtocolError> {
 }
 
 /// Validates a decoded payload length before allocation or deserialization.
-pub fn ensure_payload_size(
-    kind: MessageKind,
-    actual: usize,
-    maximum: usize,
-) -> Result<(), ProtocolError> {
+pub const fn ensure_payload_size( kind: MessageKind, actual: usize, maximum: usize, ) -> Result<(), ProtocolError> {
     if actual == 0 {
         return Err(ProtocolError::InvalidPayloadLength { length: actual });
     }
@@ -401,7 +390,7 @@ pub fn ensure_payload_size(
     Ok(())
 }
 
-fn validate_response_version(response: &QueryResponse) -> Result<(), ProtocolError> {
+const fn validate_response_version(response: &QueryResponse) -> Result<(), ProtocolError> {
     let version = match response {
         QueryResponse::Ok { version, .. } | QueryResponse::Error { version, .. } => *version,
     };

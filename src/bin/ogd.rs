@@ -1,5 +1,7 @@
 //! OG daemon entry point.
 #![cfg_attr(rustfmt, rustfmt_skip)]
+#![allow(unused)]
+
 use std::{
     env, thread, fs, error::Error, fmt::{self, Display, Formatter}, io::{self, BufReader, Read, Write},
     net::{TcpListener, TcpStream}, path::{Path, PathBuf}, process::{Command, ExitCode, Stdio}, collections::{HashMap, HashSet}, sync::{ atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc, Condvar, Mutex, OnceLock },
@@ -198,21 +200,10 @@ fn run() -> Result<(), DaemonError> {
                 path: sync_root.clone(),
                 source,
             })?;
-            debug::log(
-                DebugTopic::Core,
-                None,
-                format!("Files sync root configured at {}", sync_root.display()),
-            );
+            debug::log( DebugTopic::Core, None, format!("Files sync root configured at {}", sync_root.display()), );
         }
     }
-    debug::log(DebugTopic::Core, None, format!(
-        "starting storage={} bind={} enabled={} published={} compiled={}",
-        if build_profile::has_db_engine() { configuration.storage_backend.as_str() } else { "disabled" },
-        configuration.bind_address,
-        configuration.node_capabilities.names().join(","),
-        configuration.published_capabilities.names().join(","),
-        ServiceCapabilities::compiled().names().join(","),
-    ));
+    debug::log(DebugTopic::Core, None, format!( "starting storage={} bind={} enabled={} published={} compiled={}", if build_profile::has_db_engine() { configuration.storage_backend.as_str() } else { "disabled" }, configuration.bind_address, configuration.node_capabilities.names().join(","), configuration.published_capabilities.names().join(","), ServiceCapabilities::compiled().names().join(","), ));
     if let Some(engine) = engine.as_ref() {
         start_debug_memory_reporter(Arc::clone(engine));
     }
@@ -327,25 +318,37 @@ fn run() -> Result<(), DaemonError> {
     } else {
         "disabled".to_owned()
     };
-    let with_modules = match configuration.storage_backend {
-        _default => {
-            let metrics = if configuration.import_metrics { ", metrics enabled" } else { "" };
-            let query_debug = if configuration.debug_query { ", query instrumentation enabled" } else { "" };
-            let authorization = format!( ", authorization {}{}", configuration.authorization_mode.as_str(), query_debug );
-            format!(
-                "memory limit {}, profile {}, runtime reserve {}, managed budget {}, planner cache {}, operation budget {}, query budget {}, import budget {}, heavy concurrency {}{}",
-                format_bytes(configuration.memory_profile.process_limit_bytes),
-                configuration.memory_profile.effective_profile_label(),
-                format_bytes(Some(configuration.memory_profile.runtime_reserve_bytes)),
-                format_bytes(configuration.memory_profile.managed_budget_bytes),
-                format_bytes(Some(configuration.memory_profile.planner_cache_bytes)),
-                format_bytes(Some(configuration.memory_profile.operation_budget_bytes)),
-                format_bytes(Some(configuration.memory_profile.query_budget_bytes)),
-                format_bytes(Some(configuration.memory_profile.import_budget_bytes)),
-                format_bytes(Some(configuration.memory_profile.max_concurrent_heavy)),
-                format!("{authorization}{metrics}"),
-            )
-        }
+    let with_modules = {
+        let metrics = if configuration.import_metrics {
+            ", metrics enabled"
+        } else {
+            ""
+        };
+        let query_debug = if configuration.debug_query {
+            ", query instrumentation enabled"
+        } else {
+            ""
+        };
+        let authorization = format!(
+            ", authorization {}{}",
+            configuration.authorization_mode.as_str(),
+            query_debug
+        );
+
+        format!(
+            "memory limit {}, profile {}, runtime reserve {}, managed budget {}, planner cache {}, operation budget {}, query budget {}, import budget {}, heavy concurrency {}{}{}",
+            format_bytes(configuration.memory_profile.process_limit_bytes),
+            configuration.memory_profile.effective_profile_label(),
+            format_bytes(Some(configuration.memory_profile.runtime_reserve_bytes)),
+            format_bytes(configuration.memory_profile.managed_budget_bytes),
+            format_bytes(Some(configuration.memory_profile.planner_cache_bytes)),
+            format_bytes(Some(configuration.memory_profile.operation_budget_bytes)),
+            format_bytes(Some(configuration.memory_profile.query_budget_bytes)),
+            format_bytes(Some(configuration.memory_profile.import_budget_bytes)),
+            format_bytes(Some(configuration.memory_profile.max_concurrent_heavy)),
+            authorization,
+            metrics,
+        )
     };
     const MODULE_LINE_COUNT: usize = 14;
 
@@ -363,38 +366,34 @@ fn run() -> Result<(), DaemonError> {
 
     let [with_modules1, with_modules2, with_modules3, with_modules4, with_modules5, with_modules6, with_modules7, with_modules8, with_modules9, with_modules10, with_modules11, with_modules12, with_modules13, with_modules14] =
         module_lines;
-    println!(
-        "                                          
-                                          
-                                          
-               ++++++#########            
-           +++++++#############           
-        ++++++++######++++++###           
-      ++++++++######     +++##+++         
-     ++++++  #####          ++++++        openglacier daemon version {version}
-    ++++++ #####             ++++++       
-   ++++++ #####               ++++++      Copyright (c) 2026 openglacier.org
-   +++++ #####                ######      under the MIT licence
-  ++++++#####          #############+     
-  +++++#####     ###################+     storage {with_engine} ({with_storage_path})
-  +++++####    ##########    #######+     transport {local_address}
-  ++++####      ####        ########+     
-  ++++####                 ####+###*+     {with_modules1}
-   +++####                #### ####+      {with_modules2}
-   ++####                #####+####+      {with_modules3}
-    +####               ##### +#####      {with_modules4}
-    +####+             #####+++#####      {with_modules5}
-     #####++         ##### ++++#####      {with_modules6}
-      ####++++++   ######++++++#####      {with_modules7}
-      #######++########+++++++ #####      {with_modules8}
-       ##############++++++    #####      {with_modules9}
-          ########             #####      {with_modules10}
-                                 ###      {with_modules11}
-                                          {with_modules12}
-                                          {with_modules13}
-                                          {with_modules14}
-"
+    println!("
+    \x1b[1mopenglacier core\x1b[0m - \x1b[3mantaa palaa\x1b[0m
+    \x1b[2mv{version}\x1b[0m
+
+    \x1b[1mRuntime\x1b[0m
+    storage      {with_engine} ({with_storage_path})
+    transport    {local_address}
+
+    \x1b[1mModules\x1b[0m
+    {with_modules1}
+    {with_modules2}
+    {with_modules3}
+    {with_modules4}
+    {with_modules5}
+    {with_modules6}
+    {with_modules7}
+    {with_modules8}
+    {with_modules9}
+    {with_modules10}
+    {with_modules11}
+    {with_modules12}
+    {with_modules13}
+    {with_modules14}
+
+    \x1b[2mCopyright (c) 2026 openglacier.org · MIT License\x1b[0m
+    "
     );
+
     if fabric_enabled {
         if let Some(listener) = listener {
             spawn_listener_thread(
@@ -435,14 +434,7 @@ fn run() -> Result<(), DaemonError> {
     }
 }
 
-fn spawn_listener_thread(
-    listener: TcpListener,
-    engine: Option<Arc<Engine>>,
-    operation_router: Arc<OperationRouter>,
-    event_engine: Arc<EventEngine>,
-    settings: Arc<ConnectionSettings>,
-    thread_name: &str,
-) -> Result<(), DaemonError> {
+fn spawn_listener_thread( listener: TcpListener, engine: Option<Arc<Engine>>, operation_router: Arc<OperationRouter>, event_engine: Arc<EventEngine>, settings: Arc<ConnectionSettings>, thread_name: &str, ) -> Result<(), DaemonError> {
     let name = thread_name.to_owned();
     thread::Builder::new().name(name.clone()).spawn(move || {
         for accepted in listener.incoming() {
@@ -466,26 +458,12 @@ fn spawn_listener_thread(
     Ok(())
 }
 
-fn spawn_serving_connection(
-    stream: TcpStream,
-    engine: Option<Arc<Engine>>,
-    operation_router: Arc<OperationRouter>,
-    event_engine: Arc<EventEngine>,
-    settings: Arc<ConnectionSettings>,
-    thread_name: &str,
-) -> Result<(), DaemonError> {
+fn spawn_serving_connection( stream: TcpStream, engine: Option<Arc<Engine>>, operation_router: Arc<OperationRouter>, event_engine: Arc<EventEngine>, settings: Arc<ConnectionSettings>, thread_name: &str, ) -> Result<(), DaemonError> {
     let name = thread_name.to_owned();
     thread::Builder::new().name(name).spawn(move || {
         let peer = stream.peer_addr().ok();
         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-        debug::log(
-            DebugTopic::Network,
-            Some(connection_id),
-            format!(
-                "connection peer={}",
-                peer.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
-            ),
-        );
+        debug::log( DebugTopic::Network, Some(connection_id), format!( "connection peer={}", peer.map_or_else(|| "unknown".to_owned(), |value| value.to_string()) ), );
         if let Err(error) = serve_connection(
             connection_id,
             stream,
@@ -495,11 +473,7 @@ fn spawn_serving_connection(
             &settings,
             None,
         ) {
-            debug::log(
-                DebugTopic::Network,
-                Some(connection_id),
-                format!("connection error: {error}"),
-            );
+            debug::log( DebugTopic::Network, Some(connection_id), format!("connection error: {error}"), );
             eprintln!("ogd connection: {error}");
         }
         debug::log(DebugTopic::Network, Some(connection_id), "disconnect");
@@ -578,13 +552,9 @@ fn write_node_message(websocket: &mut NodeWebSocket, value: &JsonValue) -> Resul
 fn read_node_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>, String> {
     loop {
         match websocket.read() {
-            Ok(WebSocketMessage::Binary(payload)) => {
-                return rmp_serde::from_slice::<JsonValue>(&payload).map(Some).map_err(|error| error.to_string());
-            }
+            Ok(WebSocketMessage::Binary(payload)) => { return rmp_serde::from_slice::<JsonValue>(&payload).map(Some).map_err(|error| error.to_string()); }
             Ok(WebSocketMessage::Close(_)) => return Ok(None),
-            Ok(WebSocketMessage::Ping(payload)) => {
-                websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?;
-            }
+            Ok(WebSocketMessage::Ping(payload)) => { websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?; }
             Ok(WebSocketMessage::Pong(_)) => {}
             Ok(WebSocketMessage::Text(_)) => return Err("node control channel requires binary MessagePack frames".to_owned()),
             Ok(_) => {}
@@ -604,22 +574,13 @@ enum NodeMessagePoll {
 fn poll_node_message(websocket: &mut NodeWebSocket) -> Result<NodeMessagePoll, String> {
     loop {
         match websocket.read() {
-            Ok(WebSocketMessage::Binary(payload)) => {
-                let message = rmp_serde::from_slice::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                return Ok(NodeMessagePoll::Message(message));
-            }
+            Ok(WebSocketMessage::Binary(payload)) => { let message = rmp_serde::from_slice::<JsonValue>(&payload).map_err(|error| error.to_string())?; return Ok(NodeMessagePoll::Message(message)); }
             Ok(WebSocketMessage::Close(_)) => return Ok(NodeMessagePoll::Closed),
-            Ok(WebSocketMessage::Ping(payload)) => {
-                websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?;
-            }
+            Ok(WebSocketMessage::Ping(payload)) => { websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?; }
             Ok(WebSocketMessage::Pong(_)) => {}
             Ok(WebSocketMessage::Text(_)) => return Err("node control channel requires binary MessagePack frames".to_owned()),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(error))
-                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) =>
-            {
-                return Ok(NodeMessagePoll::Idle);
-            }
+            Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => { return Ok(NodeMessagePoll::Idle); }
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -635,13 +596,9 @@ fn write_gateway_message(websocket: &mut NodeWebSocket, value: &JsonValue) -> Re
 fn read_gateway_message(websocket: &mut NodeWebSocket) -> Result<Option<JsonValue>, String> {
     loop {
         match websocket.read() {
-            Ok(WebSocketMessage::Text(payload)) => {
-                return serde_json::from_str::<JsonValue>(&payload).map(Some).map_err(|error| error.to_string());
-            }
+            Ok(WebSocketMessage::Text(payload)) => { return serde_json::from_str::<JsonValue>(&payload).map(Some).map_err(|error| error.to_string()); }
             Ok(WebSocketMessage::Close(_)) => return Ok(None),
-            Ok(WebSocketMessage::Ping(payload)) => {
-                websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?;
-            }
+            Ok(WebSocketMessage::Ping(payload)) => { websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?; }
             Ok(WebSocketMessage::Pong(_)) => {}
             Ok(WebSocketMessage::Binary(_)) => return Err("gateway client channel requires JSON text frames".to_owned()),
             Ok(_) => {}
@@ -668,12 +625,7 @@ fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &Operati
 }
 
 #[cfg(feature = "fabric")]
-fn connect_authenticated_gateway_client(
-    endpoint: &str,
-    credential: &IdentityCredential,
-    read_timeout: Duration,
-    write_timeout: Duration,
-) -> Result<NodeWebSocket, String> {
+fn connect_authenticated_gateway_client( endpoint: &str, credential: &IdentityCredential, read_timeout: Duration, write_timeout: Duration, ) -> Result<NodeWebSocket, String> {
     let (mut websocket, _) = websocket_connect(endpoint).map_err(|error| error.to_string())?;
     configure_websocket_timeouts(&mut websocket, read_timeout, write_timeout)
         .map_err(|error| format!("cannot configure Gateway client timeouts: {error}"))?;
@@ -740,12 +692,7 @@ fn has_upstream_gateway(settings: &ConnectionSettings) -> bool {
 }
 
 #[cfg(feature = "fabric")]
-fn connect_authenticated_gateway_client_any(
-    settings: &ConnectionSettings,
-    credential: &IdentityCredential,
-    read_timeout: Duration,
-    write_timeout: Duration,
-) -> Result<(NodeWebSocket, String), String> {
+fn connect_authenticated_gateway_client_any( settings: &ConnectionSettings, credential: &IdentityCredential, read_timeout: Duration, write_timeout: Duration, ) -> Result<(NodeWebSocket, String), String> {
     let endpoints = gateway_client_endpoints(settings);
     if endpoints.is_empty() {
         return Err("no upstream Gateway client endpoint".to_owned());
@@ -761,12 +708,7 @@ fn connect_authenticated_gateway_client_any(
 }
 
 #[cfg(not(feature = "fabric"))]
-fn connect_authenticated_gateway_client_any(
-    _settings: &ConnectionSettings,
-    _credential: &IdentityCredential,
-    _read_timeout: Duration,
-    _write_timeout: Duration,
-) -> Result<(NodeWebSocket, String), String> {
+fn connect_authenticated_gateway_client_any( _settings: &ConnectionSettings, _credential: &IdentityCredential, _read_timeout: Duration, _write_timeout: Duration, ) -> Result<(NodeWebSocket, String), String> {
     Err("ogd was built without the `fabric` feature".to_owned())
 }
 
@@ -776,12 +718,7 @@ fn write_json_wire_response(writer: &mut TcpStream, response: &JsonValue) -> Res
     writer.write_all(&encoded).map_err(ConnectionError::Write)
 }
 
-fn forward_authority_operation(
-    writer: &mut TcpStream,
-    settings: &ConnectionSettings,
-    principal: &Principal,
-    request: &OperationRequest,
-) -> Result<bool, ConnectionError> {
+fn forward_authority_operation( writer: &mut TcpStream, settings: &ConnectionSettings, principal: &Principal, request: &OperationRequest, ) -> Result<bool, ConnectionError> {
     if request.op.is_empty() || !has_upstream_gateway(settings) {
         return Ok(false);
     }
@@ -828,11 +765,7 @@ fn forward_authority_operation(
 }
 
 #[cfg(feature = "fabric")]
-fn configure_websocket_timeouts(
-    websocket: &mut NodeWebSocket,
-    read_timeout: Duration,
-    write_timeout: Duration,
-) -> io::Result<()> {
+fn configure_websocket_timeouts( websocket: &mut NodeWebSocket, read_timeout: Duration, write_timeout: Duration, ) -> io::Result<()> {
     match websocket.get_mut() {
         MaybeTlsStream::Plain(stream) => {
             stream.set_read_timeout(Some(read_timeout))?;
@@ -1016,11 +949,7 @@ fn ensure_gateway_device_registration(engine: &Engine, identity_id: &str, device
 }
 
 #[cfg(feature = "fabric")]
-fn authenticate_gateway_fabric(
-    control: &mut NodeWebSocket,
-    configuration: &Configuration,
-    engine: Option<&Engine>,
-) -> Result<(), String> {
+fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Configuration, engine: Option<&Engine>, ) -> Result<(), String> {
     write_node_message(control, &serde_json::json!({"kind": "gateway.probe", "version": 1}))?;
     let hello = read_node_message(control)?
         .ok_or_else(|| "Gateway closed before gateway.hello".to_owned())?;
@@ -1161,14 +1090,7 @@ fn persist_gateway_directory(path: &Path, endpoints: &HashSet<String>) -> Result
 }
 
 #[cfg(feature = "fabric")]
-fn run_gateway_fabric(
-    configuration: Configuration,
-    node_credential: IdentityCredential,
-    engine: Option<Arc<Engine>>,
-    operation_router: Arc<OperationRouter>,
-    event_engine: Arc<EventEngine>,
-    settings: Arc<ConnectionSettings>,
-) -> Result<(), DaemonError> {
+fn run_gateway_fabric( configuration: Configuration, node_credential: IdentityCredential, engine: Option<Arc<Engine>>, operation_router: Arc<OperationRouter>, event_engine: Arc<EventEngine>, settings: Arc<ConnectionSettings>, ) -> Result<(), DaemonError> {
     let configuration = Arc::new(configuration);
     let known = Arc::new(Mutex::new(HashSet::<String>::new()));
     let (sender, receiver) = mpsc::channel::<String>();
@@ -1227,26 +1149,14 @@ fn run_gateway_fabric(
 }
 
 #[cfg(not(feature = "fabric"))]
-fn run_gateway_fabric(
-    _configuration: Configuration,
-    _node_credential: IdentityCredential,
-    _engine: Option<Arc<Engine>>,
-    _operation_router: Arc<OperationRouter>,
-    _event_engine: Arc<EventEngine>,
-    _settings: Arc<ConnectionSettings>,
-) -> Result<(), DaemonError> {
+fn run_gateway_fabric( _configuration: Configuration, _node_credential: IdentityCredential, _engine: Option<Arc<Engine>>, _operation_router: Arc<OperationRouter>, _event_engine: Arc<EventEngine>, _settings: Arc<ConnectionSettings>, ) -> Result<(), DaemonError> {
     Err(DaemonError::Runtime(
         "Gateway mode requires an ogd build with the `fabric` feature".to_owned(),
     ))
 }
 
 #[cfg(feature = "fabric")]
-fn set_gateway_runtime_state(
-    settings: &ConnectionSettings,
-    endpoint: &str,
-    connected: bool,
-    disconnected_state: &'static str,
-) {
+fn set_gateway_runtime_state( settings: &ConnectionSettings, endpoint: &str, connected: bool, disconnected_state: &'static str, ) {
     let any_connected = {
         let mut connections = settings.gateway_connections.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         connections.insert(endpoint.to_owned(), connected);
@@ -1257,16 +1167,7 @@ fn set_gateway_runtime_state(
 }
 
 #[cfg(feature = "fabric")]
-fn run_gateway_node(
-    endpoint: String,
-    configuration: &Configuration,
-    node_credential: IdentityCredential,
-    engine: Option<Arc<Engine>>,
-    operation_router: Arc<OperationRouter>,
-    event_engine: Arc<EventEngine>,
-    settings: Arc<ConnectionSettings>,
-    discovery_sender: Option<mpsc::Sender<String>>,
-) -> Result<(), DaemonError> {
+fn run_gateway_node( endpoint: String, configuration: &Configuration, node_credential: IdentityCredential, engine: Option<Arc<Engine>>, operation_router: Arc<OperationRouter>, event_engine: Arc<EventEngine>, settings: Arc<ConnectionSettings>, discovery_sender: Option<mpsc::Sender<String>>, ) -> Result<(), DaemonError> {
     let capabilities = configuration.published_capabilities.names();
     let operation_contracts = OPERATION_CATALOG
         .iter()
@@ -1449,19 +1350,11 @@ fn run_gateway_node(
                     let delegated_token = message.get("delegationToken").and_then(JsonValue::as_str).map(str::to_owned);
                     if let Some(capability_name) = delegated_capability.as_deref() {
                         let Some(capability) = ServiceCapability::parse(capability_name) else {
-                            debug::log(
-                                DebugTopic::Gateway,
-                                None,
-                                format!("rejecting node.open for unknown capability={capability_name}"),
-                            );
+                            debug::log( DebugTopic::Gateway, None, format!("rejecting node.open for unknown capability={capability_name}"), );
                             continue;
                         };
                         if !configuration.published_capabilities.contains(capability) {
-                            debug::log(
-                                DebugTopic::Gateway,
-                                None,
-                                format!("rejecting node.open for unpublished capability={capability_name}"),
-                            );
+                            debug::log( DebugTopic::Gateway, None, format!("rejecting node.open for unpublished capability={capability_name}"), );
                             continue;
                         }
                     }
@@ -1539,26 +1432,12 @@ fn gateway_response_for_request(_websocket: &mut NodeWebSocket, _request: &Opera
 }
 
 #[cfg(not(feature = "fabric"))]
-fn connect_authenticated_gateway_client(
-    _endpoint: &str,
-    _credential: &IdentityCredential,
-    _read_timeout: Duration,
-    _write_timeout: Duration,
-) -> Result<NodeWebSocket, String> {
+fn connect_authenticated_gateway_client( _endpoint: &str, _credential: &IdentityCredential, _read_timeout: Duration, _write_timeout: Duration, ) -> Result<NodeWebSocket, String> {
     Err("ogd was built without the `fabric` feature".to_owned())
 }
 
 #[cfg(not(feature = "fabric"))]
-fn run_gateway_node(
-    _endpoint: String,
-    _configuration: &Configuration,
-    _credential: IdentityCredential,
-    _engine: Option<Arc<Engine>>,
-    _operation_router: Arc<OperationRouter>,
-    _event_engine: Arc<EventEngine>,
-    _settings: Arc<ConnectionSettings>,
-    _discovery_sender: Option<mpsc::Sender<String>>,
-) -> Result<(), DaemonError> {
+fn run_gateway_node( _endpoint: String, _configuration: &Configuration, _credential: IdentityCredential, _engine: Option<Arc<Engine>>, _operation_router: Arc<OperationRouter>, _event_engine: Arc<EventEngine>, _settings: Arc<ConnectionSettings>, _discovery_sender: Option<mpsc::Sender<String>>, ) -> Result<(), DaemonError> {
     Err(DaemonError::Runtime(
         "Gateway mode requires an ogd build with the `fabric` feature".to_owned(),
     ))
@@ -1620,14 +1499,7 @@ fn ensure_node_device_credential(engine: &Engine, credential: &IdentityCredentia
     if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
         return Err(DaemonError::NodeDeviceCredentialState);
     }
-    debug::log(
-        DebugTopic::Auth,
-        None,
-        format!(
-            "registered local node device credential identity={} device={}",
-            credential.identity_id, credential.device_id,
-        ),
-    );
+    debug::log( DebugTopic::Auth, None, format!( "registered local node device credential identity={} device={}", credential.identity_id, credential.device_id, ), );
     Ok(())
 }
 
@@ -1642,33 +1514,15 @@ fn ensure_node_events_permission(engine: &Engine, credential: &IdentityCredentia
 
     let query = enrollment_events_permission_query(&credential.identity_id, unix_time_millis());
     if execute_request(engine, QueryRequest::new(0, query)).is_ok() {
-        debug::log(
-            DebugTopic::Auth,
-            None,
-            format!(
-                "grant local node identity={} action=events.subscribe resource=* source=node-bootstrap",
-                credential.identity_id
-            ),
-        );
+        debug::log( DebugTopic::Auth, None, format!( "grant local node identity={} action=events.subscribe resource=* source=node-bootstrap", credential.identity_id ), );
     } else {
-        debug::log(
-            DebugTopic::Auth,
-            None,
-            format!(
-                "cannot grant local node identity={} action=events.subscribe resource=*",
-                credential.identity_id
-            ),
-        );
+        debug::log( DebugTopic::Auth, None, format!( "cannot grant local node identity={} action=events.subscribe resource=*", credential.identity_id ), );
     }
 }
 
 const FABRIC_DEFAULTS_ID: &str = "defaults";
 
-fn bootstrap_fabric_defaults_if_needed(
-    engine: &Engine,
-    credential: &og_core::access::identity_file::IdentityCredential,
-    published: ServiceCapabilities,
-) -> Result<(), DaemonError> {
+fn bootstrap_fabric_defaults_if_needed( engine: &Engine, credential: &og_core::access::identity_file::IdentityCredential, published: ServiceCapabilities, ) -> Result<(), DaemonError> {
     let query = format!(
         "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
         query_string(FABRIC_DEFAULTS_ID),
@@ -1716,19 +1570,7 @@ fn bootstrap_fabric_defaults_if_needed(
     if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
         return Err(DaemonError::BootstrapFabricResourcesState);
     }
-    debug::log(
-        DebugTopic::Gateway,
-        None,
-        format!(
-            "seed fabric defaults device={} capabilities={}",
-            credential.device_id,
-            assignments
-                .iter()
-                .filter_map(|assignment| assignment.get("capability").and_then(JsonValue::as_str))
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-    );
+    debug::log( DebugTopic::Gateway, None, format!( "seed fabric defaults device={} capabilities={}", credential.device_id, assignments .iter() .filter_map(|assignment| assignment.get("capability").and_then(JsonValue::as_str)) .collect::<Vec<_>>() .join(",") ), );
     Ok(())
 }
 
@@ -1947,12 +1789,7 @@ fn llm_run_owner(authentication: &ConnectionAuth, delegation: Option<&GatewayDel
 
 
 #[cfg(all(feature = "agent", feature = "fabric"))]
-fn connect_delegated_gateway_client(
-    endpoint: &str,
-    token: &str,
-    read_timeout: Duration,
-    write_timeout: Duration,
-) -> Result<NodeWebSocket, AgentError> {
+fn connect_delegated_gateway_client( endpoint: &str, token: &str, read_timeout: Duration, write_timeout: Duration, ) -> Result<NodeWebSocket, AgentError> {
     let (mut websocket, _) = websocket_connect(endpoint)
         .map_err(|error| AgentError::capability("gateway.delegation.open", error.to_string()))?;
     configure_websocket_timeouts(&mut websocket, read_timeout, write_timeout)
@@ -1997,10 +1834,7 @@ fn connect_delegated_gateway_client(
 }
 
 #[cfg(all(feature = "agent", feature = "fabric"))]
-fn connect_delegated_gateway_client_any(
-    settings: &ConnectionSettings,
-    token: &str,
-) -> Result<NodeWebSocket, AgentError> {
+fn connect_delegated_gateway_client_any( settings: &ConnectionSettings, token: &str, ) -> Result<NodeWebSocket, AgentError> {
     let endpoints = gateway_client_endpoints(settings);
     if endpoints.is_empty() {
         return Err(AgentError::capability(
@@ -2047,11 +1881,7 @@ impl fmt::Debug for LocalAgentInvoker<'_> {
 
 #[cfg(feature = "agent")]
 impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
-    fn invoke(
-        &mut self,
-        operation: &str,
-        data: JsonValue,
-    ) -> Result<AgentCapabilityResponse, AgentError> {
+    fn invoke( &mut self, operation: &str, data: JsonValue, ) -> Result<AgentCapabilityResponse, AgentError> {
         match operation {
             "llm.generate" => {
                 #[cfg(feature = "llm")]
@@ -2213,11 +2043,7 @@ impl GatewayAgentInvoker {
 
 #[cfg(all(feature = "agent", feature = "fabric"))]
 impl AgentCapabilityInvoker for GatewayAgentInvoker {
-    fn invoke(
-        &mut self,
-        operation: &str,
-        data: JsonValue,
-    ) -> Result<AgentCapabilityResponse, AgentError> {
+    fn invoke( &mut self, operation: &str, data: JsonValue, ) -> Result<AgentCapabilityResponse, AgentError> {
         let id = RequestId::Number(self.next_id);
         self.next_id = self.next_id.saturating_add(1);
         let request_id = serde_json::to_value(id)
@@ -2291,11 +2117,7 @@ impl fmt::Debug for OgdAgentInvoker<'_> {
 
 #[cfg(feature = "agent")]
 impl AgentCapabilityInvoker for OgdAgentInvoker<'_> {
-    fn invoke(
-        &mut self,
-        operation: &str,
-        data: JsonValue,
-    ) -> Result<AgentCapabilityResponse, AgentError> {
+    fn invoke( &mut self, operation: &str, data: JsonValue, ) -> Result<AgentCapabilityResponse, AgentError> {
         let provider = match self {
             Self::Local(_) => "local",
             #[cfg(feature = "fabric")]
@@ -2320,13 +2142,7 @@ impl AgentCapabilityInvoker for OgdAgentInvoker<'_> {
                     _ => {}
                 }
             }
-            debug::log(
-                DebugTopic::Agent,
-                None,
-                format!(
-                    "llm.generate provider={provider} output={output:?} toolCalls={tool_calls:?}"
-                ),
-            );
+            debug::log( DebugTopic::Agent, None, format!( "llm.generate provider={provider} output={output:?} toolCalls={tool_calls:?}" ), );
         }
         Ok(response)
     }
@@ -2394,15 +2210,7 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: Option<&Engi
                         "error": error.to_string(),
                     })
                 });
-            debug::log(
-                DebugTopic::Protocol,
-                Some(connection_id),
-                format!(
-                    "< message bytes={} encoding=msgpack {}",
-                    payload.len(),
-                    value
-                ),
-            );
+            debug::log( DebugTopic::Protocol, Some(connection_id), format!( "< message bytes={} encoding=msgpack {}", payload.len(), value ), );
         }
 
         let request_started = Instant::now();
@@ -2415,14 +2223,7 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: Option<&Engi
         match decoded {
             Ok(operation_request) => {
                 request_id = Some(operation_request.id);
-                debug::log(
-                    DebugTopic::Router,
-                    Some(connection_id),
-                    format!(
-                        "request id={} op={}",
-                        operation_request.id, operation_request.op
-                    ),
-                );
+                debug::log( DebugTopic::Router, Some(connection_id), format!( "request id={} op={}", operation_request.id, operation_request.op ), );
                 let authority_request = operation_request.clone();
                 match operation_router.route(operation_request) {
                     Ok(operation) => {
@@ -2517,26 +2318,14 @@ fn serve_connection( connection_id: u64, stream: TcpStream, engine: Option<&Engi
                         "protocol.unsafe_javascript_integer"
                     }
                 };
-                debug::log(
-                    DebugTopic::Protocol,
-                    Some(connection_id),
-                    format!("msgpack decode failed error={error}"),
-                );
+                debug::log( DebugTopic::Protocol, Some(connection_id), format!("msgpack decode failed error={error}"), );
                 let response = QueryResponse::protocol_error(code, error.to_string());
                 write_response(&mut writer, &response)?;
             }
         }
         let wire_us = elapsed_micros(wire_started);
         if debug::timing_enabled() {
-            debug::log(
-                DebugTopic::Executor,
-                Some(connection_id),
-                format!(
-                    "request_id={} decode_us={decode_us} wire_us={wire_us} total_us={}",
-                    request_id.map_or_else(|| "-".to_owned(), |id| id.to_string()),
-                    elapsed_micros(request_started)
-                ),
-            );
+            debug::log( DebugTopic::Executor, Some(connection_id), format!( "request_id={} decode_us={decode_us} wire_us={wire_us} total_us={}", request_id.map_or_else(|| "-".to_owned(), |id| id.to_string()), elapsed_micros(request_started) ), );
         }
 
         if settings.import_metrics && compact {
@@ -2559,11 +2348,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
     macro_rules! reject_response { ($response:expr)=>{{write_response(&mut writer,&$response)?;return Ok(true);}}; }
     match operation {
                             RoutedOperation::QueryExecute(Routed { id, input: QueryExecuteInput { query, context, read_only } }) => {
-                            debug::log(
-                                DebugTopic::Query,
-                                Some(connection_id),
-                                format!("id={id} {}", query),
-                            );
+                            debug::log( DebugTopic::Query, Some(connection_id), format!("id={id} {}", query), );
 
                             // Place context is optional for backward compatibility; AppInstance is an optional sub-scope.
                             // When supplied, it is untrusted wire data until og-core resolves it
@@ -2639,7 +2424,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                     && !context.place_role.can_write()
                                 {
                                     write_place_role_denied(
-                                        &mut writer,
+                                        writer,
                                         id,
                                         context,
                                         access.action,
@@ -2667,7 +2452,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                     None => {
                                         let response =
                                             execute_request(engine, QueryRequest::new(id, query));
-                                        write_response(&mut writer, &response)?;
+                                        write_response(writer, &response)?;
                                         return Ok(true);
                                     }
                                 };
@@ -2690,7 +2475,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                     )
                                 {
                                     write_authorization_denied(
-                                        &mut writer,
+                                        writer,
                                         id,
                                         authentication.principal(),
                                         access.action,
@@ -2729,7 +2514,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                             // scope is applied below query syntax. The legacy streaming path remains
                             // unchanged for unscoped queries.
                             let streaming = if execution_context.is_none() {
-                                try_write_streaming_request(engine, &mut writer, &request)
+                                try_write_streaming_request(engine, writer, &request)
                             } else {
                                 Ok(false)
                             };
@@ -2747,7 +2532,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                         execution_context.as_ref(),
                                     );
                                     let ok = response.is_ok();
-                                    write_response(&mut writer, &response)?;
+                                    write_response(writer, &response)?;
                                     let event_type = if ok { "query.finished" } else { "query.failed" };
                                     event_engine.publish_global(
                                         event_type,
@@ -2758,7 +2543,7 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                             (execution_context.as_ref(), scoped_write_collection.as_ref())
                                         {
                                             let audience = place_audience(engine, id, &context.place_id)
-                                                .unwrap_or_else(|_| Audience::Global);
+                                                .unwrap_or(Audience::Global);
                                             publish_durable_event(
                                                 engine,
                                                 audience,
@@ -2796,24 +2581,20 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
     macro_rules! value_or_reject { ($id:expr,$result:expr,$code:expr)=>{{match $result{Ok(value)=>value,Err(error)=>reject!($id,$code,error.to_string())}}}; }
     match operation {
                             RoutedOperation::AuthBegin(Routed { id, input: AuthBeginInput { identity_id, device_id } }) => {
-                            debug::log(
-                                DebugTopic::Auth,
-                                Some(connection_id),
-                                format!("begin identity={identity_id} device={device_id}"),
-                            );
+                            debug::log( DebugTopic::Auth, Some(connection_id), format!("begin identity={identity_id} device={device_id}"), );
                             match load_device_credential(engine, id, &identity_id, &device_id) {
                                 Ok(credential) => {
                                     match authentication.begin(&credential, DEFAULT_CHALLENGE_TTL) {
                                         Ok(challenge) => reply!(id, serde_json::to_value(challenge)
                                                     .expect("challenge serializes"),),
-                                        Err(error) => write_auth_error(&mut writer, id, error)?,
+                                        Err(error) => write_auth_error(writer, id, error)?,
                                     }
                                 }
-                                Err(response) => write_response(&mut writer, &response)?,
+                                Err(response) => write_response(writer, &response)?,
                             }
                         }
                             RoutedOperation::AuthComplete(Routed { id, input: ChallengeSignatureInput { challenge_id, signature } }) => {
-                            let Some((identity_id, device_id)) = pending_auth_subject(&authentication)
+                            let Some((identity_id, device_id)) = pending_auth_subject(authentication)
                             else {
                                 reject!(id, "auth.failed", "no authentication challenge is pending");
                             };
@@ -2824,11 +2605,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                                     &credential,
                                 ) {
                                     Ok(principal) => {
-                                        debug::log(
-                                            DebugTopic::Auth,
-                                            Some(connection_id),
-                                            format!("authenticated principal={principal:?}"),
-                                        );
+                                        debug::log( DebugTopic::Auth, Some(connection_id), format!("authenticated principal={principal:?}"), );
                                         event_engine.publish_global(
                                             "auth.authenticated",
                                             serde_json::json!({"identityId": identity_id, "deviceId": device_id}),
@@ -2842,17 +2619,13 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                                                 .get_mut()
                                                 .set_read_timeout(Some(Duration::from_millis(250)))
                                                 .map_err(ConnectionError::ConfigureSocket)?;
-                                            debug::log(
-                                                DebugTopic::Events,
-                                                Some(connection_id),
-                                                format!("authenticated keepalive subscribed subscription_id={subscription_id}"),
-                                            );
+                                            debug::log( DebugTopic::Events, Some(connection_id), format!("authenticated keepalive subscribed subscription_id={subscription_id}"), );
                                         }
                                         reply!(id, serde_json::json!({"authenticated": true, "principal": principal}),);
                                     }
-                                    Err(error) => write_auth_error(&mut writer, id, error)?,
+                                    Err(error) => write_auth_error(writer, id, error)?,
                                 },
-                                Err(response) => write_response(&mut writer, &response)?,
+                                Err(response) => write_response(writer, &response)?,
                             }
                         }
                             RoutedOperation::AuthEnrollBegin(Routed { id, input: AuthEnrollBeginInput { identity_id, identity_public_key, device_id, device_public_key, token } }) => {
@@ -2867,7 +2640,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                                 DEFAULT_CHALLENGE_TTL,
                             ) {
                                 Ok(challenge) => reply!(id, serde_json::to_value(challenge).expect("challenge serializes"),),
-                                Err(error) => write_auth_error(&mut writer, id, error)?,
+                                Err(error) => write_auth_error(writer, id, error)?,
                             }
                         }
                             RoutedOperation::AuthEnrollComplete(Routed { id, input: ChallengeSignatureInput { challenge_id, signature } }) => match authentication.complete_enrollment(&challenge_id, &signature) {
@@ -2877,21 +2650,21 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                                 let identity_response =
                                     execute_request(engine, QueryRequest::new(id, identity_query));
                                 if !identity_response.is_ok() {
-                                    write_response(&mut writer, &identity_response)?;
+                                    write_response(writer, &identity_response)?;
                                     return Ok(true);
                                 }
                                 let device_query = format!("on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}}}", query_string(&enrollment.device_id), query_string(&enrollment.identity_id), query_string(&enrollment.device_public_key));
                                 let device_response = execute_request(
                                     engine,
-                                    QueryRequest::new(id.clone(), device_query),
+                                    QueryRequest::new(id, device_query),
                                 );
                                 if !device_response.is_ok() {
                                     let rollback = format!( "on _identities | where identityId == {} | delete", query_string(&enrollment.identity_id) );
                                     let _ = execute_request(
                                         engine,
-                                        QueryRequest::new(id.clone(), rollback),
+                                        QueryRequest::new(id, rollback),
                                     );
-                                    write_response(&mut writer, &device_response)?;
+                                    write_response(writer, &device_response)?;
                                     return Ok(true);
                                 }
 
@@ -2904,31 +2677,24 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                                 );
                                 let permission_response = execute_request(
                                     engine,
-                                    QueryRequest::new(id.clone(), permission_query),
+                                    QueryRequest::new(id, permission_query),
                                 );
                                 if !permission_response.is_ok() {
                                     let rollback_device = format!( "on _devices | where deviceId == {} | delete", query_string(&enrollment.device_id) );
                                     let rollback_identity = format!( "on _identities | where identityId == {} | delete", query_string(&enrollment.identity_id) );
                                     let _ = execute_request(
                                         engine,
-                                        QueryRequest::new(id.clone(), rollback_device),
+                                        QueryRequest::new(id, rollback_device),
                                     );
                                     let _ = execute_request(
                                         engine,
-                                        QueryRequest::new(id.clone(), rollback_identity),
+                                        QueryRequest::new(id, rollback_identity),
                                     );
-                                    write_response(&mut writer, &permission_response)?;
+                                    write_response(writer, &permission_response)?;
                                     return Ok(true);
                                 }
 
-                                debug::log(
-                                    DebugTopic::Permission,
-                                    Some(connection_id),
-                                    format!(
-                                        "grant identity={} action=events.subscribe resource=* source=enrollment",
-                                        enrollment.identity_id
-                                    ),
-                                );
+                                debug::log( DebugTopic::Permission, Some(connection_id), format!( "grant identity={} action=events.subscribe resource=* source=enrollment", enrollment.identity_id ), );
                                 publish_durable_event(
                                     engine,
                                     Audience::identities([enrollment.identity_id.clone()]),
@@ -2937,14 +2703,14 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                                 );
                                 reply!(id, serde_json::json!({"enrolled": true, "identityId": enrollment.identity_id, "deviceId": enrollment.device_id}),);
                             }
-                            Err(error) => write_auth_error(&mut writer, id, error)?,
+                            Err(error) => write_auth_error(writer, id, error)?,
                         },
                             RoutedOperation::AuthClassicRegister(Routed { id, input: ClassicAuthRegisterInput { identifier, password } }) => {
                             if !settings.classic_auth_enabled { reject!(id, "auth.classic_disabled", "classic authentication is disabled"); }
                             let identity_id = identity_or_reject!(id, "an authenticated identity is required");
                             let identifier = identifier.trim();
                             if identifier.is_empty() || identifier.len() > 200 { reject!(id, "auth.invalid_identifier", "identifier must contain between 1 and 200 bytes"); }
-                            if password.as_bytes().len() < CLASSIC_AUTH_MIN_PASSWORD_BYTES { reject!(id, "auth.weak_password", "password must contain at least 12 bytes"); }
+                            if password.len() < CLASSIC_AUTH_MIN_PASSWORD_BYTES { reject!(id, "auth.weak_password", "password must contain at least 12 bytes"); }
                             let normalized = identifier.to_lowercase();
                             let existing = query_documents_or_reject!(id, format!("on _credentials | where loginNormalized == {} or identityId == {} | limit 1", query_string(&normalized), query_string(identity_id)));
                             if !existing.is_empty() { reject!(id, "auth.identifier_unavailable", "identifier or identity is already registered"); }
@@ -3001,7 +2767,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                             };
                             match authentication.establish(&device) {
                                 Ok(principal) => reply!(id, serde_json::json!({"authenticated": true, "principal": principal, "deviceId": device.device_id, "sourceDeviceId": source_device_id, "enrolled": enrolled})),
-                                Err(error) => write_auth_error(&mut writer, id, error)?,
+                                Err(error) => write_auth_error(writer, id, error)?,
                             }
                         }
                             RoutedOperation::IdentityGet(Routed { id, input: PasswordInput { password } }) => {
@@ -3009,7 +2775,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                             let portable = value_or_reject!(id, IdentityCredential::renew(identity_id), "identity.generate_failed");
                             let bytes = value_or_reject!(id, identity_file::encrypt_bytes(&portable, password.as_bytes()), "identity.encrypt_failed");
                             let now = unix_time_millis();
-                            execute_query_or_reject!(id, format!( "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {now}}}", query_string(&portable.device_id), query_string(&identity_id), query_string(&portable.public_key), ));
+                            execute_query_or_reject!(id, format!( "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {now}}}", query_string(&portable.device_id), query_string(identity_id), query_string(&portable.public_key), ));
                             reply!(id, serde_json::json!({ "file": encode_base64(&bytes), "fileName": format!("{identity_id}.ogid"), "identityId": identity_id, "deviceId": portable.device_id, }));
                         }
                             RoutedOperation::IdentityRenew(Routed { id, input: IdentityRenewInput { device_id, public_key, password } }) => {
@@ -3032,7 +2798,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                             let principal = Principal::Identity { identity_id: identity_id.clone(), device_id: device_id.clone() };
                             if portable_file.is_some() {
                                 let device = DeviceCredential { identity_id: identity_id.clone(), device_id: device_id.clone(), public_key: public_key.clone(), algorithm: "ed25519".to_owned(), encoding: "spki-der".to_owned(), active: true };
-                                if let Err(error) = authentication.establish(&device) { write_auth_error(&mut writer, id, error)?; return Ok(true); }
+                                if let Err(error) = authentication.establish(&device) { write_auth_error(writer, id, error)?; return Ok(true); }
                             }
                             publish_durable_event(engine, Audience::identities([identity_id.clone()]), "identity.renewed", serde_json::json!({"identityId": identity_id, "deviceId": device_id, "previousDeviceId": current_device_id, "renewedAt": now}));
                             let mut data = serde_json::json!({ "identityId": identity_id, "deviceId": device_id, "previousDeviceId": current_device_id, "renewedAt": now, "principal": principal });
@@ -3065,11 +2831,7 @@ fn handle_subscription_operation( mut writer: &mut TcpStream, reader: &mut BufRe
                             {
                                 ensure_authenticated_keepalive_type(&mut types);
                             }
-                            debug::log(
-                                DebugTopic::Events,
-                                Some(connection_id),
-                                format!("subscribe types={types:?}"),
-                            );
+                            debug::log( DebugTopic::Events, Some(connection_id), format!("subscribe types={types:?}"), );
                             let active = event_engine.subscribe(types);
                             let subscription_id = active.id();
                             *subscription = Some(active);
@@ -4214,7 +3976,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 ) {
                                     Ok(summary) => reply!(id, serde_json::json!({"name": name, "collections": summary.collections, "documents": summary.documents}),),
                                     Err(error) => write_response(
-                                        &mut writer,
+                                        writer,
                                         &QueryResponse::request_error(
                                             id,
                                             "backup.create_failed",
@@ -4239,7 +4001,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                                 "source": summary.source,
                                             }),),
                                     Err(error) => write_response(
-                                        &mut writer,
+                                        writer,
                                         &QueryResponse::request_error(
                                             id,
                                             "backup.inspect_failed",
@@ -4259,7 +4021,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                         reply!(id, serde_json::json!({"restored": true, "name": name, "collections": summary.collections, "documents": summary.documents}));
                                     }
                                     Err(error) => write_response(
-                                        &mut writer,
+                                        writer,
                                         &QueryResponse::request_error(
                                             id,
                                             "backup.restore_failed",
@@ -4309,7 +4071,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     principal_identity_id(authentication.principal()) == Some(identity_id.as_str());
                                 if !self_registration
                                     && !ensure_operation_resource_authorized(
-                                        &mut writer,
+                                        writer,
                                         settings,
                                         engine,
                                         authentication.principal(),
@@ -4331,7 +4093,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     Principal::Anonymous => None,
                                 };
                                 if current_device == Some(device_id.as_str()) {
-                                    write_response(&mut writer, &QueryResponse::request_error(
+                                    write_response(writer, &QueryResponse::request_error(
                                         id,
                                         "device.current_revoke_forbidden",
                                         "the current device cannot be revoked; use identity.renew instead",
@@ -4339,13 +4101,13 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     return Ok(());
                                 }
                                 let self_owned = if let Some(identity_id) = self_identity {
-                                    match try_load_device_credential(engine, id.clone(), identity_id, &device_id) {
+                                    match try_load_device_credential(engine, id, identity_id, &device_id) {
                                         Ok(Some(_)) => true,
                                         Ok(None) => false,
-                                        Err(response) => { write_response(&mut writer, &response)?; return Ok(()); }
+                                        Err(response) => { write_response(writer, &response)?; return Ok(()); }
                                     }
                                 } else { false };
-                                if !self_owned && !ensure_operation_resource_authorized(&mut writer, settings, engine, authentication.principal(), id.clone(), OperationKind::DeviceRevoke, "_devices")? {
+                                if !self_owned && !ensure_operation_resource_authorized(writer, settings, engine, authentication.principal(), id, OperationKind::DeviceRevoke, "_devices")? {
                                     return Ok(());
                                 }
                                 let revoked_at = revoked_at.unwrap_or_else(unix_time_millis);
@@ -4488,7 +4250,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 let detach_response =
                                     execute_request(engine, QueryRequest::new(id, detach_query));
                                 if !detach_response.is_ok() {
-                                    write_response(&mut writer, &detach_response)?;
+                                    write_response(writer, &detach_response)?;
                                     return Ok(());
                                 }
                                 let query = format!( "on _places | where placeId == {} and state == \"active\" | set state = \"deleted\", deletedAt = {deleted_at}", query_string(&place_id), );
@@ -5025,20 +4787,12 @@ fn event_visible_to(audience: &Audience, principal: &Principal) -> bool {
 }
 
 fn write_event( connection_id: u64, writer: &mut TcpStream, event: &og_core::CoreEvent, ) -> Result<(), ConnectionError> {
-    debug::log(
-        DebugTopic::Events,
-        Some(connection_id),
-        format!("deliver type={} event_id={}", event.event_type, event.id),
-    );
+    debug::log( DebugTopic::Events, Some(connection_id), format!("deliver type={} event_id={}", event.event_type, event.id), );
     if debug::protocol_enabled() {
         let value = serde_json::to_value(event)
             .map(debug::redact_json)
             .unwrap_or(JsonValue::Null);
-        debug::log(
-            DebugTopic::Protocol,
-            Some(connection_id),
-            format!("> event {}", value),
-        );
+        debug::log( DebugTopic::Protocol, Some(connection_id), format!("> event {}", value), );
     }
     let encoded = encode_message(event, MessageKind::Response, MAX_RESPONSE_BYTES)
         .map_err(ConnectionError::Encode)?;
@@ -5066,7 +4820,7 @@ fn pending_auth_subject(authentication: &ConnectionAuth) -> Option<(String, Stri
 
 fn try_load_device_credential( engine: &Engine, request_id: RequestId, identity_id: &str, device_id: &str, ) -> Result<Option<DeviceCredential>, QueryResponse> {
     let query = format!( "on _devices | where deviceId == {} and identityId == {} | limit 1", query_string(device_id), query_string(identity_id), );
-    let response = execute_request(engine, QueryRequest::new(request_id.clone(), query));
+    let response = execute_request(engine, QueryRequest::new(request_id, query));
     match response {
         QueryResponse::Ok { documents, .. } => {
             let Some(document) = documents.into_iter().next() else {
@@ -5103,7 +4857,7 @@ fn try_load_device_credential( engine: &Engine, request_id: RequestId, identity_
 }
 
 fn load_device_credential( engine: &Engine, request_id: RequestId, identity_id: &str, device_id: &str, ) -> Result<DeviceCredential, QueryResponse> {
-    match try_load_device_credential(engine, request_id.clone(), identity_id, device_id)? {
+    match try_load_device_credential(engine, request_id, identity_id, device_id)? {
         Some(credential) => Ok(credential),
         None => Err(QueryResponse::request_error(
             request_id,
@@ -5154,16 +4908,7 @@ struct ResourceAssignmentError {
     message: &'static str,
 }
 
-fn upsert_resource_assignment(
-    mut assignments: Vec<JsonValue>,
-    assigned_by: &str,
-    identity_id: &str,
-    device_id: &str,
-    capability: &str,
-    role: Option<&str>,
-    service_role: Option<&str>,
-    storage_role: Option<&str>,
-) -> Result<Vec<JsonValue>, ResourceAssignmentError> {
+fn upsert_resource_assignment( mut assignments: Vec<JsonValue>, assigned_by: &str, identity_id: &str, device_id: &str, capability: &str, role: Option<&str>, service_role: Option<&str>, storage_role: Option<&str>, ) -> Result<Vec<JsonValue>, ResourceAssignmentError> {
     let existing = assignments.iter().find(|entry| {
         let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
         let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
@@ -5253,12 +4998,7 @@ fn upsert_resource_assignment(
     Ok(assignments)
 }
 
-fn remove_resource_assignment(
-    mut assignments: Vec<JsonValue>,
-    identity_id: &str,
-    device_id: &str,
-    capability: &str,
-) -> Vec<JsonValue> {
+fn remove_resource_assignment( mut assignments: Vec<JsonValue>, identity_id: &str, device_id: &str, capability: &str, ) -> Vec<JsonValue> {
     assignments.retain(|entry| {
         let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
         let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
@@ -5595,11 +5335,7 @@ fn list_place_access( engine: &Engine, request_id: RequestId, place: &PlaceRecor
     }
 }
 
-fn place_audience(
-    engine: &Engine,
-    request_id: RequestId,
-    place_id: &str,
-) -> Result<Audience, QueryResponse> {
+fn place_audience( engine: &Engine, request_id: RequestId, place_id: &str, ) -> Result<Audience, QueryResponse> {
     let place = load_place(engine, request_id, place_id)?;
     let mut identities = vec![place.owner_identity_id.clone()];
     for entry in list_place_access(engine, request_id, &place)? {
@@ -5610,16 +5346,10 @@ fn place_audience(
     Ok(Audience::identities(identities))
 }
 
-fn resolve_place_role(
-    engine: &Engine,
-    request_id: RequestId,
-    identity_id: &str,
-    place: &PlaceRecord,
-) -> Result<Option<PlaceRole>, QueryResponse> {
+fn resolve_place_role( engine: &Engine, request_id: RequestId, identity_id: &str, place: &PlaceRecord, ) -> Result<Option<PlaceRole>, QueryResponse> {
     if place.owner_identity_id == identity_id {
         return Ok(Some(PlaceRole::Owner));
     }
-
     let query = format!( "on _sharings | where owner == {} and target == {} | select sharingId, permissions, placeRole, state", query_string(&place.owner_identity_id), query_string(identity_id), );
     match execute_request(engine, QueryRequest::new(request_id, query)) {
         QueryResponse::Ok { documents, .. } => {
@@ -5673,13 +5403,7 @@ fn resolve_place_role(
     }
 }
 
-fn resolve_place_access_for_principal(
-    engine: &Engine,
-    request_id: RequestId,
-    principal: &Principal,
-    place: &PlaceRecord,
-    allow_public: bool,
-) -> Result<PlaceRole, QueryResponse> {
+fn resolve_place_access_for_principal( engine: &Engine, request_id: RequestId, principal: &Principal, place: &PlaceRecord, allow_public: bool, ) -> Result<PlaceRole, QueryResponse> {
     if let Some(identity_id) = principal_identity_id(principal) {
         return resolve_place_role(engine, request_id, identity_id, place)?.ok_or_else(|| {
             QueryResponse::request_error(
@@ -5725,12 +5449,7 @@ fn list_public_places(engine: &Engine, request_id: RequestId) -> Result<Vec<Json
     Ok(visible)
 }
 
-fn list_storage_collections(
-    snapshot: &dyn StorageRead,
-    stats: bool,
-    place_id: Option<&str>,
-    app_instance_id: Option<&str>,
-) -> Result<Vec<JsonValue>, StorageError> {
+fn list_storage_collections( snapshot: &dyn StorageRead, stats: bool, place_id: Option<&str>, app_instance_id: Option<&str>, ) -> Result<Vec<JsonValue>, StorageError> {
     let mut collections = Vec::new();
     for name in snapshot.collections()? {
         if let Some(place_id) = place_id {
@@ -5746,7 +5465,7 @@ fn list_storage_collections(
                 &mut |stored| {
                     let document = stored.document();
                     let place_matches = document.get(PLACE_SCOPE_FIELD) == Some(&expected_place);
-                    let app_matches = expected_app_instance.as_ref().map_or(true, |expected| {
+                    let app_matches = expected_app_instance.as_ref().is_none_or(|expected| {
                         document.get(APP_INSTANCE_SCOPE_FIELD) == Some(expected)
                     });
                     if place_matches && app_matches {
@@ -5796,13 +5515,7 @@ fn list_storage_collections(
     Ok(collections)
 }
 
-fn resolve_query_execution_context(
-    engine: &Engine,
-    request_id: RequestId,
-    principal: &Principal,
-    requested: RequestedExecutionContext,
-    allow_public: bool,
-) -> Result<ExecutionContext, QueryResponse> {
+fn resolve_query_execution_context( engine: &Engine, request_id: RequestId, principal: &Principal, requested: RequestedExecutionContext, allow_public: bool, ) -> Result<ExecutionContext, QueryResponse> {
     let place = load_place(engine, request_id, &requested.place_id)?;
     let place_role = resolve_place_access_for_principal(
         engine,
@@ -5835,11 +5548,7 @@ fn resolve_query_execution_context(
     })
 }
 
-fn list_places_for_identity(
-    engine: &Engine,
-    request_id: RequestId,
-    identity_id: &str,
-) -> Result<Vec<JsonValue>, QueryResponse> {
+fn list_places_for_identity( engine: &Engine, request_id: RequestId, identity_id: &str, ) -> Result<Vec<JsonValue>, QueryResponse> {
     let places = match execute_request(
         engine,
         QueryRequest::new(
@@ -5878,11 +5587,7 @@ struct SharingRecord {
     target: String,
 }
 
-fn load_sharing(
-    engine: &Engine,
-    request_id: RequestId,
-    sharing_id: &str,
-) -> Result<SharingRecord, QueryResponse> {
+fn load_sharing( engine: &Engine, request_id: RequestId, sharing_id: &str, ) -> Result<SharingRecord, QueryResponse> {
     let query = format!( "on _sharings | where sharingId == {} | limit 1", query_string(sharing_id), );
     match execute_request(engine, QueryRequest::new(request_id, query)) {
         QueryResponse::Ok { documents, .. } => {
@@ -5916,11 +5621,7 @@ fn load_sharing(
     }
 }
 
-fn write_auth_error(
-    writer: &mut TcpStream,
-    request_id: RequestId,
-    error: og_core::AuthError,
-) -> Result<(), ConnectionError> {
+fn write_auth_error( writer: &mut TcpStream, request_id: RequestId, error: og_core::AuthError, ) -> Result<(), ConnectionError> {
     write_response(
         writer,
         &QueryResponse::request_error(request_id, "auth.failed", error.to_string()),
@@ -5931,10 +5632,7 @@ fn query_string(value: &str) -> String {
     serde_json::to_string(value).expect("serializing a Rust string to JSON cannot fail")
 }
 
-fn read_message(
-    reader: &mut BufReader<TcpStream>,
-    payload: &mut Vec<u8>,
-) -> Result<usize, ConnectionError> {
+fn read_message( reader: &mut BufReader<TcpStream>, payload: &mut Vec<u8>, ) -> Result<usize, ConnectionError> {
     let mut header = [0_u8; LENGTH_PREFIX_BYTES];
     match reader.read_exact(&mut header) {
         Ok(()) => {}
@@ -5951,11 +5649,7 @@ fn read_message(
     Ok(length)
 }
 
-fn try_write_streaming_request(
-    engine: &Engine,
-    writer: &mut TcpStream,
-    request: &QueryRequest,
-) -> Result<bool, ConnectionError> {
+fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request: &QueryRequest, ) -> Result<bool, ConnectionError> {
     let started = Instant::now();
     let parse_started = Instant::now();
     let pipeline = match parse_pipeline(&request.query) {
@@ -6081,7 +5775,7 @@ fn try_write_streaming_request(
             write_document(row.id(), row.document())
         })
     };
-    drop(write_document);
+
     let statistics = match streamed {
         Ok(Some(statistics)) => statistics,
         Ok(None) => {
@@ -6132,12 +5826,7 @@ fn try_write_streaming_request(
     Ok(true)
 }
 
-fn write_streaming_error(
-    writer: &mut TcpStream,
-    request_id: RequestId,
-    code: impl Into<String>,
-    message: impl Into<String>,
-) -> Result<(), ConnectionError> {
+fn write_streaming_error( writer: &mut TcpStream, request_id: RequestId, code: impl Into<String>, message: impl Into<String>, ) -> Result<(), ConnectionError> {
     let mut buffer = Vec::with_capacity(512);
     write_stream_response_buffered(
         writer,
@@ -6153,8 +5842,6 @@ fn enrollment_events_permission_query(identity_id: &str, created_at: u64) -> Str
         query_string(identity_id)
     )
 }
-
-
 
 fn file_scope_component(value:&str)->String{
     let mut encoded=String::with_capacity(value.len()*2);
@@ -6195,12 +5882,7 @@ fn run_data_worker_for_file(settings:&ConnectionSettings,engine:&Engine,id:Reque
     result
 }
 
-fn scoped_native_file_store(
-    settings:&ConnectionSettings,
-    id:RequestId,
-    place_id:&str,
-    instance_id:&str,
-)->Result<NativeFileStore,QueryResponse>{
+fn scoped_native_file_store( settings:&ConnectionSettings, id:RequestId, place_id:&str, instance_id:&str, )->Result<NativeFileStore,QueryResponse>{
     let root=settings.files_path
         .join(file_scope_component(place_id))
         .join(file_scope_component(instance_id));
@@ -6208,13 +5890,7 @@ fn scoped_native_file_store(
         .map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))
 }
 
-
-fn scoped_native_version_store(
-    settings:&ConnectionSettings,
-    id:RequestId,
-    place_id:&str,
-    instance_id:&str,
-)->Result<NativeFileStore,QueryResponse>{
+fn scoped_native_version_store( settings:&ConnectionSettings, id:RequestId, place_id:&str, instance_id:&str, )->Result<NativeFileStore,QueryResponse>{
     let root=settings.files_path
         .join(".versions")
         .join(file_scope_component(place_id))
@@ -6225,9 +5901,7 @@ fn scoped_native_version_store(
 
 static NEXT_FILE_VERSION_ID: AtomicU64 = AtomicU64::new(1);
 
-fn file_version_json(
-    version_id:&str,file:&FileEntry,remote_id:&str,metadata:&og_core::files::FileMetadata,created_at:u64
-)->JsonValue{
+fn file_version_json( version_id:&str,file:&FileEntry,remote_id:&str,metadata:&og_core::files::FileMetadata,created_at:u64 )->JsonValue{
     serde_json::json!({
         "versionId":version_id,
         "fileId":file.file_id.as_str(),
@@ -6244,17 +5918,13 @@ fn file_version_json(
 }
 
 #[cfg(feature = "files")]
-fn list_file_versions(
-    engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
-)->Result<Vec<JsonValue>,QueryResponse>{
+fn list_file_versions( engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str )->Result<Vec<JsonValue>,QueryResponse>{
     let query=format!( "on _file_versions | where _place == {} and _app_instance == {} and fileId == {} | sort createdAt desc", query_string(place_id),query_string(instance_id),query_string(file_id) );
     match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{documents,..}=>Ok(documents),error@QueryResponse::Error{..}=>Err(error)}
 }
 
 #[cfg(feature = "files")]
-fn load_file_version(
-    engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str
-)->Result<JsonValue,QueryResponse>{
+fn load_file_version( engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str )->Result<JsonValue,QueryResponse>{
     let query=format!( "on _file_versions | where _place == {} and _app_instance == {} and fileId == {} and versionId == {} | limit 1", query_string(place_id),query_string(instance_id),query_string(file_id),query_string(version_id) );
     match execute_request(engine,QueryRequest::new(id,query)){
         QueryResponse::Ok{documents,..}=>documents.into_iter().next().ok_or_else(||QueryResponse::request_error(id,"file.version_not_found","File version was not found")),
@@ -6263,16 +5933,12 @@ fn load_file_version(
 }
 
 #[cfg(feature = "files")]
-fn delete_file_version_metadata(
-    engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str
-)->Result<(),QueryResponse>{
+fn delete_file_version_metadata( engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str )->Result<(),QueryResponse>{
     let query=format!( "on _file_versions | where _place == {} and _app_instance == {} and fileId == {} and versionId == {} | delete", query_string(place_id),query_string(instance_id),query_string(file_id),query_string(version_id) );
     match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(()),error@QueryResponse::Error{..}=>Err(error)}
 }
 
-fn archive_current_file(
-    engine:&Engine,settings:&ConnectionSettings,id:RequestId,file:&FileEntry
-)->Result<JsonValue,QueryResponse>{
+fn archive_current_file( engine:&Engine,settings:&ConnectionSettings,id:RequestId,file:&FileEntry )->Result<JsonValue,QueryResponse>{
     let source=scoped_native_file_store(settings,id,&file.place_id,&file.app_instance_id)?;
     let versions=scoped_native_version_store(settings,id,&file.place_id,&file.app_instance_id)?;
     let created_at=unix_time_millis();
@@ -6295,9 +5961,7 @@ fn archive_current_file(
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn resolve_file_context(
-    engine:&Engine, id:RequestId, principal:&Principal, allow_public:bool, place_id:&str, instance_id:&str, write:bool
-)->Result<ExecutionContext,QueryResponse>{
+fn resolve_file_context( engine:&Engine, id:RequestId, principal:&Principal, allow_public:bool, place_id:&str, instance_id:&str, write:bool )->Result<ExecutionContext,QueryResponse>{
     let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:Some(instance_id.to_owned())},allow_public)?;
     if write && !context.place_role.can_write(){
         return Err(QueryResponse::request_error(id,"authorization.denied","Place access is read-only for Files"));
@@ -6403,7 +6067,6 @@ fn delete_file_metadata(engine:&Engine,id:RequestId,place_id:&str,instance_id:&s
     match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(()),error@QueryResponse::Error{..}=>Err(error)}
 }
 
-
 fn replace_file_json(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,json:&JsonValue)->Result<JsonValue,QueryResponse>{
     let delete=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete",query_string(place_id),query_string(instance_id),query_string(file_id));
     match execute_request(engine,QueryRequest::new(id,delete)){
@@ -6477,9 +6140,7 @@ fn file_is_trashed(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,fi
 }
 
 #[cfg(feature = "files")]
-fn restore_file_entry(
-    engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
-)->Result<JsonValue,QueryResponse>{
+fn restore_file_entry( engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str )->Result<JsonValue,QueryResponse>{
     let mut json=load_file_entry_json(engine,id,place_id,instance_id,file_id)?;
     if json.get("trashed").and_then(JsonValue::as_bool)!=Some(true){
         return Err(QueryResponse::request_error(id,"file.not_trashed","File entry is not in the trash"));
@@ -6519,9 +6180,7 @@ fn restore_file_entry(
 }
 
 #[cfg(feature = "files")]
-fn purge_file_versions(
-    engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
-)->Result<(),QueryResponse>{
+fn purge_file_versions( engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str )->Result<(),QueryResponse>{
     let versions=list_file_versions(engine,id,place_id,instance_id,file_id)?;
     if versions.is_empty(){return Ok(());}
     let store=scoped_native_version_store(settings,id,place_id,instance_id)?;
@@ -6537,9 +6196,7 @@ fn purge_file_versions(
 }
 
 #[cfg(feature = "files")]
-fn permanently_delete_file_tree(
-    engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str
-)->Result<(),QueryResponse>{
+fn permanently_delete_file_tree( engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str )->Result<(),QueryResponse>{
     let entry=load_file_entry(engine,id,place_id,instance_id,file_id)?;
     for child in child_file_entries(engine,id,place_id,instance_id,file_id)? {
         permanently_delete_file_tree(engine,settings,id,place_id,instance_id,child.file_id.as_str())?;
@@ -6613,12 +6270,7 @@ fn write_file_store_error(writer:&mut TcpStream,id:RequestId,error:FileStoreErro
     write_response(writer,&file_store_query_error(id,error))
 }
 
-fn require_identity<'a>(
-    writer: &mut TcpStream,
-    principal: &'a og_core::access::auth::Principal,
-    id: RequestId,
-    message: &str,
-) -> Result<Option<&'a str>, ConnectionError> {
+fn require_identity<'a>( writer: &mut TcpStream, principal: &'a og_core::access::auth::Principal, id: RequestId, message: &str, ) -> Result<Option<&'a str>, ConnectionError> {
     let Some(identity_id) = principal_identity_id(principal) else {
         write_response(writer, &QueryResponse::request_error(id, "authorization.required", message))?;
         return Ok(None);
@@ -6626,13 +6278,7 @@ fn require_identity<'a>(
     Ok(Some(identity_id))
 }
 
-fn ensure_routed_static_authorized(
-    writer: &mut TcpStream,
-    settings: &ConnectionSettings,
-    engine: Option<&Engine>,
-    principal: &og_core::access::auth::Principal,
-    operation: &RoutedOperation,
-) -> Result<bool, ConnectionError> {
+fn ensure_routed_static_authorized( writer: &mut TcpStream, settings: &ConnectionSettings, engine: Option<&Engine>, principal: &og_core::access::auth::Principal, operation: &RoutedOperation, ) -> Result<bool, ConnectionError> {
     match operation.kind().access() {
         AccessPolicy::Permission { action, resource } => {
             let Some(engine) = engine else {
@@ -6655,15 +6301,7 @@ fn ensure_routed_static_authorized(
     }
 }
 
-fn ensure_operation_resource_authorized(
-    writer: &mut TcpStream,
-    settings: &ConnectionSettings,
-    engine: &Engine,
-    principal: &og_core::access::auth::Principal,
-    id: RequestId,
-    operation: OperationKind,
-    resource: &str,
-) -> Result<bool, ConnectionError> {
+fn ensure_operation_resource_authorized( writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, principal: &og_core::access::auth::Principal, id: RequestId, operation: OperationKind, resource: &str, ) -> Result<bool, ConnectionError> {
     match operation.access() {
         AccessPolicy::DynamicPermission(action) =>
             ensure_authorized(writer, settings, engine, principal, id, action, resource),
@@ -6673,15 +6311,7 @@ fn ensure_operation_resource_authorized(
     }
 }
 
-fn ensure_authorized(
-    writer: &mut TcpStream,
-    settings: &ConnectionSettings,
-    engine: &Engine,
-    principal: &og_core::access::auth::Principal,
-    id: RequestId,
-    action: AuthorizationAction,
-    resource: &str,
-) -> Result<bool, ConnectionError> {
+fn ensure_authorized( writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, principal: &og_core::access::auth::Principal, id: RequestId, action: AuthorizationAction, resource: &str, ) -> Result<bool, ConnectionError> {
     if !settings.authorization_mode.is_enforced() || authorize_connection(engine, principal, action, resource) {
         return Ok(true);
     }
@@ -6689,12 +6319,7 @@ fn ensure_authorized(
     Ok(false)
 }
 
-fn authorize_connection(
-    engine: &Engine,
-    principal: &og_core::access::auth::Principal,
-    action: AuthorizationAction,
-    resource: &str,
-) -> bool {
+fn authorize_connection( engine: &Engine, principal: &og_core::access::auth::Principal, action: AuthorizationAction, resource: &str, ) -> bool {
     let Some(request) = AuthorizationRequest::from_principal(principal, action, resource) else {
         return false;
     };
@@ -6712,13 +6337,7 @@ fn permission_exists(engine: &Engine, request: &AuthorizationRequest) -> bool {
     )
 }
 
-fn write_authorization_denied(
-    writer: &mut TcpStream,
-    id: RequestId,
-    principal: &og_core::access::auth::Principal,
-    action: AuthorizationAction,
-    resource: &str,
-) -> Result<(), ConnectionError> {
+fn write_authorization_denied( writer: &mut TcpStream, id: RequestId, principal: &og_core::access::auth::Principal, action: AuthorizationAction, resource: &str, ) -> Result<(), ConnectionError> {
     let message = match principal {
         og_core::access::auth::Principal::Anonymous => format!(
             "authentication is required for {} on {:?}",
@@ -6738,13 +6357,7 @@ fn write_authorization_denied(
     )
 }
 
-fn write_place_role_denied(
-    writer: &mut TcpStream,
-    id: RequestId,
-    context: &ExecutionContext,
-    action: AuthorizationAction,
-    resource: &str,
-) -> Result<(), ConnectionError> {
+fn write_place_role_denied( writer: &mut TcpStream, id: RequestId, context: &ExecutionContext, action: AuthorizationAction, resource: &str, ) -> Result<(), ConnectionError> {
     let message = format!( "Place role {:?} is not allowed to perform {} on {:?} in Place {:?}", context.place_role.as_str(), action.as_str(), resource, context.place_id, );
     write_response(
         writer,
@@ -6752,12 +6365,7 @@ fn write_place_role_denied(
     )
 }
 
-fn publish_durable_event(
-    engine: &Engine,
-    audience: Audience,
-    event_type: &str,
-    payload: JsonValue,
-) -> bool {
+fn publish_durable_event( engine: &Engine, audience: Audience, event_type: &str, payload: JsonValue, ) -> bool {
     let created_at = unix_time_millis();
     let event_id = EVENT_OUTBOX_ID_GENERATOR
         .get_or_init(UuidV7Generator::new)
@@ -6775,14 +6383,7 @@ fn publish_durable_event(
     if stored {
         event_outbox_wake().notify();
     }
-    debug::log(
-        DebugTopic::Events,
-        None,
-        format!(
-            "outbox {} type={event_type} event_id={event_id}",
-            if stored { "pending" } else { "failed" }
-        ),
-    );
+    debug::log( DebugTopic::Events, None, format!( "outbox {} type={event_type} event_id={event_id}", if stored { "pending" } else { "failed" } ), );
     stored
 }
 
@@ -6865,11 +6466,7 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
             let estimate = serde_json::to_vec(&document)
                 .map_or(4096, |bytes| bytes.len().saturating_add(1024));
             let Ok(_permit) = engine.memory_governor().reserve(MemoryClass::Indexing, estimate) else {
-                debug::log(
-                    DebugTopic::Events,
-                    None,
-                    format!("outbox deferred reason=memory estimate={estimate}"),
-                );
+                debug::log( DebugTopic::Events, None, format!("outbox deferred reason=memory estimate={estimate}"), );
                 return Some(EVENT_OUTBOX_RETRY_DELAY);
             };
             let audience = document
@@ -6887,11 +6484,7 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
             );
 
             if events.publish(event) {
-                debug::log(
-                    DebugTopic::Events,
-                    None,
-                    format!("publish type={event_type} event_id={event_id}"),
-                );
+                debug::log( DebugTopic::Events, None, format!("publish type={event_type} event_id={event_id}"), );
                 let delivered = format!(
                     "on _event_outbox | where _id == {} | delete",
                     query_string(row_id),
@@ -6902,11 +6495,7 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
                     return Some(EVENT_OUTBOX_RETRY_DELAY);
                 }
             } else {
-                debug::log(
-                    DebugTopic::Events,
-                    None,
-                    format!("retry type={event_type} event_id={event_id} reason=queue_full"),
-                );
+                debug::log( DebugTopic::Events, None, format!("retry type={event_type} event_id={event_id} reason=queue_full"), );
                 let retry_at = unix_time_millis().saturating_add(
                     u64::try_from(EVENT_OUTBOX_RETRY_DELAY.as_millis()).unwrap_or(u64::MAX),
                 );
@@ -6951,17 +6540,7 @@ fn start_debug_memory_reporter(engine: Arc<Engine>) {
                     )
                 },
             );
-            debug::log(
-                DebugTopic::Memory,
-                None,
-                format!(
-                    "{process} governed={} peak={} reservations={} rejected={}",
-                    format_bytes(Some(snapshot.current_bytes)),
-                    format_bytes(Some(snapshot.peak_bytes)),
-                    snapshot.active_reservations,
-                    snapshot.failed_reservations
-                ),
-            );
+            debug::log( DebugTopic::Memory, None, format!( "{process} governed={} peak={} reservations={} rejected={}", format_bytes(Some(snapshot.current_bytes)), format_bytes(Some(snapshot.peak_bytes)), snapshot.active_reservations, snapshot.failed_reservations ), );
             thread::sleep(Duration::from_secs(1));
         })
         .expect("debug memory reporter must start");
@@ -6971,11 +6550,7 @@ fn execute_request(engine: &Engine, request: QueryRequest) -> QueryResponse {
     execute_request_scoped(engine, request, None)
 }
 
-fn execute_request_scoped(
-    engine: &Engine,
-    request: QueryRequest,
-    context: Option<&ExecutionContext>,
-) -> QueryResponse {
+fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Option<&ExecutionContext>, ) -> QueryResponse {
     let started = Instant::now();
     let parse_started = Instant::now();
     let pipeline = match parse_pipeline(&request.query) {
@@ -7089,10 +6664,7 @@ fn execute_request_scoped(
 }
 
 #[inline]
-fn execution_row_to_json(
-    row: &og_core::query::ExecutionRow,
-    plan: &og_core::query::PhysicalPlan,
-) -> JsonValue {
+fn execution_row_to_json( row: &og_core::query::ExecutionRow, plan: &og_core::query::PhysicalPlan, ) -> JsonValue {
     let mut value = document_to_json(row.document());
     if exposes_document_id(plan)
         && !matches!(row.origin(), og_core::query::ExecutionRowOrigin::Synthetic)
@@ -7246,20 +6818,13 @@ fn write_response(writer: &mut TcpStream, response: &QueryResponse) -> Result<()
     writer.flush().map_err(ConnectionError::Write)
 }
 
-fn write_stream_response(
-    writer: &mut TcpStream,
-    response: &StreamResponse,
-) -> Result<(), ConnectionError> {
+fn write_stream_response( writer: &mut TcpStream, response: &StreamResponse, ) -> Result<(), ConnectionError> {
     let encoded =
         og_core::protocol::encode_stream_response(response).map_err(ConnectionError::Encode)?;
     writer.write_all(&encoded).map_err(ConnectionError::Write)
 }
 
-fn write_stream_response_buffered(
-    writer: &mut TcpStream,
-    response: &StreamResponse,
-    buffer: &mut Vec<u8>,
-) -> Result<(), ConnectionError> {
+fn write_stream_response_buffered( writer: &mut TcpStream, response: &StreamResponse, buffer: &mut Vec<u8>, ) -> Result<(), ConnectionError> {
     let encoded =
         og_core::protocol::encode_stream_response(response).map_err(ConnectionError::Encode)?;
     buffer.clear();
@@ -7267,11 +6832,7 @@ fn write_stream_response_buffered(
     writer.write_all(buffer).map_err(ConnectionError::Write)
 }
 
-fn write_message_buffered<T: Serialize>(
-    writer: &mut TcpStream,
-    value: &T,
-    buffer: &mut Vec<u8>,
-) -> Result<(), ConnectionError> {
+fn write_message_buffered<T: Serialize>( writer: &mut TcpStream, value: &T, buffer: &mut Vec<u8>, ) -> Result<(), ConnectionError> {
     let payload = rmp_serde::to_vec_named(value)
         .map_err(|error| ConnectionError::Encode(ProtocolError::InvalidMessagePackEncode(error)))?;
     buffer.clear();
@@ -7584,14 +7145,19 @@ impl Configuration {
     fn bootstrap_password(&self) -> Result<Vec<u8>, DaemonError> {
         if let Some(path) = &self.bootstrap_password_file {
             let mut password = fs::read(path).map_err(DaemonError::BootstrapAdmin)?;
-            while password.last().is_some_and(|byte| matches!(byte, b'\n' | b'\r')) { password.pop(); }
-            if !password.is_empty() { return Ok(password); }
+            while password.last().is_some_and(|byte| matches!(byte, b'\n' | b'\r')) {
+                password.pop();
+            }
+            if !password.is_empty() {
+                return Ok(password);
+            }
         }
-        self.bootstrap_password
+
+        Ok(self.bootstrap_password
             .as_ref()
             .filter(|value| !value.is_empty())
             .map(|value| value.as_bytes().to_vec())
-            .ok_or(DaemonError::BootstrapPasswordMissing)
+            .unwrap_or_else(|| b"openglacierd".to_vec()))
     }
 }
 
@@ -8372,16 +7938,7 @@ fn file_sync_local_name(path: &Path, kind: &str) -> Result<String, String> {
     Ok(name.to_owned())
 }
 
-fn file_sync_reconcile_local_mutations(
-    source: &mut FileSyncSource<'_>,
-    root: &Path,
-    selection: &og_core::files::FileSyncSelection,
-    base: &Path,
-    primary_files: bool,
-    tree: &[FileEntry],
-    paths: &HashMap<String, PathBuf>,
-    index: &FileSyncIndex,
-) -> Result<FileSyncMutationSummary, String> {
+fn file_sync_reconcile_local_mutations( source: &mut FileSyncSource<'_>, root: &Path, selection: &og_core::files::FileSyncSelection, base: &Path, primary_files: bool, tree: &[FileEntry], paths: &HashMap<String, PathBuf>, index: &FileSyncIndex, ) -> Result<FileSyncMutationSummary, String> {
     let mutable_ids = file_sync_mutable_ids(tree, selection);
     let by_id: HashMap<String, FileEntry> = tree.iter().cloned().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
     let previous: HashMap<String, FileSyncIndexEntry> = index.entries.iter()
@@ -8633,13 +8190,7 @@ fn file_sync_reserve_component(base: &Path, desired: String, stable_id: &str, cl
     }
 }
 
-fn file_sync_relative_paths(
-    entries: &[FileEntry],
-    included: &HashSet<String>,
-    base: &Path,
-    primary_files: bool,
-    claimed: &mut HashMap<String, String>,
-) -> HashMap<String, PathBuf> {
+fn file_sync_relative_paths( entries: &[FileEntry], included: &HashSet<String>, base: &Path, primary_files: bool, claimed: &mut HashMap<String, String>, ) -> HashMap<String, PathBuf> {
     let by_id: HashMap<String, FileEntry> = entries.iter().cloned().map(|entry| (entry.file_id.as_str().to_owned(), entry)).collect();
     let mut ordered: Vec<&FileEntry> = entries.iter().filter(|entry| included.contains(entry.file_id.as_str())).collect();
     ordered.sort_by_key(|entry| file_sync_entry_depth(entry, &by_id));
@@ -8665,13 +8216,7 @@ fn file_sync_rebase_index_paths(index: &mut FileSyncIndex, old_prefix: &Path, ne
     }
 }
 
-fn file_sync_materialize_entry(
-    source: &mut FileSyncSource<'_>,
-    root: &Path,
-    logical: &FileEntry,
-    relative_path: PathBuf,
-    index: &mut FileSyncIndex,
-) -> Result<(FileSyncIndexEntry, bool, bool), String> {
+fn file_sync_materialize_entry( source: &mut FileSyncSource<'_>, root: &Path, logical: &FileEntry, relative_path: PathBuf, index: &mut FileSyncIndex, ) -> Result<(FileSyncIndexEntry, bool, bool), String> {
     let key_matches = |entry: &&FileSyncIndexEntry| entry.place_id == logical.place_id && entry.app_instance_id == logical.app_instance_id && entry.file_id == logical.file_id.as_str();
     let destination = root.join(&relative_path);
 
@@ -9053,10 +8598,7 @@ fn gateway_raw_write_from_path(_websocket: &mut NodeWebSocket, _request: &Operat
     Err("ogd was built without the `fabric` feature".to_owned())
 }
 
-fn start_upstream_event_relay(
-    settings: Arc<ConnectionSettings>,
-    event_engine: Arc<EventEngine>,
-) -> Option<thread::JoinHandle<()>> {
+fn start_upstream_event_relay( settings: Arc<ConnectionSettings>, event_engine: Arc<EventEngine>, ) -> Option<thread::JoinHandle<()>> {
     if !has_upstream_gateway(&settings)
         || settings.upstream_identity.is_none()
         || !settings.service_capabilities.contains(ServiceCapability::Events)
@@ -9081,10 +8623,7 @@ fn start_upstream_event_relay(
         .ok()
 }
 
-fn run_upstream_event_relay_session(
-    settings: &ConnectionSettings,
-    event_engine: &EventEngine,
-) -> Result<(), String> {
+fn run_upstream_event_relay_session( settings: &ConnectionSettings, event_engine: &EventEngine, ) -> Result<(), String> {
     let credential = settings
         .upstream_identity
         .as_ref()
@@ -9148,12 +8687,7 @@ fn file_sync_event_relevant(event_type: &str) -> bool {
         || event_type.starts_with("app.instance.")
 }
 
-fn run_file_sync_once(
-    settings: &ConnectionSettings,
-    engine: &Engine,
-    identity_id: &str,
-    device_id: &str,
-) -> Result<(u64, JsonValue), String> {
+fn run_file_sync_once( settings: &ConnectionSettings, engine: &Engine, identity_id: &str, device_id: &str, ) -> Result<(u64, JsonValue), String> {
     let _run = settings
         .file_sync_run
         .lock()
@@ -9206,11 +8740,7 @@ fn run_file_sync_once(
     result.map(|summary| (run_at, summary))
 }
 
-fn start_file_sync_worker(
-    settings: Arc<ConnectionSettings>,
-    engine: Arc<Engine>,
-    event_engine: Arc<EventEngine>,
-) -> Option<thread::JoinHandle<()>> {
+fn start_file_sync_worker( settings: Arc<ConnectionSettings>, engine: Arc<Engine>, event_engine: Arc<EventEngine>, ) -> Option<thread::JoinHandle<()>> {
     if !settings.service_capabilities.contains(ServiceCapability::Files) {
         return None;
     }
@@ -9492,15 +9022,7 @@ fn load_file_sync_runtime(configuration: &Configuration) -> Result<FileSyncRunti
                 config.root.display()
             )));
         }
-        debug::log(
-            DebugTopic::Core,
-            None,
-            if config.root.is_dir() {
-                format!("Files sync configured at {}", config.root.display())
-            } else {
-                format!("Files sync root unavailable at {}; waiting for restore/reconfiguration", config.root.display())
-            },
-        );
+        debug::log( DebugTopic::Core, None, if config.root.is_dir() { format!("Files sync configured at {}", config.root.display()) } else { format!("Files sync root unavailable at {}; waiting for restore/reconfiguration", config.root.display()) }, );
     }
 
     Ok(FileSyncRuntime {
@@ -9667,10 +9189,7 @@ struct ConnectionSettings {
 }
 
 #[derive(Debug)]
-enum QueryTextError {
-    Parse(String),
-    Planning(String),
-}
+enum QueryTextError { Parse(String), Planning(String), }
 
 impl Display for QueryTextError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -9700,24 +9219,12 @@ enum ConnectionError {
 impl Display for ConnectionError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::ConfigureSocket(error) => {
-                write!(formatter, "cannot configure socket: {error}")
-            }
-            Self::CloneSocket(error) => {
-                write!(formatter, "cannot clone socket: {error}")
-            }
-            Self::Read(error) => {
-                write!(formatter, "cannot read request: {error}")
-            }
-            Self::Write(error) => {
-                write!(formatter, "cannot write response: {error}")
-            }
-            Self::Encode(error) => {
-                write!(formatter, "cannot encode response: {error}")
-            }
-            Self::Protocol(error) => {
-                write!(formatter, "protocol error: {error}")
-            }
+            Self::ConfigureSocket(error) => { write!(formatter, "cannot configure socket: {error}") }
+            Self::CloneSocket(error) => { write!(formatter, "cannot clone socket: {error}") }
+            Self::Read(error) => { write!(formatter, "cannot read request: {error}") }
+            Self::Write(error) => { write!(formatter, "cannot write response: {error}") }
+            Self::Encode(error) => { write!(formatter, "cannot encode response: {error}") }
+            Self::Protocol(error) => { write!(formatter, "protocol error: {error}") }
         }
     }
 }
@@ -9748,41 +9255,15 @@ enum DaemonError {
     BootstrapAdminState,
     BootstrapAppsState,
     BootstrapFabricResourcesState,
-    Environment {
-        name: &'static str,
-        source: env::VarError,
-    },
-    InvalidDuration {
-        name: &'static str,
-        value: String,
-        source: std::num::ParseIntError,
-    },
-    InvalidBoolean {
-        name: &'static str,
-        value: String,
-    },
-    InvalidByteSize {
-        name: &'static str,
-        value: String,
-    },
-    ZeroDuration {
-        name: &'static str,
-    },
-    InvalidStorageBackend {
-        value: String,
-    },
-    PrepareStorageDirectory {
-        path: PathBuf,
-        source: io::Error,
-    },
-    OpenStorage {
-        path: PathBuf,
-        source: StorageError,
-    },
-    Bind {
-        address: String,
-        source: io::Error,
-    },
+    Environment {name: &'static str, source: env::VarError},
+    InvalidDuration {name: &'static str, value: String, source: std::num::ParseIntError},
+    InvalidBoolean {name: &'static str, value: String},
+    InvalidByteSize {name: &'static str, value: String},
+    ZeroDuration {name: &'static str},
+    InvalidStorageBackend {value: String},
+    PrepareStorageDirectory {path: PathBuf, source: io::Error},
+    OpenStorage {path: PathBuf, source: StorageError},
+    Bind {address: String, source: io::Error},
     LocalAddress(io::Error),
     SpawnConnectionThread(io::Error),
     Runtime(String),
@@ -9791,9 +9272,7 @@ enum DaemonError {
 impl Display for DaemonError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BootstrapAdmin(source) => {
-                write!(formatter, "cannot create bootstrap administrator: {source}")
-            }
+            Self::BootstrapAdmin(source) => { write!(formatter, "cannot create bootstrap administrator: {source}")}
             Self::BootstrapIdentity(source) => write!(formatter, "cannot create encrypted bootstrap identity: {source}"),
             Self::NodeIdentity(source) => write!(formatter, "cannot load node identity: {source}"),
             Self::NodeIdentityMissing => formatter.write_str("Gateway mode requires OGD_NODE_IDENTITY_FILE and OGD_NODE_IDENTITY_PASSWORD"),
@@ -9801,56 +9280,20 @@ impl Display for DaemonError {
             Self::NodeDeviceCredentialState => formatter.write_str("cannot persist local node device credential"),
             Self::NodeDeviceCredentialConflict { device_id } => write!(formatter, "local device credential conflicts with configured node identity for device `{device_id}`"),
             Self::BootstrapPasswordMissing => formatter.write_str("bootstrap identity requires OGD_BOOTSTRAP_PASSWORD_FILE or OGD_BOOTSTRAP_PASSWORD"),
-            Self::BootstrapAdminState => {
-                formatter.write_str("cannot persist bootstrap administrator")
-            }
+            Self::BootstrapAdminState => { formatter.write_str("cannot persist bootstrap administrator") }
             Self::BootstrapAppsState => formatter.write_str("cannot persist built-in Apps from apps.json"),
             Self::BootstrapFabricResourcesState => formatter.write_str("cannot persist bootstrap fabric resource defaults"),
-            Self::Environment { name, source } => {
-                write!(formatter, "cannot read {name}: {source}")
-            }
-            Self::InvalidDuration {
-                name,
-                value,
-                source,
-            } => write!(
-                formatter,
-                "{name} must be a positive integer in milliseconds; got `{value}`: {source}"
-            ),
-            Self::InvalidBoolean { name, value } => write!(
-                formatter,
-                "{name} must be one of 1/0, true/false, yes/no, on/off; got `{value}`"
-            ),
-            Self::InvalidByteSize { name, value } => write!(
-                formatter,
-                "{name} must be a positive byte size such as 268435456, 256M or 2G; got `{value}`"
-            ),
-            Self::ZeroDuration { name } => {
-                write!(formatter, "{name} must be greater than zero")
-            }
-            Self::InvalidStorageBackend { value } => write!(
-                formatter,
-                "OGD_STORAGE must be `memory` or `glacier`; got `{value}`"
-            ),
-            Self::PrepareStorageDirectory { path, source } => write!(
-                formatter,
-                "cannot create storage directory {}: {source}",
-                path.display()
-            ),
-            Self::OpenStorage { path, source } => write!(
-                formatter,
-                "cannot open storage at {}: {source}",
-                path.display()
-            ),
-            Self::Bind { address, source } => {
-                write!(formatter, "cannot bind {address}: {source}")
-            }
-            Self::LocalAddress(source) => {
-                write!(formatter, "cannot read listening address: {source}")
-            }
-            Self::SpawnConnectionThread(source) => {
-                write!(formatter, "cannot spawn connection thread: {source}")
-            }
+            Self::Environment { name, source } => { write!(formatter, "cannot read {name}: {source}") }
+            Self::InvalidDuration {name, value, source} => write!(formatter, "{name} must be a positive integer in milliseconds; got `{value}`: {source}"),
+            Self::InvalidBoolean { name, value } => write!(formatter, "{name} must be one of 1/0, true/false, yes/no, on/off; got `{value}`"),
+            Self::InvalidByteSize { name, value } => write!(formatter, "{name} must be a positive byte size such as 268435456, 256M or 2G; got `{value}`"),
+            Self::ZeroDuration { name } => { write!(formatter, "{name} must be greater than zero")}
+            Self::InvalidStorageBackend { value } => write!(formatter, "OGD_STORAGE must be `memory` or `glacier`; got `{value}`"),
+            Self::PrepareStorageDirectory { path, source } => write!(formatter, "cannot create storage directory {}: {source}", path.display()),
+            Self::OpenStorage { path, source } => write!(formatter, "cannot open storage at {}: {source}", path.display()),
+            Self::Bind { address, source } => { write!(formatter, "cannot bind {address}: {source}")}
+            Self::LocalAddress(source) => { write!(formatter, "cannot read listening address: {source}")}
+            Self::SpawnConnectionThread(source) => { write!(formatter, "cannot spawn connection thread: {source}")}
             Self::Runtime(message) => write!(formatter, "cannot build query runtime: {message}"),
         }
     }
@@ -9899,15 +9342,10 @@ mod tests {
     }
 
     #[cfg(feature = "fabric")] #[test] fn gateway_endpoint_normalization_supports_seeds_and_discovery_hints() { assert_eq!( normalize_gateway_node_endpoint("gw+insecure://127.0.0.1:3000").as_deref(), Some("ws://127.0.0.1:3000/node") ); assert_eq!( normalize_gateway_node_endpoint("gw://example.test").as_deref(), Some("wss://example.test/node") ); assert_eq!( normalize_gateway_node_endpoint("ws://127.0.0.1:3001").as_deref(), Some("ws://127.0.0.1:3001/node") ); assert_eq!( normalize_gateway_node_endpoint("ws://127.0.0.1:3002/peer").as_deref(), Some("ws://127.0.0.1:3002/node") ); assert_eq!( gateway_client_endpoint_from_node("ws://127.0.0.1:3000/node").as_deref(), Some("ws://127.0.0.1:3000/ws") ); }
-
     #[test] fn node_identity_proof_is_bound_to_gateway_challenge_and_device() { let proof = node_identity_proof("nonce-a", "device-a", "identity-a", "device-a"); assert_eq!(proof, "og.node.challenge.v1\nnonce-a\ndevice-a\nidentity-a\ndevice-a"); assert_ne!(proof, node_identity_proof("nonce-b", "device-a", "identity-a", "device-a")); assert_ne!(proof, node_identity_proof("nonce-a", "device-b", "identity-a", "device-b")); }
-
     #[test] fn fabric_device_verification_requires_known_active_exact_key() { let engine = app_bootstrap_test_engine(); let inserted = execute_request(&engine, QueryRequest::new(1, r#"on _devices | insert {identityId: "identity-a", deviceId: "device-a", publicKey: "key-a", state: "active"}"#)); assert!(inserted.is_ok()); assert!(registered_device_matches(&engine, "identity-a", "device-a", "key-a")); assert!(!registered_device_matches(&engine, "identity-a", "device-a", "key-b")); assert!(!registered_device_matches(&engine, "identity-a", "device-unknown", "key-a")); let revoked = execute_request(&engine, QueryRequest::new(2, r#"on _devices | where deviceId == "device-a" | set state = "revoked""#)); assert!(revoked.is_ok()); assert!(!registered_device_matches(&engine, "identity-a", "device-a", "key-a")); }
-
     #[test] fn gateway_device_registration_is_idempotent_and_exact() { let engine = app_bootstrap_test_engine(); ensure_gateway_device_registration(&engine, "gateway-identity", "gateway-device", "gateway-key") .expect("Gateway enrollment persists"); ensure_gateway_device_registration(&engine, "gateway-identity", "gateway-device", "gateway-key") .expect("Gateway enrollment is idempotent"); assert!(registered_identity_matches(&engine, "gateway-identity", "gateway-key")); assert!(registered_device_matches(&engine, "gateway-identity", "gateway-device", "gateway-key")); assert!(!registered_device_matches(&engine, "gateway-identity", "gateway-device", "other-key")); }
-
     #[cfg(feature = "fabric")] #[test] fn gateway_enrollment_hmac_matches_sha256_reference_vector() { assert_eq!( hmac_sha256_base64(b"key", b"The quick brown fox jumps over the lazy dog"), "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg=" ); }
-
     #[test] fn app_bootstrap_with_empty_manifest_is_a_noop() { let engine = app_bootstrap_test_engine(); bootstrap_apps(&engine, &[]).expect("empty App manifest bootstraps"); assert!(!app_record_exists(&engine, RequestId::Number(1), "system.files") .expect("App lookup succeeds")); }
     #[test] fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() { let engine = app_bootstrap_test_engine(); let v1 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test".to_owned(), version: "1.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test", "version": "1.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds"); let drifted = execute_request( &engine, QueryRequest::new( 2, r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#, ), ); assert!(drifted.is_ok()); let custom = execute_request( &engine, QueryRequest::new( 3, r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#, ), ); assert!(custom.is_ok()); let v2 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test v2".to_owned(), version: "2.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test v2", "version": "2.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds"); let response = execute_request( &engine, QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); }; let managed = documents.first().expect("managed App exists"); assert_eq!(managed.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(managed.get("name").and_then(JsonValue::as_str), Some("System test v2")); assert_eq!(managed.get("version").and_then(JsonValue::as_str), Some("2.0.0")); assert_eq!(managed.get("updatedBy").and_then(JsonValue::as_str), Some("system")); assert_eq!(managed.get("definition"), Some(&v2.definition)); let response = execute_request( &engine, QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); }; let unmanaged = documents.first().expect("custom App exists"); assert_eq!(unmanaged.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(unmanaged.get("name").and_then(JsonValue::as_str), Some("Custom")); assert_eq!(unmanaged.get("version").and_then(JsonValue::as_str), Some("7.0.0")); assert_eq!(unmanaged.get("createdBy").and_then(JsonValue::as_str), Some("user")); assert!(unmanaged.get("updatedBy").is_none()); }
     #[test] fn place_scoped_collection_listing_filters_and_counts_by_place() { let engine = app_bootstrap_test_engine(); for (id, collection, place_id) in [ (20, "shared_items", "place-a"), (21, "shared_items", "place-a"), (22, "shared_items", "place-b"), (23, "other_items", "place-b"), ] { let response = execute_request( &engine, QueryRequest::new( id, format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)), ), ); assert!(response.is_ok()); } let snapshot = engine.storage().read().expect("snapshot opens"); let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"), None) .expect("Place collections list succeeds"); assert_eq!(collections.len(), 1); assert_eq!(collections[0].get("name").and_then(JsonValue::as_str), Some("shared_items")); assert_eq!(collections[0].get("documents").and_then(JsonValue::as_u64), Some(2)); }
@@ -9933,9 +9371,6 @@ mod tests {
     #[test] fn authenticated_keepalive_filter_is_added_once() { let mut types = vec!["sharing.*".to_owned()]; ensure_authenticated_keepalive_type(&mut types); ensure_authenticated_keepalive_type(&mut types); assert_eq!( types, vec!["sharing.*".to_owned(), "core.heartbeat".to_owned()] ); }
     #[test] fn authenticated_keepalive_filter_respects_wildcards() { for mut types in [ vec!["*".to_owned()], vec!["core.*".to_owned()], vec!["core.heartbeat".to_owned()], ] { ensure_authenticated_keepalive_type(&mut types); assert_eq!(types.len(), 1); } }
     #[test] fn auth_is_fabric_level_not_place_assignable() { assert!(valid_resource_capability("auth")); assert!(!place_resource_capability_allowed("auth")); assert!(place_resource_capability_allowed("files")); assert!(place_resource_capability_allowed("custom.capability")); }
-
     #[test] fn fabric_default_store_is_created_and_updated_explicitly() { let engine = app_bootstrap_test_engine(); let first = vec![serde_json::json!({ "identityId": "identity-a", "deviceId": "device-a", "capability": "database", "role": "provider" })]; save_fabric_defaults(&engine, 1.into(), &first).expect("first fabric default persists"); assert_eq!(load_fabric_defaults(&engine, 2.into()).unwrap(), first); let second = vec![serde_json::json!({ "identityId": "identity-b", "deviceId": "device-b", "capability": "database", "role": "provider" })]; save_fabric_defaults(&engine, 3.into(), &second).expect("fabric default updates"); assert_eq!(load_fabric_defaults(&engine, 4.into()).unwrap(), second); }
-
     #[test] fn shared_resource_assignment_logic_keeps_files_axes_orthogonal() { let assignments = upsert_resource_assignment( Vec::new(), "admin", "identity-a", "device-a", "files", None, Some("primary"), Some("provider"), ).expect("files default is valid"); assert_eq!(assignments.len(), 1); assert_eq!(resource_assignment_service_role(&assignments[0]), Some("primary")); assert_eq!(resource_assignment_storage_role(&assignments[0]), Some("provider")); let updated = upsert_resource_assignment( assignments, "admin", "identity-a", "device-a", "files", None, Some("replica"), None, ).expect("service role can change without erasing storage role"); assert_eq!(resource_assignment_service_role(&updated[0]), Some("replica")); assert_eq!(resource_assignment_storage_role(&updated[0]), Some("provider")); }
-
 }

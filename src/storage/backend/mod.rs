@@ -5,15 +5,12 @@
 //! [`StorageEngine`](crate::storage::StorageEngine) façade is implemented once
 //! by [`BackendStorage`](crate::storage::BackendStorage), independently of the
 //! selected backend.
-
+#![cfg_attr(rustfmt, rustfmt_skip)]
 pub mod glacier;
 mod glacier_mmap;
 pub mod memory;
 
-use super::{
-    CollectionId, CommitResult, StorageMutation, StorageRead, StorageResult, StorageTransaction,
-    StoredDocument,
-};
+use super::{ CollectionId, CommitResult, StorageMutation, StorageRead, StorageResult, StorageTransaction, StoredDocument, };
 
 /// Common contract implemented by physical storage backends.
 ///
@@ -31,11 +28,7 @@ pub trait StorageBackend: Send + Sync {
     ///
     /// Backends should override this method when they can validate and commit a
     /// batch more efficiently than the generic transaction path.
-    fn apply_batch_atomic(
-        &self,
-        collection: &CollectionId,
-        mutations: Vec<StorageMutation>,
-    ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
+    fn apply_batch_atomic( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
         let mut transaction = self.begin()?;
         let stored = transaction.apply_batch(collection, mutations)?;
         let commit = transaction.commit()?;
@@ -43,11 +36,7 @@ pub trait StorageBackend: Send + Sync {
     }
 
     /// Applies a complete mutation vector atomically without returning rows.
-    fn apply_batch_atomic_summary(
-        &self,
-        collection: &CollectionId,
-        mutations: Vec<StorageMutation>,
-    ) -> StorageResult<CommitResult> {
+    fn apply_batch_atomic_summary( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<CommitResult> {
         self.apply_batch_atomic(collection, mutations)
             .map(|(_, commit)| commit)
     }

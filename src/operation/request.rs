@@ -11,7 +11,7 @@ use crate::protocol::{
 };
 
 /// One generic operation request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationRequest {
     /// Wire protocol version.
@@ -65,7 +65,7 @@ impl From<QueryRequest> for OperationRequest {
 }
 
 /// Accepted request forms during the protocol migration.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum IncomingRequest {
     /// New generic operation request.
@@ -112,12 +112,8 @@ mod tests {
     use super::*;
 
     #[test] fn legacy_query_is_normalized_to_query_execute() { let payload = rmp_serde::to_vec_named(&QueryRequest::new(9, "on users | limit 1")).unwrap(); let request = decode_operation_request(&payload).unwrap(); assert_eq!(request, OperationRequest::query(9, "on users | limit 1")); }
-
     #[test] fn generic_query_operation_is_decoded() { let payload = rmp_serde::to_vec_named(&OperationRequest::query(4, "on users")).unwrap(); let request = decode_operation_request(&payload).unwrap(); assert_eq!(request, OperationRequest::query(4, "on users")); }
-
     #[test] fn numeric_string_request_id_is_accepted() { #[derive(Serialize)] struct WireRequest<'a> { version: u16, id: &'a str, op: &'a str, data: Value, } let payload = rmp_serde::to_vec_named(&WireRequest { version: PROTOCOL_VERSION, id: "42", op: QUERY_EXECUTE, data: json!({"query": "on users"}), }) .unwrap(); let request = decode_operation_request(&payload).unwrap(); assert_eq!(request.id, RequestId::string("42").unwrap()); }
-
     #[test] fn arbitrary_string_request_id_is_preserved() { #[derive(Serialize)] struct WireRequest<'a> { version: u16, id: &'a str, op: &'a str, data: Value, } let payload = rmp_serde::to_vec_named(&WireRequest { version: PROTOCOL_VERSION, id: "1785677694881-1", op: AUTH_BEGIN, data: json!({"identityId": "identity-a", "deviceId": "device-a"}), }) .unwrap(); let request = decode_operation_request(&payload).unwrap(); assert_eq!(request.id.as_str(), Some("1785677694881-1")); }
-
     #[test] fn empty_operation_name_is_rejected() { let payload = rmp_serde::to_vec_named(&OperationRequest::new(4, " ", json!({}))).unwrap(); let error = decode_operation_request(&payload).unwrap_err(); assert!(matches!(error, ProtocolError::EmptyOperation)); }
 }

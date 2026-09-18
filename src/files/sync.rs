@@ -44,7 +44,7 @@ pub struct FileSyncConfig {
 
 impl FileSyncConfig {
     #[must_use]
-    pub fn new(root: PathBuf) -> Self {
+    pub const fn new(root: PathBuf) -> Self {
         Self {
             version: FILE_SYNC_CONFIG_VERSION,
             root,
@@ -247,7 +247,7 @@ impl FileSyncIndex {
 }
 
 /// Returns a portable, deterministic filesystem component for a user-facing
-/// OpenGlacier label. The same sanitization is used on every platform so a
+/// `OpenGlacier` label. The same sanitization is used on every platform so a
 /// Place/App/Instance keeps the same visible projection across devices.
 #[must_use]
 pub fn file_sync_projection_component(label: &str, fallback: &str) -> String {
@@ -288,7 +288,7 @@ pub fn file_sync_projection_component(label: &str, fallback: &str) -> String {
 pub fn file_sync_projection_suffix(stable_id: &str) -> String {
     let compact: String = stable_id
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .take(8)
         .collect();
     if compact.is_empty() {
@@ -298,10 +298,7 @@ pub fn file_sync_projection_suffix(stable_id: &str) -> String {
     }
 }
 
-fn load_json<T>(path: &Path) -> io::Result<Option<T>>
-where
-    T: for<'de> Deserialize<'de>,
-{
+fn load_json<T>(path: &Path) -> io::Result<Option<T>> where T: for<'de> Deserialize<'de>, {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -312,10 +309,7 @@ where
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-fn save_json<T>(path: &Path, value: &T) -> io::Result<()>
-where
-    T: Serialize,
-{
+fn save_json<T>(path: &Path, value: &T) -> io::Result<()> where T: Serialize, {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -338,10 +332,7 @@ mod tests {
     use super::*;
 
     #[test] fn selections_are_stable_and_id_based() { let mut config = FileSyncConfig::new(PathBuf::from("OpenGlacier")); config.set_selection( "place-1", "files-main", FileSyncSelectionMode::Selected, vec!["folder-b".into(), "folder-a".into(), "folder-a".into()], ); let selection = config .selection("place-1", "files-main") .expect("selection"); assert_eq!(selection.mode, FileSyncSelectionMode::Selected); assert_eq!(selection.folder_ids, ["folder-a", "folder-b"]); }
-
     #[test] fn all_selection_does_not_persist_redundant_folder_ids() { let mut config = FileSyncConfig::new(PathBuf::from("OpenGlacier")); config.set_selection( "place-1", "files-main", FileSyncSelectionMode::All, vec!["folder-a".into()], ); let selection = config .selection("place-1", "files-main") .expect("selection"); assert_eq!(selection.mode, FileSyncSelectionMode::All); assert!(selection.folder_ids.is_empty()); }
-
     #[test] fn reserved_projection_names_are_explicit() { assert_eq!(APP_FILES_DIRECTORY, "Apps"); assert_eq!(PRIMARY_APPS_COLLISION_NAME, "Apps (Files)"); }
-
     #[test] fn projection_components_are_portable() { assert_eq!( file_sync_projection_component(" Maison ", "Place"), "Maison" ); assert_eq!(file_sync_projection_component("A/B:C*", "Place"), "A_B_C_"); assert_eq!(file_sync_projection_component("CON", "Place"), "CON_"); assert_eq!(file_sync_projection_component("..", "Place"), "Place"); }
 }

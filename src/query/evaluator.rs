@@ -2,9 +2,7 @@
 //! Expression evaluator contracts.
 
 use std::{error::Error as StdError, fmt, sync::Arc};
-
 use crate::Document;
-
 use super::{ExecutionError, Expression, QueryRuntime, QueryRuntimeBuilder, SetAssignment};
 
 /// Result returned by evaluator operations.
@@ -23,22 +21,12 @@ pub trait EvaluationBackend: Send + Sync {
     ///
     /// Implementations must not introduce ambiguous truthiness. Expressions
     /// that cannot produce a boolean should return an error.
-    fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        context: &EvaluationContext,
-    ) -> EvaluationResult<bool>;
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, context: &EvaluationContext, ) -> EvaluationResult<bool>;
 
     /// Applies all assignments atomically to a document clone.
     ///
     /// The source document must remain unchanged when any assignment fails.
-    fn apply_assignments(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-        context: &EvaluationContext,
-    ) -> EvaluationResult<Arc<Document>>;
+    fn apply_assignments( &self, assignments: &[SetAssignment], document: &Document, context: &EvaluationContext, ) -> EvaluationResult<Arc<Document>>;
 }
 
 /// Stable evaluator used by the query runtime.
@@ -61,10 +49,7 @@ impl Evaluator {
 
     /// Creates an evaluator with an explicit context.
     #[must_use]
-    pub const fn with_context(
-        backend: Arc<dyn EvaluationBackend>,
-        context: EvaluationContext,
-    ) -> Self {
+    pub const fn with_context( backend: Arc<dyn EvaluationBackend>, context: EvaluationContext, ) -> Self {
         Self { backend, context }
     }
 
@@ -81,21 +66,13 @@ impl Evaluator {
     }
 
     /// Evaluates a strict predicate.
-    pub fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-    ) -> EvaluationResult<bool> {
+    pub fn evaluate_predicate( &self, expression: &Expression, document: &Document, ) -> EvaluationResult<bool> {
         self.backend
             .evaluate_predicate(expression, document, &self.context)
     }
 
     /// Applies one complete `set` operator.
-    pub fn apply_assignments(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-    ) -> EvaluationResult<Arc<Document>> {
+    pub fn apply_assignments( &self, assignments: &[SetAssignment], document: &Document, ) -> EvaluationResult<Arc<Document>> {
         if assignments.is_empty() {
             return Err(EvaluationError::new(EvaluationErrorKind::EmptyAssignments));
         }
@@ -461,8 +438,6 @@ mod tests {
     use super::*;
 
     #[test] fn default_context_is_strict_and_atomic() { let context = EvaluationContext::default(); assert_eq!(context.missing_policy(), MissingPolicy::Preserve); assert_eq!(context.boolean_policy(), BooleanPolicy::Strict); assert_eq!(context.assignment_policy(), AssignmentPolicy::Atomic); }
-
     #[test] fn error_is_converted_to_execution_category() { let evaluation = EvaluationError::missing_field("address.city"); let execution = ExecutionError::from(evaluation); assert!(matches!( execution.kind(), super::super::ExecutionErrorKind::Evaluation { .. } )); let mutation = ExecutionError::from(EvaluationError::new(EvaluationErrorKind::EmptyAssignments)); assert!(matches!( mutation.kind(), super::super::ExecutionErrorKind::Mutation { .. } )); }
-
     #[test] fn evaluator_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Evaluator>(); assert_send_and_sync::<EvaluationContext>(); assert_send_and_sync::<EvaluationError>(); assert_send_and_sync::<FunctionEvaluationBackend>(); }
 }

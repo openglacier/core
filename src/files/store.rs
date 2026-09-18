@@ -48,7 +48,7 @@ pub struct FileStoreEntry {
     pub metadata: FileMetadata,
 }
 
-/// Backend contract implemented by native, WebDAV, S3, Drive, OneDrive, etc.
+/// Backend contract implemented by native, `WebDAV`, S3, Drive, `OneDrive`, etc.
 ///
 /// Remote identifiers are opaque. Implementations must not assume they are
 /// local filesystem paths.
@@ -75,20 +75,10 @@ pub trait FileStore: Send + Sync {
     fn mkdir(&self, parent_remote_id: Option<&str>, name: &str) -> FileResult<FileStoreEntry>;
 
     /// Moves/renames one entry without assuming path-based addressing.
-    fn move_entry(
-        &self,
-        remote_id: &str,
-        new_parent_remote_id: Option<&str>,
-        new_name: &str,
-    ) -> FileResult<FileStoreEntry>;
+    fn move_entry( &self, remote_id: &str, new_parent_remote_id: Option<&str>, new_name: &str, ) -> FileResult<FileStoreEntry>;
 
     /// Copies one entry without assuming server-side copy support.
-    fn copy(
-        &self,
-        remote_id: &str,
-        new_parent_remote_id: Option<&str>,
-        new_name: &str,
-    ) -> FileResult<FileStoreEntry>;
+    fn copy( &self, remote_id: &str, new_parent_remote_id: Option<&str>, new_name: &str, ) -> FileResult<FileStoreEntry>;
 
     /// Deletes one provider entry.
     fn delete(&self, remote_id: &str) -> FileResult<()>;

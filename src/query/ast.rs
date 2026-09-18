@@ -6,27 +6,17 @@ use std::slice;
 
 use super::Span;
 
-/// Élément syntaxique possédant une position dans le texte source.
 pub trait Spanned {
-    /// Retourne le span complet de l'élément.
     fn span(&self) -> Span;
 }
 
-/// Mot-clé introduisant la source d'un pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SourceKeyword {
-    /// Source introduite avec `from`.
     From,
-
-    /// Alias de `from`, introduit avec `on`.
     On,
 }
 
 impl SourceKeyword {
-    /// Retourne la représentation canonique du mot-clé.
-    ///
-    /// Cette représentation est syntaxique. La normalisation logique pourra
-    /// considérer `from` et `on` comme équivalents.
     #[must_use]
     #[inline]
     pub const fn as_str(self) -> &'static str {
@@ -70,7 +60,7 @@ macro_rules! span_ast {
 
             /// Retourne le texte couvert par le nœud dans la source.
             #[must_use]
-            pub fn text<'source>(self, source: &'source str) -> Option<&'source str> {
+            pub fn text(self, source: &str) -> Option<&str> {
                 self.span.slice(source)
             }
         }
@@ -145,7 +135,7 @@ impl BooleanAst {
     }
 
     #[must_use]
-    pub fn text<'source>(self, source: &'source str) -> Option<&'source str> {
+    pub fn text(self, source: &str) -> Option<&str> {
         self.span.slice(source)
     }
 }
@@ -185,7 +175,7 @@ impl ObjectKeyAst {
     }
 
     #[must_use]
-    pub fn text<'source>(self, source: &'source str) -> Option<&'source str> {
+    pub fn text(self, source: &str) -> Option<&str> {
         match self {
             Self::Identifier(name) => name.text(source),
             Self::String(string) => string.text(source),
@@ -349,13 +339,13 @@ impl ArrayAst {
 
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.values.len()
     }
 
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
 
@@ -552,13 +542,13 @@ impl ObjectAst {
 
     #[must_use]
     #[inline]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.fields.len()
     }
 
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.fields.is_empty()
     }
 
@@ -650,7 +640,7 @@ impl SourceAliasAst {
     }
 
     #[must_use]
-    pub fn name_text<'source>(self, source: &'source str) -> Option<&'source str> {
+    pub fn name_text(self, source: &str) -> Option<&str> {
         self.name.text(source)
     }
 }
@@ -684,34 +674,17 @@ impl SourceAst {
     /// Construit une source sans alias.
     #[must_use]
     #[inline]
-    pub const fn new(
-        keyword: SourceKeyword,
-        keyword_span: Span,
-        collection: NameAst,
-        span: Span,
-    ) -> Self {
+    pub const fn new( keyword: SourceKeyword, keyword_span: Span, collection: NameAst, span: Span, ) -> Self {
         Self::build(keyword, keyword_span, collection, None, span)
     }
 
     /// Construit une source avec alias.
     #[must_use]
-    pub const fn with_alias(
-        keyword: SourceKeyword,
-        keyword_span: Span,
-        collection: NameAst,
-        alias: SourceAliasAst,
-        span: Span,
-    ) -> Self {
+    pub const fn with_alias( keyword: SourceKeyword, keyword_span: Span, collection: NameAst, alias: SourceAliasAst, span: Span, ) -> Self {
         Self::build(keyword, keyword_span, collection, Some(alias), span)
     }
 
-    const fn build(
-        keyword: SourceKeyword,
-        keyword_span: Span,
-        collection: NameAst,
-        alias: Option<SourceAliasAst>,
-        span: Span,
-    ) -> Self {
+    const fn build( keyword: SourceKeyword, keyword_span: Span, collection: NameAst, alias: Option<SourceAliasAst>, span: Span, ) -> Self {
         assert!(
             !keyword_span.is_empty(),
             "source keyword span must not be empty",
@@ -765,7 +738,7 @@ impl SourceAst {
     }
 
     #[must_use]
-    pub fn collection_name<'source>(self, source: &'source str) -> Option<&'source str> {
+    pub fn collection_name(self, source: &str) -> Option<&str> {
         self.collection.text(source)
     }
 
@@ -775,7 +748,7 @@ impl SourceAst {
     }
 
     #[must_use]
-    pub fn alias_name<'source>(self, source: &'source str) -> Option<&'source str> {
+    pub fn alias_name(self, source: &str) -> Option<&str> {
         self.alias.and_then(|alias| alias.name_text(source))
     }
 
@@ -843,7 +816,7 @@ impl EndAst {
     }
 
     #[must_use]
-    pub fn text<'source>(self, source: &'source str) -> Option<&'source str> {
+    pub fn text(self, source: &str) -> Option<&str> {
         self.span.slice(source)
     }
 }
@@ -918,13 +891,13 @@ impl SubPipelineAst {
     }
 
     #[must_use]
-    pub fn stage_count(&self) -> usize {
+    pub const fn stage_count(&self) -> usize {
         self.stages.len()
     }
 
     #[must_use]
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.stages.is_empty()
     }
 
@@ -984,7 +957,6 @@ impl StageAst {
     #[inline]
     pub fn new(pipe_span: Span, name: NameAst, arguments_span: Span, span: Span) -> Self {
         Self::validate_header(pipe_span, name, arguments_span, span);
-
         Self {
             pipe_span,
             name,
@@ -997,14 +969,7 @@ impl StageAst {
 
     /// Construit un stage composé possédant un sous-pipeline.
     #[must_use]
-    pub fn with_subpipeline(
-        pipe_span: Span,
-        name: NameAst,
-        arguments_span: Span,
-        header_span: Span,
-        subpipeline: SubPipelineAst,
-        span: Span,
-    ) -> Self {
+    pub fn with_subpipeline( pipe_span: Span, name: NameAst, arguments_span: Span, header_span: Span, subpipeline: SubPipelineAst, span: Span, ) -> Self {
         Self::validate_header(pipe_span, name, arguments_span, header_span);
 
         assert!(
@@ -1180,12 +1145,12 @@ impl PipelineAst {
     }
 
     #[must_use]
-    pub fn stage_count(&self) -> usize {
+    pub const fn stage_count(&self) -> usize {
         self.stages.len()
     }
 
     #[must_use]
-    pub fn is_source_only(&self) -> bool {
+    pub const fn is_source_only(&self) -> bool {
         self.stages.is_empty()
     }
 
@@ -1239,60 +1204,32 @@ mod tests {
     }
 
     #[test] fn source_keyword_has_stable_text() { assert_eq!(SourceKeyword::From.as_str(), "from"); assert_eq!(SourceKeyword::On.as_str(), "on"); assert_eq!(SourceKeyword::From.to_string(), "from"); assert_eq!(SourceKeyword::On.to_string(), "on"); }
-
     #[test] fn creates_name() { let name = NameAst::new(Span::new(5, 10)); assert_eq!(name.span(), Span::new(5, 10)); assert_eq!(name.text("from users"), Some("users")); }
-
     #[test] #[should_panic(expected = "name span must not be empty")] fn rejects_empty_name() { let _ = NameAst::new(Span::at(5)); }
-
     #[test] fn displays_name_compactly() { let name = NameAst::new(Span::new(5, 10)); assert_eq!(name.to_string(), "name at 5..10"); }
-
     #[test] fn creates_scalar_values() { let string = ValueAst::String(StringAst::new(Span::new(0, 6))); let number = ValueAst::Number(NumberAst::new(Span::new(7, 9))); let boolean = ValueAst::Boolean(BooleanAst::new(true, Span::new(10, 14))); let null = ValueAst::Null(NullAst::new(Span::new(15, 19))); let identifier = ValueAst::Identifier(name(20, 23)); assert!(string.is_scalar()); assert!(number.is_scalar()); assert!(boolean.is_scalar()); assert!(null.is_scalar()); assert!(identifier.is_scalar()); assert_eq!(string.text(r#""John" 42 true null foo"#), Some(r#""John""#)); assert_eq!(number.text(r#""John" 42 true null foo"#), Some("42")); assert_eq!(boolean.text(r#""John" 42 true null foo"#), Some("true")); assert_eq!(null.text(r#""John" 42 true null foo"#), Some("null")); assert_eq!(identifier.text(r#""John" 42 true null foo"#), Some("foo")); }
-
     #[test] fn creates_array_value() { let source = r#"["rust", 42, true, null]"#; let array = ArrayAst::new( Span::new(0, 1), vec![ ValueAst::String(StringAst::new(Span::new(1, 7))), ValueAst::Number(NumberAst::new(Span::new(9, 11))), ValueAst::Boolean(BooleanAst::new(true, Span::new(13, 17))), ValueAst::Null(NullAst::new(Span::new(19, 23))), ], Span::new(23, 24), Span::new(0, 24), ); assert_eq!(array.len(), 4); assert!(!array.is_empty()); assert_eq!( array.value(0).and_then(|value| value.text(source)), Some(r#""rust""#) ); assert_eq!( array.value(3).and_then(|value| value.text(source)), Some("null") ); let value = ValueAst::Array(array); assert!(value.is_array()); assert!(!value.is_scalar()); assert_eq!(value.text(source), Some(source)); }
-
     #[test] fn creates_object_value() { let source = r#"{name: "John", age: 42}"#; let name_field = ObjectFieldAst::new( ObjectKeyAst::Identifier(name(1, 5)), Span::new(5, 6), ValueAst::String(StringAst::new(Span::new(7, 13))), Span::new(1, 13), ); let age_field = ObjectFieldAst::new( ObjectKeyAst::Identifier(name(15, 18)), Span::new(18, 19), ValueAst::Number(NumberAst::new(Span::new(20, 22))), Span::new(15, 22), ); let object = ObjectAst::new( Span::new(0, 1), vec![name_field, age_field], Span::new(22, 23), Span::new(0, 23), ); assert_eq!(object.len(), 2); assert_eq!( object.field(0).and_then(|field| field.key_text(source)), Some("name") ); assert_eq!( object.field(1).and_then(|field| field.key_text(source)), Some("age") ); let value = ValueAst::Object(object); assert!(value.is_object()); assert_eq!(value.text(source), Some(source)); }
-
     #[test] fn supports_quoted_object_keys() { let source = r#"{"display-name": "John"}"#; let key = ObjectKeyAst::String(StringAst::new(Span::new(1, 15))); let field = ObjectFieldAst::new( key, Span::new(15, 16), ValueAst::String(StringAst::new(Span::new(17, 23))), Span::new(1, 23), ); let object = ObjectAst::new( Span::new(0, 1), vec![field], Span::new(23, 24), Span::new(0, 24), ); assert!(key.is_string()); assert_eq!( object.field(0).and_then(|field| field.key_text(source)), Some(r#""display-name""#) ); }
-
     #[test] fn supports_nested_values() { let source = r#"{tags: ["rust", "db"]}"#; let array = ArrayAst::new( Span::new(7, 8), vec![ ValueAst::String(StringAst::new(Span::new(8, 14))), ValueAst::String(StringAst::new(Span::new(16, 20))), ], Span::new(20, 21), Span::new(7, 21), ); let field = ObjectFieldAst::new( ObjectKeyAst::Identifier(name(1, 5)), Span::new(5, 6), ValueAst::Array(array), Span::new(1, 21), ); let object = ObjectAst::new( Span::new(0, 1), vec![field], Span::new(21, 22), Span::new(0, 22), ); let value = ValueAst::Object(object); assert_eq!(value.text(source), Some(source)); assert!(value.is_object()); }
-
     #[test] fn allows_empty_array_and_object() { let array = ArrayAst::new( Span::new(0, 1), Vec::new(), Span::new(1, 2), Span::new(0, 2), ); let object = ObjectAst::new( Span::new(3, 4), Vec::new(), Span::new(4, 5), Span::new(3, 5), ); assert!(array.is_empty()); assert!(object.is_empty()); }
-
     #[test] fn creates_from_source() { let source = users_source(); assert_eq!(source.keyword(), SourceKeyword::From); assert_eq!(source.keyword_span(), Span::new(0, 4)); assert_eq!(source.collection(), name(5, 10)); assert_eq!(source.span(), Span::new(0, 10)); assert_eq!(source.collection_name("from users"), Some("users")); assert!(!source.has_alias()); assert_eq!(source.alias(), None); }
-
     #[test] fn creates_on_source() { let source = SourceAst::new( SourceKeyword::On, Span::new(0, 2), name(3, 8), Span::new(0, 8), ); assert_eq!(source.keyword(), SourceKeyword::On); assert_eq!(source.collection_name("on users"), Some("users")); }
-
     #[test] fn creates_source_with_alias() { let source_text = "on users as u"; let alias = SourceAliasAst::new(Span::new(9, 11), name(12, 13), Span::new(9, 13)); let source = SourceAst::with_alias( SourceKeyword::On, Span::new(0, 2), name(3, 8), alias, Span::new(0, 13), ); assert!(source.has_alias()); assert_eq!(source.alias(), Some(alias)); assert_eq!(source.alias_name(source_text), Some("u")); }
-
     #[test] #[should_panic(expected = "source keyword span must not be empty")] fn rejects_empty_source_keyword() { let _ = SourceAst::new( SourceKeyword::From, Span::at(0), name(1, 6), Span::new(0, 6), ); }
-
     #[test] #[should_panic(expected = "source span must contain collection span")] fn rejects_source_not_containing_collection() { let _ = SourceAst::new( SourceKeyword::From, Span::new(0, 4), name(5, 10), Span::new(0, 8), ); }
-
     #[test] fn creates_stage_with_arguments() { let source = "from users | where age > 18"; let stage = StageAst::new( Span::new(11, 12), name(13, 18), Span::new(19, 27), Span::new(11, 27), ); assert_eq!(stage.pipe_span(), Span::new(11, 12)); assert_eq!(stage.name_text(source), Some("where")); assert_eq!(stage.arguments_text(source), Some("age > 18")); assert_eq!(stage.header_span(), Span::new(11, 27)); assert_eq!(stage.span(), Span::new(11, 27)); assert!(stage.has_arguments()); assert!(!stage.is_composite()); assert_eq!(stage.subpipeline(), None); }
-
     #[test] fn creates_stage_without_arguments() { let source = "from users | inspect"; let stage = StageAst::new( Span::new(11, 12), name(13, 20), Span::at(20), Span::new(11, 20), ); assert_eq!(stage.name_text(source), Some("inspect")); assert_eq!(stage.arguments_text(source), Some("")); assert!(!stage.has_arguments()); }
-
     #[test] fn creates_end_marker() { let source = "| end"; let end = EndAst::new(Span::new(0, 1), Span::new(2, 5), Span::new(0, 5)); assert_eq!(end.pipe_span(), Span::new(0, 1)); assert_eq!(end.keyword_span(), Span::new(2, 5)); assert_eq!(end.text(source), Some(source)); }
-
     #[test] fn creates_composite_load_stage() { let source = "on users | load | with replace | chunk x | end"; let with_stage = StageAst::new( Span::new(16, 17), name(18, 22), Span::new(23, 30), Span::new(16, 30), ); let chunk_stage = StageAst::new( Span::new(31, 32), name(33, 38), Span::new(39, 40), Span::new(31, 40), ); let end = EndAst::new(Span::new(41, 42), Span::new(43, 46), Span::new(41, 46)); let subpipeline = SubPipelineAst::new( vec![with_stage.clone(), chunk_stage.clone()], end, Span::new(16, 46), ); let load = StageAst::with_subpipeline( Span::new(9, 10), name(11, 15), Span::at(15), Span::new(9, 15), subpipeline, Span::new(9, 46), ); assert!(load.is_composite()); assert_eq!(load.name_text(source), Some("load")); let body = load.subpipeline().expect("load body"); assert_eq!(body.stage_count(), 2); assert_eq!(body.stage(0), Some(&with_stage)); assert_eq!(body.stage(1), Some(&chunk_stage)); assert_eq!(body.end(), end); }
-
     #[test] fn supports_nested_composite_stages() { let source = "on a | union | lookup b | into x | end | end"; let into_stage = StageAst::new( Span::new(24, 25), name(26, 30), Span::new(31, 32), Span::new(24, 32), ); let lookup_end = EndAst::new(Span::new(33, 34), Span::new(35, 38), Span::new(33, 38)); let lookup_body = SubPipelineAst::new(vec![into_stage], lookup_end, Span::new(24, 38)); let lookup_stage = StageAst::with_subpipeline( Span::new(13, 14), name(15, 21), Span::new(22, 23), Span::new(13, 23), lookup_body, Span::new(13, 38), ); let union_end = EndAst::new(Span::new(39, 40), Span::new(41, 44), Span::new(39, 44)); let union_body = SubPipelineAst::new(vec![lookup_stage], union_end, Span::new(13, 44)); let union_stage = StageAst::with_subpipeline( Span::new(5, 6), name(7, 12), Span::at(12), Span::new(5, 12), union_body, Span::new(5, 44), ); let nested_lookup = union_stage .subpipeline() .and_then(|body| body.stage(0)) .expect("nested lookup"); assert_eq!(nested_lookup.name_text(source), Some("lookup")); assert!(nested_lookup.is_composite()); }
-
     #[test] fn creates_empty_subpipeline() { let end = EndAst::new(Span::new(9, 10), Span::new(11, 14), Span::new(9, 14)); let subpipeline = SubPipelineAst::empty(end); assert!(subpipeline.is_empty()); assert_eq!(subpipeline.stage_count(), 0); assert_eq!(subpipeline.end(), end); }
-
     #[test] fn creates_source_only_pipeline() { let pipeline = PipelineAst::source_only(users_source()); assert_eq!(pipeline.source(), users_source()); assert_eq!(pipeline.stage_count(), 0); assert!(pipeline.is_source_only()); assert_eq!(pipeline.span(), Span::new(0, 10)); assert_eq!(pipeline.text("from users"), Some("from users")); }
-
     #[test] fn creates_pipeline_with_stages() { let source_text = "from users | where age > 18 | set active = true"; let where_stage = StageAst::new( Span::new(11, 12), name(13, 18), Span::new(19, 27), Span::new(11, 27), ); let set_stage = StageAst::new( Span::new(28, 29), name(30, 33), Span::new(34, 47), Span::new(28, 47), ); let pipeline = PipelineAst::new( users_source(), vec![where_stage.clone(), set_stage.clone()], Span::new(0, 47), ); assert_eq!(pipeline.stage_count(), 2); assert_eq!(pipeline.stage(0), Some(&where_stage)); assert_eq!(pipeline.stage(1), Some(&set_stage)); assert_eq!(pipeline.stage(2), None); assert_eq!(pipeline.text(source_text), Some(source_text)); }
-
     #[test] fn iterates_over_stages_in_source_order() { let first = StageAst::new( Span::new(11, 12), name(13, 18), Span::new(19, 27), Span::new(11, 27), ); let second = StageAst::new( Span::new(28, 29), name(30, 33), Span::new(34, 47), Span::new(28, 47), ); let pipeline = PipelineAst::new( users_source(), vec![first.clone(), second.clone()], Span::new(0, 47), ); assert_eq!( pipeline.iter_stages().cloned().collect::<Vec<_>>(), vec![first.clone(), second.clone()], ); assert_eq!( (&pipeline).into_iter().cloned().collect::<Vec<_>>(), vec![first, second], ); }
-
     #[test] fn consumes_pipeline_into_parts() { let stage = StageAst::new( Span::new(11, 12), name(13, 18), Span::new(19, 27), Span::new(11, 27), ); let pipeline = PipelineAst::new(users_source(), vec![stage.clone()], Span::new(0, 27)); let (source, stages) = pipeline.into_parts(); assert_eq!(source, users_source()); assert_eq!(stages, vec![stage]); }
-
     #[test] #[should_panic(expected = "pipeline stages must be ordered")] fn rejects_unordered_stages() { let first = StageAst::new( Span::new(20, 21), name(22, 27), Span::at(27), Span::new(20, 27), ); let second = StageAst::new( Span::new(11, 12), name(13, 18), Span::at(18), Span::new(11, 18), ); let _ = PipelineAst::new(users_source(), vec![first, second], Span::new(0, 27)); }
-
     #[test] fn syntax_aliases_remain_distinguishable() { let from = SourceAst::new( SourceKeyword::From, Span::new(0, 4), name(5, 10), Span::new(0, 10), ); let on = SourceAst::new( SourceKeyword::On, Span::new(0, 2), name(3, 8), Span::new(0, 8), ); assert_ne!(from.keyword(), on.keyword()); }
-
     #[test] fn different_literal_arguments_remain_distinguishable() { let first_source = "from users | where age > 18"; let second_source = "from users | where age > 42"; let first = StageAst::new( Span::new(11, 12), name(13, 18), Span::new(19, 27), Span::new(11, 27), ); let second = StageAst::new( Span::new(11, 12), name(13, 18), Span::new(19, 27), Span::new(11, 27), ); assert_eq!(first.arguments_text(first_source), Some("age > 18")); assert_eq!(second.arguments_text(second_source), Some("age > 42")); }
-
     #[test] fn leaf_ast_nodes_remain_compact() { assert!(std::mem::size_of::<NameAst>() <= 2 * std::mem::size_of::<usize>(),); assert!(std::mem::size_of::<StringAst>() <= 2 * std::mem::size_of::<usize>(),); assert!(std::mem::size_of::<NumberAst>() <= 2 * std::mem::size_of::<usize>(),); assert!(std::mem::size_of::<BooleanAst>() <= 3 * std::mem::size_of::<usize>(),); assert!(std::mem::size_of::<NullAst>() <= 2 * std::mem::size_of::<usize>(),); assert!(std::mem::size_of::<SourceAliasAst>() <= 6 * std::mem::size_of::<usize>(),); assert!(std::mem::size_of::<EndAst>() <= 6 * std::mem::size_of::<usize>(),); }
 }

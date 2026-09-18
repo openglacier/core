@@ -235,8 +235,6 @@ mod tests {
     use super::*;
 
     #[test] fn queue_is_bounded() { let scheduler = LlmScheduler::new(1, 1); let _active = scheduler.schedule("a".to_owned()).unwrap(); let _queued = scheduler.schedule("a".to_owned()).unwrap(); assert!(matches!( scheduler.schedule("a".to_owned()), Err(LlmError::Busy(_)) )); }
-
     #[test] fn cancelling_unknown_run_is_false() { let scheduler = LlmScheduler::new(1, 1); assert!(!scheduler.cancel(42, "a")); }
-
     #[test] fn cancellation_is_scoped_to_owner() { let scheduler = LlmScheduler::new(1, 1); let run = scheduler.schedule("owner-a".to_owned()).unwrap(); assert!(!scheduler.cancel(run.run_id(), "owner-b")); assert!(scheduler.cancel(run.run_id(), "owner-a")); }
 }

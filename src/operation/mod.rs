@@ -6,7 +6,6 @@ mod payload;
 mod request;
 mod response;
 mod router;
-//use crate::error::{Error, Result};
 pub use catalog::*;
 pub use catalog::{
     operation_by_name, AccessPolicy, OperationDescriptor, OperationKind, OPERATION_CATALOG,

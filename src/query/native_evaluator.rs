@@ -24,22 +24,12 @@ use super::{
 /// layout without forcing changes in the executor or runtime.
 pub trait NativeSemantics: Send + Sync {
     /// Evaluates one expression as a strict predicate.
-    fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<bool>;
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<bool>;
 
     /// Applies all assignments to a private document value.
     ///
     /// The returned document is published only when this call succeeds.
-    fn apply_assignments(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<Document>;
+    fn apply_assignments( &self, assignments: &[SetAssignment], document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<Document>;
 }
 
 /// Production evaluation backend.
@@ -106,7 +96,7 @@ impl NativeEvaluator {
         self.into_evaluator().into_runtime()
     }
 
-    fn session<'a>(&'a self, context: &'a EvaluationContext) -> NativeEvaluationSession<'a> {
+    const fn session<'a>(&'a self, context: &'a EvaluationContext) -> NativeEvaluationSession<'a> {
         NativeEvaluationSession {
             context,
             limits: self.limits,
@@ -128,12 +118,7 @@ impl fmt::Debug for NativeEvaluator {
 }
 
 impl EvaluationBackend for NativeEvaluator {
-    fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        context: &EvaluationContext,
-    ) -> EvaluationResult<bool> {
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, context: &EvaluationContext, ) -> EvaluationResult<bool> {
         self.statistics
             .predicate_evaluations
             .fetch_add(1, Ordering::Relaxed);
@@ -154,12 +139,7 @@ impl EvaluationBackend for NativeEvaluator {
         result
     }
 
-    fn apply_assignments(
-        &self,
-        assignments: &[SetAssignment],
-        document: &Document,
-        context: &EvaluationContext,
-    ) -> EvaluationResult<Arc<Document>> {
+    fn apply_assignments( &self, assignments: &[SetAssignment], document: &Document, context: &EvaluationContext, ) -> EvaluationResult<Arc<Document>> {
         self.statistics
             .mutation_evaluations
             .fetch_add(1, Ordering::Relaxed);
@@ -304,10 +284,10 @@ pub struct NativeDepthGuard<'session, 'context> {
     session: &'session mut NativeEvaluationSession<'context>,
 }
 
-impl<'session, 'context> NativeDepthGuard<'session, 'context> {
+impl<'context> NativeDepthGuard<'_, 'context> {
     /// Returns the guarded mutable session.
     #[must_use]
-    pub fn session(&mut self) -> &mut NativeEvaluationSession<'context> {
+    pub const fn session(&mut self) -> &mut NativeEvaluationSession<'context> {
         self.session
     }
 }
@@ -345,7 +325,7 @@ impl NativeEvaluationLimits {
 
     /// Creates validated limits.
     #[inline]
-    pub fn new(max_depth: usize, max_steps: u64) -> Result<Self, NativeEvaluationLimitsError> {
+    pub const fn new(max_depth: usize, max_steps: u64) -> Result<Self, NativeEvaluationLimitsError> {
         if max_depth == 0 {
             return Err(NativeEvaluationLimitsError::ZeroDepth);
         }
@@ -411,12 +391,8 @@ mod tests {
     use super::*;
 
     #[test] fn default_limits_are_non_zero() { let limits = NativeEvaluationLimits::default(); assert!(limits.max_depth > 0); assert!(limits.max_steps > 0); }
-
     #[test] fn rejects_zero_limits() { assert_eq!( NativeEvaluationLimits::new(0, 1), Err(NativeEvaluationLimitsError::ZeroDepth) ); assert_eq!( NativeEvaluationLimits::new(1, 0), Err(NativeEvaluationLimitsError::ZeroSteps) ); }
-
     #[test] fn session_enforces_step_limit() { let context = EvaluationContext::default(); let mut session = NativeEvaluationSession { context: &context, limits: NativeEvaluationLimits { max_depth: 2, max_steps: 1, }, depth: 0, steps: 0, }; assert!(session.charge().is_ok()); assert!(session.charge().is_err()); }
-
     #[test] fn depth_guard_restores_depth() { let context = EvaluationContext::default(); let mut session = NativeEvaluationSession { context: &context, limits: NativeEvaluationLimits { max_depth: 2, max_steps: 10, }, depth: 0, steps: 0, }; { let mut guard = session.enter().unwrap(); assert_eq!(guard.session().depth(), 1); } assert_eq!(session.depth(), 0); }
-
     #[test] fn public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<NativeEvaluator>(); assert_send_and_sync::<NativeEvaluationLimits>(); assert_send_and_sync::<NativeEvaluationStatisticsSnapshot>(); }
 }

@@ -199,11 +199,7 @@ impl StageDefinition {
     ///
     /// Returns an error when the stage name is invalid.
     #[inline]
-    pub fn new(
-        name: impl AsRef<str>,
-        kind: StageKind,
-        argument_policy: StageArgumentPolicy,
-    ) -> StageResult<Self> {
+    pub fn new( name: impl AsRef<str>, kind: StageKind, argument_policy: StageArgumentPolicy, ) -> StageResult<Self> {
         Ok(Self {
             name: StageName::parse(name)?,
             kind,
@@ -340,13 +336,8 @@ impl StageRegistry {
     /// # Errors
     ///
     /// Returns an error when the name is invalid or duplicated.
-    pub fn register_custom(
-        &mut self,
-        name: impl AsRef<str>,
-        argument_policy: StageArgumentPolicy,
-    ) -> StageResult<()> {
+    pub fn register_custom( &mut self, name: impl AsRef<str>, argument_policy: StageArgumentPolicy, ) -> StageResult<()> {
         let definition = StageDefinition::new(name, StageKind::Custom, argument_policy)?;
-
         self.register(definition)
     }
 
@@ -375,6 +366,7 @@ impl StageRegistry {
     }
 
     /// Iterates over definitions in deterministic name order.
+    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &StageDefinition> {
         self.definitions.values()
     }
@@ -393,11 +385,7 @@ impl StageRegistry {
     ///
     /// Returns an error for an invalid span, unknown stage, missing arguments,
     /// or forbidden arguments.
-    pub fn resolve<'registry, 'ast, 'source>(
-        &'registry self,
-        stage: &'ast StageAst,
-        source: &'source str,
-    ) -> StageResult<ResolvedStage<'registry, 'ast, 'source>> {
+    pub fn resolve<'registry, 'ast, 'source>( &'registry self, stage: &'ast StageAst, source: &'source str, ) -> StageResult<ResolvedStage<'registry, 'ast, 'source>> {
         let name = stage
             .name_text(source)
             .ok_or_else(StageError::invalid_source_span)?;
@@ -437,7 +425,7 @@ impl StageRegistry {
     fn insert_builtin(&mut self, definition: StageDefinition) {
         let previous = self.replace(definition);
 
-        debug_assert!(previous.is_none(), "native stage names must be unique",);
+        debug_assert!(previous.is_none(), "native stage names must be unique");
     }
 }
 
@@ -543,19 +531,19 @@ impl StageError {
         &self.kind
     }
 
-    fn empty_name() -> Self {
+    const fn empty_name() -> Self {
         Self::new(StageErrorKind::EmptyName)
     }
 
-    fn invalid_start(character: char) -> Self {
+    const fn invalid_start(character: char) -> Self {
         Self::new(StageErrorKind::InvalidNameStart { character })
     }
 
-    fn invalid_character(index: usize, character: char) -> Self {
+    const fn invalid_character(index: usize, character: char) -> Self {
         Self::new(StageErrorKind::InvalidNameCharacter { index, character })
     }
 
-    fn duplicate_stage(name: StageName) -> Self {
+    const fn duplicate_stage(name: StageName) -> Self {
         Self::new(StageErrorKind::DuplicateStage { name })
     }
 
@@ -565,15 +553,15 @@ impl StageError {
         })
     }
 
-    fn missing_arguments(name: StageName) -> Self {
+    const fn missing_arguments(name: StageName) -> Self {
         Self::new(StageErrorKind::MissingArguments { name })
     }
 
-    fn unexpected_arguments(name: StageName) -> Self {
+    const fn unexpected_arguments(name: StageName) -> Self {
         Self::new(StageErrorKind::UnexpectedArguments { name })
     }
 
-    fn invalid_source_span() -> Self {
+    const fn invalid_source_span() -> Self {
         Self::new(StageErrorKind::InvalidSourceSpan)
     }
 }
@@ -598,19 +586,19 @@ impl fmt::Display for StageError {
             }
 
             StageErrorKind::DuplicateStage { name } => {
-                write!(formatter, "stage {name:?} is already registered",)
+                write!(formatter, "stage {name:?} is already registered")
             }
 
             StageErrorKind::UnknownStage { name } => {
-                write!(formatter, "unknown query stage {name:?}",)
+                write!(formatter, "unknown query stage {name:?}")
             }
 
             StageErrorKind::MissingArguments { name } => {
-                write!(formatter, "stage {name:?} requires arguments",)
+                write!(formatter, "stage {name:?} requires arguments")
             }
 
             StageErrorKind::UnexpectedArguments { name } => {
-                write!(formatter, "stage {name:?} does not accept arguments",)
+                write!(formatter, "stage {name:?} does not accept arguments")
             }
 
             StageErrorKind::InvalidSourceSpan => {
@@ -685,50 +673,27 @@ mod tests {
     use crate::query::parse;
 
     #[test] fn validates_stage_names() { assert!(StageName::parse("where").is_ok()); assert!(StageName::parse("_internal").is_ok()); assert!(StageName::parse("stage2").is_ok()); assert!(StageName::parse("étape").is_ok()); }
-
     #[test] fn rejects_empty_stage_name() { let error = StageName::parse("").expect_err("empty name must fail"); assert_eq!(error.kind(), &StageErrorKind::EmptyName); }
-
     #[test] fn rejects_invalid_stage_name_start() { let error = StageName::parse("2stage").expect_err("name must fail"); assert_eq!( error.kind(), &StageErrorKind::InvalidNameStart { character: '2' }, ); }
-
     #[test] fn rejects_invalid_stage_name_character() { let error = StageName::parse("my-stage").expect_err("name must fail"); assert_eq!( error.kind(), &StageErrorKind::InvalidNameCharacter { index: 2, character: '-', }, ); }
-
     #[test] fn stage_name_is_case_sensitive() { assert_ne!( StageName::parse("where").unwrap(), StageName::parse("Where").unwrap(), ); }
-
     #[test] fn creates_builtin_registry() { let registry = StageRegistry::with_builtins(); assert_eq!(registry.len(), 3); assert!(registry.contains("where")); assert!(registry.contains("set")); assert!(registry.contains("load")); }
-
     #[test] fn builtin_registry_is_case_sensitive() { let registry = StageRegistry::with_builtins(); assert!(registry.contains("where")); assert!(!registry.contains("Where")); }
-
     #[test] fn registers_custom_stage() { let mut registry = StageRegistry::new(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let definition = registry.get("inspect").expect("stage must be registered"); assert_eq!(definition.kind(), StageKind::Custom); assert_eq!(definition.argument_policy(), StageArgumentPolicy::Optional,); }
-
     #[test] fn rejects_duplicate_stage() { let mut registry = StageRegistry::new(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let error = registry .register_custom("inspect", StageArgumentPolicy::Required) .expect_err("duplicate stage must fail"); assert_eq!( error.kind(), &StageErrorKind::DuplicateStage { name: StageName::parse("inspect").unwrap(), }, ); }
-
     #[test] fn replaces_stage_definition() { let mut registry = StageRegistry::new(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let replacement = StageDefinition::new("inspect", StageKind::Custom, StageArgumentPolicy::Required) .unwrap(); let previous = registry .replace(replacement) .expect("old definition must be returned"); assert_eq!(previous.argument_policy(), StageArgumentPolicy::Optional,); assert_eq!( registry.get("inspect").unwrap().argument_policy(), StageArgumentPolicy::Required, ); }
-
     #[test] fn removes_stage_definition() { let mut registry = StageRegistry::with_builtins(); let removed = registry.remove("load").expect("load must exist"); assert_eq!(removed.kind(), StageKind::Load); assert!(!registry.contains("load")); }
-
     #[test] fn registry_iteration_is_deterministic() { let mut registry = StageRegistry::new(); registry .register_custom("zeta", StageArgumentPolicy::Optional) .unwrap(); registry .register_custom("alpha", StageArgumentPolicy::Optional) .unwrap(); registry .register_custom("middle", StageArgumentPolicy::Optional) .unwrap(); let names = registry .iter() .map(|definition| definition.name().as_str()) .collect::<Vec<_>>(); assert_eq!(names, vec!["alpha", "middle", "zeta"]); }
-
-    #[test] fn resolves_where_stage() { let source = "from users | where age >= 18"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let resolved = registry .resolve(&stage, source) .expect("where must resolve"); assert_eq!(resolved.name().as_str(), "where"); assert_eq!(resolved.kind(), StageKind::Where); assert_eq!(resolved.arguments(), "age >= 18"); assert!(resolved.is_read_only()); assert!(!resolved.is_mutating()); }
-
-    #[test] fn resolves_set_stage() { let source = "from users | set enabled = true"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let resolved = registry.resolve(&stage, source).expect("set must resolve"); assert_eq!(resolved.kind(), StageKind::Set); assert_eq!(resolved.arguments(), "enabled = true"); assert!(resolved.is_mutating()); assert!(!resolved.is_read_only()); }
-
-    #[test] fn resolves_custom_stage() { let source = "from users | inspect verbose"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::with_builtins(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let resolved = registry .resolve(&stage, source) .expect("custom stage must resolve"); assert_eq!(resolved.kind(), StageKind::Custom); assert_eq!(resolved.arguments(), "verbose"); }
-
-    #[test] fn rejects_unknown_stage() { let source = "from users | inspect verbose"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let error = registry .resolve(&stage, source) .expect_err("unknown stage must fail"); assert_eq!( error.kind(), &StageErrorKind::UnknownStage { name: Arc::from("inspect"), }, ); }
-
-    #[test] fn rejects_missing_required_arguments() { let source = "from users | where"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let error = registry .resolve(&stage, source) .expect_err("missing arguments must fail"); assert_eq!( error.kind(), &StageErrorKind::MissingArguments { name: StageName::parse("where").unwrap(), }, ); }
-
-    #[test] fn accepts_optional_arguments_when_absent() { let source = "from users | inspect"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::new(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let resolved = registry .resolve(&stage, source) .expect("optional arguments may be absent"); assert_eq!(resolved.arguments(), ""); assert!(!resolved.has_arguments()); }
-
-    #[test] fn rejects_arguments_when_forbidden() { let source = "from users | commit now"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::new(); registry .register_custom("commit", StageArgumentPolicy::Forbidden) .unwrap(); let error = registry .resolve(&stage, source) .expect_err("arguments must be rejected"); assert_eq!( error.kind(), &StageErrorKind::UnexpectedArguments { name: StageName::parse("commit").unwrap(), }, ); }
-
-    #[test] fn accepts_forbidden_policy_without_arguments() { let source = "from users | commit"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::new(); registry .register_custom("commit", StageArgumentPolicy::Forbidden) .unwrap(); let resolved = registry .resolve(&stage, source) .expect("argumentless stage must resolve"); assert_eq!(resolved.arguments(), ""); }
-
+    #[test] fn resolves_where_stage() { let source = "from users | where age >= 18"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let resolved = registry .resolve(stage, source) .expect("where must resolve"); assert_eq!(resolved.name().as_str(), "where"); assert_eq!(resolved.kind(), StageKind::Where); assert_eq!(resolved.arguments(), "age >= 18"); assert!(resolved.is_read_only()); assert!(!resolved.is_mutating()); }
+    #[test] fn resolves_set_stage() { let source = "from users | set enabled = true"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let resolved = registry.resolve(stage, source).expect("set must resolve"); assert_eq!(resolved.kind(), StageKind::Set); assert_eq!(resolved.arguments(), "enabled = true"); assert!(resolved.is_mutating()); assert!(!resolved.is_read_only()); }
+    #[test] fn resolves_custom_stage() { let source = "from users | inspect verbose"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::with_builtins(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let resolved = registry .resolve(stage, source) .expect("custom stage must resolve"); assert_eq!(resolved.kind(), StageKind::Custom); assert_eq!(resolved.arguments(), "verbose"); }
+    #[test] fn rejects_unknown_stage() { let source = "from users | inspect verbose"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let error = registry .resolve(stage, source) .expect_err("unknown stage must fail"); assert_eq!( error.kind(), &StageErrorKind::UnknownStage { name: Arc::from("inspect"), }, ); }
+    #[test] fn rejects_missing_required_arguments() { let source = "from users | where"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let registry = StageRegistry::with_builtins(); let error = registry .resolve(stage, source) .expect_err("missing arguments must fail"); assert_eq!( error.kind(), &StageErrorKind::MissingArguments { name: StageName::parse("where").unwrap(), }, ); }
+    #[test] fn accepts_optional_arguments_when_absent() { let source = "from users | inspect"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::new(); registry .register_custom("inspect", StageArgumentPolicy::Optional) .unwrap(); let resolved = registry .resolve(stage, source) .expect("optional arguments may be absent"); assert_eq!(resolved.arguments(), ""); assert!(!resolved.has_arguments()); }
+    #[test] fn rejects_arguments_when_forbidden() { let source = "from users | commit now"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::new(); registry .register_custom("commit", StageArgumentPolicy::Forbidden) .unwrap(); let error = registry .resolve(stage, source) .expect_err("arguments must be rejected"); assert_eq!( error.kind(), &StageErrorKind::UnexpectedArguments { name: StageName::parse("commit").unwrap(), }, ); }
+    #[test] fn accepts_forbidden_policy_without_arguments() { let source = "from users | commit"; let pipeline = parse(source).unwrap(); let stage = pipeline.stage(0).unwrap(); let mut registry = StageRegistry::new(); registry .register_custom("commit", StageArgumentPolicy::Forbidden) .unwrap(); let resolved = registry .resolve(stage, source) .expect("argumentless stage must resolve"); assert_eq!(resolved.arguments(), ""); }
     #[test] fn native_stage_metadata_is_correct() { let where_stage = StageDefinition::native_where(); let set_stage = StageDefinition::native_set(); let load_stage = StageDefinition::native_load(); assert!(where_stage.is_read_only()); assert!(!where_stage.is_mutating()); assert!(set_stage.is_mutating()); assert!(load_stage.is_mutating()); }
-
     #[test] fn argument_policy_accepts_expected_values() { assert!(StageArgumentPolicy::Forbidden.accepts(false),); assert!(!StageArgumentPolicy::Forbidden.accepts(true),); assert!(StageArgumentPolicy::Optional.accepts(false),); assert!(StageArgumentPolicy::Optional.accepts(true),); assert!(!StageArgumentPolicy::Required.accepts(false),); assert!(StageArgumentPolicy::Required.accepts(true),); }
-
     #[test] fn collects_registry_from_definitions() { let definitions = vec![ StageDefinition::new("first", StageKind::Custom, StageArgumentPolicy::Optional) .unwrap(), StageDefinition::new("second", StageKind::Custom, StageArgumentPolicy::Required) .unwrap(), ]; let registry: StageResult<StageRegistry> = definitions.into_iter().collect(); let registry = registry.unwrap(); assert!(registry.contains("first")); assert!(registry.contains("second")); }
-
     #[test] fn collecting_duplicate_definitions_fails() { let definitions = vec![ StageDefinition::new("inspect", StageKind::Custom, StageArgumentPolicy::Optional) .unwrap(), StageDefinition::new("inspect", StageKind::Custom, StageArgumentPolicy::Required) .unwrap(), ]; let registry: StageResult<StageRegistry> = definitions.into_iter().collect(); assert!(matches!( registry.unwrap_err().kind(), StageErrorKind::DuplicateStage { .. }, )); }
 }

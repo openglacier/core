@@ -313,12 +313,7 @@ impl FileStore for NativeFileStore {
         self.entry(&remote_id)
     }
 
-    fn move_entry(
-        &self,
-        remote_id: &str,
-        new_parent_remote_id: Option<&str>,
-        new_name: &str,
-    ) -> FileResult<FileStoreEntry> {
+    fn move_entry( &self, remote_id: &str, new_parent_remote_id: Option<&str>, new_name: &str, ) -> FileResult<FileStoreEntry> {
         let source = self.resolve_existing(remote_id)?;
         fs::symlink_metadata(&source).map_err(map_not_found)?;
         self.ensure_directory(new_parent_remote_id)?;
@@ -329,12 +324,7 @@ impl FileStore for NativeFileStore {
         self.entry(&new_remote_id)
     }
 
-    fn copy(
-        &self,
-        remote_id: &str,
-        new_parent_remote_id: Option<&str>,
-        new_name: &str,
-    ) -> FileResult<FileStoreEntry> {
+    fn copy( &self, remote_id: &str, new_parent_remote_id: Option<&str>, new_name: &str, ) -> FileResult<FileStoreEntry> {
         let source = self.resolve_existing(remote_id)?;
         fs::symlink_metadata(&source).map_err(map_not_found)?;
         self.ensure_directory(new_parent_remote_id)?;
@@ -433,6 +423,5 @@ mod tests {
     }
 
     #[test] fn native_store_supports_streaming_range_and_mutations() { let (store, root) = test_store(); let directory = store.mkdir(None, "docs").expect("mkdir"); let mut source: &[u8] = b"openglacier"; let written = store .write( FileWrite { remote_id: None, parent_remote_id: Some(&directory.remote_id), name: "hello.txt", content_type: Some("text/plain"), size: Some(11), }, &mut source, ) .expect("write"); assert_eq!(written.metadata.size, Some(11)); let mut range = store .read(&written.remote_id, Some(FileRange::new(4, Some(4)))) .expect("range read"); let mut bytes = Vec::new(); range.read_to_end(&mut bytes).expect("read range"); assert_eq!(bytes, b"glac"); let copied = store .copy(&written.remote_id, Some(&directory.remote_id), "copy.txt") .expect("copy"); let moved = store .move_entry(&copied.remote_id, None, "moved.txt") .expect("move"); assert_eq!(moved.remote_id, "moved.txt"); assert_eq!(store.list(None).expect("list root").len(), 2); store .delete(&directory.remote_id) .expect("delete directory"); store.delete(&moved.remote_id).expect("delete moved"); fs::remove_dir_all(root).expect("cleanup"); }
-
     #[test] fn traversal_and_invalid_ranges_are_rejected() { let (store, root) = test_store(); let mut source: &[u8] = b"abc"; let file = store .write( FileWrite { remote_id: None, parent_remote_id: None, name: "a.txt", content_type: None, size: None, }, &mut source, ) .expect("write"); assert!(matches!( store.stat("../outside"), Err(FileStoreError::InvalidRemoteId) )); assert!(matches!( store.read(&file.remote_id, Some(FileRange::new(4, None))), Err(FileStoreError::InvalidRange) )); store.delete(&file.remote_id).expect("delete"); fs::remove_dir_all(root).expect("cleanup"); }
 }

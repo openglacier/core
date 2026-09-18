@@ -13,7 +13,7 @@ pub struct FieldName(Arc<str>);
 impl FieldName {
     #[must_use] pub fn new(value: impl Into<Arc<str>>) -> Self { Self(value.into()) }
     #[must_use] pub fn as_str(&self) -> &str { &self.0 }
-    #[must_use] pub fn as_arc(&self) -> &Arc<str> { &self.0 }
+    #[must_use] pub const fn as_arc(&self) -> &Arc<str> { &self.0 }
     #[must_use] pub fn into_arc(self) -> Arc<str> { self.0 }
     #[must_use] pub fn to_owned_string(&self) -> String { self.0.to_string() }
     #[must_use] pub fn is_empty(&self) -> bool { self.0.is_empty() }
@@ -47,7 +47,9 @@ impl Document {
 
     #[must_use] #[inline] pub fn len(&self) -> usize { self.fields.len() }
     #[must_use] #[inline] pub fn is_empty(&self) -> bool { self.fields.is_empty() }
+    #[must_use]
     pub fn contains_key(&self, name: &str) -> bool { self.fields.contains_key(name) }
+    #[must_use]
     pub fn get(&self, name: &str) -> Option<&Value> { self.fields.get(name) }
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Value> { self.fields.get_mut(name) }
     pub fn entry(&mut self, name: impl Into<FieldName>) -> btree_map::Entry<'_, FieldName, Value> { self.fields.entry(name.into()) }
@@ -56,13 +58,17 @@ impl Document {
     pub fn remove(&mut self, name: &str) -> Option<Value> { self.fields.remove(name) }
     pub fn clear(&mut self) { self.fields.clear(); }
     pub fn retain(&mut self, mut predicate: impl FnMut(&FieldName, &mut Value) -> bool) { self.fields.retain(|name, value| predicate(name, value)); }
-    pub fn append(&mut self, other: &mut Document) { self.fields.append(&mut other.fields); }
+    pub fn append(&mut self, other: &mut Self) { self.fields.append(&mut other.fields); }
+    #[must_use]
     pub fn iter(&self) -> Iter<'_> { Iter { inner: self.fields.iter() } }
+    #[must_use]
     pub fn keys(&self) -> Keys<'_> { Keys { inner: self.fields.keys() } }
+    #[must_use]
     pub fn values(&self) -> Values<'_> { Values { inner: self.fields.values() } }
     pub fn values_mut(&mut self) -> ValuesMut<'_> { ValuesMut { inner: self.fields.values_mut() } }
+    #[must_use]
     pub fn into_iter_fields(self) -> IntoIter { IntoIter { inner: self.fields.into_iter() } }
-    #[must_use] pub fn as_map(&self) -> &BTreeMap<FieldName, Value> { &self.fields }
+    #[must_use] pub const fn as_map(&self) -> &BTreeMap<FieldName, Value> { &self.fields }
     #[must_use] pub fn into_map(self) -> BTreeMap<FieldName, Value> { self.fields }
 
     pub fn extend<I, K>(&mut self, fields: I)
@@ -196,7 +202,7 @@ where
     where
         I: IntoIterator<Item = (K, Value)>,
     {
-        Document::extend(self, fields);
+        Self::extend(self, fields);
     }
 }
 

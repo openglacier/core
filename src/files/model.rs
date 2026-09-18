@@ -141,7 +141,7 @@ pub struct FileMetadata {
 /// One `_files` document.
 ///
 /// `remote_id` is deliberately opaque: it may be a native blob identifier,
-/// an S3 key, a Drive item ID, a OneDrive item ID, or another provider token.
+/// an S3 key, a Drive item ID, a `OneDrive` item ID, or another provider token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
     pub file_id: FileId,

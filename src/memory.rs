@@ -1,15 +1,8 @@
 //! Global memory-budget primitives.
-//!
+//! To not be confused with the memory backend.
 //! It provides a shared governor, RAII reservations and diagnostics that later patches can wire into caches and physical operators.
 #![cfg_attr(rustfmt, rustfmt_skip)]
-use std::{
-    collections::VecDeque,
-    fmt,
-    sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, Weak,
-    },
-};
+use std::{ collections::VecDeque, fmt, sync::{ atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex, Weak, }, };
 
 pub use crate::error::{MemoryReservationError, ProcessMemoryPressureError, QueryAdmissionError};
 
@@ -356,9 +349,9 @@ impl MemoryProfileConfig {
             .expect("memory profile templates cannot be empty");
 
         let scale = |value: u64| -> usize {
-            let scaled = (value as u128)
+            let scaled = u128::from(value)
                 .saturating_mul(limit_bytes as u128)
-                .checked_div(template.limit as u128)
+                .checked_div(u128::from(template.limit))
                 .unwrap_or(0);
             u128_to_usize_saturating(scaled)
         };
@@ -381,7 +374,7 @@ impl MemoryProfileConfig {
     }
 
     #[must_use]
-    pub fn is_scaled(self) -> bool {
+    pub const fn is_scaled(self) -> bool {
         match (
             self.process_limit_bytes,
             self.profile.canonical_limit_bytes(),
@@ -587,16 +580,12 @@ impl MemoryGovernor {
     ///
     /// The caller retains the strong [`Arc`] and therefore controls the hook
     /// lifetime. Dead registrations are removed lazily during reclaim.
-    pub fn register_reclaimer(
-        &self,
-        class: MemoryClass,
-        reclaimer: &Arc<dyn MemoryReclaimer>,
-    ) {
+    pub fn register_reclaimer( &self, class: MemoryClass, reclaimer: &Arc<dyn MemoryReclaimer>, ) {
         let mut reclaimers = self
             .inner
             .reclaimers
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reclaimers.push(RegisteredReclaimer {
             class,
             reclaimer: Arc::downgrade(reclaimer),
@@ -616,7 +605,7 @@ impl MemoryGovernor {
                 .inner
                 .reclaimers
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             reclaimers.retain(|entry| entry.reclaimer.strong_count() > 0);
             reclaimers
                 .iter()
@@ -640,11 +629,7 @@ impl MemoryGovernor {
     ///
     /// Successful reservations are released automatically when the returned
     /// [`MemoryReservation`] is dropped.
-    pub fn reserve(
-        &self,
-        class: MemoryClass,
-        bytes: usize,
-    ) -> Result<MemoryReservation, MemoryReservationError> {
+    pub fn reserve( &self, class: MemoryClass, bytes: usize, ) -> Result<MemoryReservation, MemoryReservationError> {
         if bytes == 0 {
             return Ok(MemoryReservation::empty(Arc::clone(&self.inner), class));
         }
@@ -697,12 +682,7 @@ impl MemoryGovernor {
         }
     }
 
-    fn reject(
-        &self,
-        class: MemoryClass,
-        requested_bytes: usize,
-        current_bytes: usize,
-    ) -> MemoryReservationError {
+    fn reject( &self, class: MemoryClass, requested_bytes: usize, current_bytes: usize, ) -> MemoryReservationError {
         self.inner
             .failed_reservations
             .fetch_add(1, Ordering::Relaxed);
@@ -798,11 +778,7 @@ impl MemoryGovernor {
     /// separate from
     /// [`Self::reserve`]: zero-byte reservations and pure accounting operations
     /// must never fail because of process pressure.
-    pub fn ensure_process_capacity(
-        &self,
-        class: MemoryClass,
-        requested_bytes: usize,
-    ) -> Result<(), ProcessMemoryPressureError> {
+    pub fn ensure_process_capacity( &self, class: MemoryClass, requested_bytes: usize, ) -> Result<(), ProcessMemoryPressureError> {
         match self.process_pressure() {
             ProcessMemoryPressure::Hard {
                 rss_bytes,
@@ -820,11 +796,7 @@ impl MemoryGovernor {
     }
 
     /// Admits one operation against the profile-wide concurrency envelope.
-    pub fn admit(
-        &self,
-        class: WorkloadClass,
-        requested_bytes: usize,
-    ) -> Result<QueryMemoryPermit, QueryAdmissionError> {
+    pub fn admit( &self, class: WorkloadClass, requested_bytes: usize, ) -> Result<QueryMemoryPermit, QueryAdmissionError> {
         if class == WorkloadClass::Streaming {
             return Ok(QueryMemoryPermit::empty(Arc::clone(&self.inner), class));
         }
@@ -839,7 +811,7 @@ impl MemoryGovernor {
             .inner
             .admission
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let heavy = state
             .records
             .iter()
@@ -881,7 +853,7 @@ impl MemoryGovernor {
             .inner
             .admission
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         QueryMemorySnapshot {
             base_profile: self.inner.profile.profile,
             profile_scaled: self.inner.profile.is_scaled(),
@@ -908,7 +880,7 @@ impl MemoryGovernor {
             .inner
             .events
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         MemoryEventSnapshot {
             events: events.events.iter().copied().collect(),
             dropped_events: events.dropped,
@@ -923,13 +895,7 @@ impl Default for MemoryGovernor {
     }
 }
 
-fn record_event(
-    inner: &MemoryGovernorInner,
-    kind: MemoryEventKind,
-    class: MemoryClass,
-    bytes: usize,
-    current_bytes: usize,
-) {
+fn record_event( inner: &MemoryGovernorInner, kind: MemoryEventKind, class: MemoryClass, bytes: usize, current_bytes: usize, ) {
     if kind != MemoryEventKind::Rejected && bytes < MEMORY_EVENT_MIN_BYTES {
         return;
     }
@@ -945,7 +911,7 @@ fn record_event(
     inner
         .events
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(event);
 }
 
@@ -996,7 +962,7 @@ pub struct QueryMemoryPermit {
     released: bool,
 }
 impl QueryMemoryPermit {
-    fn empty(inner: Arc<MemoryGovernorInner>, class: WorkloadClass) -> Self {
+    const fn empty(inner: Arc<MemoryGovernorInner>, class: WorkloadClass) -> Self {
         Self {
             inner,
             id: 0,
@@ -1027,7 +993,7 @@ impl Drop for QueryMemoryPermit {
             .inner
             .admission
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(index) = state.records.iter().position(|r| r.id == self.id) {
             let record = state.records.swap_remove(index);
             state.active_bytes = state.active_bytes.saturating_sub(record.budget_bytes);
@@ -1046,7 +1012,7 @@ pub struct MemoryReservation {
 }
 
 impl MemoryReservation {
-    fn empty(inner: Arc<MemoryGovernorInner>, class: MemoryClass) -> Self {
+    const fn empty(inner: Arc<MemoryGovernorInner>, class: MemoryClass) -> Self {
         Self {
             inner,
             class,
@@ -1160,11 +1126,11 @@ fn process_memory_snapshot(governed_bytes: usize) -> Option<ProcessMemorySnapsho
         let rss_kib = rss_kib?;
         let rss_bytes = rss_kib.saturating_mul(1024);
         let anonymous_bytes = anonymous_kib.unwrap_or(rss_kib).saturating_mul(1024);
-        return Some(process_memory_snapshot_from_parts(
+        Some(process_memory_snapshot_from_parts(
             rss_bytes,
             anonymous_bytes,
             governed_bytes,
-        ));
+        ))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1173,11 +1139,7 @@ fn process_memory_snapshot(governed_bytes: usize) -> Option<ProcessMemorySnapsho
     }
 }
 
-fn process_memory_snapshot_from_parts(
-    rss_bytes: usize,
-    anonymous_bytes: usize,
-    governed_bytes: usize,
-) -> ProcessMemorySnapshot {
+const fn process_memory_snapshot_from_parts( rss_bytes: usize, anonymous_bytes: usize, governed_bytes: usize, ) -> ProcessMemorySnapshot {
     ProcessMemorySnapshot {
         rss_bytes,
         anonymous_bytes,
@@ -1185,11 +1147,7 @@ fn process_memory_snapshot_from_parts(
     }
 }
 
-fn classify_process_pressure(
-    limit_bytes: usize,
-    process: ProcessMemorySnapshot,
-    governed_bytes: usize,
-) -> ProcessMemoryPressure {
+const fn classify_process_pressure( limit_bytes: usize, process: ProcessMemorySnapshot, governed_bytes: usize, ) -> ProcessMemoryPressure {
     let soft_limit_bytes = limit_bytes.saturating_mul(9) / 10;
     let pressure_bytes = process.pressure_bytes(governed_bytes);
     if pressure_bytes > limit_bytes {
@@ -1216,11 +1174,7 @@ fn classify_process_pressure(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test] fn reservation_is_released_on_drop() { let governor = MemoryGovernor::with_limit(128); { let reservation = governor.reserve(MemoryClass::Query, 64).unwrap(); assert_eq!(reservation.bytes(), 64); assert_eq!(governor.snapshot().current_bytes, 64); } let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!(snapshot.active_reservations, 0); assert_eq!(snapshot.peak_bytes, 64); }
-
-    #[test] fn hard_limit_rejects_without_changing_current_usage() { let governor = MemoryGovernor::with_limit(100); let _held = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let error = governor .reserve(MemoryClass::Query, 21) .expect_err("reservation must exceed the limit"); assert_eq!(error.class, MemoryClass::Query); assert_eq!(error.requested_bytes, 21); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 80); assert_eq!(snapshot.failed_reservations, 1); }
-
+    
     #[derive(Debug)]
     struct TestReclaimer {
         reservation: Mutex<Option<MemoryReservation>>,
@@ -1238,40 +1192,26 @@ mod tests {
             reservation.shrink_by(target_bytes)
         }
     }
-
+    
+    #[test] fn reservation_is_released_on_drop() { let governor = MemoryGovernor::with_limit(128); { let reservation = governor.reserve(MemoryClass::Query, 64).unwrap(); assert_eq!(reservation.bytes(), 64); assert_eq!(governor.snapshot().current_bytes, 64); } let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!(snapshot.active_reservations, 0); assert_eq!(snapshot.peak_bytes, 64); }
+    #[test] fn hard_limit_rejects_without_changing_current_usage() { let governor = MemoryGovernor::with_limit(100); let _held = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let error = governor .reserve(MemoryClass::Query, 21) .expect_err("reservation must exceed the limit"); assert_eq!(error.class, MemoryClass::Query); assert_eq!(error.requested_bytes, 21); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 80); assert_eq!(snapshot.failed_reservations, 1); }
     #[test] fn query_reservation_reclaims_page_cache_before_rejecting() { let governor = MemoryGovernor::with_limit(100); let cache = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(TestReclaimer { reservation: Mutex::new(Some(cache)), }); governor.register_reclaimer(MemoryClass::PageCache, &reclaimer); let query = governor .reserve(MemoryClass::Query, 40) .expect("query should evict revocable page cache"); assert_eq!(query.bytes(), 40); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 100); assert_eq!( snapshot.classes[MemoryClass::PageCache.index()].current_bytes, 60 ); assert_eq!( snapshot.classes[MemoryClass::Query.index()].current_bytes, 40 ); }
-
     #[test] fn page_cache_does_not_reclaim_itself() { let governor = MemoryGovernor::with_limit(100); let cache = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(TestReclaimer { reservation: Mutex::new(Some(cache)), }); governor.register_reclaimer(MemoryClass::PageCache, &reclaimer); assert!(governor.reserve(MemoryClass::PageCache, 21).is_err()); }
-
     #[test] fn classes_are_accounted_independently() { let governor = MemoryGovernor::with_limit(1_000); let _cache = governor.reserve(MemoryClass::PageCache, 300).unwrap(); let _query = governor.reserve(MemoryClass::Query, 200).unwrap(); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 500); assert_eq!( snapshot.classes[MemoryClass::PageCache.index()].current_bytes, 300 ); assert_eq!( snapshot.classes[MemoryClass::Query.index()].current_bytes, 200 ); }
-
     #[test] fn observed_bytes_are_diagnostic_only() { let governor = MemoryGovernor::with_limit(128); governor.set_observed_bytes(MemoryClass::Indexing, 1_000_000); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!( snapshot.classes[MemoryClass::Indexing.index()].observed_bytes, 1_000_000 ); assert!(governor.reserve(MemoryClass::Query, 64).is_ok()); }
-
     #[test] fn zero_byte_reservation_has_no_accounting_effect() { let governor = MemoryGovernor::with_limit(0); let reservation = governor.reserve(MemoryClass::Network, 0).unwrap(); assert_eq!(reservation.bytes(), 0); assert_eq!(governor.snapshot().current_bytes, 0); }
-
     #[test] fn zero_byte_reservation_is_independent_from_process_pressure() { let governor = MemoryGovernor::with_limit(0); assert!(governor.reserve(MemoryClass::Network, 0).is_ok()); }
-
     #[test] fn process_pressure_error_uses_rss_wording_not_reserved_wording() { let error = ProcessMemoryPressureError { class: MemoryClass::Network, requested_bytes: 1024, rss_bytes: 300, soft_limit_bytes: 225, hard_limit_bytes: 250, }; let rendered = error.to_string(); assert!(rendered.contains("RSS is 300 bytes")); assert!(!rendered.contains("already reserved")); }
-
     #[test] fn file_backed_rss_does_not_trigger_process_pressure() { let process = process_memory_snapshot_from_parts(7000, 768, 512); assert_eq!(process.non_anonymous_rss_bytes(), 6232); assert_eq!(process.pressure_bytes(512), 768); assert!(matches!( classify_process_pressure(1024, process, 512), ProcessMemoryPressure::Normal { .. } )); }
-
     #[test] fn anonymous_rss_still_triggers_hard_process_pressure() { let process = process_memory_snapshot_from_parts(1200, 1100, 512); assert!(matches!( classify_process_pressure(1024, process, 512), ProcessMemoryPressure::Hard { .. } )); }
-
     #[test] fn governed_reservations_are_a_floor_for_process_pressure() { let process = process_memory_snapshot_from_parts(900, 400, 950); assert_eq!(process.pressure_bytes(950), 950); assert!(matches!( classify_process_pressure(1024, process, 950), ProcessMemoryPressure::Soft { .. } )); }
-
     #[test] fn cloned_governors_share_the_same_budget() { let governor = MemoryGovernor::with_limit(100); let clone = governor.clone(); let _held = governor.reserve(MemoryClass::Import, 70).unwrap(); assert!(clone.reserve(MemoryClass::Query, 31).is_err()); assert_eq!(clone.snapshot().current_bytes, 70); }
-
     #[test] fn event_log_records_reserve_release_and_reject() { let governor = MemoryGovernor::with_limit_and_event_capacity(5 * 1024 * 1024, 8); let reservation = governor .reserve(MemoryClass::Query, MEMORY_EVENT_MIN_BYTES) .unwrap(); assert!(governor .reserve(MemoryClass::Import, 4 * 1024 * 1024) .is_err()); drop(reservation); let snapshot = governor.event_snapshot(); assert_eq!(snapshot.events.len(), 3); assert_eq!(snapshot.events[0].kind, MemoryEventKind::Reserved); assert_eq!(snapshot.events[1].kind, MemoryEventKind::Rejected); assert_eq!(snapshot.events[2].kind, MemoryEventKind::Released); assert_eq!(snapshot.events[2].current_bytes, 0); }
-
     #[test] fn event_log_is_bounded_and_counts_dropped_events() { let governor = MemoryGovernor::unlimited_with_event_capacity(2); for _ in 0..2 { let reservation = governor .reserve(MemoryClass::Planner, MEMORY_EVENT_MIN_BYTES) .unwrap(); drop(reservation); } let snapshot = governor.event_snapshot(); assert_eq!(snapshot.capacity, 2); assert_eq!(snapshot.events.len(), 2); assert_eq!(snapshot.dropped_events, 2); assert!(snapshot.events[0].sequence < snapshot.events[1].sequence); }
     #[test] fn automatic_profiles_calibrate_known_limits() { let mib = 1024 * 1024; let profile = MemoryProfileConfig::for_limit(256 * mib); assert_eq!(profile.profile, MemoryProfile::Mib256); assert_eq!(profile.runtime_reserve_bytes, 48 * mib); assert!(profile.managed_budget_bytes.unwrap() < 256 * mib); assert_eq!(profile.max_concurrent_heavy, 1); assert_eq!( MemoryProfileConfig::for_limit(1024 * mib).profile, MemoryProfile::Gib1 ); #[cfg(target_pointer_width = "64")] { assert_eq!( MemoryProfileConfig::for_limit(8 * 1024 * mib).profile, MemoryProfile::Gib8 ); assert_eq!( MemoryProfileConfig::for_limit(16 * 1024 * mib).profile, MemoryProfile::Gib16 ); assert_eq!( MemoryProfileConfig::for_limit(32 * 1024 * mib).profile, MemoryProfile::Gib32 ); } }
-
     #[cfg(target_pointer_width = "32")] #[test] fn large_canonical_profiles_are_unrepresentable_on_32_bit() { assert_eq!(MemoryProfile::Gib8.canonical_limit_bytes(), None); assert_eq!(MemoryProfile::Gib16.canonical_limit_bytes(), None); assert_eq!(MemoryProfile::Gib32.canonical_limit_bytes(), None); }
-
     #[test] fn arbitrary_limits_use_the_nearest_profile_and_keep_the_exact_limit() { let mib = 1024 * 1024; let gib = 1024 * mib; let profile_512m = MemoryProfileConfig::for_limit(512 * mib); assert_eq!(profile_512m.profile, MemoryProfile::Mib256); assert_eq!(profile_512m.process_limit_bytes, Some(512 * mib)); assert_eq!(profile_512m.runtime_reserve_bytes, 96 * mib); assert_eq!(profile_512m.max_concurrent_heavy, 1); let profile_850m = MemoryProfileConfig::for_limit(850 * mib); assert_eq!(profile_850m.profile, MemoryProfile::Gib1); assert_eq!(profile_850m.process_limit_bytes, Some(850 * mib)); assert_eq!(profile_850m.max_concurrent_heavy, 2); let profile_1500m = MemoryProfileConfig::for_limit(1536 * mib); assert_eq!(profile_1500m.profile, MemoryProfile::Gib1); assert_eq!(profile_1500m.process_limit_bytes, Some(1536 * mib)); let profile_2g = MemoryProfileConfig::for_limit(2 * gib); assert_eq!(profile_2g.profile, MemoryProfile::Gib1); assert_eq!(profile_2g.process_limit_bytes, Some(2 * gib)); }
-
     #[test] fn tiny_profile_serializes_heavy_operations() { let governor = MemoryGovernor::with_process_limit(256 * 1024 * 1024); let _query = governor .admit(WorkloadClass::Query, 64 * 1024 * 1024) .unwrap(); assert!(governor .admit(WorkloadClass::Import, 16 * 1024 * 1024) .is_err()); let snapshot = governor.query_memory_snapshot(); assert_eq!(snapshot.active_heavy_operations, 1); assert_eq!(snapshot.rejected_operations, 1); }
-
     #[test] fn admission_budget_is_released_on_drop() { let governor = MemoryGovernor::with_process_limit(1024 * 1024 * 1024); { let _permit = governor .admit(WorkloadClass::Query, 64 * 1024 * 1024) .unwrap(); assert_eq!(governor.query_memory_snapshot().active_heavy_operations, 1); } assert_eq!(governor.query_memory_snapshot().active_heavy_operations, 0); assert_eq!(governor.query_memory_snapshot().active_operation_bytes, 0); }
     #[test] fn effective_profile_label_distinguishes_scaled_profiles() { const MIB: usize = 1024 * 1024; let scaled = MemoryProfileConfig::for_limit(2 * 1024 * MIB); assert_eq!(scaled.profile, MemoryProfile::Gib1); assert!(scaled.is_scaled()); assert_eq!(scaled.effective_profile_label(), "custom (base: 1g)"); let canonical = MemoryProfileConfig::for_limit(1024 * MIB); assert!(!canonical.is_scaled()); assert_eq!(canonical.effective_profile_label(), "1g"); }
 }

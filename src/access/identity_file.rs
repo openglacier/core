@@ -155,20 +155,12 @@ pub fn load(path: &Path, password: &[u8]) -> Result<IdentityCredential, Identity
     decrypt_bytes(&bytes, password)
 }
 
-pub fn save(
-    path: &Path,
-    credential: &IdentityCredential,
-    password: &[u8],
-) -> Result<(), IdentityFileError> {
+pub fn save( path: &Path, credential: &IdentityCredential, password: &[u8], ) -> Result<(), IdentityFileError> {
     let bytes = encrypt_bytes(credential, password)?;
     write_private(path, &bytes)
 }
 
-pub fn stage(
-    destination: &Path,
-    credential: &IdentityCredential,
-    password: &[u8],
-) -> Result<PathBuf, IdentityFileError> {
+pub fn stage( destination: &Path, credential: &IdentityCredential, password: &[u8], ) -> Result<PathBuf, IdentityFileError> {
     let mut staged = destination.as_os_str().to_os_string();
     staged.push(".next");
     let staged = PathBuf::from(staged);
@@ -181,11 +173,7 @@ pub fn commit(staged: &Path, destination: &Path) -> Result<(), IdentityFileError
     Ok(())
 }
 
-pub fn copy_encrypted(
-    source: &Path,
-    destination: &Path,
-    password: &[u8],
-) -> Result<(), IdentityFileError> {
+pub fn copy_encrypted( source: &Path, destination: &Path, password: &[u8], ) -> Result<(), IdentityFileError> {
     let bytes = fs::read(source)?;
     // Export is password-gated: authenticate/decrypt the envelope before copying
     // the original ciphertext verbatim. The private key never leaves og-core.
@@ -193,10 +181,7 @@ pub fn copy_encrypted(
     write_private(destination, &bytes)
 }
 
-pub fn encrypt_bytes(
-    credential: &IdentityCredential,
-    password: &[u8],
-) -> Result<Vec<u8>, IdentityFileError> {
+pub fn encrypt_bytes( credential: &IdentityCredential, password: &[u8], ) -> Result<Vec<u8>, IdentityFileError> {
     if password.len() < MIN_PASSWORD_BYTES {
         return Err(IdentityFileError::WeakPassword);
     }
@@ -231,10 +216,7 @@ pub fn encrypt_bytes(
     })?)
 }
 
-pub fn decrypt_bytes(
-    bytes: &[u8],
-    password: &[u8],
-) -> Result<IdentityCredential, IdentityFileError> {
+pub fn decrypt_bytes( bytes: &[u8], password: &[u8], ) -> Result<IdentityCredential, IdentityFileError> {
     let envelope: EncryptedIdentityFile = serde_json::from_slice(bytes)?;
     validate_envelope(&envelope)?;
     let salt = decode_fixed::<SALT_BYTES>(&envelope.salt, "invalid salt")?;
@@ -297,10 +279,7 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<[u8; KEY_BYTES], IdentityF
     Ok(key)
 }
 
-fn decode_fixed<const N: usize>(
-    value: &str,
-    message: &'static str,
-) -> Result<[u8; N], IdentityFileError> {
+fn decode_fixed<const N: usize>( value: &str, message: &'static str, ) -> Result<[u8; N], IdentityFileError> {
     decode_base64(value)
         .map_err(|_| IdentityFileError::InvalidFormat(message))?
         .try_into()
@@ -342,8 +321,6 @@ mod tests {
     use super::*;
 
     #[test] fn encrypted_identity_round_trips() { let identity = IdentityCredential::generate().unwrap(); let bytes = encrypt_bytes(&identity, b"correct horse battery staple").unwrap(); let decoded = decrypt_bytes(&bytes, b"correct horse battery staple").unwrap(); assert_eq!(decoded.identity_id, identity.identity_id); assert_eq!(decoded.device_id, identity.device_id); assert_eq!(decoded.public_key, identity.public_key); assert_eq!( decoded.sign_base64(b"challenge"), identity.sign_base64(b"challenge") ); }
-
     #[test] fn encrypted_export_requires_correct_password() { let identity = IdentityCredential::generate().unwrap(); let unique = UuidV7Generator::new().next_id().to_string(); let source = std::env::temp_dir().join(format!("og-{unique}.ogid")); let destination = std::env::temp_dir().join(format!("og-{unique}-copy.ogid")); save(&source, &identity, b"correct horse battery staple").unwrap(); assert!(matches!( copy_encrypted(&source, &destination, b"wrong password"), Err(IdentityFileError::InvalidPassword) )); assert!(!destination.exists()); copy_encrypted(&source, &destination, b"correct horse battery staple").unwrap(); assert_eq!(fs::read(&source).unwrap(), fs::read(&destination).unwrap()); let _ = fs::remove_file(source); let _ = fs::remove_file(destination); }
-
     #[test] fn wrong_password_is_rejected() { let identity = IdentityCredential::generate().unwrap(); let bytes = encrypt_bytes(&identity, b"good password").unwrap(); assert!(matches!( decrypt_bytes(&bytes, b"bad password"), Err(IdentityFileError::InvalidPassword) )); }
 }

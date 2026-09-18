@@ -199,61 +199,31 @@ where
     pub const fn model(&self) -> &Arc<M> { &self.model }
 
     /// Evaluates an expression to a semantic value.
-    pub fn evaluate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<SemanticValue<M::Value>> {
+    pub fn evaluate( &self, expression: &Expression, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<SemanticValue<M::Value>> {
         self.evaluate_source(expression, ExpressionSource::Document(document), session)
     }
 
     /// Evaluates an expression directly from a field resolver.
-    pub fn evaluate_resolved(
-        &self,
-        expression: &Expression,
-        resolver: &dyn ExpressionFieldResolver<M::Value>,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<SemanticValue<M::Value>> {
+    pub fn evaluate_resolved( &self, expression: &Expression, resolver: &dyn ExpressionFieldResolver<M::Value>, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<SemanticValue<M::Value>> {
         self.evaluate_source(expression, ExpressionSource::Resolver(resolver), session)
     }
 
     /// Evaluates an expression as a strict predicate.
-    pub fn evaluate_predicate(
-        &self,
-        expression: &Expression,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<bool> {
+    pub fn evaluate_predicate( &self, expression: &Expression, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<bool> {
         self.evaluate_predicate_source(expression, ExpressionSource::Document(document), session)
     }
 
     /// Evaluates a strict predicate directly from a field resolver.
-    pub fn evaluate_predicate_resolved(
-        &self,
-        expression: &Expression,
-        resolver: &dyn ExpressionFieldResolver<M::Value>,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<bool> {
+    pub fn evaluate_predicate_resolved( &self, expression: &Expression, resolver: &dyn ExpressionFieldResolver<M::Value>, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<bool> {
         self.evaluate_predicate_source(expression, ExpressionSource::Resolver(resolver), session)
     }
 
-    fn evaluate_source(
-        &self,
-        expression: &Expression,
-        source: ExpressionSource<'_, M::Value>,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<SemanticValue<M::Value>> {
+    fn evaluate_source( &self, expression: &Expression, source: ExpressionSource<'_, M::Value>, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<SemanticValue<M::Value>> {
         let mut guard = session.enter()?;
         self.evaluate_node_source(expression, source, guard.session())
     }
 
-    fn evaluate_predicate_source(
-        &self,
-        expression: &Expression,
-        source: ExpressionSource<'_, M::Value>,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<bool> {
+    fn evaluate_predicate_source( &self, expression: &Expression, source: ExpressionSource<'_, M::Value>, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<bool> {
         let value = self.evaluate_source(expression, source, session)?;
 
         match value {
@@ -268,28 +238,19 @@ where
     }
 
     /// Applies one assignment to a private document clone.
-    pub fn apply_assignment(
-        &self,
-        index: usize,
-        assignment: &SetAssignment,
-        document: &Document,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<Document> {
+    pub fn apply_assignment( &self, index: usize, assignment: &SetAssignment, document: &Document, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<Document> {
         session.charge()?;
-
         let expression = self
             .model
             .assignment_expression(assignment)
             .map_err(|error| {
                 assignment_error(self.model.assignment_field(assignment), index, error)
             })?;
-
         let value = self
             .evaluate(expression, document, session)
             .map_err(|error| {
                 assignment_error(self.model.assignment_field(assignment), index, error)
             })?;
-
         self.model
             .assign(assignment, value, document)
             .map_err(|error| {
@@ -306,13 +267,9 @@ where
 
     /// Creates closure-backed native semantics with explicit adapter options.
     #[must_use]
-    pub fn into_native_functions_with_options(
-        self,
-        options: NativeSemanticOptions,
-    ) -> NativeSemanticFunctions {
+    pub fn into_native_functions_with_options( self, options: NativeSemanticOptions, ) -> NativeSemanticFunctions {
         let predicate_semantics = self.clone();
         let assignment_semantics = self;
-
         NativeSemanticFunctions::with_options(
             move |expression, document, session| {
                 predicate_semantics.evaluate_predicate(expression, document, session)
@@ -330,10 +287,7 @@ where
 
     /// Builds the production native evaluator with explicit safety limits.
     #[must_use]
-    pub fn into_native_evaluator_with_limits(
-        self,
-        limits: NativeEvaluationLimits,
-    ) -> NativeEvaluator {
+    pub fn into_native_evaluator_with_limits( self, limits: NativeEvaluationLimits, ) -> NativeEvaluator {
         self.into_native_functions()
             .into_native_evaluator_with_limits(limits)
     }
@@ -355,12 +309,7 @@ where
     #[rustfmt::skip]#[must_use]
     pub fn into_runtime_with_limits(self, limits: NativeEvaluationLimits) -> QueryRuntime { self.into_native_evaluator_with_limits(limits).into_runtime() }
 
-    fn evaluate_node_source(
-        &self,
-        expression: &Expression,
-        source: ExpressionSource<'_, M::Value>,
-        session: &mut NativeEvaluationSession<'_>,
-    ) -> EvaluationResult<SemanticValue<M::Value>> {
+    fn evaluate_node_source( &self, expression: &Expression, source: ExpressionSource<'_, M::Value>, session: &mut NativeEvaluationSession<'_>, ) -> EvaluationResult<SemanticValue<M::Value>> {
         session.charge()?;
 
         match self.model.classify(expression)? {
@@ -431,9 +380,9 @@ enum ExpressionSource<'a, V> {
     Resolver(&'a dyn ExpressionFieldResolver<V>),
 }
 
-impl<'a, V> Copy for ExpressionSource<'a, V> {}
+impl<V> Copy for ExpressionSource<'_, V> {}
 
-impl<'a, V> Clone for ExpressionSource<'a, V> {
+impl<V> Clone for ExpressionSource<'_, V> {
     fn clone(&self) -> Self {
         *self
     }
@@ -466,12 +415,8 @@ mod tests {
     use super::*;
 
     #[test] fn semantic_value_presence_helpers_are_consistent() { let present = SemanticValue::Present(7_u64); let missing: SemanticValue<u64> = SemanticValue::Missing; assert!(present.is_present()); assert!(!present.is_missing()); assert_eq!(present.as_present(), Some(&7)); assert!(!missing.is_present()); assert!(missing.is_missing()); assert_eq!(missing.as_present(), None); }
-
     #[test] fn semantic_value_preserves_missing_during_map() { let value: SemanticValue<u64> = SemanticValue::Missing; assert_eq!(value.map(|number| number + 1), SemanticValue::Missing); }
-
     #[test] fn semantic_value_maps_present_values() { let value = SemanticValue::Present(2_u64); assert_eq!(value.map(|number| number + 1), SemanticValue::Present(3),); }
-
     #[test] fn semantic_value_rejects_missing_as_present() { let value: SemanticValue<u64> = SemanticValue::Missing; assert!(value.into_present().is_err()); }
-
     #[test] fn semantic_value_is_cloneable_and_debuggable() { fn assert_traits<T: Clone + fmt::Debug>() {} assert_traits::<SemanticValue<u64>>(); }
 }
