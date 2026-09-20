@@ -186,6 +186,20 @@ jobs:
 
           cross --version
 
+    - name: Verify cross configuration
+      if: matrix.builder == 'cross'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if [ ! -f Cross.toml ]; then
+          echo "ERROR: Cross.toml is required for cross builds."
+          exit 1
+        fi
+
+        echo "==> Cross.toml"
+        cat Cross.toml
+
       - name: Install cargo-zigbuild
         if: matrix.builder == 'zig'
         shell: bash
