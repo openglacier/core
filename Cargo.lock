@@ -1352,16 +1352,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "og-llama-common-chat"
-version = "0.1.0"
-dependencies = [
- "cc",
- "llama-cpp-sys-2",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1385,7 +1375,7 @@ dependencies = [
  "llama-cpp-2",
  "mmap-guard",
  "notify",
- "og-llama-common-chat",
+ "openglacier-llama-common-chat",
  "proptest",
  "ratatui",
  "rmp-serde",
@@ -1395,6 +1385,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "tungstenite",
+]
+
+[[package]]
+name = "openglacier-llama-common-chat"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c5bae1195db312e50c71018f69124b3c99b7a7c161430e28381f9f9f729251d"
+dependencies = [
+ "cc",
+ "llama-cpp-sys-2",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

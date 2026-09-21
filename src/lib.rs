@@ -25,6 +25,9 @@ pub mod memory;
 pub mod operation;
 pub mod query;
 pub mod service;
+pub mod daemon;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod spill;
 pub use model::capability::{ capabilities_of, capabilities_of_number, Capabilities, Capability, ValueCapabilities, };
 pub use model::compare::{

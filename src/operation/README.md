@@ -16,7 +16,7 @@ Le routeur et le catalogue consomment ensuite cette définition automatiquement.
 > **État actuel**
 >
 > Le handler métier n’est pas encore un pointeur de fonction stocké dans la définition canonique.
-> Pour une opération `Standard`, il faut donc encore ajouter son corps dans le handler de domaine correspondant dans `src/bin/ogd.rs`.
+> Pour une opération `Standard`, il faut donc encore ajouter son corps dans le handler de domaine correspondant dans `src/daemon/mod.rs`.
 > En revanche, il n’est plus nécessaire d’ajouter manuellement un variant dans plusieurs enums ou de maintenir un second mapping dans le router.
 
 ---
@@ -29,7 +29,7 @@ Pour une opération standard avec un nouveau payload :
 |---|---:|---|
 | `src/operation/definition.rs` | oui | Déclaration canonique de l’opération |
 | `src/operation/payload.rs` | oui si nouveau payload | Type wire + validation/normalisation |
-| `src/bin/ogd.rs` | oui actuellement | Corps métier dans le handler du domaine |
+| `src/daemon/mod.rs` | oui actuellement | Corps métier dans le handler du domaine |
 | `src/access/authorization.rs` | seulement si nouvelle action | Nouvelle `AuthorizationAction` |
 | tests du domaine / router | recommandé | Validation du contrat et du comportement |
 
@@ -371,7 +371,7 @@ Cela signifie :
 Dans l’état actuel, le corps métier des opérations standard se trouve dans le handler standard de :
 
 ```text
-src/bin/ogd.rs
+src/daemon/mod.rs
 ```
 
 Repérer :
@@ -700,7 +700,7 @@ Pour ajouter une opération standard :
 [ ] ExecutionMode correcte
 [ ] HandlerKind correct
 [ ] nouvelle AuthorizationAction seulement si nécessaire
-[ ] corps métier dans le handler de domaine d’ogd.rs
+[ ] corps métier dans le handler de domaine dans `src/daemon/mod.rs`
 [ ] test payload invalide
 [ ] test routage
 [ ] test autorisation
@@ -740,7 +740,7 @@ Pour une opération classique, les modifications normales sont :
 ```text
 src/operation/payload.rs
 src/operation/definition.rs
-src/bin/ogd.rs
+src/daemon/mod.rs
 ```
 
 Éventuellement :
