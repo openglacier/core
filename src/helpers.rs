@@ -5,6 +5,10 @@ pub use crate::error::Base64DecodeError;
 
 use crate::{Document, Number, Value};
 use serde_json::{Map, Value as JsonValue};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const PLACE_SCOPE_FIELD: &str = "_place";
@@ -34,14 +38,23 @@ pub fn elapsed_micros(started: Instant) -> u64 {
 pub fn elapsed_nanos(started: Instant) -> u64 {
     u128_to_u64_saturating(started.elapsed().as_nanos())
 }
+#[inline]
+#[must_use]
+pub fn elapsed_millis(started: Instant) -> u64 {
+    u128_to_u64_saturating(started.elapsed().as_millis())
+}
+/// Milliseconds since the Unix epoch, or `None` for a time before it.
+#[must_use]
+pub fn system_time_millis(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH).ok().map(|duration| u128_to_u64_saturating(duration.as_millis()))
+}
 #[must_use]
 pub fn unix_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
+    system_time_millis(SystemTime::now()).unwrap_or_default()
+}
+#[must_use]
+pub fn unix_time_nanos() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
 }
 #[inline]
 #[must_use]
@@ -83,6 +96,53 @@ pub fn value_to_json(value: &Value) -> JsonValue {
         Value::Array(v) => JsonValue::Array(v.iter().map(value_to_json).collect()),
         Value::Object(v) => document_to_json(v),
     }
+}
+/// Typed field accessors for JSON objects, e.g. `document.str_field("name")`.
+pub trait JsonFields {
+    fn field(&self, key: &str) -> Option<&JsonValue>;
+    fn str_field(&self, key: &str) -> Option<&str> { self.field(key)?.as_str() }
+    /// The string field, or `""` when it is missing or not a string.
+    fn string_field(&self, key: &str) -> String { self.str_field(key).unwrap_or_default().to_owned() }
+    fn u64_field(&self, key: &str) -> Option<u64> { self.field(key)?.as_u64() }
+    fn i64_field(&self, key: &str) -> Option<i64> { self.field(key)?.as_i64() }
+    fn bool_field(&self, key: &str) -> Option<bool> { self.field(key)?.as_bool() }
+    fn array_field(&self, key: &str) -> Option<&Vec<JsonValue>> { self.field(key)?.as_array() }
+    fn object_field(&self, key: &str) -> Option<&Map<String, JsonValue>> { self.field(key)?.as_object() }
+}
+impl JsonFields for JsonValue {
+    fn field(&self, key: &str) -> Option<&JsonValue> { self.get(key) }
+}
+impl JsonFields for Map<String, JsonValue> {
+    fn field(&self, key: &str) -> Option<&JsonValue> { self.get(key) }
+}
+
+/// Converts JSON into a runtime value. The error describes the unrepresentable number.
+pub fn json_to_value(json: &JsonValue) -> Result<Value, String> {
+    Ok(match json {
+        JsonValue::Null => Value::Null,
+        JsonValue::Bool(v) => Value::Bool(*v),
+        JsonValue::String(v) => Value::string(v.as_str()),
+        JsonValue::Number(v) => {
+            if let Some(v) = v.as_i64() {
+                Value::signed(v)
+            } else if let Some(v) = v.as_u64() {
+                Value::unsigned(v)
+            } else if let Some(v) = v.as_f64() {
+                Value::float(v).map_err(|error| error.to_string())?
+            } else {
+                return Err("JSON number cannot be represented".to_owned());
+            }
+        }
+        JsonValue::Array(v) => Value::array(v.iter().map(json_to_value).collect::<Result<Vec<_>, _>>()?),
+        JsonValue::Object(v) => Value::object(json_object_to_document(v)?),
+    })
+}
+pub fn json_object_to_document(object: &Map<String, JsonValue>) -> Result<Document, String> {
+    let mut document = Document::new();
+    for (name, value) in object {
+        document.insert(name.as_str(), json_to_value(value)?);
+    }
+    Ok(document)
 }
 fn number_to_json(number: Number) -> JsonValue {
     match number {
@@ -185,10 +245,49 @@ pub fn hex(bytes: &[u8]) -> String {
     output
 }
 
+pub const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Continues a FNV-1a 64-bit hash over `bytes`; start from [`FNV1A64_OFFSET`].
+#[inline]
+#[must_use]
+pub fn fnv1a64_continue(hash: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(hash, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME))
+}
+#[inline]
+#[must_use]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_continue(FNV1A64_OFFSET, bytes)
+}
+
+/// Locks `mutex`, recovering the guard if a previous holder panicked.
+#[inline]
+pub fn lock_unpoisoned<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Replaces `path` atomically: `fill` writes `temporary`, which is then flushed,
+/// synced and renamed over `path`. Missing parent directories are created.
+pub fn write_file_atomic<T>( path: &Path, temporary: &Path, fill: impl FnOnce(&mut File) -> io::Result<T>, ) -> io::Result<T> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let mut output = OpenOptions::new().write(true).create(true).truncate(true).open(temporary)?;
+    let result = fill(&mut output)?;
+    output.flush()?;
+    output.sync_all()?;
+    drop(output);
+    fs::rename(temporary, path)?;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test] fn base64_round_trip_is_stable() { let input = b"openglacier authentication"; assert_eq!(decode_base64(&encode_base64(input)).unwrap(), input); }
     #[test] fn standard_vectors_are_stable() { assert_eq!(encode_base64(b""), ""); assert_eq!(encode_base64(b"f"), "Zg=="); assert_eq!(encode_base64(b"fo"), "Zm8="); assert_eq!(encode_base64(b"foo"), "Zm9v"); assert_eq!(decode_base64("Zm9v").unwrap(), b"foo"); }
+    #[test] fn fnv1a64_matches_reference_vectors() { assert_eq!(fnv1a64(b""), FNV1A64_OFFSET); assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c); assert_eq!(fnv1a64_continue(fnv1a64(b"fo"), b"o"), fnv1a64(b"foo")); }
+    #[test] fn json_round_trips_through_value() { let json = serde_json::json!({"a": [1, -2, 2.5, "x", null, true], "b": {"c": 18446744073709551615u64}}); assert_eq!(value_to_json(&json_to_value(&json).unwrap()), json); }
+    #[test] fn json_fields_read_typed_values() { let json = serde_json::json!({"s": "x", "n": 3, "b": true}); assert_eq!(json.str_field("s"), Some("x")); assert_eq!(json.string_field("n"), ""); assert_eq!(json.u64_field("n"), Some(3)); assert_eq!(json.bool_field("b"), Some(true)); assert_eq!(json.as_object().unwrap().str_field("missing"), None); }
     #[test] fn malformed_padding_is_rejected() { assert!(decode_base64("Zg=a").is_err()); assert!(decode_base64("Zg==AAAA").is_err()); assert!(decode_base64("Zh==").is_err()); }
 }

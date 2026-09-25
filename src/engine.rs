@@ -43,6 +43,24 @@ static EXTERNAL_GROUP_MERGE_FINISH_NS: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_RSS_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_RSS_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
 static EXTERNAL_GROUP_UNMANAGED_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
+/// External group counters exposed as global `_memory` fields.
+static EXTERNAL_GROUP_COUNTERS: [(&str, &AtomicU64); 30] = [
+    ("external_group_flushes", &EXTERNAL_GROUP_FLUSHES), ("external_group_partials_written", &EXTERNAL_GROUP_PARTIALS_WRITTEN),
+    ("external_group_bytes_written", &EXTERNAL_GROUP_BYTES_WRITTEN), ("external_group_flush_us", &EXTERNAL_GROUP_FLUSH_US),
+    ("external_group_partials_merged", &EXTERNAL_GROUP_PARTIALS_MERGED), ("external_group_merge_us", &EXTERNAL_GROUP_MERGE_US),
+    ("external_group_peak_groups_per_flush", &EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH), ("external_group_source_us", &EXTERNAL_GROUP_SOURCE_US),
+    ("external_group_rows_consumed", &EXTERNAL_GROUP_ROWS_CONSUMED), ("external_group_consume_samples", &EXTERNAL_GROUP_CONSUME_SAMPLES),
+    ("external_group_key_ns", &EXTERNAL_GROUP_KEY_NS), ("external_group_lookup_ns", &EXTERNAL_GROUP_LOOKUP_NS),
+    ("external_group_accumulate_ns", &EXTERNAL_GROUP_ACCUMULATE_NS), ("external_group_group_hits", &EXTERNAL_GROUP_GROUP_HITS),
+    ("external_group_group_misses", &EXTERNAL_GROUP_GROUP_MISSES), ("external_group_accumulator_create_us", &EXTERNAL_GROUP_ACCUMULATOR_CREATE_US),
+    ("external_group_flush_triggers", &EXTERNAL_GROUP_FLUSH_TRIGGERS), ("external_group_estimated_peak_bytes", &EXTERNAL_GROUP_ESTIMATED_PEAK_BYTES),
+    ("external_group_partial_finish_us", &EXTERNAL_GROUP_PARTIAL_FINISH_US), ("external_group_flush_sort_us", &EXTERNAL_GROUP_FLUSH_SORT_US),
+    ("external_group_encode_write_us", &EXTERNAL_GROUP_ENCODE_WRITE_US), ("external_group_merge_init_us", &EXTERNAL_GROUP_MERGE_INIT_US),
+    ("external_group_merge_samples", &EXTERNAL_GROUP_MERGE_SAMPLES), ("external_group_merge_select_ns", &EXTERNAL_GROUP_MERGE_SELECT_NS),
+    ("external_group_merge_partial_ns", &EXTERNAL_GROUP_MERGE_PARTIAL_NS), ("external_group_merge_read_ns", &EXTERNAL_GROUP_MERGE_READ_NS),
+    ("external_group_merge_finish_ns", &EXTERNAL_GROUP_MERGE_FINISH_NS), ("external_group_rss_samples", &EXTERNAL_GROUP_RSS_SAMPLES),
+    ("external_group_rss_peak_bytes", &EXTERNAL_GROUP_RSS_PEAK_BYTES), ("external_group_unmanaged_peak_bytes", &EXTERNAL_GROUP_UNMANAGED_PEAK_BYTES),
+];
 fn update_atomic_peak(target: &AtomicU64, value: u64) {
     target.fetch_max(value, AtomicOrdering::Relaxed);
 }
@@ -80,7 +98,7 @@ use crate::{
     spill::{SpillEngine, SpillRun, SpillRunReader},
     storage::{
         CollectionId, DocumentId, DocumentVersion, MemoryStorage, ProjectedValueRef, ScanOptions,
-        StorageEngine, StorageError, StorageRead, StoredDocument,
+        StorageEngine, StorageError, StorageRead, StorageTransaction, StoredDocument,
     },
     Document, Value,
 };
@@ -148,6 +166,176 @@ const fn is_bounded_secondary_row_operator(operator: &PhysicalOperator) -> bool 
                 ..
             }
     )
+}
+
+/// Whether a stage can run row by row on the output of a blocking stage.
+const fn is_streaming_tail_operator(operator: &PhysicalOperator) -> bool {
+    matches!(
+        operator,
+        PhysicalOperator::Filter { .. }
+            | PhysicalOperator::Select { .. }
+            | PhysicalOperator::Skip { .. }
+            | PhysicalOperator::Limit { .. }
+            | PhysicalOperator::Custom {
+                writes: false,
+                changes_cardinality: false,
+                ..
+            }
+    )
+}
+
+/// How many rows a blocking core must produce for the streaming tail that
+/// follows it: skips and the first declared row bound add up (`skip k | limit
+/// n` needs `k + n` rows), and only projections may sit in between.
+fn tail_row_limit(tail: &[PhysicalOperator]) -> Option<usize> {
+    let mut offset = 0usize;
+    for operator in tail {
+        match operator {
+            PhysicalOperator::Skip { count } => offset = offset.saturating_add(*count),
+            PhysicalOperator::Select { .. } => {}
+            _ => {
+                let properties = operator.execution_properties();
+                // An exact-count stage must still see one row too many to fail.
+                let extra = usize::from(properties.exact_rows().is_some());
+                return properties
+                    .stream_row_bound()
+                    .map(|bound| offset.saturating_add(bound).saturating_add(extra));
+            }
+        }
+    }
+    None
+}
+
+/// Decomposition of a governed read plan: a streaming prefix, one blocking
+/// core with a bounded executor, then a row-local streaming tail.
+struct GovernedShape<'a> {
+    blocking_index: usize,
+    core_end: usize,
+    tail: &'a [PhysicalOperator],
+    count_alias: Option<&'a str>,
+    output_limit: Option<usize>,
+}
+
+fn governed_shape(operators: &[PhysicalOperator]) -> Option<GovernedShape<'_>> {
+    let blocking_index = operators.iter().position(|operator| {
+        matches!(
+            operator.execution_properties().flow,
+            crate::query::Flow::GovernedBlocking
+        )
+    })?;
+    if !operators[..blocking_index].iter().all(|operator| {
+        matches!(
+            operator.execution_properties().flow,
+            crate::query::Flow::Streaming
+        )
+    }) {
+        return None;
+    }
+    let rest = &operators[blocking_index..];
+    let core_len = match rest {
+        [PhysicalOperator::Group { .. }, PhysicalOperator::Sort { .. }, ..]
+        | [PhysicalOperator::Sort { .. }, PhysicalOperator::Distinct { .. }, ..] => 2,
+        _ => 1,
+    };
+    let core_end = blocking_index + core_len;
+    let mut tail = &operators[core_end..];
+    let count_alias = tail.last().and_then(PhysicalOperator::count_alias);
+    if count_alias.is_some() {
+        tail = &tail[..tail.len() - 1];
+    }
+    if !tail.iter().all(is_streaming_tail_operator) {
+        return None;
+    }
+    let output_limit = tail_row_limit(tail);
+    let core = &operators[blocking_index..core_end];
+    let supported = match core {
+        [operator] => {
+            matches!(operator.execution_properties().order, Order::Ordered(_))
+                || operator.execution_properties().retained_rows().is_some()
+                || matches!(
+                    operator,
+                    PhysicalOperator::Distinct { .. } | PhysicalOperator::Group { .. } | PhysicalOperator::Pivot { .. }
+                )
+                || matches!(
+                    operator,
+                    PhysicalOperator::Lookup { pipeline, .. }
+                        | PhysicalOperator::Union { pipeline, .. }
+                        if pipeline.operators().iter().all(is_bounded_secondary_row_operator)
+                )
+        }
+        [PhysicalOperator::Group { .. }, PhysicalOperator::Sort { .. }] => true,
+        [PhysicalOperator::Sort { .. }, PhysicalOperator::Distinct { .. }] => output_limit.is_some(),
+        _ => false,
+    };
+    supported.then_some(GovernedShape {
+        blocking_index,
+        core_end,
+        tail,
+        count_alias,
+        output_limit,
+    })
+}
+
+/// Per-scan state of a chain of streaming row-local stages: the skip and
+/// declared row-bound budgets they have consumed so far.
+struct StreamingRowChain<'a> {
+    operators: &'a [PhysicalOperator],
+    skip_remaining: Vec<Option<usize>>,
+    limit_remaining: Vec<Option<usize>>,
+    filtered: u64,
+}
+
+impl<'a> StreamingRowChain<'a> {
+    fn new(operators: &'a [PhysicalOperator]) -> Self {
+        Self {
+            operators,
+            skip_remaining: operators
+                .iter()
+                .map(|operator| match operator {
+                    PhysicalOperator::Skip { count } => Some(*count),
+                    _ => None,
+                })
+                .collect(),
+            limit_remaining: operators
+                .iter()
+                .map(|operator| operator.execution_properties().stream_row_bound())
+                .collect(),
+            filtered: 0,
+        }
+    }
+
+    /// Whether a stage lets no row through, so the source need not be read.
+    fn has_empty_bound(&self) -> bool {
+        self.limit_remaining.contains(&Some(0))
+    }
+}
+
+/// Hands one streamed row to the visitor, or only counts it under a terminal `count`.
+fn emit_streamed_row( visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, count_only: bool, returned: &mut u64, row: ExecutionRow, ) -> Result<(), StorageError> {
+    if !count_only {
+        let output = StoredDocument::new(*row.id(), row.version(), row.shared_document())?;
+        visitor(output).map_err(backend_storage_error)?;
+    }
+    *returned = returned.saturating_add(1);
+    Ok(())
+}
+
+/// Error raised when a stage declaring an exact row count (`single`) sees
+/// another number of rows.
+fn exact_rows_error(operator: &PhysicalOperator, expected: usize, found: impl std::fmt::Display) -> ExecutionError {
+    ExecutionError::evaluation(format!("{} expected exactly {expected} row(s), found {found}", operator.name()))
+}
+
+/// Fails when a stage declaring an exact row count saw fewer rows than required.
+fn ensure_exact_rows(operators: &[PhysicalOperator], remaining: &[Option<usize>]) -> EngineResult<()> {
+    for (operator, remaining) in operators.iter().zip(remaining) {
+        if let (Some(expected), Some(remaining)) = (operator.execution_properties().exact_rows(), remaining) {
+            if *remaining > 0 {
+                return Err(EngineError::execution(exact_rows_error(operator, expected, expected - remaining)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Result returned by engine operations.
@@ -410,29 +598,14 @@ impl Engine {
             }
         }
 
-        let mut streamed_count = 0_u64;
         let mut scanned = 0_u64;
         let mut filtered = 0_u64;
+        // Rows handed to the visitor, or only counted under a terminal `count`.
         let mut returned = 0_u64;
-        let mut skip_remaining = physical
-            .operators()
-            .iter()
-            .map(|operator| match operator {
-                PhysicalOperator::Skip { count } => Some(*count),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut limit_remaining = physical
-            .operators()
-            .iter()
-            .map(|operator| match operator {
-                PhysicalOperator::Limit { count } => Some(*count),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let count_only = count_alias.is_some();
+        let mut chain = StreamingRowChain::new(&physical.operators()[..data_operator_len]);
 
-        if limit_remaining.contains(&Some(0))
-        {
+        if chain.has_empty_bound() {
             let strategy = match physical.source().access() {
                 crate::query::PhysicalAccess::CollectionScan { .. } => {
                     ExecutionStrategy::CollectionScan
@@ -593,109 +766,18 @@ impl Engine {
                 };
                 let source_gated = leading_filter_pipeline.is_some();
 
+                let first_operator = if source_gated { leading_filter_len } else { 0 };
                 let mut process_stored = |stored: StoredDocument| {
                     if !source_gated {
                         scanned = scanned.saturating_add(1);
                     }
-                    let (id, version, mut document) = stored.into_parts();
-                    let mut keep = true;
-                    let mut stop_after_row = false;
-
-                    for (index, operator) in physical
-                        .operators()
-                        .iter()
-                        .take(data_operator_len)
-                        .enumerate()
-                        .skip(if source_gated { leading_filter_len } else { 0 })
-                    {
-                        match operator {
-                            PhysicalOperator::Filter { predicate } => {
-                                let mut evaluation = document.as_ref().clone();
-                                evaluation.insert("_id", Value::from(id.to_string()));
-                                if !self
-                                    .runtime
-                                    .evaluate_predicate(predicate, &evaluation)
-                                    .map_err(backend_storage_error)?
-                                {
-                                    keep = false;
-                                    filtered = filtered.saturating_add(1);
-                                    break;
-                                }
-                            }
-                            PhysicalOperator::Select { fields } => {
-                                let mut evaluation = document.as_ref().clone();
-                                evaluation.insert("_id", Value::from(id.to_string()));
-                                let selected = self
-                                    .runtime
-                                    .apply_select(fields, &evaluation)
-                                    .map_err(backend_storage_error)?;
-                                let mut selected = selected.as_ref().clone();
-                                selected.remove("_id");
-                                document = Arc::new(selected);
-                            }
-                            PhysicalOperator::Custom {
-                                name,
-                                arguments,
-                                writes: false,
-                                changes_cardinality: false,
-                            } => {
-                                let mut evaluation = document.as_ref().clone();
-                                evaluation.insert("_id", Value::from(id.to_string()));
-                                match self
-                                    .runtime
-                                    .apply_custom(name, arguments, false, &evaluation)
-                                    .map_err(backend_storage_error)?
-                                {
-                                    crate::query::CustomOperatorResult::Keep => {}
-                                    crate::query::CustomOperatorResult::Replace(replacement) => {
-                                        let mut replacement = replacement.as_ref().clone();
-                                        replacement.remove("_id");
-                                        document = Arc::new(replacement);
-                                    }
-                                    crate::query::CustomOperatorResult::Discard => {
-                                        keep = false;
-                                        filtered = filtered.saturating_add(1);
-                                        break;
-                                    }
-                                    crate::query::CustomOperatorResult::Expand(_) => {
-                                        return Err(StorageError::backend(
-                                            "streaming custom operator unexpectedly expanded rows",
-                                        ));
-                                    }
-                                }
-                            }
-                            PhysicalOperator::Skip { .. } => {
-                                let remaining = skip_remaining[index].as_mut().expect("skip state");
-                                if *remaining > 0 {
-                                    *remaining -= 1;
-                                    keep = false;
-                                    filtered = filtered.saturating_add(1);
-                                    break;
-                                }
-                            }
-                            PhysicalOperator::Limit { .. } => {
-                                let remaining =
-                                    limit_remaining[index].as_mut().expect("limit state");
-                                if *remaining == 0 {
-                                    return Ok(false);
-                                }
-                                *remaining -= 1;
-                                stop_after_row |= *remaining == 0;
-                            }
-                            _ => unreachable!("validated streaming operator"),
-                        }
-                    }
-
-                    if keep {
-                        if count_alias.is_some() {
-                            streamed_count = streamed_count.saturating_add(1);
-                        } else {
-                            let output = StoredDocument::new(id, version, document)?;
-                            visitor(output).map_err(backend_storage_error)?;
-                            returned = returned.saturating_add(1);
-                        }
-                    }
-                    Ok(!stop_after_row)
+                    self.drive_streaming_row(
+                        &mut chain,
+                        first_operator,
+                        ExecutionRow::from_stored(stored),
+                        None,
+                        &mut |row| emit_streamed_row(visitor, count_only, &mut returned, row),
+                    )
                 };
 
                 if let Some(value_pipeline) = leading_filter_pipeline {
@@ -739,109 +821,22 @@ impl Engine {
                     .map_err(storage_engine_error)?
                 {
                     scanned = 1;
-                    let (row_id, version, mut document) = stored.into_parts();
-                    let mut keep = true;
-                    for (index, operator) in physical
-                        .operators()
-                        .iter()
-                        .take(data_operator_len)
-                        .enumerate()
-                    {
-                        match operator {
-                            PhysicalOperator::Filter { predicate } => {
-                                let mut evaluation = document.as_ref().clone();
-                                evaluation.insert("_id", Value::from(row_id.to_string()));
-                                if !self
-                                    .runtime
-                                    .evaluate_predicate(predicate, &evaluation)
-                                    .map_err(EngineError::execution)?
-                                {
-                                    keep = false;
-                                    filtered = filtered.saturating_add(1);
-                                    break;
-                                }
-                            }
-                            PhysicalOperator::Select { fields } => {
-                                let mut evaluation = document.as_ref().clone();
-                                evaluation.insert("_id", Value::from(row_id.to_string()));
-                                let selected = self
-                                    .runtime
-                                    .apply_select(fields, &evaluation)
-                                    .map_err(EngineError::execution)?;
-                                let mut selected = selected.as_ref().clone();
-                                selected.remove("_id");
-                                document = Arc::new(selected);
-                            }
-                            PhysicalOperator::Custom {
-                                name,
-                                arguments,
-                                writes: false,
-                                changes_cardinality: false,
-                            } => {
-                                let mut evaluation = document.as_ref().clone();
-                                evaluation.insert("_id", Value::from(row_id.to_string()));
-                                match self
-                                    .runtime
-                                    .apply_custom(name, arguments, false, &evaluation)
-                                    .map_err(EngineError::execution)?
-                                {
-                                    crate::query::CustomOperatorResult::Keep => {}
-                                    crate::query::CustomOperatorResult::Replace(replacement) => {
-                                        let mut replacement = replacement.as_ref().clone();
-                                        replacement.remove("_id");
-                                        document = Arc::new(replacement);
-                                    }
-                                    crate::query::CustomOperatorResult::Discard => {
-                                        keep = false;
-                                        filtered = filtered.saturating_add(1);
-                                        break;
-                                    }
-                                    crate::query::CustomOperatorResult::Expand(_) => {
-                                        return Err(EngineError::execution(
-                                            ExecutionError::evaluation(
-                                                "streaming custom operator unexpectedly expanded rows",
-                                            ),
-                                        ));
-                                    }
-                                }
-                            }
-                            PhysicalOperator::Skip { .. } => {
-                                let remaining = skip_remaining[index].as_mut().expect("skip state");
-                                if *remaining > 0 {
-                                    *remaining -= 1;
-                                    keep = false;
-                                    filtered = filtered.saturating_add(1);
-                                    break;
-                                }
-                            }
-                            PhysicalOperator::Limit { .. } => {
-                                let remaining =
-                                    limit_remaining[index].as_mut().expect("limit state");
-                                if *remaining == 0 {
-                                    keep = false;
-                                    break;
-                                }
-                                *remaining -= 1;
-                            }
-                            _ => unreachable!("validated streaming operator"),
-                        }
-                    }
-                    if keep {
-                        if count_alias.is_some() {
-                            streamed_count = 1;
-                        } else {
-                            let output = StoredDocument::new(row_id, version, document)
-                                .map_err(storage_engine_error)?;
-                            visitor(output)?;
-                            returned = 1;
-                        }
-                    }
+                    self.drive_streaming_row(
+                        &mut chain,
+                        0,
+                        ExecutionRow::from_stored(stored),
+                        None,
+                        &mut |row| emit_streamed_row(visitor, count_only, &mut returned, row),
+                    )
+                    .map_err(storage_engine_error)?;
                 }
                 ExecutionStrategy::PrimaryKeyLookup
             }
         };
+        ensure_exact_rows(chain.operators, &chain.limit_remaining)?;
+        let filtered = filtered.saturating_add(chain.filtered);
         let statistics = if let Some(alias) = count_alias {
-            emit_streaming_count(visitor, alias, streamed_count)?;
+            emit_streaming_count(visitor, alias, returned)?;
             ExecutionStatistics::streamed_with_strategies(
                 scanned,
                 filtered,
@@ -920,7 +915,7 @@ impl Engine {
     /// for both compound operators.  LOOKUP may provide an outer document so
     /// nested predicates keep their alias-aware semantics without materializing
     /// the secondary collection.
-    fn stream_bounded_secondary_pipeline( &self, collection: &CollectionId, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>)>, union_origin: bool, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
+    fn stream_bounded_secondary_pipeline( &self, collection: &CollectionId, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>, Option<&str>)>, union_origin: bool, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
         let read = self.storage.read().map_err(storage_engine_error)?;
         let operators = pipeline.operators();
         if !operators.iter().all(is_bounded_secondary_row_operator) {
@@ -929,26 +924,11 @@ impl Engine {
             )));
         }
 
-        let mut skip_remaining = operators
-            .iter()
-            .map(|operator| match operator {
-                PhysicalOperator::Skip { count } => Some(*count),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut limit_remaining = operators
-            .iter()
-            .map(|operator| match operator {
-                PhysicalOperator::Limit { count } => Some(*count),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        let mut chain = StreamingRowChain::new(operators);
         let mut scanned = 0u64;
-        let mut filtered = 0u64;
         let mut returned = 0u64;
 
-        if limit_remaining.contains(&Some(0))
-        {
+        if chain.has_empty_bound() {
             return Ok(ExecutionStatistics::streamed_pipeline(
                 0,
                 0,
@@ -974,39 +954,75 @@ impl Engine {
 
         read.scan_each(collection, options, &mut |stored| {
             scanned = scanned.saturating_add(1);
-            let mut row = if union_origin {
+            let row = if union_origin {
                 ExecutionRow::from_union(stored)
             } else {
                 ExecutionRow::from_stored(stored)
             };
-            let mut keep = true;
-            let mut stop_after_row = false;
+            self.drive_streaming_row(&mut chain, 0, row, lookup_context, &mut |row| {
+                visitor(row).map_err(backend_storage_error)?;
+                returned = returned.saturating_add(1);
+                Ok(())
+            })
+        })
+        .map_err(storage_engine_error)?;
+        ensure_exact_rows(operators, &chain.limit_remaining)?;
 
-            for (index, operator) in operators.iter().enumerate() {
+        Ok(ExecutionStatistics::streamed_pipeline(
+            scanned,
+            chain.filtered,
+            returned,
+            ExecutionStrategy::CollectionScan,
+        ))
+    }
+
+    /// Drives one source row through `chain.operators[start..]`, handing
+    /// every row that survives the chain to `emit`.
+    ///
+    /// Rows are processed one at a time from a depth-first work stack: when a
+    /// stage emits several rows (`unwind`), they continue through the
+    /// following stages in input order, so an expanding stage streams
+    /// mid-chain like any row-local stage. Returns whether the scan should
+    /// continue, `false` once a declared row bound is exhausted.
+    fn drive_streaming_row( &self, chain: &mut StreamingRowChain<'_>, start: usize, row: ExecutionRow, lookup_context: Option<(&Document, Option<&str>, Option<&str>)>, emit: &mut dyn FnMut(ExecutionRow) -> Result<(), StorageError>, ) -> Result<bool, StorageError> {
+        let mut stop_after_row = false;
+        let mut pending = vec![(start, row)];
+
+        'rows: while let Some((start, mut row)) = pending.pop() {
+            for (index, operator) in chain.operators.iter().enumerate().skip(start) {
+                // Declared row bounds (`limit`, `first`, …) are enforced
+                // when a row reaches the stage, before it is evaluated.
+                if let Some(remaining) = chain.limit_remaining[index].as_mut() {
+                    let exact = operator.execution_properties().exact_rows();
+                    if *remaining == 0 {
+                        return match exact {
+                            Some(expected) => Err(backend_storage_error(exact_rows_error(operator, expected, "more"))),
+                            None => Ok(false),
+                        };
+                    }
+                    *remaining -= 1;
+                    stop_after_row |= *remaining == 0 && exact.is_none();
+                }
                 match operator {
                     PhysicalOperator::Filter { predicate } => {
                         let evaluation = row.evaluation_document();
                         let accepted = match lookup_context {
-                            Some((outer, alias)) => self.runtime.evaluate_lookup_predicate(
+                            Some((outer, inner_alias, outer_alias)) => self.runtime.evaluate_lookup_predicate(
                                 predicate,
-                                outer,
-                                alias,
-                                &evaluation,
+                                &crate::query::LookupFields { inner: &evaluation, inner_alias, outer, outer_alias },
                             ),
                             None => self.runtime.evaluate_predicate(predicate, &evaluation),
                         }
                         .map_err(backend_storage_error)?;
                         if !accepted {
-                            keep = false;
-                            filtered = filtered.saturating_add(1);
-                            break;
+                            chain.filtered = chain.filtered.saturating_add(1);
+                            continue 'rows;
                         }
                     }
                     PhysicalOperator::Select { fields } => {
-                        let evaluation = row.evaluation_document();
                         let selected = self
                             .runtime
-                            .apply_select(fields, &evaluation)
+                            .apply_select(fields, &row.evaluation_document())
                             .map_err(backend_storage_error)?;
                         row.replace_document(selected, false);
                     }
@@ -1015,11 +1031,11 @@ impl Engine {
                         arguments,
                         writes: false,
                         changes_cardinality: false,
+                        ..
                     } => {
-                        let evaluation = row.evaluation_document();
                         match self
                             .runtime
-                            .apply_custom(name, arguments, false, &evaluation)
+                            .apply_custom(name, arguments, false, &row.evaluation_document())
                             .map_err(backend_storage_error)?
                         {
                             crate::query::CustomOperatorResult::Keep => {}
@@ -1027,52 +1043,39 @@ impl Engine {
                                 row.replace_document(document, false);
                             }
                             crate::query::CustomOperatorResult::Discard => {
-                                keep = false;
-                                filtered = filtered.saturating_add(1);
-                                break;
+                                chain.filtered = chain.filtered.saturating_add(1);
+                                continue 'rows;
                             }
-                            crate::query::CustomOperatorResult::Expand(_) => {
-                                return Err(StorageError::backend(
-                                    "bounded secondary custom operator unexpectedly expanded rows",
-                                ));
+                            crate::query::CustomOperatorResult::Expand(documents) => {
+                                if documents.is_empty() {
+                                    chain.filtered = chain.filtered.saturating_add(1);
+                                }
+                                // Reversed onto the stack so the first item is
+                                // processed first; each keeps the source row identity.
+                                pending.extend(documents.into_iter().rev().map(|document| {
+                                    let mut expanded = row.clone();
+                                    expanded.replace_document(document, false);
+                                    (index + 1, expanded)
+                                }));
+                                continue 'rows;
                             }
                         }
                     }
                     PhysicalOperator::Skip { .. } => {
-                        let remaining = skip_remaining[index].as_mut().expect("skip state");
+                        let remaining = chain.skip_remaining[index].as_mut().expect("skip state");
                         if *remaining > 0 {
                             *remaining -= 1;
-                            keep = false;
-                            filtered = filtered.saturating_add(1);
-                            break;
+                            chain.filtered = chain.filtered.saturating_add(1);
+                            continue 'rows;
                         }
                     }
-                    PhysicalOperator::Limit { .. } => {
-                        let remaining = limit_remaining[index].as_mut().expect("limit state");
-                        if *remaining == 0 {
-                            return Ok(false);
-                        }
-                        *remaining -= 1;
-                        stop_after_row |= *remaining == 0;
-                    }
-                    _ => unreachable!("validated bounded secondary row operator"),
+                    PhysicalOperator::Limit { .. } => {}
+                    _ => unreachable!("validated streaming row operator"),
                 }
             }
-
-            if keep {
-                visitor(row).map_err(backend_storage_error)?;
-                returned = returned.saturating_add(1);
-            }
-            Ok(!stop_after_row)
-        })
-        .map_err(storage_engine_error)?;
-
-        Ok(ExecutionStatistics::streamed_pipeline(
-            scanned,
-            filtered,
-            returned,
-            ExecutionStrategy::CollectionScan,
-        ))
+            emit(row)?;
+        }
+        Ok(!stop_after_row)
     }
 
     /// Returns whether the governed blocking streaming executor supports this plan shape.
@@ -1084,56 +1087,16 @@ impl Engine {
         if physical.is_write() || physical.is_memory_streaming() {
             return false;
         }
-        let Some(index) = physical.operators().iter().position(|operator| {
-            matches!(
-                operator.execution_properties().flow,
-                crate::query::Flow::GovernedBlocking
-            )
-        }) else {
+        let Some(shape) = governed_shape(physical.operators()) else {
             return false;
         };
-        if !physical.operators()[..index].iter().all(|operator| {
-            matches!(
-                operator.execution_properties().flow,
-                crate::query::Flow::Streaming
-            )
-        }) {
-            return false;
-        }
-        let suffix = &physical.operators()[index..];
-        let bounded = suffix
-            .last()
-            .is_some_and(|operator| operator.execution_properties().linear_bound().is_some());
-        let core = if bounded {
-            &suffix[..suffix.len() - 1]
-        } else {
-            suffix
-        };
-        match core {
-            [operator] => {
-                matches!(operator.execution_properties().order, Order::Ordered(_))
-                    || matches!(
-                        operator,
-                        PhysicalOperator::Distinct { .. } | PhysicalOperator::Group { .. }
-                    )
-                    || matches!(
-                        operator,
-                        PhysicalOperator::Lookup { pipeline, .. }
-                            | PhysicalOperator::Union { pipeline, .. }
-                            if suffix.len() == 1
-                                && pipeline
-                                    .operators()
-                                    .iter()
-                                    .all(is_bounded_secondary_row_operator)
-                    )
-            }
-            [PhysicalOperator::Group { .. }, ordering] => {
-                matches!(ordering.execution_properties().order, Order::Ordered(_))
-            }
-            [ordering, PhysicalOperator::Distinct { .. }] if bounded => {
-                matches!(ordering.execution_properties().order, Order::Ordered(_))
-            }
-            _ => false,
+        // A pivot is bounded only when the runtime can aggregate it incrementally.
+        match &physical.operators()[shape.blocking_index..shape.core_end] {
+            [PhysicalOperator::Pivot { specification }] => self
+                .runtime
+                .incremental_pivot_accumulator(specification)
+                .is_ok_and(|accumulator| accumulator.is_some()),
+            _ => true,
         }
     }
 
@@ -1262,6 +1225,7 @@ impl Engine {
             arguments,
             writes: false,
             changes_cardinality: false,
+            ..
         } = near
         else {
             return Ok(None);
@@ -2319,36 +2283,64 @@ impl Engine {
         if !self.supports_governed_blocking_streaming(physical) {
             return Ok(None);
         }
+        let shape = governed_shape(physical.operators()).expect("governed support check guarantees a shape");
 
-        let blocking_index = physical
-            .operators()
-            .iter()
-            .position(|operator| {
-                matches!(
-                    operator.execution_properties().flow,
-                    crate::query::Flow::GovernedBlocking
-                )
-            })
-            .expect("governed support check guarantees a blocking stage");
+        // The streaming tail (`select`, `skip`, `first`, `unwind`, a terminal
+        // `count`, …) runs row by row on the core's output. A leading `skip`/
+        // bound of the tail was already pushed into the core as a row limit.
+        let mut chain = StreamingRowChain::new(shape.tail);
+        let mut counted = 0u64;
+        let mut delivered = 0u64;
+        let mut open = !chain.has_empty_bound();
+        let statistics = {
+            let mut tail_visitor = |row: ExecutionRow| -> EngineResult<()> {
+                if !open {
+                    return Ok(());
+                }
+                let mut sink = |row: ExecutionRow| -> Result<(), StorageError> {
+                    if shape.count_alias.is_some() {
+                        counted = counted.saturating_add(1);
+                        return Ok(());
+                    }
+                    visitor(row).map_err(backend_storage_error)?;
+                    delivered = delivered.saturating_add(1);
+                    Ok(())
+                };
+                open = self
+                    .drive_streaming_row(&mut chain, 0, row, None, &mut sink)
+                    .map_err(storage_engine_error)?;
+                Ok(())
+            };
+            self.stream_governed_core(physical, &shape, &mut tail_visitor)?
+        };
+        let Some(statistics) = statistics else {
+            return Ok(None);
+        };
+        ensure_exact_rows(shape.tail, &chain.limit_remaining)?;
+        if let Some(alias) = shape.count_alias {
+            let document = Arc::new(Document::from_fields([(alias, Value::from(counted))]));
+            let stored = StoredDocument::new(DocumentId::synthetic(0x0063_6f75_6e74, 1), DocumentVersion::INITIAL, document)
+                .map_err(storage_engine_error)?;
+            visitor(ExecutionRow::from_stored(stored))?;
+            delivered = 1;
+        }
+        if shape.tail.is_empty() && shape.count_alias.is_none() {
+            return Ok(Some(statistics));
+        }
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            statistics.scanned(),
+            statistics.filtered().saturating_add(chain.filtered),
+            delivered,
+            statistics.strategies(),
+        )))
+    }
 
-        let suffix = &physical.operators()[blocking_index + 1..];
-        let chained_group_sort = matches!(
-            &physical.operators()[blocking_index],
-            PhysicalOperator::Group { .. }
-        ) && match suffix {
-            [ordering] => matches!(ordering.execution_properties().order, Order::Ordered(_)),
-            [ordering, bound] => {
-                matches!(ordering.execution_properties().order, Order::Ordered(_))
-                    && bound.execution_properties().linear_bound().is_some()
-            }
-            _ => false,
-        };
-        let output_limit = match suffix {
-            [] => None,
-            [bound] => bound.execution_properties().linear_bound(),
-            _ if chained_group_sort => None,
-            _ => return Ok(None),
-        };
+    /// Runs the streaming prefix and the blocking core of a governed plan,
+    /// emitting up to `shape.output_limit` rows to `visitor`.
+    fn stream_governed_core( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let blocking_index = shape.blocking_index;
+        let core = &physical.operators()[blocking_index..shape.core_end];
+        let output_limit = shape.output_limit;
 
         let prefix = PhysicalPlan::new(
             physical.source().clone(),
@@ -2376,12 +2368,76 @@ impl Engine {
         let available = snapshot.available_bytes.unwrap_or(query_budget);
         let working_budget = available.min(query_budget).max(1024 * 1024);
 
+        // A stage that retains at most N rows (`sample N`) keeps a reservoir of
+        // N rows while the prefix streams; memory is bounded by N.
+        if let Some(capacity) = core[0].execution_properties().retained_rows() {
+            let mut reservoir = crate::query::Reservoir::new(capacity);
+            let prefix_stats = self
+                .stream_read_pipeline(&prefix, &mut |stored| {
+                    reservoir.push(ExecutionRow::from_stored(stored));
+                    Ok(())
+                })?
+                .expect("validated streaming prefix");
+            let dropped = reservoir.seen().saturating_sub(capacity as u64);
+            let mut rows = reservoir.into_items();
+            if let Some(limit) = output_limit {
+                rows.truncate(limit);
+            }
+            let returned = rows.len() as u64;
+            for row in rows {
+                visitor(row)?;
+            }
+            return Ok(Some(ExecutionStatistics::streamed_with_strategies(
+                prefix_stats.scanned(),
+                prefix_stats.filtered().saturating_add(dropped),
+                returned,
+                ExecutionStrategies::default().with(source_strategy),
+            )));
+        }
+
         // UNION and LOOKUP are bounded at the compound-stage boundary. UNION
         // streams both branches directly; LOOKUP only retains the matches for
         // the current outer row, which is the smallest semantic unit that must
         // exist in memory because the runtime attaches it as one result value.
-        if suffix.is_empty() {
-            match &physical.operators()[blocking_index] {
+        // PIVOT keeps one aggregate cell per (row key, column) while the
+        // prefix streams; only that state, never the rows, is retained.
+        if let [PhysicalOperator::Pivot { specification }] = core {
+            let mut accumulator = self
+                .runtime
+                .incremental_pivot_accumulator(specification)
+                .map_err(EngineError::execution)?
+                .ok_or_else(|| EngineError::execution(ExecutionError::evaluation("pivot runtime has no incremental accumulator")))?;
+            let reservation = reserve_query_memory(&self.memory_governor, "pivot working set", working_budget)
+                .map_err(EngineError::execution)?;
+            let prefix_stats = self
+                .stream_read_pipeline(&prefix, &mut |stored| {
+                    accumulator.push(stored.document()).map_err(EngineError::execution)?;
+                    if accumulator.retained_bytes() > working_budget {
+                        return Err(EngineError::execution(ExecutionError::evaluation(
+                            "pivot cells exceed the governed query working set; reduce the row or column cardinality",
+                        )));
+                    }
+                    Ok(())
+                })?
+                .expect("validated streaming prefix");
+            let rows = accumulator.finish().map_err(EngineError::execution)?;
+            drop(reservation);
+            let returned = rows.len() as u64;
+            for row in rows {
+                visitor(ExecutionRow::synthetic(row))?;
+            }
+            return Ok(Some(ExecutionStatistics::streamed_with_strategies(
+                prefix_stats.scanned(),
+                prefix_stats.filtered(),
+                returned,
+                ExecutionStrategies::default()
+                    .with(source_strategy)
+                    .with(ExecutionStrategy::InMemoryPivot),
+            )));
+        }
+
+        if let [core_operator] = core {
+            match core_operator {
                 PhysicalOperator::Union {
                     collection,
                     pipeline,
@@ -2425,6 +2481,7 @@ impl Engine {
                 PhysicalOperator::Lookup {
                     collection,
                     alias,
+                    outer_alias,
                     into,
                     pipeline,
                 } if pipeline
@@ -2449,7 +2506,7 @@ impl Engine {
                             let inner_stats = self.stream_bounded_secondary_pipeline(
                                 collection,
                                 pipeline,
-                                Some((outer.document(), alias.as_deref())),
+                                Some((outer.document(), alias.as_deref(), outer_alias.as_deref())),
                                 false,
                                 &mut |row| {
                                     let estimated = execution_row_working_bytes(&row)
@@ -2497,9 +2554,9 @@ impl Engine {
 
         if let [PhysicalOperator::Sort { keys: sort_keys }, PhysicalOperator::Distinct {
             fields: distinct_fields,
-        }, bound] = &physical.operators()[blocking_index..]
+        }] = core
         {
-            let Some(limit) = bound.execution_properties().linear_bound() else {
+            let Some(limit) = output_limit else {
                 return Ok(None);
             };
             let reservation = reserve_query_memory(
@@ -2579,15 +2636,7 @@ impl Engine {
             )));
         }
 
-        if let [PhysicalOperator::Group { keys: group_keys }, PhysicalOperator::Sort { keys: sort_keys }, tail @ ..] =
-            &physical.operators()[blocking_index..]
-        {
-            let output_limit = match tail {
-                [] => None,
-                [bound] => bound.execution_properties().linear_bound(),
-                _ => return Ok(None),
-            };
-
+        if let [PhysicalOperator::Group { keys: group_keys }, PhysicalOperator::Sort { keys: sort_keys }] = core {
             // Reuse the same governed in-memory group primitive used by GROUP
             // alone before choosing the external path. Chaining SORT/LIMIT must
             // not force spill when the grouped state already fits the contract.
@@ -2990,7 +3039,7 @@ impl Engine {
             )));
         }
 
-        match &physical.operators()[blocking_index] {
+        match &core[0] {
             PhysicalOperator::Sort { keys } if output_limit.is_some() => {
                 let limit = output_limit.expect("checked Top-N limit");
                 if let Some((rows, statistics)) =
@@ -3583,392 +3632,89 @@ impl Engine {
         let storage = MemoryStorage::new();
         let collection = CollectionId::parse(vcollections::MEMORY).map_err(storage_engine_error)?;
         let snapshot = self.memory_governor.snapshot();
-        let observed_bytes = snapshot.classes.iter().fold(0usize, |total, class| {
-            total.saturating_add(class.observed_bytes)
-        });
-        let pressure = self.memory_governor.process_pressure();
+        let observed_bytes = snapshot.classes.iter().fold(0usize, |total, class| total.saturating_add(class.observed_bytes));
         let event_snapshot = self.memory_governor.event_snapshot();
         let spill = crate::spill::stats_snapshot();
         let process = snapshot.process;
-        let (pressure_state, soft_limit_bytes, hard_limit_bytes) = match pressure {
+        let profile = self.memory_governor.profile();
+        let (pressure_state, soft_limit_bytes, hard_limit_bytes) = match self.memory_governor.process_pressure() {
             ProcessMemoryPressure::Unlimited => ("unlimited", None, None),
-            ProcessMemoryPressure::Unavailable { limit_bytes } => {
-                ("unavailable", None, Some(limit_bytes))
-            }
-            ProcessMemoryPressure::Normal {
-                soft_limit_bytes,
-                hard_limit_bytes,
-                ..
-            } => ("normal", Some(soft_limit_bytes), Some(hard_limit_bytes)),
-            ProcessMemoryPressure::Soft {
-                soft_limit_bytes,
-                hard_limit_bytes,
-                ..
-            } => ("soft", Some(soft_limit_bytes), Some(hard_limit_bytes)),
-            ProcessMemoryPressure::Hard {
-                soft_limit_bytes,
-                hard_limit_bytes,
-                ..
-            } => ("hard", Some(soft_limit_bytes), Some(hard_limit_bytes)),
+            ProcessMemoryPressure::Unavailable { limit_bytes } => ("unavailable", None, Some(limit_bytes)),
+            ProcessMemoryPressure::Normal { soft_limit_bytes, hard_limit_bytes, .. } => ("normal", Some(soft_limit_bytes), Some(hard_limit_bytes)),
+            ProcessMemoryPressure::Soft { soft_limit_bytes, hard_limit_bytes, .. } => ("soft", Some(soft_limit_bytes), Some(hard_limit_bytes)),
+            ProcessMemoryPressure::Hard { soft_limit_bytes, hard_limit_bytes, .. } => ("hard", Some(soft_limit_bytes), Some(hard_limit_bytes)),
+        };
+        let pressure_bytes = process.map(|p| p.pressure_bytes(snapshot.current_bytes));
+        let over_limit = |bytes: Option<usize>, limit: Option<usize>, headroom: bool| match (bytes, limit) {
+            (Some(bytes), Some(limit)) => Some(if headroom { limit.saturating_sub(bytes) } else { bytes.saturating_sub(limit) }),
+            _ => None,
         };
         let mut transaction = storage.begin().map_err(storage_engine_error)?;
 
-        let global = Document::from_fields([
+        let mut global = Document::from_fields([
             ("scope", Value::from("global")),
             ("class", Value::from("all")),
-            (
-                "profile",
-                Value::from(self.memory_governor.profile().effective_profile_label()),
-            ),
-            (
-                "base_profile",
-                Value::from(self.memory_governor.profile().profile.as_str()),
-            ),
-            (
-                "profile_scaled",
-                Value::from(self.memory_governor.profile().is_scaled()),
-            ),
-            (
-                "process_limit_bytes",
-                optional_usize_value(self.memory_governor.profile().process_limit_bytes)?,
-            ),
-            (
-                "runtime_reserve_bytes",
-                usize_value(self.memory_governor.profile().runtime_reserve_bytes)?,
-            ),
-            (
-                "managed_budget_bytes",
-                optional_usize_value(self.memory_governor.profile().managed_budget_bytes)?,
-            ),
-            ("limit_bytes", optional_usize_value(snapshot.limit_bytes)?),
-            ("current_bytes", usize_value(snapshot.current_bytes)?),
-            ("peak_bytes", usize_value(snapshot.peak_bytes)?),
-            ("observed_bytes", usize_value(observed_bytes)?),
-            (
-                "available_bytes",
-                optional_usize_value(snapshot.available_bytes)?,
-            ),
-            (
-                "active_reservations",
-                usize_value(snapshot.active_reservations)?,
-            ),
-            (
-                "failed_reservations",
-                Value::from(snapshot.failed_reservations),
-            ),
-            ("event_capacity", usize_value(event_snapshot.capacity)?),
+            ("profile", Value::from(profile.effective_profile_label())),
+            ("base_profile", Value::from(profile.profile.as_str())),
+            ("profile_scaled", Value::from(profile.is_scaled())),
+            ("process_limit_bytes", optional_usize_value(profile.process_limit_bytes)),
+            ("runtime_reserve_bytes", usize_value(profile.runtime_reserve_bytes)),
+            ("managed_budget_bytes", optional_usize_value(profile.managed_budget_bytes)),
+            ("limit_bytes", optional_usize_value(snapshot.limit_bytes)),
+            ("current_bytes", usize_value(snapshot.current_bytes)),
+            ("peak_bytes", usize_value(snapshot.peak_bytes)),
+            ("observed_bytes", usize_value(observed_bytes)),
+            ("available_bytes", optional_usize_value(snapshot.available_bytes)),
+            ("active_reservations", usize_value(snapshot.active_reservations)),
+            ("failed_reservations", Value::from(snapshot.failed_reservations)),
+            ("event_capacity", usize_value(event_snapshot.capacity)),
             ("dropped_events", Value::from(event_snapshot.dropped_events)),
             ("pressure_state", Value::from(pressure_state)),
-            ("soft_limit_bytes", optional_usize_value(soft_limit_bytes)?),
-            ("hard_limit_bytes", optional_usize_value(hard_limit_bytes)?),
-            (
-                "rss_bytes",
-                optional_usize_value(process.map(|p| p.rss_bytes))?,
-            ),
-            (
-                "anonymous_bytes",
-                optional_usize_value(process.map(|p| p.anonymous_bytes))?,
-            ),
-            (
-                "non_anonymous_rss_bytes",
-                optional_usize_value(process.map(super::memory::ProcessMemorySnapshot::non_anonymous_rss_bytes))?,
-            ),
-            (
-                "process_pressure_bytes",
-                optional_usize_value(process.map(|p| p.pressure_bytes(snapshot.current_bytes)))?,
-            ),
-            (
-                "unmanaged_bytes",
-                optional_usize_value(process.map(|p| p.unmanaged_bytes))?,
-            ),
+            ("soft_limit_bytes", optional_usize_value(soft_limit_bytes)),
+            ("hard_limit_bytes", optional_usize_value(hard_limit_bytes)),
+            ("rss_bytes", optional_usize_value(process.map(|p| p.rss_bytes))),
+            ("anonymous_bytes", optional_usize_value(process.map(|p| p.anonymous_bytes))),
+            ("non_anonymous_rss_bytes", optional_usize_value(process.map(super::memory::ProcessMemorySnapshot::non_anonymous_rss_bytes))),
+            ("process_pressure_bytes", optional_usize_value(pressure_bytes)),
+            ("unmanaged_bytes", optional_usize_value(process.map(|p| p.unmanaged_bytes))),
             ("memory_enforcement", Value::from("managed")),
             ("rss_enforced", Value::from(false)),
-            (
-                "process_headroom_bytes",
-                optional_usize_value(match (process, hard_limit_bytes) {
-                    (Some(process), Some(limit)) => {
-                        Some(limit.saturating_sub(process.pressure_bytes(snapshot.current_bytes)))
-                    }
-                    _ => None,
-                })?,
-            ),
-            (
-                "process_pressure_over_limit_bytes",
-                optional_usize_value(match (process, hard_limit_bytes) {
-                    (Some(process), Some(limit)) => {
-                        Some(process.pressure_bytes(snapshot.current_bytes).saturating_sub(limit))
-                    }
-                    _ => None,
-                })?,
-            ),
-            (
-                "rss_over_limit_bytes",
-                optional_usize_value(match (process, hard_limit_bytes) {
-                    (Some(process), Some(limit)) => Some(process.rss_bytes.saturating_sub(limit)),
-                    _ => None,
-                })?,
-            ),
+            ("process_headroom_bytes", optional_usize_value(over_limit(pressure_bytes, hard_limit_bytes, true))),
+            ("process_pressure_over_limit_bytes", optional_usize_value(over_limit(pressure_bytes, hard_limit_bytes, false))),
+            ("rss_over_limit_bytes", optional_usize_value(over_limit(process.map(|p| p.rss_bytes), hard_limit_bytes, false))),
             ("spill_runs_created", Value::from(spill.runs_created)),
             ("spill_runs_active", Value::from(spill.runs_active)),
-            (
-                "spill_runs_peak_active",
-                Value::from(spill.runs_peak_active),
-            ),
+            ("spill_runs_peak_active", Value::from(spill.runs_peak_active)),
             ("spill_runs_deleted", Value::from(spill.runs_deleted)),
             ("spill_records_written", Value::from(spill.records_written)),
-            (
-                "spill_payload_bytes_written",
-                Value::from(spill.payload_bytes_written),
-            ),
-            (
-                "spill_framing_bytes_written",
-                Value::from(spill.framing_bytes_written),
-            ),
-            (
-                "spill_bytes_written",
-                Value::from(
-                    spill
-                        .payload_bytes_written
-                        .saturating_add(spill.framing_bytes_written),
-                ),
-            ),
+            ("spill_payload_bytes_written", Value::from(spill.payload_bytes_written)),
+            ("spill_framing_bytes_written", Value::from(spill.framing_bytes_written)),
+            ("spill_bytes_written", Value::from(spill.payload_bytes_written.saturating_add(spill.framing_bytes_written))),
             ("spill_records_read", Value::from(spill.records_read)),
-            (
-                "spill_payload_bytes_read",
-                Value::from(spill.payload_bytes_read),
-            ),
+            ("spill_payload_bytes_read", Value::from(spill.payload_bytes_read)),
             ("spill_live_bytes", Value::from(spill.live_bytes)),
             ("spill_peak_live_bytes", Value::from(spill.peak_live_bytes)),
             ("spill_create_us", Value::from(spill.create_us)),
             ("spill_flush_us", Value::from(spill.flush_us)),
             ("spill_sync_us", Value::from(spill.sync_us)),
-            (
-                "external_group_flushes",
-                Value::from(EXTERNAL_GROUP_FLUSHES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_partials_written",
-                Value::from(EXTERNAL_GROUP_PARTIALS_WRITTEN.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_bytes_written",
-                Value::from(EXTERNAL_GROUP_BYTES_WRITTEN.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_flush_us",
-                Value::from(EXTERNAL_GROUP_FLUSH_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_partials_merged",
-                Value::from(EXTERNAL_GROUP_PARTIALS_MERGED.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_us",
-                Value::from(EXTERNAL_GROUP_MERGE_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_peak_groups_per_flush",
-                Value::from(EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_source_us",
-                Value::from(EXTERNAL_GROUP_SOURCE_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_rows_consumed",
-                Value::from(EXTERNAL_GROUP_ROWS_CONSUMED.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_consume_samples",
-                Value::from(EXTERNAL_GROUP_CONSUME_SAMPLES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_key_ns",
-                Value::from(EXTERNAL_GROUP_KEY_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_lookup_ns",
-                Value::from(EXTERNAL_GROUP_LOOKUP_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_accumulate_ns",
-                Value::from(EXTERNAL_GROUP_ACCUMULATE_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_group_hits",
-                Value::from(EXTERNAL_GROUP_GROUP_HITS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_group_misses",
-                Value::from(EXTERNAL_GROUP_GROUP_MISSES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_accumulator_create_us",
-                Value::from(EXTERNAL_GROUP_ACCUMULATOR_CREATE_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_flush_triggers",
-                Value::from(EXTERNAL_GROUP_FLUSH_TRIGGERS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_estimated_peak_bytes",
-                Value::from(EXTERNAL_GROUP_ESTIMATED_PEAK_BYTES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_partial_finish_us",
-                Value::from(EXTERNAL_GROUP_PARTIAL_FINISH_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_flush_sort_us",
-                Value::from(EXTERNAL_GROUP_FLUSH_SORT_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_encode_write_us",
-                Value::from(EXTERNAL_GROUP_ENCODE_WRITE_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_init_us",
-                Value::from(EXTERNAL_GROUP_MERGE_INIT_US.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_samples",
-                Value::from(EXTERNAL_GROUP_MERGE_SAMPLES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_select_ns",
-                Value::from(EXTERNAL_GROUP_MERGE_SELECT_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_partial_ns",
-                Value::from(EXTERNAL_GROUP_MERGE_PARTIAL_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_read_ns",
-                Value::from(EXTERNAL_GROUP_MERGE_READ_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_merge_finish_ns",
-                Value::from(EXTERNAL_GROUP_MERGE_FINISH_NS.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_rss_samples",
-                Value::from(EXTERNAL_GROUP_RSS_SAMPLES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_rss_peak_bytes",
-                Value::from(EXTERNAL_GROUP_RSS_PEAK_BYTES.load(AtomicOrdering::Relaxed)),
-            ),
-            (
-                "external_group_unmanaged_peak_bytes",
-                Value::from(EXTERNAL_GROUP_UNMANAGED_PEAK_BYTES.load(AtomicOrdering::Relaxed)),
-            ),
         ]);
-        transaction
-            .insert(
-                &collection,
-                DocumentId::synthetic(0x6d65_6d6f_7279, 0),
-                Arc::new(global),
-            )
-            .map_err(storage_engine_error)?;
+        global.extend(EXTERNAL_GROUP_COUNTERS.iter().map(|(name, counter)| (*name, Value::from(counter.load(AtomicOrdering::Relaxed)))));
+        // Class rows share the global schema; fields without a per-class meaning stay null.
+        let class_template = Document::from_fields(global.keys().map(|name| (name.clone(), Value::Null)));
+        insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x6d65_6d6f_7279, 0), global)?;
 
         for (ordinal, class) in snapshot.classes.into_iter().enumerate() {
-            let document = Document::from_fields([
+            let mut document = class_template.clone();
+            document.extend([
                 ("scope", Value::from("class")),
                 ("class", Value::from(class.class.as_str())),
-                ("profile", Value::Null),
-                ("base_profile", Value::Null),
-                ("profile_scaled", Value::Null),
-                ("process_limit_bytes", Value::Null),
-                ("runtime_reserve_bytes", Value::Null),
-                ("managed_budget_bytes", Value::Null),
-                ("limit_bytes", Value::Null),
-                ("current_bytes", usize_value(class.current_bytes)?),
-                ("peak_bytes", usize_value(class.peak_bytes)?),
-                ("observed_bytes", usize_value(class.observed_bytes)?),
-                ("available_bytes", Value::Null),
-                (
-                    "active_reservations",
-                    usize_value(class.active_reservations)?,
-                ),
-                (
-                    "failed_reservations",
-                    Value::from(class.failed_reservations),
-                ),
-                ("event_capacity", Value::Null),
-                ("dropped_events", Value::Null),
-                ("pressure_state", Value::Null),
-                ("soft_limit_bytes", Value::Null),
-                ("hard_limit_bytes", Value::Null),
-                ("rss_bytes", Value::Null),
-                ("anonymous_bytes", Value::Null),
-                ("non_anonymous_rss_bytes", Value::Null),
-                ("process_pressure_bytes", Value::Null),
-                ("unmanaged_bytes", Value::Null),
-                ("memory_enforcement", Value::Null),
-                ("rss_enforced", Value::Null),
-                ("process_headroom_bytes", Value::Null),
-                ("process_pressure_over_limit_bytes", Value::Null),
-                ("rss_over_limit_bytes", Value::Null),
-                ("spill_runs_created", Value::Null),
-                ("spill_runs_active", Value::Null),
-                ("spill_runs_peak_active", Value::Null),
-                ("spill_runs_deleted", Value::Null),
-                ("spill_records_written", Value::Null),
-                ("spill_payload_bytes_written", Value::Null),
-                ("spill_framing_bytes_written", Value::Null),
-                ("spill_bytes_written", Value::Null),
-                ("spill_records_read", Value::Null),
-                ("spill_payload_bytes_read", Value::Null),
-                ("spill_live_bytes", Value::Null),
-                ("spill_peak_live_bytes", Value::Null),
-                ("spill_create_us", Value::Null),
-                ("spill_flush_us", Value::Null),
-                ("spill_sync_us", Value::Null),
-                ("external_group_flushes", Value::Null),
-                ("external_group_partials_written", Value::Null),
-                ("external_group_bytes_written", Value::Null),
-                ("external_group_flush_us", Value::Null),
-                ("external_group_partials_merged", Value::Null),
-                ("external_group_merge_us", Value::Null),
-                ("external_group_peak_groups_per_flush", Value::Null),
-                ("external_group_source_us", Value::Null),
-                ("external_group_rows_consumed", Value::Null),
-                ("external_group_consume_samples", Value::Null),
-                ("external_group_key_ns", Value::Null),
-                ("external_group_lookup_ns", Value::Null),
-                ("external_group_accumulate_ns", Value::Null),
-                ("external_group_group_hits", Value::Null),
-                ("external_group_group_misses", Value::Null),
-                ("external_group_accumulator_create_us", Value::Null),
-                ("external_group_flush_triggers", Value::Null),
-                ("external_group_estimated_peak_bytes", Value::Null),
-                ("external_group_partial_finish_us", Value::Null),
-                ("external_group_flush_sort_us", Value::Null),
-                ("external_group_encode_write_us", Value::Null),
-                ("external_group_merge_init_us", Value::Null),
-                ("external_group_merge_samples", Value::Null),
-                ("external_group_merge_select_ns", Value::Null),
-                ("external_group_merge_partial_ns", Value::Null),
-                ("external_group_merge_read_ns", Value::Null),
-                ("external_group_merge_finish_ns", Value::Null),
-                ("external_group_rss_samples", Value::Null),
-                ("external_group_rss_peak_bytes", Value::Null),
-                ("external_group_unmanaged_peak_bytes", Value::Null),
+                ("current_bytes", usize_value(class.current_bytes)),
+                ("peak_bytes", usize_value(class.peak_bytes)),
+                ("observed_bytes", usize_value(class.observed_bytes)),
+                ("active_reservations", usize_value(class.active_reservations)),
+                ("failed_reservations", Value::from(class.failed_reservations)),
             ]);
-            transaction
-                .insert(
-                    &collection,
-                    DocumentId::synthetic(
-                        0x6d65_6d63_6c61,
-                        u64::try_from(ordinal).map_err(|_| {
-                            EngineError::execution(ExecutionError::evaluation(
-                                "too many memory classes",
-                            ))
-                        })?,
-                    ),
-                    Arc::new(document),
-                )
-                .map_err(storage_engine_error)?;
+            insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x6d65_6d63_6c61, usize_to_u64_saturating(ordinal)), document)?;
         }
 
         transaction.commit().map_err(storage_engine_error)?;
@@ -3980,86 +3726,40 @@ impl Engine {
         let collection = CollectionId::parse(vcollections::QUERY_MEMORY).map_err(storage_engine_error)?;
         let snapshot = self.memory_governor.query_memory_snapshot();
         let mut transaction = storage.begin().map_err(storage_engine_error)?;
+        let profile = if snapshot.profile_scaled {
+            format!("custom (base: {})", snapshot.base_profile.as_str())
+        } else {
+            snapshot.base_profile.as_str().to_owned()
+        };
         let global = Document::from_fields([
             ("scope", Value::from("global")),
             ("operation_id", Value::Null),
             ("class", Value::from("all")),
-            (
-                "profile",
-                Value::from(if snapshot.profile_scaled {
-                    format!("custom (base: {})", snapshot.base_profile.as_str())
-                } else {
-                    snapshot.base_profile.as_str().to_owned()
-                }),
-            ),
+            ("profile", Value::from(profile)),
             ("base_profile", Value::from(snapshot.base_profile.as_str())),
             ("profile_scaled", Value::from(snapshot.profile_scaled)),
-            (
-                "process_limit_bytes",
-                optional_usize_value(snapshot.process_limit_bytes)?,
-            ),
-            (
-                "runtime_reserve_bytes",
-                usize_value(snapshot.runtime_reserve_bytes)?,
-            ),
-            (
-                "managed_budget_bytes",
-                optional_usize_value(snapshot.managed_budget_bytes)?,
-            ),
-            (
-                "operation_budget_bytes",
-                usize_value(snapshot.operation_budget_bytes)?,
-            ),
-            (
-                "active_operation_bytes",
-                usize_value(snapshot.active_operation_bytes)?,
-            ),
-            (
-                "peak_operation_bytes",
-                usize_value(snapshot.peak_operation_bytes)?,
-            ),
-            (
-                "active_heavy_operations",
-                usize_value(snapshot.active_heavy_operations)?,
-            ),
-            (
-                "rejected_operations",
-                Value::from(snapshot.rejected_operations),
-            ),
+            ("process_limit_bytes", optional_usize_value(snapshot.process_limit_bytes)),
+            ("runtime_reserve_bytes", usize_value(snapshot.runtime_reserve_bytes)),
+            ("managed_budget_bytes", optional_usize_value(snapshot.managed_budget_bytes)),
+            ("operation_budget_bytes", usize_value(snapshot.operation_budget_bytes)),
+            ("active_operation_bytes", usize_value(snapshot.active_operation_bytes)),
+            ("peak_operation_bytes", usize_value(snapshot.peak_operation_bytes)),
+            ("active_heavy_operations", usize_value(snapshot.active_heavy_operations)),
+            ("rejected_operations", Value::from(snapshot.rejected_operations)),
             ("budget_bytes", Value::Null),
         ]);
-        transaction
-            .insert(
-                &collection,
-                DocumentId::synthetic(0x7175_6572_796d, 0),
-                Arc::new(global),
-            )
-            .map_err(storage_engine_error)?;
+        // Operation rows share the global schema; fields without a per-operation meaning stay null.
+        let operation_template = Document::from_fields(global.keys().map(|name| (name.clone(), Value::Null)));
+        insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x7175_6572_796d, 0), global)?;
         for record in snapshot.records {
-            let document = Document::from_fields([
+            let mut document = operation_template.clone();
+            document.extend([
                 ("scope", Value::from("operation")),
                 ("operation_id", Value::from(record.id)),
                 ("class", Value::from(record.class.as_str())),
-                ("profile", Value::Null),
-                ("base_profile", Value::Null),
-                ("profile_scaled", Value::Null),
-                ("process_limit_bytes", Value::Null),
-                ("runtime_reserve_bytes", Value::Null),
-                ("managed_budget_bytes", Value::Null),
-                ("operation_budget_bytes", Value::Null),
-                ("active_operation_bytes", Value::Null),
-                ("peak_operation_bytes", Value::Null),
-                ("active_heavy_operations", Value::Null),
-                ("rejected_operations", Value::Null),
-                ("budget_bytes", usize_value(record.budget_bytes)?),
+                ("budget_bytes", usize_value(record.budget_bytes)),
             ]);
-            transaction
-                .insert(
-                    &collection,
-                    DocumentId::synthetic(0x7175_6572_796f, record.id),
-                    Arc::new(document),
-                )
-                .map_err(storage_engine_error)?;
+            insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x7175_6572_796f, record.id), document)?;
         }
         transaction.commit().map_err(storage_engine_error)?;
         Ok(storage)
@@ -4076,19 +3776,13 @@ impl Engine {
                 ("sequence", Value::from(event.sequence)),
                 ("kind", Value::from(event.kind.as_str())),
                 ("class", Value::from(event.class.as_str())),
-                ("bytes", usize_value(event.bytes)?),
-                ("current_bytes", usize_value(event.current_bytes)?),
-                ("limit_bytes", optional_usize_value(event.limit_bytes)?),
-                ("event_capacity", usize_value(snapshot.capacity)?),
+                ("bytes", usize_value(event.bytes)),
+                ("current_bytes", usize_value(event.current_bytes)),
+                ("limit_bytes", optional_usize_value(event.limit_bytes)),
+                ("event_capacity", usize_value(snapshot.capacity)),
                 ("dropped_events", Value::from(snapshot.dropped_events)),
             ]);
-            transaction
-                .insert(
-                    &collection,
-                    DocumentId::synthetic(0x6d65_6d65_766e, event.sequence),
-                    Arc::new(document),
-                )
-                .map_err(storage_engine_error)?;
+            insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x6d65_6d65_766e, event.sequence), document)?;
         }
 
         transaction.commit().map_err(storage_engine_error)?;
@@ -4097,8 +3791,7 @@ impl Engine {
 
     fn index_observations_storage(&self) -> EngineResult<MemoryStorage> {
         let storage = MemoryStorage::new();
-        let collection =
-            CollectionId::parse(vcollections::INDEX_OBSERVATIONS).map_err(storage_engine_error)?;
+        let collection = CollectionId::parse(vcollections::INDEX_OBSERVATIONS).map_err(storage_engine_error)?;
         let snapshot = self.indexing.snapshot();
         let dropped_full = snapshot.dropped_full;
         let dropped_disconnected = snapshot.dropped_disconnected;
@@ -4108,44 +3801,24 @@ impl Engine {
         observations.sort_by_key(|(fingerprint, _)| fingerprint.as_u64());
 
         for (ordinal, (fingerprint, aggregate)) in observations.into_iter().enumerate() {
+            let access = match aggregate.access {
+                ObservedAccess::CollectionScan => "collection_scan",
+                ObservedAccess::PrimaryKeyLookup => "primary_key_lookup",
+            };
+            let average_elapsed_us = aggregate.elapsed_micros.checked_div(aggregate.executions).unwrap_or(0);
             let document = Document::from_fields([
-                (
-                    "fingerprint",
-                    Value::from(format!("{:016x}", fingerprint.as_u64())),
-                ),
+                ("fingerprint", Value::from(format!("{:016x}", fingerprint.as_u64()))),
                 ("collection", Value::from(aggregate.collection.as_str())),
-                (
-                    "access",
-                    Value::from(match aggregate.access {
-                        ObservedAccess::CollectionScan => "collection_scan",
-                        ObservedAccess::PrimaryKeyLookup => "primary_key_lookup",
-                    }),
-                ),
+                ("access", Value::from(access)),
                 ("executions", Value::from(aggregate.executions)),
                 ("scanned", Value::from(aggregate.scanned)),
                 ("returned", Value::from(aggregate.returned)),
                 ("elapsed_us", Value::from(aggregate.elapsed_micros)),
-                (
-                    "average_elapsed_us",
-                    Value::from(if aggregate.executions == 0 {
-                        0
-                    } else {
-                        aggregate.elapsed_micros / aggregate.executions
-                    }),
-                ),
+                ("average_elapsed_us", Value::from(average_elapsed_us)),
                 ("dropped_full", Value::from(dropped_full)),
                 ("dropped_disconnected", Value::from(dropped_disconnected)),
             ]);
-            let ordinal = u64::try_from(ordinal).map_err(|_| {
-                EngineError::execution(ExecutionError::evaluation("too many indexing observations"))
-            })?;
-            transaction
-                .insert(
-                    &collection,
-                    DocumentId::synthetic(fingerprint.as_u64(), ordinal),
-                    Arc::new(document),
-                )
-                .map_err(storage_engine_error)?;
+            insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(fingerprint.as_u64(), usize_to_u64_saturating(ordinal)), document)?;
         }
         transaction.commit().map_err(storage_engine_error)?;
         Ok(storage)
@@ -4160,16 +3833,16 @@ impl Engine {
     }
 }
 
-fn usize_value(value: usize) -> EngineResult<Value> {
-    u64::try_from(value).map(Value::from).map_err(|_| {
-        EngineError::execution(ExecutionError::evaluation(
-            "memory counter does not fit in the public numeric representation",
-        ))
-    })
+fn usize_value(value: usize) -> Value {
+    Value::from(usize_to_u64_saturating(value))
 }
 
-fn optional_usize_value(value: Option<usize>) -> EngineResult<Value> {
-    value.map_or(Ok(Value::Null), usize_value)
+fn optional_usize_value(value: Option<usize>) -> Value {
+    value.map_or(Value::Null, usize_value)
+}
+
+fn insert_virtual_document( transaction: &mut dyn StorageTransaction, collection: &CollectionId, id: DocumentId, document: Document, ) -> EngineResult<()> {
+    transaction.insert(collection, id, Arc::new(document)).map(drop).map_err(storage_engine_error)
 }
 
 impl fmt::Debug for Engine {

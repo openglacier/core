@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{helpers::u128_to_u64_saturating, storage::UuidV7Generator};
+use crate::{helpers::{system_time_millis, u128_to_u64_saturating}, storage::UuidV7Generator};
 
 use super::{
     FileCapabilities, FileKind, FileMetadata, FileRange, FileReader, FileResult, FileStore,
@@ -378,16 +378,9 @@ fn metadata_from_fs(metadata: &fs::Metadata) -> FileMetadata {
             metadata.len(),
             system_time_nanos(metadata.modified().ok())
         )),
-        created_at: system_time_millis(metadata.created().ok()),
-        modified_at: system_time_millis(metadata.modified().ok()),
+        created_at: metadata.created().ok().and_then(system_time_millis),
+        modified_at: metadata.modified().ok().and_then(system_time_millis),
     }
-}
-
-fn system_time_millis(value: Option<SystemTime>) -> Option<u64> {
-    value?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| u128_to_u64_saturating(duration.as_millis()))
 }
 
 fn system_time_nanos(value: Option<SystemTime>) -> u64 {

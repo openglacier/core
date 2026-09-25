@@ -8,7 +8,7 @@ use std::{
 };
 use serde::{ de::{DeserializeSeed, SeqAccess, Visitor}, Deserialize, Serialize, };
 use super::{glacier_mmap::GlacierReadOnlyMap, StorageBackend};
-use crate::helpers::{elapsed_micros, elapsed_nanos, u64_to_usize_saturating, usize_to_u64_saturating};
+use crate::helpers::{elapsed_micros, elapsed_nanos, fnv1a64 as checksum64, fnv1a64_continue as checksum64_continue, lock_unpoisoned, u64_to_usize_saturating, usize_to_u64_saturating, FNV1A64_OFFSET};
 use crate::model::{Document, Number, Value};
 use crate::storage::{
     project_document, CollectionId, CommitResult, DeleteResult, DocumentId, DocumentVersion,
@@ -964,9 +964,7 @@ fn resident_memory_snapshot(state: &GlacierState) -> GlacierResidentMemorySnapsh
 }
 
 fn add_segment_catalog_memory( snapshot: &mut GlacierResidentMemorySnapshot, catalog: &Mutex<Arc<SegmentCatalogSnapshot>>, ) {
-    let guard = catalog
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = lock_unpoisoned(catalog);
     let entries = guard.segments.len();
     let bytes = std::mem::size_of::<SegmentCatalogSnapshot>()
         .saturating_add(entries.saturating_mul(std::mem::size_of::<SegmentCatalogEntry>()));
@@ -1430,9 +1428,7 @@ const fn hot_projection_reservation_upper_bound( record_count: usize, field_coun
 fn begin_hot_projection_build( governor: Option<&MemoryGovernor>, cache: &Mutex<HotProjectionCache>, collection: &CollectionId, fields: &[FieldPath], record_count: usize, records_len: usize, metrics: &GlacierReadMetrics, ) -> Option<HotProjectionBuilder> {
     let governor = governor?;
     let upper = hot_projection_reservation_upper_bound(record_count, fields.len(), records_len);
-    let can_reserve = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    let can_reserve = lock_unpoisoned(cache)
         .can_reserve(upper);
     if !can_reserve {
         metrics.hot_projection_cache_admission_skips.fetch_add(1, Ordering::Relaxed);
@@ -1447,7 +1443,7 @@ fn begin_hot_projection_build( governor: Option<&MemoryGovernor>, cache: &Mutex<
 
 fn install_hot_projection( segment_start: u64, data: Arc<HotProjectionData>, cache: &Mutex<HotProjectionCache>, metrics: &GlacierReadMetrics, ) {
     let inserted = {
-        let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = lock_unpoisoned(cache);
         let inserted = cache.insert(segment_start, data);
         if inserted {
             let resident = usize_to_u64_saturating(cache.resident_bytes);
@@ -1485,10 +1481,7 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
         // are skipped so reported reclaimed bytes always correspond to released
         // PageCache reservations.
         let (hot_freed, hot_evicted) = {
-            let mut cache = inner
-                .hot_projection_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cache = lock_unpoisoned(&inner.hot_projection_cache);
             let result = cache.reclaim(target_bytes);
             inner.read_metrics.hot_projection_cache_resident_bytes.store(
                 usize_to_u64_saturating(cache.resident_bytes),
@@ -1546,10 +1539,7 @@ impl MemoryReclaimer for GlacierPageCacheReclaimer {
             return hot_freed;
         }
         let released = {
-            let mut reservation = inner
-                .page_cache_reservation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reservation = lock_unpoisoned(&inner.page_cache_reservation);
             reservation
                 .as_mut()
                 .map_or(0, |reservation| reservation.shrink_by(freed))
@@ -1733,11 +1723,7 @@ impl GlacierBackend {
                 inner: Arc::downgrade(&backend.inner),
             });
             governor.register_reclaimer(MemoryClass::PageCache, &reclaimer);
-            *backend
-                .inner
-                .page_cache_reclaimer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reclaimer);
+            *lock_unpoisoned(&backend.inner.page_cache_reclaimer) = Some(reclaimer);
         }
         backend.refresh_resident_memory_observation();
         Ok(backend)
@@ -4080,7 +4066,7 @@ fn append_committed_data_records( path: &Path, generation: u64, records: Vec<Dat
     let directory_meta_checksum = checksum64_pair(&directory, &metadata);
     let records_checksum = encoded
         .iter()
-        .fold(0xcbf2_9ce4_8422_2325u64, |hash, bytes| {
+        .fold(FNV1A64_OFFSET, |hash, bytes| {
             checksum64_continue(hash, bytes)
         });
 
@@ -4155,7 +4141,7 @@ fn append_committed_data_records( path: &Path, generation: u64, records: Vec<Dat
         .collect()
 }
 
-fn checksum64_pair(first: &[u8], second: &[u8]) -> u64 { checksum64_continue(checksum64_continue(0xcbf2_9ce4_8422_2325, first), second) }
+fn checksum64_pair(first: &[u8], second: &[u8]) -> u64 { checksum64_continue(checksum64(first), second) }
 
 #[derive(Debug)]
 struct SegmentCatalogEntry {
@@ -4401,9 +4387,7 @@ fn read_segment_catalog_headers( path: &Path, start: u64, end: u64, mut expected
 }
 
 fn prepare_segment_catalog( path: &Path, file_len: u64, cache: &Mutex<Arc<SegmentCatalogSnapshot>>, metrics: &GlacierReadMetrics, ) -> StorageResult<Arc<SegmentCatalogSnapshot>> {
-    let mut guard = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = lock_unpoisoned(cache);
     if guard.file_len == file_len {
         metrics.segment_catalog_hits.fetch_add(1, Ordering::Relaxed);
         return Ok(Arc::clone(&guard));
@@ -4453,14 +4437,6 @@ fn prepare_segment_catalog( path: &Path, file_len: u64, cache: &Mutex<Arc<Segmen
         .fetch_add(elapsed_micros(started), Ordering::Relaxed);
     *guard = Arc::clone(&snapshot);
     Ok(snapshot)
-}
-
-fn checksum64_continue(mut hash: u64, bytes: &[u8]) -> u64 {
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    for byte in bytes {
-        hash = (hash ^ u64::from(*byte)).wrapping_mul(PRIME);
-    }
-    hash
 }
 
 // Tiny segments are cheaper to copy through the existing buffered path than to
@@ -5559,9 +5535,7 @@ fn scan_collection_sequential_value_refs( path: &Path, state: &GlacierState, col
     let projection_hot = reusable_projection
         && append_only_visible
         && memory_governor.is_some()
-        && hot_projection_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        && lock_unpoisoned(hot_projection_cache)
             .observe_signature(collection, fields);
 
     let io_started = Instant::now();
@@ -5609,9 +5583,7 @@ fn scan_collection_sequential_value_refs( path: &Path, state: &GlacierState, col
             && segment.known_insert_collection() == Some(collection.as_str())
             && segment.known_physical_sets() == Some(true)
         {
-            let cached = hot_projection_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            let cached = lock_unpoisoned(hot_projection_cache)
                 .lookup(segment_start, collection, fields);
             if let Some((data, slots, superset)) = cached
                 .filter(|(data, _, _)| data.row_count() == record_count)
@@ -5988,9 +5960,7 @@ fn scan_collection_sequential_values( path: &Path, state: &GlacierState, collect
         && full_visitor.is_none()
         && gate_field_count == fields.len()
         && memory_governor.is_some()
-        && hot_projection_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        && lock_unpoisoned(hot_projection_cache)
             .observe_signature(collection, fields);
 
     let io_started = Instant::now();
@@ -6031,9 +6001,7 @@ fn scan_collection_sequential_values( path: &Path, state: &GlacierState, collect
             && segment.known_insert_collection() == Some(collection.as_str())
             && segment.known_physical_sets() == Some(true)
         {
-            let cached = hot_projection_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            let cached = lock_unpoisoned(hot_projection_cache)
                 .lookup(segment_start, collection, fields);
             if let Some((data, slots, superset)) = cached
                 .filter(|(data, _, _)| data.row_count() == record_count)
@@ -6515,7 +6483,7 @@ fn write_checkpoint( path: &Path, checkpoint: &PersistentCheckpoint, ) -> Storag
         let buffered = BufWriter::with_capacity(CHECKPOINT_WRITE_BUFFER_BYTES, &mut file);
         let mut writer = ChecksumWriter {
             inner: buffered,
-            hash: 0xcbf2_9ce4_8422_2325,
+            hash: FNV1A64_OFFSET,
             bytes: 0,
         };
         checkpoint
@@ -7037,7 +7005,7 @@ fn load_checkpoint( path: &Path, format: GlacierFormatInfo, data_file_len: u64, 
     }
 
     let expected_checksum = u64::from_be_bytes(header[24..32].try_into().unwrap());
-    let mut checksum = 0xcbf2_9ce4_8422_2325u64;
+    let mut checksum = FNV1A64_OFFSET;
     let mut remaining = payload_len;
     let mut buffer = [0u8; 64 * 1024];
     while remaining > 0 {
@@ -7924,13 +7892,6 @@ fn make_store_id(created_at_ms: u64) -> [u8; 16] {
     id[8..].copy_from_slice(&mixed.to_be_bytes());
     id
 }
-fn checksum64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    bytes.iter().fold(OFFSET, |hash, byte| {
-        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
-    })
-}
 fn io_error<'a>( operation: &'static str, path: &'a Path, ) -> impl FnOnce(std::io::Error) -> StorageError + 'a {
     move |error| {
         StorageError::backend(format!(
@@ -7946,10 +7907,7 @@ mod tests {
     use crate::storage::UuidV7Generator;
 
     fn temp_path(label: &str) -> PathBuf {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let stamp = crate::helpers::unix_time_nanos();
         std::env::temp_dir().join(format!(
             "og-glacier-v2-{label}-{}-{stamp}.glacier",
             std::process::id()
@@ -7965,11 +7923,11 @@ mod tests {
     #[test] fn startup_metrics_describe_rebuilt_segments_and_records() { let path = temp_path("startup-metrics"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let metrics = reopened.startup_metrics(); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn projected_scan_metrics_count_physical_read_work() { let path = temp_path("read-metrics"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); doc.insert("city", Value::string("Paris")); storage .apply_batch_atomic_summary(&users, vec![StorageMutation::insert(id, Arc::new(doc))]) .unwrap(); let read = storage.read().unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let mut visited = 0u64; read.scan_projected_unordered_each(&users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }) .unwrap(); let metrics = storage.read_metrics(); assert_eq!(visited, 1); assert_eq!(metrics.scans, 1); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); assert_eq!(metrics.projected_records, 1); assert_eq!(metrics.decoded_fields, 1); assert_eq!(metrics.mmap_segments, 0); assert_eq!(metrics.mmap_bypass_segments, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[cfg(all(target_pointer_width = "64", target_family = "unix"))] #[test] fn projected_scan_reuses_mmap_and_refreshes_after_append() { let path = temp_path("read-mmap"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let first_id = UuidV7Generator::new().next_id(); let mut first = Document::new(); first.insert("name", Value::string("Alice")); first.insert( "payload", Value::string("x".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(first_id, Arc::new(first))], ) .unwrap(); let read = storage.read().unwrap(); for _ in 0..2 { let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 1); } let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 0); assert_eq!(metrics.segment_catalog_refreshes, 1); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 2); assert!(metrics.mmap_bytes >= (MIN_MMAP_SEGMENT_PAYLOAD_BYTES as u64) * 2); assert_eq!(metrics.mmap_fallback_segments, 0); let second_id = UuidV7Generator::new().next_id(); let mut second = Document::new(); second.insert("name", Value::string("Bob")); second.insert( "payload", Value::string("y".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(second_id, Arc::new(second))], ) .unwrap(); let read = storage.read().unwrap(); let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 2); let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 1); assert_eq!(metrics.segment_catalog_refreshes, 2); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 4); assert_eq!(metrics.mmap_fallback_segments, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
-    #[test] fn startup_replay_seeds_segment_catalog_validation() { let path = temp_path("segment-catalog-startup"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let startup = reopened.startup_metrics(); assert_eq!(startup.segment_catalog_segments, 1); let catalog = reopened .inner .segment_catalog .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()); assert_eq!(catalog.segments.len(), 1); let entry = &catalog.segments[0]; assert!(entry.directory_verified.load(Ordering::Acquire)); assert_eq!(entry.known_insert_collection(), Some("users")); drop(catalog); let resident = reopened.resident_memory(); assert_eq!(resident.segment_catalog_entries, 1); assert!(resident.segment_catalog_estimated_bytes > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn startup_replay_seeds_segment_catalog_validation() { let path = temp_path("segment-catalog-startup"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let startup = reopened.startup_metrics(); assert_eq!(startup.segment_catalog_segments, 1); let catalog = lock_unpoisoned(&reopened.inner.segment_catalog); assert_eq!(catalog.segments.len(), 1); let entry = &catalog.segments[0]; assert!(entry.directory_verified.load(Ordering::Acquire)); assert_eq!(entry.known_insert_collection(), Some("users")); drop(catalog); let resident = reopened.resident_memory(); assert_eq!(resident.segment_catalog_entries, 1); assert!(resident.segment_catalog_estimated_bytes > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn governed_hot_projection_cache_is_two_touch_and_reuses_rows() { let path = temp_path("hot-projection-two-touch"); let users = CollectionId::parse("users").unwrap(); let governor = MemoryGovernor::unlimited(); let storage = GlacierBackend::open_governed(&path, governor).unwrap(); let ids = UuidV7Generator::new().reserve(2); let mut mutations = Vec::new(); for (id, (name, score)) in ids.into_iter().zip([("Alice", 7_i64), ("Bob", 9_i64)]) { let mut document = Document::new(); document.insert("name", Value::string(name)); document.insert("score", Value::signed(score)); mutations.push(StorageMutation::insert(id, Arc::new(document))); } storage.apply_batch_atomic_summary(&users, mutations).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let options = ScanOptions::default().with_reusable_projection(); for pass in 0..3 { let read = storage.read().unwrap(); let mut rows = 0usize; read.scan_projected_value_refs_unordered_each( &users, options, &fields, &mut |values| { assert!(matches!(&values[0], Some(ProjectedValueRef::String(_)))); rows += 1; Ok(true) }, ) .unwrap(); assert_eq!(rows, 2); let metrics = storage.read_metrics(); match pass { 0 => { assert_eq!(metrics.hot_projection_cache_builds, 0); assert_eq!(metrics.hot_projection_cache_hits, 0); } 1 => { assert_eq!(metrics.hot_projection_cache_builds, 1); assert_eq!(metrics.hot_projection_cache_hits, 0); assert!(metrics.hot_projection_cache_resident_bytes > 0); } 2 => { assert_eq!(metrics.hot_projection_cache_builds, 1); assert_eq!(metrics.hot_projection_cache_hits, 1); assert_eq!(metrics.hot_projection_cache_reused_rows, 2); } _ => unreachable!(), } } let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn hot_projection_cache_reuses_covering_superset() { let path = temp_path("hot-projection-superset"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap(); let id = UuidV7Generator::new().next_id(); let mut document = Document::new(); document.insert("name", Value::string("Alice")); document.insert("score", Value::signed(7)); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(document))], ) .unwrap(); let wide = [ FieldPath::parse("name").unwrap(), FieldPath::parse("score").unwrap(), ]; let options = ScanOptions::default().with_reusable_projection(); for _ in 0..2 { storage .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, options, &wide, &mut |_values| Ok(true), ) .unwrap(); } assert_eq!(storage.read_metrics().hot_projection_cache_builds, 1); let narrow = [FieldPath::parse("name").unwrap()]; let mut rows = 0usize; storage .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, options, &narrow, &mut |values| { assert!(matches!(&values[0], Some(ProjectedValueRef::String("Alice")))); rows += 1; Ok(true) }, ) .unwrap(); assert_eq!(rows, 1); let metrics = storage.read_metrics(); assert_eq!(metrics.hot_projection_cache_hits, 1); assert_eq!(metrics.hot_projection_cache_superset_hits, 1); assert_eq!(metrics.hot_projection_cache_builds, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn hot_projection_cache_crosses_borrowed_and_gated_value_consumers() { let path = temp_path("hot-projection-cross-consumer"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap(); let ids = UuidV7Generator::new().reserve(2); let mut mutations = Vec::new(); for (id, (active, score)) in ids.into_iter().zip([(true, 7_i64), (false, 9_i64)]) { let mut document = Document::new(); document.insert("active", Value::Bool(active)); document.insert("score", Value::signed(score)); mutations.push(StorageMutation::insert(id, Arc::new(document))); } storage.apply_batch_atomic_summary(&users, mutations).unwrap(); let fields = [ FieldPath::parse("active").unwrap(), FieldPath::parse("score").unwrap(), ]; let options = ScanOptions::default().with_reusable_projection(); for _ in 0..2 { storage .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, options, &fields, &mut |_values| Ok(true), ) .unwrap(); } assert_eq!(storage.read_metrics().hot_projection_cache_builds, 1); let mut accepted_scores = Vec::new(); storage .read() .unwrap() .scan_projected_values_gated_unordered_each( &users, options, &fields, 1, &mut |values| Ok(values[0] == Some(Value::Bool(true))), &mut |values| { accepted_scores.push(values[1].clone()); Ok(true) }, ) .unwrap(); assert_eq!(accepted_scores, vec![Some(Value::signed(7))]); assert_eq!(storage.read_metrics().hot_projection_cache_hits, 1); assert_eq!(storage.read_metrics().hot_projection_cache_reused_rows, 2); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
-    #[test] fn hot_projection_cache_requires_governor_and_is_revocable() { let path = temp_path("hot-projection-governed"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut document = Document::new(); document.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(document))], ) .unwrap(); let fields = [FieldPath::parse("name").unwrap()]; for _ in 0..3 { storage .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, ScanOptions::default().with_reusable_projection(), &fields, &mut |_values| Ok(true), ) .unwrap(); } let metrics = storage.read_metrics(); assert_eq!(metrics.hot_projection_cache_builds, 0); assert_eq!(metrics.hot_projection_cache_resident_bytes, 0); } let governed = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; for _ in 0..2 { governed .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, ScanOptions::default().with_reusable_projection(), &fields, &mut |_values| Ok(true), ) .unwrap(); } assert!(governed.read_metrics().hot_projection_cache_resident_bytes > 0); let reclaimer = governed .inner .page_cache_reclaimer .lock() .unwrap_or_else(|poisoned| poisoned.into_inner()) .as_ref() .cloned() .unwrap(); assert!(reclaimer.reclaim(1) > 0); assert_eq!(governed.read_metrics().hot_projection_cache_resident_bytes, 0); assert!(governed.read_metrics().hot_projection_cache_evictions > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn hot_projection_cache_requires_governor_and_is_revocable() { let path = temp_path("hot-projection-governed"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut document = Document::new(); document.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(document))], ) .unwrap(); let fields = [FieldPath::parse("name").unwrap()]; for _ in 0..3 { storage .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, ScanOptions::default().with_reusable_projection(), &fields, &mut |_values| Ok(true), ) .unwrap(); } let metrics = storage.read_metrics(); assert_eq!(metrics.hot_projection_cache_builds, 0); assert_eq!(metrics.hot_projection_cache_resident_bytes, 0); } let governed = GlacierBackend::open_governed(&path, MemoryGovernor::unlimited()).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; for _ in 0..2 { governed .read() .unwrap() .scan_projected_value_refs_unordered_each( &users, ScanOptions::default().with_reusable_projection(), &fields, &mut |_values| Ok(true), ) .unwrap(); } assert!(governed.read_metrics().hot_projection_cache_resident_bytes > 0); let reclaimer = lock_unpoisoned(&governed.inner.page_cache_reclaimer) .as_ref() .cloned() .unwrap(); assert!(reclaimer.reclaim(1) > 0); assert_eq!(governed.read_metrics().hot_projection_cache_resident_bytes, 0); assert!(governed.read_metrics().hot_projection_cache_evictions > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn physical_projection_skips_unrequested_field_payload_decode() { let name = rmp_serde::to_vec(&ImageValue::String("Alice".to_owned())).unwrap(); let ignored = rmp_serde::to_vec(&ImageValue::String("Paris".to_owned())).unwrap(); let document = ImageDocument { id: [7u8; 16], version: 3, fields: vec![ ImageField { name: "name".to_owned(), value: name, }, ImageField { name: "city".to_owned(), value: ignored, }, ], }; let mut bytes = encode_physical_set_record(9, &document).unwrap(); assert_eq!(&bytes[..8], &PHYSICAL_SET_MAGIC); let header = parse_physical_set_header(&bytes).unwrap().unwrap(); let city = physical_field_entries(&bytes, header) .unwrap() .into_iter() .find(|entry| entry.name == "city") .map(|entry| (entry.offset, entry.length)) .unwrap(); let payload_base = PHYSICAL_SET_HEADER_BYTES + header.directory_len; bytes[payload_base + city.0] = 0xc1; let directory = &bytes[PHYSICAL_SET_HEADER_BYTES..payload_base]; let payloads = &bytes[payload_base..]; let checksum = checksum64_pair(directory, payloads); bytes[56..64].copy_from_slice(&checksum.to_be_bytes()); let fields = [FieldPath::parse("name").unwrap()]; let requested = fields .iter() .map(|path| path.first().as_str()) .collect::<BTreeSet<_>>(); let (projected, decoded_fields) = decode_projected_physical_set( &bytes, parse_physical_set_header(&bytes).unwrap().unwrap(), &fields, Some(&requested), ) .unwrap(); assert_eq!(decoded_fields, 1); assert!(projected.get("name").is_some()); assert!(decode_physical_set_document( &bytes, parse_physical_set_header(&bytes).unwrap().unwrap(), ) .is_err()); }
     #[test] fn projected_values_append_only_uses_trusted_compiled_path() { let path = temp_path("projected-values-trusted"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let ids = UuidV7Generator::new().reserve(2); for (id, name) in ids.into_iter().zip(["Alice", "Bob"]) { let mut document = Document::new(); document.insert("name", Value::string(name)); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(document))], ) .unwrap(); } let fields = [FieldPath::parse("name").unwrap()]; let read = storage.read().unwrap(); let mut projected = Vec::new(); read.scan_projected_values_unordered_each( &users, ScanOptions::default(), &fields, &mut |values| { projected.push(values[0].clone()); Ok(true) }, ) .unwrap(); assert_eq!(projected.len(), 2); assert!(projected.contains(&Some(Value::string("Alice")))); assert!(projected.contains(&Some(Value::string("Bob")))); let metrics = storage.read_metrics(); assert_eq!(metrics.visibility_fast_scans, 1); assert_eq!(metrics.visibility_fallback_scans, 0); assert_eq!(metrics.trusted_header_records, 2); assert_eq!(metrics.verified_header_records, 0); assert_eq!(metrics.projection_layout_misses, 1); assert_eq!(metrics.projection_layout_hits, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn projected_values_fallback_after_replace_preserves_result() { let path = temp_path("projected-values-replace-fallback"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut original = Document::new(); original.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(original))], ) .unwrap(); let mut replacement = Document::new(); replacement.insert("name", Value::string("Bob")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::replace( id, Arc::new(replacement), VersionPrecondition::Any, )], ) .unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let read = storage.read().unwrap(); let mut projected = Vec::new(); read.scan_projected_values_unordered_each( &users, ScanOptions::default(), &fields, &mut |values| { projected.push(values[0].clone()); Ok(true) }, ) .unwrap(); assert_eq!(projected, vec![Some(Value::string("Bob"))]); let metrics = storage.read_metrics(); assert_eq!(metrics.visibility_fast_scans, 0); assert_eq!(metrics.visibility_fallback_scans, 1); assert!(metrics.visibility_checks > 0); assert!(metrics.verified_header_records > 0); assert_eq!(metrics.trusted_header_records, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }

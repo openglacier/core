@@ -26,6 +26,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::{
     debug::{self, DebugTopic},
+    helpers::elapsed_millis,
     operation::{LlmGenerateInput, LlmMessageInput, LlmToolChoice, LlmToolDefinition},
 };
 
@@ -170,7 +171,7 @@ impl LlmRuntime {
                 prompt_tokens: 0,
                 cached_prompt_tokens: 0,
                 completion_tokens: 0,
-                elapsed_ms: elapsed_ms(started),
+                elapsed_ms: elapsed_millis(started),
                 finish_reason: "cancelled",
             });
         }
@@ -179,7 +180,7 @@ impl LlmRuntime {
                 prompt_tokens: 0,
                 cached_prompt_tokens: 0,
                 completion_tokens: 0,
-                elapsed_ms: elapsed_ms(started),
+                elapsed_ms: elapsed_millis(started),
                 finish_reason: "cancelled",
             });
         }
@@ -615,7 +616,7 @@ impl LlmRuntime {
             prompt_tokens: prompt_tokens.len() as u64,
             cached_prompt_tokens: cached_prompt_tokens as u64,
             completion_tokens: u64::from(completion_tokens),
-            elapsed_ms: elapsed_ms(started),
+            elapsed_ms: elapsed_millis(started),
             finish_reason,
         })
     }
@@ -1095,10 +1096,6 @@ fn model_name(path: &Path) -> String {
     path.file_name()
         .and_then(|value| value.to_str())
         .map_or_else(|| path.display().to_string(), |value| value.to_owned())
-}
-
-fn elapsed_ms(started: Instant) -> u64 {
-    started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
 
 #[derive(Debug, Clone, PartialEq)]

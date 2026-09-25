@@ -226,36 +226,11 @@ pub struct MemoryReservationError { pub class: crate::memory::MemoryClass, pub r
 impl fmt::Display for MemoryReservationError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self.limit_bytes { Some(limit) => write!(f, "memory reservation rejected for {}: requested {} bytes with {} bytes already reserved; limit is {} bytes", self.class, self.requested_bytes, self.current_bytes, limit), None => write!(f, "memory reservation rejected for {}: byte accounting overflow", self.class), } } }
 impl error::Error for MemoryReservationError {}
 
-/// Invalid evaluation-pipeline configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EvaluationPipelineBuildError { MissingModel }
-impl fmt::Display for EvaluationPipelineBuildError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::MissingModel => f.write_str("evaluation pipeline requires an expression model") } } }
-impl error::Error for EvaluationPipelineBuildError {}
-
-/// Invalid native evaluation limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeEvaluationLimitsError { ZeroDepth, ZeroSteps }
-impl fmt::Display for NativeEvaluationLimitsError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::ZeroDepth => f.write_str("native evaluation maximum depth must be greater than zero"), Self::ZeroSteps => f.write_str("native evaluation maximum steps must be greater than zero"), } } }
-impl error::Error for NativeEvaluationLimitsError {}
-
-/// Invalid native semantic builder configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeSemanticBuildError { MissingPredicate, MissingAssignment }
-impl fmt::Display for NativeSemanticBuildError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::MissingPredicate => f.write_str("native semantics require a predicate implementation"), Self::MissingAssignment => f.write_str("native semantics require an assignment implementation"), } } }
-impl error::Error for NativeSemanticBuildError {}
-
 /// Invalid query runtime builder configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueryRuntimeBuildError { MissingPredicateHandler, MissingSetHandler }
 impl fmt::Display for QueryRuntimeBuildError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::MissingPredicateHandler => f.write_str("query runtime requires a predicate handler"), Self::MissingSetHandler => f.write_str("query runtime requires a set handler"), } } }
 impl error::Error for QueryRuntimeBuildError {}
-
-/// Missing operation in a native expression-model configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NativeExpressionModelBuildError { MissingClassify, MissingLiteral, MissingField, MissingStrictBoolean, MissingBooleanValue, MissingCompare, MissingAssignmentExpression, MissingAssignmentField, MissingAssign }
-impl NativeExpressionModelBuildError { #[must_use] pub const fn operation(self) -> &'static str { match self { Self::MissingClassify => "expression classification", Self::MissingLiteral => "literal extraction", Self::MissingField => "field resolution", Self::MissingStrictBoolean => "strict boolean conversion", Self::MissingBooleanValue => "boolean value construction", Self::MissingCompare => "comparison", Self::MissingAssignmentExpression => "assignment expression extraction", Self::MissingAssignmentField => "assignment diagnostic field formatting", Self::MissingAssign => "document assignment", } } }
-impl fmt::Display for NativeExpressionModelBuildError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "native expression model requires {}", self.operation()) } }
-impl error::Error for NativeExpressionModelBuildError {}
 
 #[cfg(test)]
 mod tests {

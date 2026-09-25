@@ -9,7 +9,7 @@ use std::{
 
 use crate::{
     compare,
-    model::parse_number_value,
+    helpers::json_to_value,
     model::CoercionPolicy,
     model::Document,
     model::Number,
@@ -22,11 +22,11 @@ use crate::{
 };
 
 use super::{
-    parse_expression, BinaryOperator, CustomOperatorResult, ExecutionError, ExecutionResult,
-    Expression, ExpressionFieldPath, ExpressionView, IncrementalGroupAccumulator,
-    InsertDocumentMaterializer, Literal, LookupDocuments, PhysicalLoadMode, PivotAggregate,
+    parse_expression, CustomOperatorResult, ExecutionError, ExecutionResult,
+    Expression, ExpressionFieldPath, IncrementalGroupAccumulator, IncrementalPivotAccumulator,
+    InsertDocumentMaterializer, LookupDocuments, PhysicalLoadMode, PivotAggregate,
     PivotSpecification, PivotValue, QueryRuntime, SortDirection, SortKey, StreamingLoadMutation,
-    SyntheticDocument, UnaryOperator,
+    SyntheticDocument,
 };
 
 /// Parsed native `near` stage shared by the document fallback and projected Top-N path.
@@ -190,6 +190,9 @@ impl QueryRuntimeMaterializationExt for QueryRuntime {
         .with_lookup(move |into, outer, matches| {
             lookup_materializer.materialize_lookup(into, outer, matches)
         })
+        .with_incremental_pivot(move |specification| {
+            Ok(Box::new(pivot_materializer.incremental_pivot(specification)))
+        })
         .with_pivot(move |specification, documents| {
             pivot_materializer.materialize_pivot(specification, documents)
         })
@@ -331,43 +334,10 @@ impl StreamingLoadMaterializer {
         let mut document = Document::new();
         for (name, value) in object {
             if name != "_id" {
-                document.insert(name.as_str(), json_value(value)?);
+                document.insert(name.as_str(), json_to_value(value).map_err(ExecutionError::mutation)?);
             }
         }
         Ok((id, document))
-    }
-}
-
-fn json_value(value: &serde_json::Value) -> ExecutionResult<Value> {
-    match value {
-        serde_json::Value::Null => Ok(Value::null()),
-        serde_json::Value::Bool(value) => Ok(Value::bool(*value)),
-        serde_json::Value::String(value) => Ok(Value::string(value.as_str())),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Ok(Value::signed(value))
-            } else if let Some(value) = value.as_u64() {
-                Ok(Value::unsigned(value))
-            } else if let Some(value) = value.as_f64() {
-                Number::float(value)
-                    .map(Number::into_value)
-                    .map_err(|error| ExecutionError::mutation(error.to_string()))
-            } else {
-                Err(ExecutionError::mutation("unsupported JSON number"))
-            }
-        }
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(json_value)
-            .collect::<ExecutionResult<Vec<_>>>()
-            .map(Value::array),
-        serde_json::Value::Object(values) => {
-            let mut document = Document::new();
-            for (name, value) in values {
-                document.insert(name.as_str(), json_value(value)?);
-            }
-            Ok(Value::object(document))
-        }
     }
 }
 
@@ -469,7 +439,8 @@ impl RuntimeMaterializer {
                     "invalid derive expression {expression_source:?}: {error}"
                 ))
             })?;
-            let value = evaluate_derive_expression(&expression, document)?;
+            // Assignments apply in order, so later ones can use earlier results.
+            let value = evaluate_derive_expression(&expression, &result)?;
             let path = field.split('.').collect::<Vec<_>>();
             insert_path(&mut result, &path, value);
         }
@@ -876,42 +847,98 @@ impl RuntimeMaterializer {
         Ok(Arc::new(result))
     }
 
-    /// Materializes a pivot result.
+    /// Materializes a pivot result from a complete document set.
     pub fn materialize_pivot( &self, specification: &PivotSpecification, documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
-        let mut groups: BTreeMap<String, PivotGroup> = BTreeMap::new();
+        let mut accumulator = self.incremental_pivot(specification);
         for document in documents {
-            let row_values = specification
-                .rows()
-                .iter()
-                .map(|path| cloned_path_value(document, path))
-                .collect::<Vec<_>>();
-            let row_key = stable_values_key(&row_values);
-            let column_values = specification
-                .columns()
-                .iter()
-                .map(|path| cloned_path_value(document, path))
-                .collect::<Vec<_>>();
-            let column_name = column_label(&column_values);
-            let group = groups.entry(row_key).or_insert_with(|| PivotGroup {
-                row_values,
-                cells: BTreeMap::new(),
-            });
-            for value in specification.values() {
-                let cell_name = pivot_cell_name(&column_name, value, specification.values().len());
-                let input = cloned_path_value(document, value.field());
-                group
-                    .cells
-                    .entry(cell_name)
-                    .or_insert_with(|| AggregateState::new(value.aggregate()))
-                    .push(input)?;
-            }
+            accumulator.push(document)?;
         }
+        Box::new(accumulator).finish()
+    }
+
+    /// Starts an incremental pivot that retains only its aggregate cells.
+    #[must_use]
+    pub fn incremental_pivot(&self, specification: &PivotSpecification) -> DefaultIncrementalPivotAccumulator {
+        DefaultIncrementalPivotAccumulator {
+            specification: specification.clone(),
+            groups: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+}
+
+/// Pivot state: one aggregate cell per (row key, column) pair.
+#[derive(Debug)]
+pub struct DefaultIncrementalPivotAccumulator {
+    specification: PivotSpecification,
+    groups: BTreeMap<String, PivotGroup>,
+    bytes: usize,
+}
+
+impl IncrementalPivotAccumulator for DefaultIncrementalPivotAccumulator {
+    fn push(&mut self, document: &Document) -> ExecutionResult<()> {
+        let specification = &self.specification;
+        let row_values = specification
+            .rows()
+            .iter()
+            .map(|path| cloned_path_value(document, path))
+            .collect::<Vec<_>>();
+        let row_key = stable_values_key(&row_values);
+        let column_values = specification
+            .columns()
+            .iter()
+            .map(|path| cloned_path_value(document, path))
+            .collect::<Vec<_>>();
+        let column_name = column_label(&column_values);
+        if !self.groups.contains_key(&row_key) {
+            self.bytes = self.bytes.saturating_add(
+                PIVOT_ENTRY_BYTES + row_key.len() * 2 + row_values.iter().map(optional_value_bytes).sum::<usize>(),
+            );
+        }
+        let group = self.groups.entry(row_key).or_insert_with(|| PivotGroup {
+            row_values,
+            cells: BTreeMap::new(),
+        });
+        for value in specification.values() {
+            let cell_name = pivot_cell_name(&column_name, value, specification.values().len());
+            let input = cloned_path_value(document, value.field());
+            if !group.cells.contains_key(&cell_name) {
+                self.bytes = self.bytes.saturating_add(PIVOT_ENTRY_BYTES + cell_name.len() * 2);
+            }
+            let cell = group
+                .cells
+                .entry(cell_name)
+                .or_insert_with(|| AggregateState::new(value.aggregate()));
+            let before = cell.retained_bytes();
+            cell.push(input)?;
+            self.bytes = self.bytes.saturating_add(cell.retained_bytes()).saturating_sub(before);
+        }
+        Ok(())
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn finish(self: Box<Self>) -> ExecutionResult<Vec<SyntheticDocument>> {
+        let Self { specification, groups, .. } = *self;
         groups
             .into_values()
             .enumerate()
-            .map(|(index, group)| build_pivot_document(index, specification, group))
+            .map(|(index, group)| build_pivot_document(index, &specification, group))
             .collect()
     }
+}
+
+/// Fixed overhead charged per retained map entry and aggregate state.
+const PIVOT_ENTRY_BYTES: usize = 96;
+
+fn optional_value_bytes(value: &Option<Value>) -> usize {
+    value.as_ref().map_or(0, |value| match value {
+        Value::String(text) => text.len(),
+        Value::Number(_) | Value::Bool(_) | Value::Null => 0,
+        other => format!("{other:?}").len(),
+    })
 }
 
 #[derive(Debug)]
@@ -948,6 +975,16 @@ impl AggregateState {
             PivotAggregate::Minimum => Self::Minimum(None),
             PivotAggregate::Maximum => Self::Maximum(None),
             PivotAggregate::Count => Self::Count(0),
+        }
+    }
+
+    /// Bytes retained by a cell beyond its fixed overhead.
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::First(value) | Self::Last(value) | Self::Minimum(value) | Self::Maximum(value) => {
+                optional_value_bytes(value)
+            }
+            Self::Sum { .. } | Self::Average { .. } | Self::Count(_) => 0,
         }
     }
 
@@ -1836,78 +1873,13 @@ fn format_number(value: Number) -> String {
 }
 
 fn split_projection_items(source: &str) -> ExecutionResult<Vec<&str>> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut escaped = false;
-
-    for (index, character) in source.char_indices() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                quoted = false;
-            }
-            continue;
-        }
-
-        match character {
-            '"' => quoted = true,
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&source[start..index]);
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-
-    if quoted || depth != 0 {
-        return Err(ExecutionError::evaluation(
-            "invalid select projection list: unclosed quote or parenthesis",
-        ));
-    }
-
-    parts.push(&source[start..]);
-    Ok(parts)
+    super::syntax::split_top_level(source, ',')
+        .map_err(|message| ExecutionError::evaluation(format!("invalid select projection list: {message}")))
 }
 
 fn split_derive_assignments(source: &str) -> ExecutionResult<Vec<(&str, &str)>> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let mut depth = 0usize;
-    let mut quoted = false;
-    let mut escaped = false;
-
-    for (index, character) in source.char_indices() {
-        if quoted {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                quoted = false;
-            }
-            continue;
-        }
-
-        match character {
-            '"' => quoted = true,
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&source[start..index]);
-                start = index + character.len_utf8();
-            }
-            _ => {}
-        }
-    }
-    parts.push(&source[start..]);
-
+    let parts = super::syntax::split_top_level(source, ',')
+        .map_err(|message| ExecutionError::evaluation(format!("invalid derive assignment list: {message}")))?;
     parts
         .into_iter()
         .enumerate()
@@ -1934,88 +1906,9 @@ fn split_derive_assignments(source: &str) -> ExecutionResult<Vec<(&str, &str)>> 
         .collect()
 }
 
+/// `derive` and `select … as` evaluate through the common expression evaluator.
 fn evaluate_derive_expression( expression: &Expression, document: &Document, ) -> ExecutionResult<Value> {
-    match expression.ungrouped().view() {
-        ExpressionView::Literal(literal) => match literal {
-            Literal::Null => Ok(Value::null()),
-            Literal::Bool(value) => Ok(Value::bool(*value)),
-            Literal::String(value) => Ok(Value::string(Arc::clone(value))),
-            Literal::Number(text) => parse_number_value(text)
-                .map(Value::Number)
-                .map_err(|error| ExecutionError::evaluation(error.to_string())),
-            Literal::Json(text) => super::json_value::parse_json_literal(text),
-        },
-        ExpressionView::Field(path) => cloned_path_value(document, path)
-            .ok_or_else(|| ExecutionError::evaluation(format!("derive field {path} is missing"))),
-        ExpressionView::Group(inner) => evaluate_derive_expression(inner, document),
-        ExpressionView::Unary { operator, operand } => {
-            let value = evaluate_derive_expression(operand, document)?;
-            match operator {
-                UnaryOperator::Positive => derive_numeric_value(value, "+"),
-                UnaryOperator::Negate => {
-                    let number = numeric_as_f64(&value, "-")?;
-                    Number::float(-number)
-                        .map(Value::Number)
-                        .map_err(|error| ExecutionError::evaluation(error.to_string()))
-                }
-                UnaryOperator::Not => value
-                    .as_bool()
-                    .map(|value| Value::bool(!value))
-                    .ok_or_else(|| ExecutionError::evaluation("derive `!` expects a boolean")),
-            }
-        }
-        ExpressionView::Binary {
-            left,
-            operator,
-            right,
-        } if operator.is_arithmetic() => {
-            let left = evaluate_derive_expression(left, document)?;
-            let right = evaluate_derive_expression(right, document)?;
-            let left = numeric_as_f64(&left, operator.as_str())?;
-            let right = numeric_as_f64(&right, operator.as_str())?;
-            let result = match operator {
-                BinaryOperator::Add => left + right,
-                BinaryOperator::Subtract => left - right,
-                BinaryOperator::Multiply => left * right,
-                BinaryOperator::Divide if right == 0.0 => {
-                    return Err(ExecutionError::evaluation("division by zero in derive"));
-                }
-                BinaryOperator::Divide => left / right,
-                BinaryOperator::Remainder if right == 0.0 => {
-                    return Err(ExecutionError::evaluation("remainder by zero in derive"));
-                }
-                BinaryOperator::Remainder => left % right,
-                _ => unreachable!(),
-            };
-            Number::float(result)
-                .map(Value::Number)
-                .map_err(|error| ExecutionError::evaluation(error.to_string()))
-        }
-        ExpressionView::Binary { operator, .. } => Err(ExecutionError::evaluation(format!(
-            "derive operator {operator} is not supported"
-        ))),
-    }
-}
-
-fn derive_numeric_value(value: Value, operator: &str) -> ExecutionResult<Value> {
-    if value.as_number().is_some() {
-        Ok(value)
-    } else {
-        Err(ExecutionError::evaluation(format!(
-            "derive operator {operator} expects a number"
-        )))
-    }
-}
-
-fn numeric_as_f64(value: &Value, operator: &str) -> ExecutionResult<f64> {
-    let number = value.as_number().ok_or_else(|| {
-        ExecutionError::evaluation(format!("derive operator {operator} expects numbers"))
-    })?;
-    Ok(match *number {
-        Number::Signed(value) => value as f64,
-        Number::Unsigned(value) => value as f64,
-        Number::Float(value) => value,
-    })
+    super::eval::evaluate_document(expression, document)
 }
 
 #[cfg(test)]
@@ -2057,10 +1950,10 @@ mod tests {
         }
     }
 
-    #[test] fn derive_subtracts_fields_and_preserves_the_source_document() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(120)); document.insert("COGS", Value::unsigned(45)); let result = RuntimeMaterializer::new() .materialize_derive("Marge=CAFacture-COGS", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("Marge"), Some(&Value::float(75.0).unwrap())); assert_eq!(document.get("Marge"), None); assert_eq!(document.get("CAFacture"), Some(&Value::unsigned(120))); }
+    #[test] fn derive_subtracts_fields_and_preserves_the_source_document() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(120)); document.insert("COGS", Value::unsigned(45)); let result = RuntimeMaterializer::new() .materialize_derive("Marge=CAFacture-COGS", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("Marge"), Some(&Value::signed(75))); assert_eq!(document.get("Marge"), None); assert_eq!(document.get("CAFacture"), Some(&Value::unsigned(120))); }
     #[test] fn derive_supports_unary_positive_without_colliding_with_pivot_numeric_conversion() { let mut document = Document::new(); document.insert("amount", Value::signed(-12)); let result = RuntimeMaterializer::new() .materialize_derive("copy=+amount", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("copy"), Some(&Value::signed(-12))); }
-    #[test] fn derive_applies_multiple_assignments_to_nested_targets() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("cost", Value::unsigned(50)); let result = RuntimeMaterializer::new() .materialize_derive( "metrics.margin=revenue-cost, metrics.ratio=(revenue-cost)/revenue", &document, ) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; let metrics = result .get("metrics") .and_then(Value::as_object) .expect("derive should create the nested object"); assert_eq!(metrics.get("margin"), Some(&Value::float(150.0).unwrap())); assert_eq!(metrics.get("ratio"), Some(&Value::float(0.75).unwrap())); }
-    #[test] fn derive_rejects_division_by_zero() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("zero", Value::unsigned(0)); let error = RuntimeMaterializer::new() .materialize_derive("ratio=revenue/zero", &document) .unwrap_err(); assert!(error.to_string().contains("division by zero in derive")); }
+    #[test] fn derive_applies_multiple_assignments_to_nested_targets() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("cost", Value::unsigned(50)); let result = RuntimeMaterializer::new() .materialize_derive( "metrics.margin=revenue-cost, metrics.ratio=(revenue-cost)/revenue", &document, ) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; let metrics = result .get("metrics") .and_then(Value::as_object) .expect("derive should create the nested object"); assert_eq!(metrics.get("margin"), Some(&Value::signed(150))); assert_eq!(metrics.get("ratio"), Some(&Value::float(0.75).unwrap())); }
+    #[test] fn derive_rejects_division_by_zero() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("zero", Value::unsigned(0)); let error = RuntimeMaterializer::new() .materialize_derive("ratio=revenue/zero", &document) .unwrap_err(); assert!(error.to_string().contains("division by zero")); }
     #[test] fn root_replaces_with_nested_object() { let mut nested = Document::new(); nested.insert("answer", Value::unsigned(42)); let mut wrapper = Document::new(); wrapper.insert("nested", Value::object(nested)); let mut document = Document::new(); document.insert("payload", Value::object(wrapper)); let result = RuntimeMaterializer::new() .materialize_custom("root", "payload.nested", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("root should replace the result document"); }; assert_eq!(result.get("answer"), Some(&Value::unsigned(42))); }
     #[test] fn root_rejects_missing_or_non_object_fields() { let materializer = RuntimeMaterializer::new(); let missing = materializer .materialize_custom("root", "payload", &Document::new()) .unwrap_err(); assert!(missing.to_string().contains("is missing")); let mut document = Document::new(); document.insert("payload", "not an object"); let scalar = materializer .materialize_custom("root", "payload", &document) .unwrap_err(); assert!(scalar.to_string().contains("must be an object")); }
     #[test] fn near_adds_cosine_distance_without_mutating_the_source_document() { let mut document = Document::new(); document.insert( "embedding", Value::array([Value::float(1.0).unwrap(), Value::float(0.0).unwrap()]), ); let result = RuntimeMaterializer::new() .materialize_custom("near", "embedding, [1.0, 0.0]", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("near should replace the result document"); }; assert_eq!(result.get("_distance"), Some(&Value::float(0.0).unwrap())); assert_eq!(document.get("_distance"), None); }
@@ -2068,7 +1961,7 @@ mod tests {
     #[test] fn near_rejects_dimension_mismatches() { let mut document = Document::new(); document.insert( "embedding", Value::array([Value::float(1.0).unwrap(), Value::float(0.0).unwrap()]), ); let error = RuntimeMaterializer::new() .materialize_custom("near", "embedding, [1.0]", &document) .unwrap_err(); assert!(error.to_string().contains("near dimension mismatch")); }
     #[test] fn select_and_count_recent_handlers_materialize_expected_documents() { let mut document = Document::new(); document.insert("a", Value::unsigned(1)); document.insert("b", Value::unsigned(2)); let field = ExpressionFieldPath::new(["a"]).unwrap(); let selected = RuntimeMaterializer::new() .materialize_select(&[field], &document) .unwrap(); assert_eq!(selected.get("a"), Some(&Value::unsigned(1))); assert_eq!(selected.get("b"), None); let counted = RuntimeMaterializer::new() .materialize_count("count", 7) .unwrap(); assert_eq!(counted.get("count"), Some(&Value::unsigned(7))); }
     #[test] fn select_aliases_may_be_mixed_with_plain_fields() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(100)); document.insert("COGS", Value::unsigned(40)); let result = RuntimeMaterializer::new() .materialize_custom("select", "CAFacture as CA, COGS", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("select should replace the result document"); }; assert_eq!(result.get("CA"), Some(&Value::unsigned(100))); assert_eq!(result.get("COGS"), Some(&Value::unsigned(40))); assert_eq!(result.get("CAFacture"), None); }
-    #[test] fn select_expression_can_reference_an_alias_defined_earlier() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(100)); document.insert("COGS", Value::unsigned(40)); let result = RuntimeMaterializer::new() .materialize_custom( "select", "CAFacture as CA, COGS, CA - COGS as Marge", &document, ) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("select should replace the result document"); }; assert_eq!(result.get("CA"), Some(&Value::unsigned(100))); assert_eq!(result.get("COGS"), Some(&Value::unsigned(40))); assert_eq!(result.get("Marge"), Some(&Value::float(60.0).unwrap())); }
+    #[test] fn select_expression_can_reference_an_alias_defined_earlier() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(100)); document.insert("COGS", Value::unsigned(40)); let result = RuntimeMaterializer::new() .materialize_custom( "select", "CAFacture as CA, COGS, CA - COGS as Marge", &document, ) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("select should replace the result document"); }; assert_eq!(result.get("CA"), Some(&Value::unsigned(100))); assert_eq!(result.get("COGS"), Some(&Value::unsigned(40))); assert_eq!(result.get("Marge"), Some(&Value::signed(60))); }
     #[test] fn lookup_keeps_outer_and_writes_empty_array() { let mut outer = Document::new(); outer.insert("name", Value::string("Alice")); let result = RuntimeMaterializer::new() .materialize_lookup("workspaces", &outer, &LookupDocuments::new([])) .unwrap(); assert_eq!(result.get("name"), Some(&Value::string("Alice"))); assert_eq!( result.get("workspaces").and_then(Value::as_array), Some(&[][..]) ); }
     #[test] fn rename_moves_a_top_level_field() { let mut document = Document::new(); document.insert("name", Value::string("Alice")); document.insert("age", Value::unsigned(42)); let result = RuntimeMaterializer::new() .materialize_custom("rename", "name as display_name", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("rename should replace the document"); }; assert_eq!(result.get("name"), None); assert_eq!(result.get("display_name"), Some(&Value::string("Alice"))); assert_eq!(result.get("age"), Some(&Value::unsigned(42))); }
     #[test] fn rename_moves_a_nested_field_and_prunes_empty_parent() { let mut profile = Document::new(); profile.insert("name", Value::string("Alice")); let mut document = Document::new(); document.insert("profile", Value::object(profile)); let result = RuntimeMaterializer::new() .materialize_custom("rename", "profile.name as display_name", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("rename should replace the document"); }; assert_eq!(result.get("profile"), None); assert_eq!(result.get("display_name"), Some(&Value::string("Alice"))); }

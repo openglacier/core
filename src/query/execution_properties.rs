@@ -126,17 +126,16 @@ impl ExecutionProperties<'_> {
         self.writes() || !matches!(self.shape, Shape::Linear)
     }
 
-    /// Returns a generic downstream row bound when this stage is a pure,
-    /// streaming, order/field-preserving linear reducer.
+    /// Returns how many rows a streaming, order-preserving, read-only linear
+    /// reducer lets through, whatever it does to their fields.
     ///
-    /// Today `Limit` is the only operator that satisfies this contract. The
-    /// executor no longer needs to know its identity to consume the bound.
+    /// Streaming executors enforce this bound generically: `limit N` and a
+    /// row-bounded extension stage such as `first` stop the scan the same way.
     #[must_use]
-    pub const fn linear_bound(self) -> Option<usize> {
+    pub const fn stream_row_bound(self) -> Option<usize> {
         if !matches!(self.flow, Flow::Streaming)
             || !matches!(self.cardinality, CardinalityEffect::Reduce)
             || !matches!(self.order, Order::Preserved)
-            || !matches!(self.fields, Fields::Preserved)
             || !matches!(self.shape, Shape::Linear)
             || !matches!(self.effect, Effect::ReadOnly)
         {
@@ -145,6 +144,43 @@ impl ExecutionProperties<'_> {
         match self.bound {
             Bound::AtMost(value) | Bound::Exact(value) => Some(value),
             Bound::Unknown => None,
+        }
+    }
+
+    /// Returns a generic downstream row bound when this stage is a pure,
+    /// streaming, order/field-preserving linear reducer.
+    ///
+    /// Today `Limit` is the only operator that satisfies this contract. The
+    /// executor no longer needs to know its identity to consume the bound.
+    #[must_use]
+    pub const fn linear_bound(self) -> Option<usize> {
+        if !matches!(self.fields, Fields::Preserved) || !matches!(self.bound, Bound::AtMost(_)) {
+            return None;
+        }
+        self.stream_row_bound()
+    }
+
+    /// Returns how many rows a blocking stage retains at most (`sample n`).
+    ///
+    /// Executors may run such a stage over any input size with memory bounded
+    /// by this count.
+    #[must_use]
+    pub const fn retained_rows(self) -> Option<usize> {
+        match (self.flow, self.bound, self.effect) {
+            (Flow::GovernedBlocking, Bound::AtMost(count), Effect::ReadOnly) => Some(count),
+            _ => None,
+        }
+    }
+
+    /// Returns the exact number of rows a streaming stage requires (`single`).
+    ///
+    /// Such a stage is also a row bound; executors additionally fail when
+    /// fewer or more rows reach it.
+    #[must_use]
+    pub const fn exact_rows(self) -> Option<usize> {
+        match (self.stream_row_bound(), self.bound) {
+            (Some(count), Bound::Exact(_)) => Some(count),
+            _ => None,
         }
     }
 }

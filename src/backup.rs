@@ -5,7 +5,7 @@ use crate::storage::{
     CollectionId, DocumentId, ScanOptions, StorageEngine, StorageError, StorageMutation,
     VersionPrecondition,
 };
-use crate::{helpers::document_to_json, query::vcollections, Document, Value};
+use crate::{helpers::{document_to_json, json_object_to_document}, query::vcollections};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use std::{
@@ -211,7 +211,10 @@ pub fn restore( storage: &dyn StorageEngine, path: &Path, replace: bool, ) -> Re
                 let collection = current
                     .as_ref()
                     .ok_or_else(|| BackupError::Invalid("document before collection".into()))?;
-                let document = json_to_document(data)?;
+                let JsonValue::Object(data) = data else {
+                    return Err(BackupError::Invalid("document payload is not an object".into()));
+                };
+                let document = json_object_to_document(&data).map_err(BackupError::Invalid)?;
                 batch.push(StorageMutation::insert(
                     DocumentId::parse(id)?,
                     Arc::new(document),
@@ -309,46 +312,10 @@ fn read_record(r: &mut impl Read) -> Result<Record, BackupError> {
     r.read_exact(&mut b)?;
     rmp_serde::from_slice(&b).map_err(BackupError::Decode)
 }
-fn json_to_document(v: JsonValue) -> Result<Document, BackupError> {
-    let JsonValue::Object(m) = v else {
-        return Err(BackupError::Invalid(
-            "document payload is not an object".into(),
-        ));
-    };
-    let mut d = Document::new();
-    for (k, v) in m {
-        d.insert(k, json_to_value(v)?);
-    }
-    Ok(d)
-}
-fn json_to_value(v: JsonValue) -> Result<Value, BackupError> {
-    Ok(match v {
-        JsonValue::Null => Value::Null,
-        JsonValue::Bool(v) => Value::Bool(v),
-        JsonValue::String(v) => Value::string(v),
-        JsonValue::Array(v) => Value::array(
-            v.into_iter()
-                .map(json_to_value)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        JsonValue::Object(v) => Value::object(json_to_document(JsonValue::Object(v))?),
-        JsonValue::Number(n) => {
-            if let Some(v) = n.as_i64() {
-                Value::signed(v)
-            } else if let Some(v) = n.as_u64() {
-                Value::unsigned(v)
-            } else if let Some(v) = n.as_f64() {
-                Value::float(v).map_err(|e| BackupError::Invalid(e.to_string()))?
-            } else {
-                return Err(BackupError::Invalid("unsupported number".into()));
-            }
-        }
-    })
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::MemoryStorage;
+    use crate::{storage::MemoryStorage, Document, Value};
     #[test] fn round_trip() { let storage = MemoryStorage::new(); let c = CollectionId::parse("users").unwrap(); let mut tx = storage.begin().unwrap(); let mut d = Document::new(); d.insert("name", Value::string("Alice")); tx.insert(&c, DocumentId::from_test_label("a"), Arc::new(d)) .unwrap(); tx.commit().unwrap(); let p = std::env::temp_dir().join(format!("og-backup-{}.ogb", std::process::id())); let s = create( &storage, &p, BackupMetadata { created_at: 42, source: BackupSource { instance_id: "instance-test".into(), hostname: "test-host".into(), platform: "test-os".into(), arch: "test-arch".into(), core_version: "0.1.0".into(), }, }, ) .unwrap(); assert_eq!(s.documents, 1); let info = inspect(&p).unwrap(); assert_eq!(info.created_at, 42); assert_eq!(info.size_bytes, std::fs::metadata(&p).unwrap().len()); assert_eq!(info.source.instance_id, "instance-test"); let restored = MemoryStorage::new(); restore(&restored, &p, false).unwrap(); assert_eq!(restored.read().unwrap().count(&c).unwrap(), 1); let _ = std::fs::remove_file(p); }
 }

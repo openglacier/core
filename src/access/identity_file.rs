@@ -4,8 +4,8 @@
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
-    fs::{self, File},
-    io::{self, Read, Write},
+    fs::{self},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -16,6 +16,7 @@ use chacha20poly1305::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
+use getrandom::fill;
 
 use crate::{
     helpers::{decode_base64, encode_base64},
@@ -80,6 +81,7 @@ pub enum IdentityFileError {
     InvalidPassword,
     WeakPassword,
     Crypto,
+    RandomGenerationFailed
 }
 
 impl Display for IdentityFileError {
@@ -91,6 +93,7 @@ impl Display for IdentityFileError {
             Self::InvalidPassword => f.write_str("invalid identity password or corrupted file"),
             Self::WeakPassword => f.write_str("identity password must contain at least 12 bytes"),
             Self::Crypto => f.write_str("identity cryptography failed"),
+            Self::RandomGenerationFailed => f.write_str("identity generation failed to generate random data"),
         }
     }
 }
@@ -175,8 +178,7 @@ pub fn commit(staged: &Path, destination: &Path) -> Result<(), IdentityFileError
 
 pub fn copy_encrypted( source: &Path, destination: &Path, password: &[u8], ) -> Result<(), IdentityFileError> {
     let bytes = fs::read(source)?;
-    // Export is password-gated: authenticate/decrypt the envelope before copying
-    // the original ciphertext verbatim. The private key never leaves og-core.
+    // Export is password-gated: authenticate/decrypt the envelope before copying. the original ciphertext verbatim. The private key never leaves og-core.
     decrypt_bytes(&bytes, password)?;
     write_private(destination, &bytes)
 }
@@ -287,15 +289,12 @@ fn decode_fixed<const N: usize>( value: &str, message: &'static str, ) -> Result
 }
 
 fn random_bytes(output: &mut [u8]) -> Result<(), IdentityFileError> {
-    File::open("/dev/urandom")?.read_exact(output)?;
+    fill(output).map_err(|_| IdentityFileError::RandomGenerationFailed)?;
     Ok(())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), IdentityFileError> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
     let mut options = fs::OpenOptions::new();

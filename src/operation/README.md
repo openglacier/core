@@ -217,8 +217,25 @@ Utilisé notamment pour des opérations comme :
 
 ```text
 core.health
+core.discover
 ping
 auth.begin
+```
+
+`Public` couvre aussi les opérations dont l’accès se décide par un Place : le handler résout
+ce qui donne l’accès au principal (`PlaceAccess`) — son rôle dans le scope, sinon la politique
+publique du Place (`readonly` / `readwrite`), anonyme compris — puis vérifie l’unique action de
+l’opération (lecture ou écriture). Une politique publique n’est jamais traduite en rôle et
+n’accorde jamais l’administration.
+
+```text
+place.list
+place.get
+app.instance.list
+query.context.resolve
+file.list
+file.read
+file.write
 ```
 
 ---
@@ -234,7 +251,7 @@ AccessPolicy::Authenticated
 Exemple typique :
 
 ```text
-place.get
+place.update
 ```
 
 Le handler peut ensuite vérifier le rôle de l’identité dans le Place.

@@ -21,7 +21,7 @@ pub use lexer::{lex, LexError, LexErrorKind, LexResult, Lexer, TokenStream};
 
 pub use parser::{
     parse, parse_tokens, ParseError, ParseErrorKind, ParseResult, Parser, QueryParseError,
-    QueryParseResult,
+    QueryParseResult, SubPipelinePolicy,
 };
 
 pub use span::Span;
@@ -34,8 +34,14 @@ pub use stage::{
     StageName, StageRegistry, StageResult,
 };
 
+mod eval;
 mod expression;
 mod json_value;
+
+pub use eval::{
+    check_call, evaluate, evaluate_document, evaluate_predicate, value_expression_runtime,
+    DocumentFields, ExpressionFieldResolver, LookupFields, SemanticValue,
+};
 
 pub use expression::{
     parse_expression, BinaryOperator, Expression, ExpressionError, ExpressionErrorKind,
@@ -84,8 +90,9 @@ mod executor;
 pub use executor::{
     CustomOperatorResult, DocumentScope, ExecutionError, ExecutionErrorKind, ExecutionOutput,
     ExecutionResult, ExecutionRow, ExecutionRowOrigin, ExecutionRuntime, ExecutionStatistics,
-    ExecutionStrategies, ExecutionStrategy, Executor, IncrementalGroupAccumulator, LookupDocuments,
-    PreparedInsertDocument, StreamingLoadMutation, SyntheticDocument,
+    ExecutionStrategies, ExecutionStrategy, Executor, IncrementalGroupAccumulator,
+    IncrementalPivotAccumulator, LookupDocuments, PreparedInsertDocument, Reservoir,
+    StreamingLoadMutation, SyntheticDocument,
 };
 
 pub(crate) use executor::{
@@ -118,50 +125,6 @@ mod runtime_materializer;
 
 pub(crate) use runtime_materializer::{group_field_layout, NearSpec};
 pub use runtime_materializer::{QueryRuntimeMaterializationExt, RuntimeMaterializer};
-
-mod evaluator;
-
-pub use evaluator::{
-    AssignmentPolicy, BooleanPolicy, EvaluationBackend, EvaluationContext, EvaluationError,
-    EvaluationErrorKind, EvaluationResult, Evaluator, FunctionEvaluationBackend, MissingPolicy,
-};
-
-mod native_evaluator;
-
-pub use native_evaluator::{
-    NativeDepthGuard, NativeEvaluationLimits, NativeEvaluationLimitsError, NativeEvaluationSession,
-    NativeEvaluationStatisticsSnapshot, NativeEvaluator, NativeSemantics,
-};
-
-mod native_semantics;
-
-pub use native_semantics::{
-    NativeSemanticBuildError, NativeSemanticBuilder, NativeSemanticFunctions, NativeSemanticOptions,
-};
-
-mod expression_semantics;
-
-pub use expression_semantics::{
-    ExpressionFieldResolver, ExpressionModel, ExpressionNode, ExpressionSemantics, SemanticValue,
-};
-
-mod expression_model;
-
-pub use expression_model::{
-    model_backend_error, NativeExpressionModel, NativeExpressionModelBuildError,
-    NativeExpressionModelBuilder,
-};
-
-mod evaluation_pipeline;
-
-pub use evaluation_pipeline::{
-    native_evaluation_runtime, native_evaluation_runtime_with_limits, EvaluationPipeline,
-    EvaluationPipelineBuildError, EvaluationPipelineBuilder,
-};
-
-mod value_expression_model;
-
-pub use value_expression_model::{value_expression_model, value_expression_runtime};
 
 pub mod planner_cache;
 pub use planner_cache::{PlannerCache, PlannerCacheStats};

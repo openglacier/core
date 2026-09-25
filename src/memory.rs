@@ -75,7 +75,7 @@ struct RegisteredReclaimer {
     reclaimer: Weak<dyn MemoryReclaimer>,
 }
 
-use crate::helpers::u128_to_usize_saturating;
+use crate::helpers::{lock_unpoisoned, u128_to_usize_saturating};
 
 const MEMORY_CLASS_COUNT: usize = 6;
 pub const DEFAULT_MEMORY_EVENT_CAPACITY: usize = 1_024;
@@ -581,11 +581,7 @@ impl MemoryGovernor {
     /// The caller retains the strong [`Arc`] and therefore controls the hook
     /// lifetime. Dead registrations are removed lazily during reclaim.
     pub fn register_reclaimer( &self, class: MemoryClass, reclaimer: &Arc<dyn MemoryReclaimer>, ) {
-        let mut reclaimers = self
-            .inner
-            .reclaimers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reclaimers = lock_unpoisoned(&self.inner.reclaimers);
         reclaimers.push(RegisteredReclaimer {
             class,
             reclaimer: Arc::downgrade(reclaimer),
@@ -601,11 +597,7 @@ impl MemoryGovernor {
         // Snapshot strong handles under the registry mutex, then drop the lock
         // before invoking backend code so reclaimers can take their own locks.
         let candidates = {
-            let mut reclaimers = self
-                .inner
-                .reclaimers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut reclaimers = lock_unpoisoned(&self.inner.reclaimers);
             reclaimers.retain(|entry| entry.reclaimer.strong_count() > 0);
             reclaimers
                 .iter()
@@ -807,11 +799,7 @@ impl MemoryGovernor {
             WorkloadClass::Streaming => 0,
         };
         let budget = requested_bytes.min(class_limit).max(1);
-        let mut state = self
-            .inner
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock_unpoisoned(&self.inner.admission);
         let heavy = state
             .records
             .iter()
@@ -849,11 +837,7 @@ impl MemoryGovernor {
 
     #[must_use]
     pub fn query_memory_snapshot(&self) -> QueryMemorySnapshot {
-        let state = self
-            .inner
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = lock_unpoisoned(&self.inner.admission);
         QueryMemorySnapshot {
             base_profile: self.inner.profile.profile,
             profile_scaled: self.inner.profile.is_scaled(),
@@ -876,11 +860,7 @@ impl MemoryGovernor {
     /// Returns an oldest-to-newest snapshot of the bounded event journal.
     #[must_use]
     pub fn event_snapshot(&self) -> MemoryEventSnapshot {
-        let events = self
-            .inner
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let events = lock_unpoisoned(&self.inner.events);
         MemoryEventSnapshot {
             events: events.events.iter().copied().collect(),
             dropped_events: events.dropped,
@@ -908,10 +888,7 @@ fn record_event( inner: &MemoryGovernorInner, kind: MemoryEventKind, class: Memo
         current_bytes,
         limit_bytes: inner.limit_bytes,
     };
-    inner
-        .events
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock_unpoisoned(&inner.events)
         .push(event);
 }
 
@@ -989,11 +966,7 @@ impl Drop for QueryMemoryPermit {
         if self.released || self.id == 0 {
             return;
         }
-        let mut state = self
-            .inner
-            .admission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = lock_unpoisoned(&self.inner.admission);
         if let Some(index) = state.records.iter().position(|r| r.id == self.id) {
             let record = state.records.swap_remove(index);
             state.active_bytes = state.active_bytes.saturating_sub(record.budget_bytes);
@@ -1182,10 +1155,7 @@ mod tests {
 
     impl MemoryReclaimer for TestReclaimer {
         fn reclaim(&self, target_bytes: usize) -> usize {
-            let mut reservation = self
-                .reservation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut reservation = lock_unpoisoned(&self.reservation);
             let Some(reservation) = reservation.as_mut() else {
                 return 0;
             };

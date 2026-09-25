@@ -3,6 +3,8 @@
 
 use std::fmt;
 
+use crate::helpers::{fnv1a64_continue, FNV1A64_OFFSET};
+
 use super::{lex, LexResult, TokenKind, TokenStream};
 
 /// Current fingerprint serialization format.
@@ -13,12 +15,6 @@ use super::{lex, LexResult, TokenKind, TokenStream};
 /// Versioning prevents an old persisted cache entry from silently matching a
 /// fingerprint produced with different encoding rules.
 const FINGERPRINT_FORMAT_VERSION: u64 = 1;
-
-/// FNV-1a 64-bit offset basis.
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-
-/// FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Fingerprint of the exact query source text.
 ///
@@ -387,7 +383,7 @@ struct StableHasher {
 impl StableHasher {
     fn for_domain(domain: &[u8]) -> Self {
         let mut hasher = Self {
-            state: FNV_OFFSET_BASIS,
+            state: FNV1A64_OFFSET,
         };
 
         hasher.write_bytes(domain);
@@ -411,10 +407,7 @@ impl StableHasher {
     }
 
     fn write_raw(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(FNV_PRIME);
-        }
+        self.state = fnv1a64_continue(self.state, bytes);
     }
 
     const fn finish(&self) -> u64 {

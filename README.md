@@ -10,7 +10,7 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-1.0.0-blue)
+![Version](https://img.shields.io/badge/version-1.0.1-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
@@ -1245,6 +1245,7 @@ Examples:
 ```text
 ping
 core.health
+core.discover
 core.operations
 node.status
 
@@ -1259,6 +1260,8 @@ events.subscribe
 
 data.worker.run
 ```
+
+`core.discover` is the public client hello: it returns the Core options a client needs before choosing its entry flow (`authRequired`, `enrollmentMode`, `classicAuthEnabled`, capabilities). `core.health` stays the liveness probe.
 
 The operation catalogue is itself discoverable.
 
@@ -1318,6 +1321,10 @@ Prefix an operation name with `.`:
 
 ```text
 .core.health
+```
+
+```text
+.core.discover
 ```
 
 ```text

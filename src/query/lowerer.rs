@@ -302,13 +302,43 @@ fn lower_operator(operator: &LogicalOperator, depth: usize) -> LoweringResult<Ph
         } => match stage.as_str() {
             "lookup" => lower_lookup(arguments.as_ref(), depth + 1),
             "union" => lower_union(arguments.as_ref(), depth + 1),
-            "sample" => PhysicalOperator::custom(stage.clone(), arguments.as_ref(), false, true)
-                .map_err(|error| LoweringError::physical(None, error)),
-
-            _ => PhysicalOperator::custom(stage.clone(), arguments.as_ref(), *mutating, false)
-                .map_err(|error| LoweringError::physical(None, error)),
+            _ => lower_custom_stage(stage.clone(), arguments.as_ref(), *mutating),
         },
     }
+}
+
+/// Lowers an extension stage and declares its execution properties.
+///
+/// This is the single place where a custom stage name is mapped to physical
+/// properties; top-level and nested pipelines share it, and executors only
+/// consume the resulting properties.
+fn lower_custom_stage( name: StageName, arguments: &str, mutating: bool, ) -> LoweringResult<PhysicalOperator> {
+    let operator = match name.as_str() {
+        // A random subset needs the whole input before emitting.
+        // A uniform random subset: blocking, but retains at most `n` rows.
+        "sample" => PhysicalOperator::custom(name, arguments, false, true)
+            .map(|operator| match arguments.trim().parse::<usize>() {
+                Ok(count) => operator.with_retained_rows(count),
+                Err(_) => operator,
+            }),
+        // At most one row, in input order; without a projection path the row is unchanged.
+        "first" => {
+            let keeps_fields = arguments.trim().is_empty();
+            PhysicalOperator::custom(name, arguments, false, false)
+                .map(|operator| operator.with_row_bound(1, keeps_fields))
+        }
+        // Exactly one row: the same bound as `first`, declared exact.
+        "single" => {
+            let keeps_fields = arguments.trim().is_empty();
+            PhysicalOperator::custom(name, arguments, false, false)
+                .map(|operator| operator.with_exact_rows(1, keeps_fields))
+        }
+        // One row per array item, in order: streams mid-chain.
+        "unwind" => PhysicalOperator::custom(name, arguments, false, false)
+            .map(PhysicalOperator::with_row_expansion),
+        _ => PhysicalOperator::custom(name, arguments, mutating, false),
+    };
+    operator.map_err(|error| LoweringError::physical(None, error))
 }
 
 fn lower_load(specification: &str) -> LoweringResult<PhysicalOperator> {
@@ -336,6 +366,7 @@ fn lower_lookup(payload: &str, depth: usize) -> LoweringResult<PhysicalOperator>
     let pipeline = lower_encoded_subpipeline("lookup", &payload.stages, depth)?;
 
     PhysicalOperator::lookup(collection, payload.alias, payload.into, pipeline)
+        .map(|operator| operator.with_outer_alias(payload.outer))
         .map_err(|error| LoweringError::physical(None, error))
 }
 
@@ -420,8 +451,7 @@ fn lower_encoded_stage( parent: &str, stage: &EncodedStage<'_>, depth: usize, ) 
                 LoweringError::invalid_nested_stage(other, format!("invalid stage name: {error}"))
             })?;
 
-            PhysicalOperator::custom(name, stage.arguments, false, false)
-                .map_err(|error| LoweringError::physical(None, error))
+            lower_custom_stage(name, stage.arguments, false)
         }
     }
     .map_err(|error| match error.kind() {
@@ -509,6 +539,7 @@ fn parse_nested_fields( stage: &EncodedStage<'_>, allow_empty: bool, ) -> Loweri
 struct LookupPayload<'a> {
     source: &'a str,
     alias: Option<&'a str>,
+    outer: Option<&'a str>,
     into: &'a str,
     stages: Vec<EncodedStage<'a>>,
 }
@@ -541,6 +572,13 @@ fn parse_lookup_payload(payload: &str) -> LoweringResult<LookupPayload<'_>> {
     cursor.expect_literal(";alias=", "lookup")?;
     let alias = cursor.read_optional_length_prefixed("lookup alias")?;
 
+    let outer = if cursor.remaining().starts_with(";outer=") {
+        cursor.expect_literal(";outer=", "lookup")?;
+        cursor.read_optional_length_prefixed("lookup outer alias")?
+    } else {
+        None
+    };
+
     cursor.expect_literal(";into=", "lookup")?;
     let into = cursor.read_length_prefixed("lookup target")?;
 
@@ -552,6 +590,7 @@ fn parse_lookup_payload(payload: &str) -> LoweringResult<LookupPayload<'_>> {
     Ok(LookupPayload {
         source,
         alias,
+        outer,
         into,
         stages,
     })

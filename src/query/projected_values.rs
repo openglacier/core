@@ -544,16 +544,7 @@ fn fast_value(value: FastScalar<'_>) -> Option<Value> {
 }
 
 fn collect_expression_fields(expression: &Expression, fields: &mut Vec<ExpressionFieldPath>) {
-    match expression.view() {
-        ExpressionView::Field(field) => fields.push(field.clone()),
-        ExpressionView::Unary { operand, .. } => collect_expression_fields(operand, fields),
-        ExpressionView::Binary { left, right, .. } => {
-            collect_expression_fields(left, fields);
-            collect_expression_fields(right, fields);
-        }
-        ExpressionView::Group(inner) => collect_expression_fields(inner, fields),
-        ExpressionView::Literal(_) => {}
-    }
+    expression.for_each_field(&mut |field| fields.push(field.clone()));
 }
 
 /// Borrowed projected row aligned to one [`ProjectedValueLayout`].

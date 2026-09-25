@@ -16,14 +16,14 @@ use crate::access::{
         AuthorizationRequest, QueryAccess,
     },
     place::{
-        parse_sharing_permission, sharing_permission, ExecutionContext, PlaceRole, PublicAccess,
+        parse_sharing_permission, sharing_permission, ExecutionContext, PlaceAccess, PlaceRole, PublicAccess,
         RequestedExecutionContext,
     },
 };
 use crate::{
     build as build_profile,
     debug::{self, DebugTopic},
-    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, unix_time_millis, APP_INSTANCE_SCOPE_FIELD, PLACE_SCOPE_FIELD},
+    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, fnv1a64_continue, JsonFields, lock_unpoisoned, system_time_millis, unix_time_millis, write_file_atomic, APP_INSTANCE_SCOPE_FIELD, FNV1A64_OFFSET, PLACE_SCOPE_FIELD},
     engine::Engine, files::{FileEntry, FileId, FileStore, FileStoreEntry, FileStoreError, FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelectionMode, FileWrite, NativeFileStore, StoreId, APP_FILES_DIRECTORY, PRIMARY_APPS_COLLISION_NAME, file_sync_projection_component, file_sync_projection_suffix}, Principal, backup,
     event_engine::{EventEngine, EventSubscription},
     memory::{MemoryClass, MemoryGovernor, MemoryProfileConfig, WorkloadClass},
@@ -614,7 +614,7 @@ fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &Operati
         let Some(message) = read_gateway_message(websocket)? else {
             return Err("gateway client channel closed before the response".to_owned());
         };
-        if message.get("kind").and_then(JsonValue::as_str) == Some("response")
+        if message.str_field("kind") == Some("response")
             && message.get("id") == Some(&request_id)
         {
             return Ok(message);
@@ -634,8 +634,8 @@ fn connect_authenticated_gateway_client( endpoint: &str, credential: &IdentityCr
         let Some(message) = read_gateway_message(&mut websocket)? else {
             return Err("gateway client channel closed before gateway.ready".to_owned());
         };
-        if message.get("kind").and_then(JsonValue::as_str) == Some("event")
-            && message.get("type").and_then(JsonValue::as_str) == Some("gateway.ready")
+        if message.str_field("kind") == Some("event")
+            && message.str_field("type") == Some("gateway.ready")
         {
             break;
         }
@@ -670,7 +670,7 @@ fn connect_authenticated_gateway_client( endpoint: &str, credential: &IdentityCr
     if let Some(error) = complete_response.get("error") {
         return Err(format!("upstream auth.complete rejected: {error}"));
     }
-    if complete_response.get("status").and_then(JsonValue::as_str) != Some("ok") {
+    if complete_response.str_field("status") != Some("ok") {
         return Err("upstream authentication did not complete successfully".to_owned());
     }
 
@@ -678,10 +678,7 @@ fn connect_authenticated_gateway_client( endpoint: &str, credential: &IdentityCr
 }
 
 fn gateway_client_endpoints(settings: &ConnectionSettings) -> Vec<String> {
-    settings
-        .upstream_client_endpoints
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    lock_unpoisoned(&settings.upstream_client_endpoints)
         .clone()
 }
 
@@ -838,10 +835,7 @@ fn registered_device_matches(engine: &Engine, identity_id: &str, device_id: &str
         query_string(device_id),
         query_string(public_key),
     );
-    matches!(
-        execute_request(engine, QueryRequest::new(0, query)),
-        QueryResponse::Ok { documents, .. } if !documents.is_empty()
-    )
+    query_has_rows(engine, 0, query)
 }
 
 fn registered_identity_matches(engine: &Engine, identity_id: &str, public_key: &str) -> bool {
@@ -851,10 +845,7 @@ fn registered_identity_matches(engine: &Engine, identity_id: &str, public_key: &
         query_string(identity_id),
         query_string(public_key),
     );
-    matches!(
-        execute_request(engine, QueryRequest::new(0, query)),
-        QueryResponse::Ok { documents, .. } if !documents.is_empty()
-    )
+    query_has_rows(engine, 0, query)
 }
 
 #[cfg(feature = "fabric")]
@@ -910,19 +901,11 @@ fn ensure_gateway_device_registration(engine: &Engine, identity_id: &str, device
     }
 
     let identity_lookup = format!("on _identities | where identityId == {} | limit 1", query_string(identity_id));
-    let identity_exists = match execute_request(engine, QueryRequest::new(0, identity_lookup)) {
-        QueryResponse::Ok { documents, .. } => !documents.is_empty(),
-        QueryResponse::Error { .. } => false,
-    };
-    if identity_exists {
+    if query_has_rows(engine, 0, identity_lookup) {
         return Err(format!("Gateway identity {identity_id} conflicts with an existing identity"));
     }
     let device_lookup = format!("on _devices | where deviceId == {} | limit 1", query_string(device_id));
-    let device_exists = match execute_request(engine, QueryRequest::new(0, device_lookup)) {
-        QueryResponse::Ok { documents, .. } => !documents.is_empty(),
-        QueryResponse::Error { .. } => false,
-    };
-    if device_exists {
+    if query_has_rows(engine, 0, device_lookup) {
         return Err(format!("Gateway device {device_id} conflicts with an existing Device"));
     }
 
@@ -951,18 +934,18 @@ fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Con
     write_node_message(control, &serde_json::json!({"kind": "gateway.probe", "version": 1}))?;
     let hello = read_node_message(control)?
         .ok_or_else(|| "Gateway closed before gateway.hello".to_owned())?;
-    if hello.get("kind").and_then(JsonValue::as_str) != Some("gateway.hello")
-        || hello.get("version").and_then(JsonValue::as_u64) != Some(1)
+    if hello.str_field("kind") != Some("gateway.hello")
+        || hello.u64_field("version") != Some(1)
     {
         return Err("Gateway did not provide a supported gateway.hello".to_owned());
     }
-    let state = hello.get("state").and_then(JsonValue::as_str).unwrap_or_default();
-    let public_key = hello.get("publicKey").and_then(JsonValue::as_str).unwrap_or_default();
+    let state = hello.str_field("state").unwrap_or_default();
+    let public_key = hello.str_field("publicKey").unwrap_or_default();
     validate_ed25519_public_key(public_key).map_err(|error| format!("invalid Gateway public key: {error}"))?;
 
     if state == "enrolled" {
-        let identity_id = hello.get("identityId").and_then(JsonValue::as_str).unwrap_or_default();
-        let device_id = hello.get("deviceId").and_then(JsonValue::as_str).unwrap_or_default();
+        let identity_id = hello.str_field("identityId").unwrap_or_default();
+        let device_id = hello.str_field("deviceId").unwrap_or_default();
         let engine = engine.ok_or_else(|| "Gateway Device verification requires a local Core trust store in Step 2".to_owned())?;
         if !registered_identity_matches(engine, identity_id, public_key)
             || !registered_device_matches(engine, identity_id, device_id, public_key)
@@ -975,12 +958,12 @@ fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Con
             "identityId": identity_id, "deviceId": device_id, "challenge": challenge,
         }))?;
         let proof = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.proof".to_owned())?;
-        if proof.get("kind").and_then(JsonValue::as_str) != Some("gateway.proof")
-            || proof.get("version").and_then(JsonValue::as_u64) != Some(1)
+        if proof.str_field("kind") != Some("gateway.proof")
+            || proof.u64_field("version") != Some(1)
         {
             return Err("Gateway did not answer the Device challenge".to_owned());
         }
-        let signature = proof.get("signature").and_then(JsonValue::as_str).unwrap_or_default();
+        let signature = proof.str_field("signature").unwrap_or_default();
         let payload = gateway_identity_proof(&challenge, identity_id, device_id);
         verify_ed25519(public_key, signature, payload.as_bytes())
             .map_err(|error| format!("Gateway Device signature rejected: {error}"))?;
@@ -1001,13 +984,13 @@ fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Con
     let token = configuration.gateway_token.as_deref()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Gateway enrollment requires OGD_GATEWAY_TOKEN on the enrolling Core".to_owned())?;
-    let enrollment_challenge = hello.get("enrollmentChallenge").and_then(JsonValue::as_str).unwrap_or_default();
+    let enrollment_challenge = hello.str_field("enrollmentChallenge").unwrap_or_default();
     if enrollment_challenge.is_empty() {
         return Err("unenrolled Gateway did not provide an enrollment challenge".to_owned());
     }
     let (identity_id, device_id) = if state == "enrolling" {
-        let identity_id = hello.get("identityId").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
-        let device_id = hello.get("deviceId").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
+        let identity_id = hello.string_field("identityId");
+        let device_id = hello.string_field("deviceId");
         if identity_id.is_empty() || device_id.is_empty() {
             return Err("pending Gateway enrollment is missing identityId/deviceId".to_owned());
         }
@@ -1028,15 +1011,15 @@ fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Con
         "challenge": challenge,
     }))?;
     let proof = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.enroll.proof".to_owned())?;
-    if proof.get("kind").and_then(JsonValue::as_str) != Some("gateway.enroll.proof")
-        || proof.get("version").and_then(JsonValue::as_u64) != Some(1)
-        || proof.get("identityId").and_then(JsonValue::as_str) != Some(identity_id.as_str())
-        || proof.get("deviceId").and_then(JsonValue::as_str) != Some(device_id.as_str())
-        || proof.get("publicKey").and_then(JsonValue::as_str) != Some(public_key)
+    if proof.str_field("kind") != Some("gateway.enroll.proof")
+        || proof.u64_field("version") != Some(1)
+        || proof.str_field("identityId") != Some(identity_id.as_str())
+        || proof.str_field("deviceId") != Some(device_id.as_str())
+        || proof.str_field("publicKey") != Some(public_key)
     {
         return Err("Gateway enrollment proof does not match its assignment".to_owned());
     }
-    let signature = proof.get("signature").and_then(JsonValue::as_str).unwrap_or_default();
+    let signature = proof.str_field("signature").unwrap_or_default();
     let payload = gateway_identity_proof(&challenge, &identity_id, &device_id);
     verify_ed25519(public_key, signature, payload.as_bytes())
         .map_err(|error| format!("Gateway enrollment Device signature rejected: {error}"))?;
@@ -1046,10 +1029,10 @@ fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Con
         "identityId": identity_id, "deviceId": device_id,
     }))?;
     let ack = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.enroll.ack".to_owned())?;
-    if ack.get("kind").and_then(JsonValue::as_str) != Some("gateway.enroll.ack")
-        || ack.get("version").and_then(JsonValue::as_u64) != Some(1)
-        || ack.get("identityId").and_then(JsonValue::as_str) != Some(identity_id.as_str())
-        || ack.get("deviceId").and_then(JsonValue::as_str) != Some(device_id.as_str())
+    if ack.str_field("kind") != Some("gateway.enroll.ack")
+        || ack.u64_field("version") != Some(1)
+        || ack.str_field("identityId") != Some(identity_id.as_str())
+        || ack.str_field("deviceId") != Some(device_id.as_str())
     {
         return Err("Gateway enrollment commit was not acknowledged".to_owned());
     }
@@ -1061,8 +1044,7 @@ fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Con
 fn load_gateway_directory(path: &Path) -> Vec<String> {
     let Ok(bytes) = fs::read(path) else { return Vec::new(); };
     let Ok(value) = serde_json::from_slice::<JsonValue>(&bytes) else { return Vec::new(); };
-    value.get("endpoints")
-        .and_then(JsonValue::as_array)
+    value.array_field("endpoints")
         .into_iter()
         .flatten()
         .filter_map(JsonValue::as_str)
@@ -1072,19 +1054,14 @@ fn load_gateway_directory(path: &Path) -> Vec<String> {
 
 #[cfg(feature = "fabric")]
 fn persist_gateway_directory(path: &Path, endpoints: &HashSet<String>) -> Result<(), String> {
-    if let Some(parent) = path.parent().filter(|value| !value.as_os_str().is_empty()) {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
     let mut values = endpoints.iter().cloned().collect::<Vec<_>>();
     values.sort();
     let payload = serde_json::to_vec_pretty(&serde_json::json!({
         "version": 1,
         "endpoints": values,
     })).map_err(|error| error.to_string())?;
-    let staged = path.with_extension("json.next");
-    fs::write(&staged, payload).map_err(|error| error.to_string())?;
-    fs::rename(&staged, path).map_err(|error| error.to_string())?;
-    Ok(())
+    write_file_atomic(path, &path.with_extension("json.next"), |output| output.write_all(&payload))
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "fabric")]
@@ -1108,13 +1085,13 @@ fn run_gateway_fabric( configuration: Configuration, node_credential: IdentityCr
             .map_err(|error| DaemonError::Runtime(format!("Gateway connection manager stopped: {error}")))?;
         let Some(endpoint) = normalize_gateway_node_endpoint(&endpoint) else { continue; };
         {
-            let mut known_guard = known.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut known_guard = lock_unpoisoned(&known);
             if !known_guard.insert(endpoint.clone()) { continue; }
             if let Err(error) = persist_gateway_directory(&configuration.gateway_directory_path, &known_guard) {
                 eprintln!("ogd gateway directory persist {}: {error}", configuration.gateway_directory_path.display());
             }
             if let Some(client_endpoint) = gateway_client_endpoint_from_node(&endpoint) {
-                let mut clients = settings.upstream_client_endpoints.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut clients = lock_unpoisoned(&settings.upstream_client_endpoints);
                 if !clients.contains(&client_endpoint) { clients.push(client_endpoint); }
             }
         }
@@ -1156,11 +1133,11 @@ fn run_gateway_fabric( _configuration: Configuration, _node_credential: Identity
 #[cfg(feature = "fabric")]
 fn set_gateway_runtime_state( settings: &ConnectionSettings, endpoint: &str, connected: bool, disconnected_state: &'static str, ) {
     let any_connected = {
-        let mut connections = settings.gateway_connections.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut connections = lock_unpoisoned(&settings.gateway_connections);
         connections.insert(endpoint.to_owned(), connected);
         connections.values().any(|value| *value)
     };
-    *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+    *lock_unpoisoned(&settings.gateway_state) =
         if any_connected { "connected" } else { disconnected_state };
 }
 
@@ -1179,6 +1156,7 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                 operation.name.to_owned(),
                 serde_json::json!({
                     "capability": operation.kind.provider_capability().map(ServiceCapability::as_str),
+                    "access": operation.access.as_str(),
                     "transport": operation.transport.as_str(),
                     "connection": operation.connection.as_str(),
                 }),
@@ -1236,7 +1214,7 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                     loop {
                         match subscription.try_recv() {
                             Ok(event) => {
-                                let Some(device_id) = event.payload.get("deviceId").and_then(JsonValue::as_str) else { continue; };
+                                let Some(device_id) = event.payload.str_field("deviceId") else { continue; };
                                 let notification = serde_json::json!({
                                     "kind": "fabric.device.revoked",
                                     "version": 1,
@@ -1269,13 +1247,13 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                     Err(error) => { eprintln!("ogd gateway control: {error}"); break; }
                 }
             };
-            match message.get("kind").and_then(JsonValue::as_str) {
+            match message.str_field("kind") {
                 Some("node.challenge") => {
-                    if message.get("version").and_then(JsonValue::as_u64) != Some(NODE_CONTROL_PROTOCOL_VERSION) {
+                    if message.u64_field("version") != Some(NODE_CONTROL_PROTOCOL_VERSION) {
                         eprintln!("ogd gateway control: unsupported node challenge version");
                         break;
                     }
-                    let Some(challenge) = message.get("challenge").and_then(JsonValue::as_str) else {
+                    let Some(challenge) = message.str_field("challenge") else {
                         eprintln!("ogd gateway control: node challenge is missing its nonce");
                         break;
                     };
@@ -1305,15 +1283,15 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                     debug::log(DebugTopic::Gateway, None, format!("node accepted endpoint={endpoint}"));
                 }
                 Some("node.rejected") => {
-                    let code = message.get("code").and_then(JsonValue::as_str).unwrap_or("NODE_REJECTED");
-                    let reason = message.get("message").and_then(JsonValue::as_str).unwrap_or("Gateway rejected this Node");
+                    let code = message.str_field("code").unwrap_or("NODE_REJECTED");
+                    let reason = message.str_field("message").unwrap_or("Gateway rejected this Node");
                     eprintln!("ogd gateway node rejected endpoint={endpoint} code={code}: {reason}");
                     break;
                 }
                 Some("fabric.gateways") if accepted => {
-                    if message.get("version").and_then(JsonValue::as_u64) != Some(1) { continue; }
+                    if message.u64_field("version") != Some(1) { continue; }
                     let Some(sender) = discovery_sender.as_ref() else { continue; };
-                    for value in message.get("endpoints").and_then(JsonValue::as_array).into_iter().flatten() {
+                    for value in message.array_field("endpoints").into_iter().flatten() {
                         let Some(raw) = value.as_str() else { continue; };
                         let Some(discovered) = normalize_gateway_node_endpoint(raw) else { continue; };
                         if discovered == endpoint { continue; }
@@ -1322,10 +1300,10 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                     }
                 }
                 Some("node.device.verify") => {
-                    let request_id = message.get("requestId").and_then(JsonValue::as_str).unwrap_or_default();
-                    let identity_id = message.get("identityId").and_then(JsonValue::as_str).unwrap_or_default();
-                    let device_id = message.get("deviceId").and_then(JsonValue::as_str).unwrap_or_default();
-                    let public_key = message.get("publicKey").and_then(JsonValue::as_str).unwrap_or_default();
+                    let request_id = message.str_field("requestId").unwrap_or_default();
+                    let identity_id = message.str_field("identityId").unwrap_or_default();
+                    let device_id = message.str_field("deviceId").unwrap_or_default();
+                    let public_key = message.str_field("publicKey").unwrap_or_default();
                     let verified = configuration.node_capabilities.contains(ServiceCapability::Auth)
                         && engine.as_deref().map(|engine| registered_device_matches(engine, identity_id, device_id, public_key)).unwrap_or(false);
                     let response = serde_json::json!({
@@ -1340,12 +1318,12 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                     }
                 }
                 Some("node.open") => {
-                    let Some(channel_id) = message.get("channelId").and_then(JsonValue::as_str).map(str::to_owned) else { continue; };
-                    let delegated_identity_id = message.get("identityId").and_then(JsonValue::as_str).map(str::to_owned);
-                    let delegated_device_id = message.get("deviceId").and_then(JsonValue::as_str).map(str::to_owned);
-                    let delegated_place_id = message.get("placeId").and_then(JsonValue::as_str).map(str::to_owned);
-                    let delegated_capability = message.get("capability").and_then(JsonValue::as_str).map(str::to_owned);
-                    let delegated_token = message.get("delegationToken").and_then(JsonValue::as_str).map(str::to_owned);
+                    let Some(channel_id) = message.str_field("channelId").map(str::to_owned) else { continue; };
+                    let delegated_identity_id = message.str_field("identityId").map(str::to_owned);
+                    let delegated_device_id = message.str_field("deviceId").map(str::to_owned);
+                    let delegated_place_id = message.str_field("placeId").map(str::to_owned);
+                    let delegated_capability = message.str_field("capability").map(str::to_owned);
+                    let delegated_token = message.str_field("delegationToken").map(str::to_owned);
                     if let Some(capability_name) = delegated_capability.as_deref() {
                         let Some(capability) = ServiceCapability::parse(capability_name) else {
                             debug::log( DebugTopic::Gateway, None, format!("rejecting node.open for unknown capability={capability_name}"), );
@@ -1356,8 +1334,9 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                             continue;
                         }
                     }
-                    let delegated_app_instance_id = message.get("appInstanceId").and_then(JsonValue::as_str).map(str::to_owned);
-                    let delegated_place_role = message.get("placeRole").and_then(JsonValue::as_str).and_then(PlaceRole::parse);
+                    let delegated_app_instance_id = message.str_field("appInstanceId").map(str::to_owned);
+                    let delegated_place_role = message.str_field("placeRole").and_then(PlaceRole::parse);
+                    let delegated_public_access = message.str_field("publicAccess").and_then(PublicAccess::parse);
                     let endpoint = endpoint.clone();
                     let engine = engine.clone();
                     let operation_router = Arc::clone(&operation_router);
@@ -1393,6 +1372,9 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                             return;
                         }
                         let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+                        // An identity delegation carries the principal of the connected client. A public
+                        // delegation carries no identity: the Authority resolved the Place public
+                        // policy for an anonymous client, and the provider executes within it.
                         let delegation = match (delegated_identity_id, delegated_device_id, delegated_capability) {
                             (Some(identity_id), Some(device_id), Some(capability)) => Some(GatewayDelegation {
                                 principal: Principal::Identity { identity_id, device_id },
@@ -1400,6 +1382,16 @@ fn run_gateway_node( endpoint: String, configuration: &Configuration, node_crede
                                 capability,
                                 app_instance_id: delegated_app_instance_id,
                                 place_role: delegated_place_role,
+                                public_access: delegated_public_access,
+                                token: delegated_token,
+                            }),
+                            (None, None, Some(capability)) if delegated_place_id.is_some() && delegated_public_access.is_some() => Some(GatewayDelegation {
+                                principal: Principal::Anonymous,
+                                place_id: delegated_place_id,
+                                capability,
+                                app_instance_id: delegated_app_instance_id,
+                                place_role: None,
+                                public_access: delegated_public_access,
                                 token: delegated_token,
                             }),
                             _ => None,
@@ -1462,29 +1454,20 @@ fn ensure_node_device_credential(engine: &Engine, credential: &IdentityCredentia
         "on _devices | where deviceId == {} | limit 1",
         query_string(&credential.device_id),
     );
-    let response = execute_request(engine, QueryRequest::new(0, lookup));
-    match response {
-        QueryResponse::Ok { documents, .. } => {
-            if let Some(document) = documents.first() {
-                let text = |field: &str| document.get(field).and_then(JsonValue::as_str);
-                let expected = text("identityId") == Some(credential.identity_id.as_str())
-                    && text("publicKey") == Some(credential.public_key.as_str())
-                    && text("algorithm") == Some("ed25519")
-                    && text("encoding") == Some("spki-der")
-                    && text("state") == Some("active");
-                if expected {
-                    return Ok(());
-                }
-                return Err(DaemonError::NodeDeviceCredentialConflict {
-                    device_id: credential.device_id.clone(),
-                });
-            }
+    // A fresh client store may not have `_devices` yet. Reads against a missing
+    // collection are therefore equivalent to "credential absent" here. The insert
+    // below creates/populates the collection through the normal Core query path. If
+    // that insert fails, we still surface a real local credential-state error.
+    if let Ok(Some(document)) = query_first(engine, 0, lookup) {
+        let expected = document.str_field("identityId") == Some(credential.identity_id.as_str())
+            && document.str_field("publicKey") == Some(credential.public_key.as_str())
+            && document.str_field("algorithm") == Some("ed25519")
+            && document.str_field("encoding") == Some("spki-der")
+            && document.str_field("state") == Some("active");
+        if expected {
+            return Ok(());
         }
-        // A fresh client store may not have `_devices` yet. Reads against a missing
-        // collection are therefore equivalent to "credential absent" here. The insert
-        // below creates/populates the collection through the normal Core query path. If
-        // that insert fails, we still surface a real local credential-state error.
-        QueryResponse::Error { .. } => {}
+        return Err(DaemonError::NodeDeviceCredentialConflict { device_id: credential.device_id.clone() });
     }
 
     let created_at = unix_time_millis();
@@ -1506,7 +1489,7 @@ fn ensure_node_events_permission(engine: &Engine, credential: &IdentityCredentia
     let lookup = format!(
         r#"on _permissions | where identityId == {identity} and state == "active" and effect == "allow" and (action == "events.subscribe" or action == "*") and (resource == "*") | limit 1"#
     );
-    if matches!(execute_request(engine, QueryRequest::new(0, lookup)), QueryResponse::Ok { documents, .. } if !documents.is_empty()) {
+    if query_has_rows(engine, 0, lookup) {
         return;
     }
 
@@ -1525,10 +1508,8 @@ fn bootstrap_fabric_defaults_if_needed( engine: &Engine, credential: &crate::acc
         "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
         query_string(FABRIC_DEFAULTS_ID),
     );
-    match execute_request(engine, QueryRequest::new(0, query)) {
-        QueryResponse::Ok { documents, .. } if !documents.is_empty() => return Ok(()),
-        QueryResponse::Ok { .. } => {}
-        QueryResponse::Error { .. } => {}
+    if query_has_rows(engine, 0, query) {
+        return Ok(());
     }
 
     let now = unix_time_millis();
@@ -1568,21 +1549,13 @@ fn bootstrap_fabric_defaults_if_needed( engine: &Engine, credential: &crate::acc
     if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
         return Err(DaemonError::BootstrapFabricResourcesState);
     }
-    debug::log( DebugTopic::Gateway, None, format!( "seed fabric defaults device={} capabilities={}", credential.device_id, assignments .iter() .filter_map(|assignment| assignment.get("capability").and_then(JsonValue::as_str)) .collect::<Vec<_>>() .join(",") ), );
+    debug::log( DebugTopic::Gateway, None, format!( "seed fabric defaults device={} capabilities={}", credential.device_id, assignments .iter() .filter_map(|assignment| assignment.str_field("capability")) .collect::<Vec<_>>() .join(",") ), );
     Ok(())
 }
 
 fn bootstrap_admin_if_needed( engine: &Engine, configuration: &Configuration, ) -> Result<(), DaemonError> {
-    let response = execute_request(engine, QueryRequest::new(0, "on _identities | count"));
-    let empty = match response {
-        QueryResponse::Ok { documents, .. } => documents
-            .first()
-            .and_then(|value| value.get("count"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0) == 0,
-        QueryResponse::Error { .. } => true,
-    };
-    if !empty { return Ok(()); }
+    let count = query_first(engine, 0, "on _identities | count").ok().flatten().and_then(|value| value.u64_field("count"));
+    if count.unwrap_or(0) != 0 { return Ok(()); }
 
     let password = configuration.bootstrap_password()?;
     let admin = BootstrapAdmin::generate().map_err(DaemonError::BootstrapIdentity)?;
@@ -1613,8 +1586,8 @@ fn valid_app_model_identifier(value: &str, allow_dots: bool) -> bool {
 fn validate_app_definition_model(definition: &JsonValue) -> Result<(), String> {
     let Some(model) = definition.get("model") else { return Ok(()); };
     let model = model.as_object().ok_or_else(|| "definition.model must be an object".to_owned())?;
-    let collections = model.get("collections").and_then(JsonValue::as_object);
-    let tables = model.get("tables").and_then(JsonValue::as_object);
+    let collections = model.object_field("collections");
+    let tables = model.object_field("tables");
 
     if model.get("collections").is_some() && collections.is_none() {
         return Err("definition.model.collections must be an object".to_owned());
@@ -1629,7 +1602,7 @@ fn validate_app_definition_model(definition: &JsonValue) -> Result<(), String> {
         if !valid_app_model_identifier(alias, false) {
             return Err(format!("invalid collection alias {alias:?}"));
         }
-        let physical_name = declaration.as_str().or_else(|| declaration.get("name").and_then(JsonValue::as_str))
+        let physical_name = declaration.as_str().or_else(|| declaration.str_field("name"))
             .ok_or_else(|| format!("collection {alias:?} must declare a name"))?;
         if !valid_app_model_identifier(physical_name, true) {
             return Err(format!("collection {alias:?} has invalid Core name {physical_name:?}"));
@@ -1642,7 +1615,7 @@ fn validate_app_definition_model(definition: &JsonValue) -> Result<(), String> {
             return Err(format!("invalid table alias {alias:?}"));
         }
         let table = table.as_object().ok_or_else(|| format!("table {alias:?} must be an object"))?;
-        let collection = table.get("collection").and_then(JsonValue::as_str)
+        let collection = table.str_field("collection")
             .ok_or_else(|| format!("table {alias:?} must reference a collection"))?;
         if !collections.contains_key(collection) {
             return Err(format!("table {alias:?} references undeclared collection {collection:?}"));
@@ -1651,7 +1624,7 @@ fn validate_app_definition_model(definition: &JsonValue) -> Result<(), String> {
             let fields = fields.as_array().ok_or_else(|| format!("table {alias:?}.fields must be an array"))?;
             let mut names = std::collections::BTreeSet::new();
             for field in fields {
-                let name = field.get("name").and_then(JsonValue::as_str)
+                let name = field.str_field("name")
                     .ok_or_else(|| format!("table {alias:?} contains a field without a name"))?;
                 if !valid_app_model_identifier(name, false) {
                     return Err(format!("table {alias:?} has invalid field name {name:?}"));
@@ -1766,7 +1739,17 @@ struct GatewayDelegation {
     capability: String,
     app_instance_id: Option<String>,
     place_role: Option<PlaceRole>,
+    public_access: Option<PublicAccess>,
     token: Option<String>,
+}
+
+impl GatewayDelegation {
+    /// The Place grant resolved by the Authority, when the Gateway transmitted one.
+    fn access(&self) -> Option<PlaceAccess> {
+        self.place_role
+            .map(PlaceAccess::Role)
+            .or_else(|| self.public_access.map(PlaceAccess::Public))
+    }
 }
 
 #[cfg(feature = "llm")]
@@ -1802,8 +1785,8 @@ fn connect_delegated_gateway_client( endpoint: &str, token: &str, read_timeout: 
                 "Gateway closed before gateway.ready",
             ));
         };
-        if message.get("kind").and_then(JsonValue::as_str) == Some("event")
-            && message.get("type").and_then(JsonValue::as_str) == Some("gateway.ready")
+        if message.str_field("kind") == Some("event")
+            && message.str_field("type") == Some("gateway.ready")
         {
             break;
         }
@@ -1822,7 +1805,7 @@ fn connect_delegated_gateway_client( endpoint: &str, token: &str, read_timeout: 
             error.to_string(),
         ));
     }
-    if response.get("status").and_then(JsonValue::as_str) != Some("ok") {
+    if response.str_field("status") != Some("ok") {
         return Err(AgentError::capability(
             "gateway.delegation.open",
             "Gateway did not accept the delegated Agent session",
@@ -1954,9 +1937,9 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                 }
                 let engine = self.engine
                     .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
-                let query = data.get("query").and_then(JsonValue::as_str)
+                let query = data.str_field("query")
                     .ok_or_else(|| AgentError::capability(operation, "query is required"))?;
-                if data.get("readOnly").and_then(JsonValue::as_bool) != Some(true) {
+                if data.bool_field("readOnly") != Some(true) {
                     return Err(AgentError::capability(operation, "Agent database queries must set readOnly=true"));
                 }
                 let pipeline = parse_pipeline(query)
@@ -1994,7 +1977,7 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                         .ok_or_else(|| AgentError::capability(operation, "local files database is unavailable"))?;
                     let instance_id = self.context.app_instance_id.as_deref()
                         .ok_or_else(|| AgentError::capability(operation, "files.list requires an AppInstance scope"))?;
-                    let parent_id = data.get("parentId").and_then(JsonValue::as_str);
+                    let parent_id = data.str_field("parentId");
                     let entries = list_file_entries(
                         engine,
                         RequestId::Number(0),
@@ -2059,7 +2042,7 @@ impl AgentCapabilityInvoker for GatewayAgentInvoker {
             else {
                 return Err(AgentError::capability(operation, "Gateway closed before capability response completed"));
             };
-            if message.get("kind").and_then(JsonValue::as_str) != Some("response")
+            if message.str_field("kind") != Some("response")
                 || message.get("id") != Some(&request_id)
             {
                 continue;
@@ -2067,7 +2050,7 @@ impl AgentCapabilityInvoker for GatewayAgentInvoker {
             if let Some(error) = message.get("error") {
                 return Err(AgentError::capability(operation, error.to_string()));
             }
-            match message.get("status").and_then(JsonValue::as_str) {
+            match message.str_field("status") {
                 Some("partial") => {
                     if let Some(data) = message.get("data") {
                         partials.push(data.clone());
@@ -2130,9 +2113,9 @@ impl AgentCapabilityInvoker for OgdAgentInvoker<'_> {
             let mut output = String::new();
             let mut tool_calls = Vec::new();
             for partial in &response.partials {
-                match partial.get("type").and_then(JsonValue::as_str) {
+                match partial.str_field("type") {
                     Some("token") => {
-                        if let Some(text) = partial.get("text").and_then(JsonValue::as_str) {
+                        if let Some(text) = partial.str_field("text") {
                             output.push_str(text);
                         }
                     }
@@ -2358,12 +2341,11 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                             && value.place_id.as_deref() == Some(requested.place_id.as_str())
                                             && value.app_instance_id.as_deref() == requested.app_instance_id.as_deref()
                                         {
-                                            value.place_role.map(|place_role| ExecutionContext {
+                                            value.access().map(|access| ExecutionContext {
                                                 principal: value.principal.clone(),
                                                 place_id: requested.place_id.clone(),
                                                 app_instance_id: requested.app_instance_id.clone(),
-                                                place_role,
-                                                public_access: None,
+                                                access,
                                             })
                                         } else { None }
                                     });
@@ -2371,7 +2353,6 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                         Some(context) => Some(context),
                                         None => match resolve_query_execution_context(
                                             engine, id, authentication.principal(), requested,
-                                            !settings.authorization_mode.is_enforced(),
                                         ) {
                                             Ok(context) => Some(context),
                                             Err(response) => reject_response!(response)
@@ -2412,14 +2393,14 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                 .filter(|access| access.action == AuthorizationAction::QueryWrite)
                                 .map(|access| access.collection.clone());
 
-                            // The resolved Place role is the capability ceiling for a scoped
-                            // Place query. Reads are allowed to every Place participant; writes are
-                            // limited to Resident and Owner before the scoped grant is considered.
+                            // The resolved Place grant is the capability ceiling for a scoped Place
+                            // query: every grant reads; writes need a writing role (Resident, Owner)
+                            // or a read/write public policy, before the scoped grant is considered.
                             if let (Some(context), Some(access)) =
                                 (execution_context.as_ref(), analyzed_access.as_ref())
                             {
                                 if access.action == AuthorizationAction::QueryWrite
-                                    && !context.place_role.can_write()
+                                    && !context.access.can_write()
                                 {
                                     write_place_role_denied(
                                         writer,
@@ -2437,7 +2418,8 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                             "principal": authentication.principal(),
                                             "placeId": context.place_id,
                                             "appInstanceId": context.app_instance_id,
-                                            "placeRole": context.place_role.as_str(),
+                                            "placeRole": context.access.role().map(PlaceRole::as_str),
+                                            "publicAccess": context.access.public_access().map(PublicAccess::as_str),
                                         }),
                                     );
                                     return Ok(true);
@@ -2462,35 +2444,40 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                 // Place roles remain
                                 // the capability ceiling: Member=read, Resident/Owner=read+write.
                                 // System collections keep the explicit global permission model.
-                                let scoped_app_collection = execution_context.is_some()
-                                    && !access.collection.starts_with('_');
-                                if !scoped_app_collection
-                                    && !authorize_connection(
-                                        engine,
-                                        authentication.principal(),
-                                        access.action,
-                                        &access.collection,
-                                    )
-                                {
-                                    write_authorization_denied(
-                                        writer,
-                                        id,
-                                        authentication.principal(),
-                                        access.action,
-                                        &access.collection,
-                                    )?;
-                                    event_engine.publish_global(
-                                        "authorization.denied",
-                                        serde_json::json!({
-                                            "requestId": id,
-                                            "action": access.action.as_str(),
-                                            "resource": access.collection,
-                                            "principal": authentication.principal(),
-                                            "placeId": execution_context.as_ref().map(|context| &context.place_id),
-                                            "appInstanceId": execution_context.as_ref().and_then(|context| context.app_instance_id.as_deref()),
-                                        }),
-                                    );
-                                    return Ok(true);
+                                // A query ending in `into` also reads its source collection.
+                                let checks = std::iter::once((access.action, access.collection.as_str()))
+                                    .chain(access.source_read.as_deref().map(|source| (AuthorizationAction::QueryRead, source)));
+                                for (action, resource) in checks {
+                                    let scoped_app_collection = execution_context.is_some()
+                                        && !resource.starts_with('_');
+                                    if !scoped_app_collection
+                                        && !authorize_connection(
+                                            engine,
+                                            authentication.principal(),
+                                            action,
+                                            resource,
+                                        )
+                                    {
+                                        write_authorization_denied(
+                                            writer,
+                                            id,
+                                            authentication.principal(),
+                                            action,
+                                            resource,
+                                        )?;
+                                        event_engine.publish_global(
+                                            "authorization.denied",
+                                            serde_json::json!({
+                                                "requestId": id,
+                                                "action": action.as_str(),
+                                                "resource": resource,
+                                                "principal": authentication.principal(),
+                                                "placeId": execution_context.as_ref().map(|context| &context.place_id),
+                                                "appInstanceId": execution_context.as_ref().and_then(|context| context.app_instance_id.as_deref()),
+                                            }),
+                                        );
+                                        return Ok(true);
+                                    }
                                 }
                             }
                             let request = QueryRequest::new(id, query);
@@ -2503,8 +2490,8 @@ fn handle_query_operation( mut writer: &mut TcpStream, settings: &ConnectionSett
                                     "context": execution_context.as_ref().map(|context| serde_json::json!({
                                         "placeId": context.place_id,
                                         "appInstanceId": context.app_instance_id,
-                                        "placeRole": context.place_role.as_str(),
-                                        "publicAccess": context.public_access.map(PublicAccess::as_str),
+                                        "placeRole": context.access.role().map(PlaceRole::as_str),
+                                        "publicAccess": context.access.public_access().map(PublicAccess::as_str),
                                     })),
                                 }),
                             );
@@ -2809,7 +2796,7 @@ fn handle_authentication_operation( mut writer: &mut TcpStream, reader: &mut Buf
                             RoutedOperation::DeviceIdentify(Routed { id, .. }) => {
                             let identity_id = identity_or_reject!(id, "authentication is required");
                             let documents = query_documents_or_reject!(id, format!("on _devices | where identityId == {} and state == \"active\" | sort createdAt asc", query_string(identity_id)));
-                            let devices = documents.iter().enumerate().filter_map(|(index, device)| device.get("deviceId").and_then(JsonValue::as_str).map(|device_id| serde_json::json!({"deviceId": device_id, "number": index + 1}))).collect::<Vec<_>>();
+                            let devices = documents.iter().enumerate().filter_map(|(index, device)| device.str_field("deviceId").map(|device_id| serde_json::json!({"deviceId": device_id, "number": index + 1}))).collect::<Vec<_>>();
                             let payload = serde_json::json!({"identityId": identity_id, "expiresAt": unix_time_millis().saturating_add(15_000), "devices": devices});
                             event_engine.publish_to(Audience::identities([identity_id.to_owned()]), "device.identify", payload.clone());
                             reply!(id, payload);
@@ -2866,9 +2853,12 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                     None => true,
                 }
         });
-        if !delegated {
-            if let Err(response)=resolve_file_context(engine,$id,authentication.principal(),!settings.authorization_mode.is_enforced(),$place_id,$instance_id,$write){reject_response!(response);}
-        }
+        if delegated {
+            // The Authority resolved the grant: a delegated write still needs a writing grant.
+            if $write && delegation.and_then(|value| value.access()).is_some_and(|access| !access.can_write()) {
+                reject!($id,"authorization.denied","Place access is read-only for Files");
+            }
+        } else if let Err(response)=resolve_file_context(engine,$id,authentication.principal(),$place_id,$instance_id,$write){reject_response!(response);}
     }}; }
     macro_rules! some_or_reject { ($id:expr,$value:expr,$code:expr,$message:expr)=>{{match $value{Some(value)=>value,None=>reject!($id,$code,$message)}}}; }
     macro_rules! file_store_or_reject { ($id:expr,$result:expr)=>{{match $result{Ok(value)=>value,Err(error)=>{write_file_store_error(&mut writer,$id,error)?;return Ok(true);}}}}; }
@@ -2976,9 +2966,9 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             RoutedOperation::FileVersionRead(Routed { id, input: FileVersionReadInput { place_id, instance_id, file_id, version_id, offset, length } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, false);
                             let version=or_reject!(load_file_version(engine,id,&place_id,&instance_id,&file_id,&version_id));
-                            let Some(remote_id)=version.get("remoteId").and_then(JsonValue::as_str) else {write_response(&mut writer,&QueryResponse::request_error(id,"file.invalid_record","version has no remoteId"))?;return Ok(true);};
+                            let Some(remote_id)=version.str_field("remoteId") else {write_response(&mut writer,&QueryResponse::request_error(id,"file.invalid_record","version has no remoteId"))?;return Ok(true);};
                             let store=or_reject!(scoped_native_version_store(settings,id,&place_id,&instance_id));
-                            let total=version.get("size").and_then(JsonValue::as_u64).unwrap_or(0);
+                            let total=version.u64_field("size").unwrap_or(0);
                             let range=if offset.is_some() || length.is_some(){Some(FileRange::new(offset.unwrap_or(0),length))}else{None};
                             let mut source=file_store_or_reject!(id,store.read(remote_id,range));
                             let start=offset.unwrap_or(0);
@@ -2995,12 +2985,12 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             let current=or_reject!(load_file_entry(engine,id,&place_id,&instance_id,&file_id));
                             let version=or_reject!(load_file_version(engine,id,&place_id,&instance_id,&file_id,&version_id));
                             or_reject!(archive_current_file(engine,settings,id,&current));
-                            let Some(version_remote)=version.get("remoteId").and_then(JsonValue::as_str) else {write_response(&mut writer,&QueryResponse::request_error(id,"file.invalid_record","version has no remoteId"))?;return Ok(true);};
+                            let Some(version_remote)=version.str_field("remoteId") else {write_response(&mut writer,&QueryResponse::request_error(id,"file.invalid_record","version has no remoteId"))?;return Ok(true);};
                             let versions=or_reject!(scoped_native_version_store(settings,id,&place_id,&instance_id));
                             let current_store=or_reject!(scoped_native_file_store(settings,id,&place_id,&instance_id));
                             let mut source=file_store_or_reject!(id,versions.read(version_remote,None));
-                            let size=version.get("size").and_then(JsonValue::as_u64);
-                            let content_type=version.get("contentType").and_then(JsonValue::as_str);
+                            let size=version.u64_field("size");
+                            let content_type=version.str_field("contentType");
                             let stored=file_store_or_reject!(id,current_store.write(FileWrite{remote_id:Some(&current.remote_id),parent_remote_id:None,name:&current.name,content_type,size},&mut source));
                             let updated=FileEntry{file_id:current.file_id,store_id:current.store_id,remote_id:stored.remote_id,parent_id:current.parent_id,name:current.name,kind:stored.kind,metadata:stored.metadata,place_id,app_instance_id:instance_id};
                             match replace_file_entry(engine,id,&updated){
@@ -3019,7 +3009,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             RoutedOperation::FileVersionDelete(Routed { id, input: FileVersionInput { place_id, instance_id, file_id, version_id } }) => {
                             ensure_file_access!(id, &place_id, &instance_id, true);
                             let version=or_reject!(load_file_version(engine,id,&place_id,&instance_id,&file_id,&version_id));
-                            let Some(remote_id)=version.get("remoteId").and_then(JsonValue::as_str) else {write_response(&mut writer,&QueryResponse::request_error(id,"file.invalid_record","version has no remoteId"))?;return Ok(true);};
+                            let Some(remote_id)=version.str_field("remoteId") else {write_response(&mut writer,&QueryResponse::request_error(id,"file.invalid_record","version has no remoteId"))?;return Ok(true);};
                             let store=or_reject!(scoped_native_version_store(settings,id,&place_id,&instance_id));
                             if let Err(error)=store.delete(remote_id){write_file_store_error(&mut writer,id,error)?;return Ok(true);}
                             match delete_file_version_metadata(engine,id,&place_id,&instance_id,&file_id,&version_id){
@@ -3164,9 +3154,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                                 } else {
                                                     "other"
                                                 };
-                                                let observed_modified_at = metadata.modified().ok()
-                                                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-                                                    .map(|value| value.as_millis() as u64);
+                                                let observed_modified_at = metadata.modified().ok().and_then(system_time_millis);
                                                 let observed_size = metadata.is_file().then_some(metadata.len());
                                                 serde_json::json!({
                                                     "exists": true,
@@ -3208,17 +3196,17 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                                 }
                             }
                             diagnostics.sort_by(|left, right| {
-                                left.get("path").and_then(JsonValue::as_str).unwrap_or_default()
-                                    .cmp(right.get("path").and_then(JsonValue::as_str).unwrap_or_default())
+                                left.str_field("path").unwrap_or_default()
+                                    .cmp(right.str_field("path").unwrap_or_default())
                             });
                             let mut reason_counts = reasons.into_iter()
                                 .map(|(reason, count)| serde_json::json!({"reason": reason, "count": count}))
                                 .collect::<Vec<_>>();
                             reason_counts.sort_by(|left, right| {
-                                std::cmp::Reverse(left.get("count").and_then(JsonValue::as_u64).unwrap_or_default())
-                                    .cmp(&std::cmp::Reverse(right.get("count").and_then(JsonValue::as_u64).unwrap_or_default()))
-                                    .then_with(|| left.get("reason").and_then(JsonValue::as_str).unwrap_or_default()
-                                        .cmp(right.get("reason").and_then(JsonValue::as_str).unwrap_or_default()))
+                                std::cmp::Reverse(left.u64_field("count").unwrap_or_default())
+                                    .cmp(&std::cmp::Reverse(right.u64_field("count").unwrap_or_default()))
+                                    .then_with(|| left.str_field("reason").unwrap_or_default()
+                                        .cmp(right.str_field("reason").unwrap_or_default()))
                             });
                             reply!(id, serde_json::json!({
                                 "configured": runtime.config.is_some(),
@@ -3462,7 +3450,7 @@ fn handle_file_operation( mut writer: &mut TcpStream, reader: &mut BufReader<Tcp
                             let mut deleted=0u64;
                             let mut failed=None;
                             for entry in entries {
-                                let Some(file_id)=entry.get("fileId").and_then(JsonValue::as_str) else {continue;};
+                                let Some(file_id)=entry.str_field("fileId") else {continue;};
                                 match permanently_delete_file_tree(engine,settings,id,&place_id,&instance_id,file_id){
                                     Ok(())=>deleted=deleted.saturating_add(1),
                                     Err(response)=>{failed=Some(response);break;}
@@ -3504,6 +3492,10 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 RoutedOperation::CoreHealth(Routed { id, .. }) => {
                                 reply!(id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), "compiledCapabilities": ServiceCapabilities::compiled().names(), "buildFeatures": build_profile::feature_names(), }),);
                             }
+                                RoutedOperation::CoreDiscover(Routed { id, .. }) => {
+                                // Public hello: the Core options a client needs before choosing its entry flow.
+                                reply!(id, serde_json::json!({ "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "enrollmentMode": settings.enrollment_mode.as_str(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), }),);
+                            }
                                 RoutedOperation::CoreOperations(Routed { id, .. }) => {
                                 let operations = OPERATION_CATALOG
                                     .iter()
@@ -3511,6 +3503,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     .map(|operation| serde_json::json!({
                                         "name": operation.name,
                                         "capability": operation.kind.provider_capability().map(ServiceCapability::as_str),
+                                        "access": operation.access.as_str(),
                                         "transport": operation.transport.as_str(),
                                         "connection": operation.connection.as_str(),
                                     }))
@@ -3578,7 +3571,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 unreachable!("fabric resource authority requires db-engine");
                             }
                                 RoutedOperation::NodeStatus(Routed { id, .. }) => {
-                                let state = *settings.gateway_state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let state = *lock_unpoisoned(&settings.gateway_state);
                                 reply!(id, serde_json::json!({ "upstream": settings.upstream.as_deref(), "state": state, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), "compiledCapabilities": ServiceCapabilities::compiled().names(), "buildFeatures": build_profile::feature_names(), }),);
                             }
                                 RoutedOperation::Ping(Routed { id, .. }) => {
@@ -3743,8 +3736,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                                 principal: delegated.principal.clone(),
                                                 place_id: requested.place_id.clone(),
                                                 app_instance_id: requested.app_instance_id.clone(),
-                                                place_role,
-                                                public_access: None,
+                                                access: PlaceAccess::Role(place_role),
                                             }
                                         } else {
                                             let Some(engine) = agent_engine else {
@@ -3759,7 +3751,6 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                                 id,
                                                 authentication.principal(),
                                                 requested.clone(),
-                                                !settings.authorization_mode.is_enforced(),
                                             ) {
                                                 Ok(context) => context,
                                                 Err(response) => reject_response!(response),
@@ -3886,7 +3877,6 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                                 place_id: place_id.to_owned(),
                                                 app_instance_id: app_instance_id.clone(),
                                             },
-                                            !settings.authorization_mode.is_enforced(),
                                         ));
                                     }
                                 } else {
@@ -4046,7 +4036,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 let documents = query_documents_or_reject!(id, format!("on _devices | where identityId == {} | sort createdAt asc", query_string(&identity_id)));
                                 let devices = documents.into_iter().map(|mut device| {
                                     if let Some(object) = device.as_object_mut() {
-                                        let current = object.get("deviceId").and_then(JsonValue::as_str) == Some(current_device_id.as_str());
+                                        let current = object.str_field("deviceId") == Some(current_device_id.as_str());
                                         object.insert("current".to_owned(), JsonValue::Bool(current));
                                     }
                                     device
@@ -4196,18 +4186,17 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 reply!(id, serde_json::json!({ "placeId": place_id, "name": name, "mood": mood, "ownerIdentityId": owner_identity_id, "role": PlaceRole::Owner.as_str(), "publicAccess": public_access.map(PublicAccess::as_str), "state": "active", "createdAt": created_at, }),);
                             }
                                 RoutedOperation::PlaceList(Routed { id, .. }) => {
-                                if settings.authorization_mode.is_enforced() {
-                                    let identity_id = identity_or_reject!(id, "an authenticated identity is required to list Places");
-                                    respond!(id, list_places_for_identity(engine, id, identity_id), |places| serde_json::json!({ "places": places }));
-                                } else {
-                                    respond!(id, list_public_places(engine, id), |places| serde_json::json!({ "places": places }));
+                                // Scope + public: the Places of the presented identity (with their role),
+                                // plus every public Place. Without an identity, only the public Places.
+                                match principal_identity_id(authentication.principal()) {
+                                    Some(identity_id) => respond!(id, list_places_for_identity_and_public(engine, id, identity_id), |places| serde_json::json!({ "places": places })),
+                                    None => respond!(id, list_public_places(engine, id), |places| serde_json::json!({ "places": places })),
                                 }
                             }
                                 RoutedOperation::PlaceGet(Routed { id, input: PlaceIdInput { place_id } }) => {
                                 let place = or_reject!(load_place(engine, id, &place_id));
-                                let role = or_reject!(resolve_place_access_for_principal(engine, id, authentication.principal(), &place, !settings.authorization_mode.is_enforced()));
-                                let public_role = matches!(authentication.principal(), Principal::Anonymous);
-                                reply!(id, place.to_json((!public_role).then_some(role)));
+                                let access = or_reject!(resolve_place_access_for_principal(engine, id, authentication.principal(), &place));
+                                reply!(id, place.to_json(access.role()));
                             }
                             RoutedOperation::PlaceUpdate(Routed { id, input: PlaceUpdateInput { place_id, name, title, subtitle, color_scheme, app_order, updated_at }, }) => {
                                 let identity_id = identity_or_reject!(id, "an authenticated identity is required to update a Place");
@@ -4342,13 +4331,28 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 execute_publish_reply!(id, query, audience, "place.public.updated", serde_json::json!({"placeId": place_id, "publicAccess": public_access.map(PublicAccess::as_str)}), serde_json::json!({"placeId": place_id, "publicAccess": public_access.map(PublicAccess::as_str)}));
                             }
                                 RoutedOperation::PlaceResourceList(Routed { id, input: PlaceIdInput { place_id } }) => {
-                                let identity_id = identity_or_reject!(id, "an authenticated identity is required to inspect Place resources");
                                 let place = or_reject!(load_place(engine, id, &place_id));
-                                place_role_or_reject!(id, identity_id, &place);
+                                let access = or_reject!(resolve_place_access_for_principal(engine, id, authentication.principal(), &place));
+                                if let PlaceAccess::Public(public_access) = access {
+                                    // Outside the scope, only the routing a Gateway needs to reach the
+                                    // assigned providers is returned: never the members' Devices.
+                                    let fabric_defaults = or_reject!(load_fabric_defaults(engine, id));
+                                    reply!(id, serde_json::json!({
+                                        "placeId": place_id,
+                                        "assignments": place.resource_assignments,
+                                        "eligibleDevices": active_devices_for_assignments(engine, id, &place.resource_assignments),
+                                        "fabricDefaults": fabric_defaults,
+                                        "fabricDefaultDevices": active_devices_for_assignments(engine, id, &fabric_defaults),
+                                        "fabricCanManage": false,
+                                        "placeRole": JsonValue::Null,
+                                        "publicAccess": public_access.as_str(),
+                                    }));
+                                    return Ok(());
+                                }
                                 let access_entries = or_reject!(list_place_access(engine, id, &place));
                                 let mut eligible_identity_ids = vec![place.owner_identity_id.clone()];
                                 for entry in &access_entries {
-                                    if entry.get("state").and_then(JsonValue::as_str) == Some("active") {
+                                    if entry.str_field("state") == Some("active") {
                                         if let Some(target) = entry.get("identityId").or_else(|| entry.get("target")).and_then(JsonValue::as_str) {
                                             if !eligible_identity_ids.iter().any(|value| value == target) { eligible_identity_ids.push(target.to_owned()); }
                                         }
@@ -4357,9 +4361,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 let mut eligible_devices = Vec::new();
                                 for identity in &eligible_identity_ids {
                                     let query = format!("on _devices | where identityId == {} and state == \"active\" | select identityId, deviceId, publicKey | sort deviceId", query_string(identity));
-                                    if let QueryResponse::Ok { documents, .. } = execute_request(engine, QueryRequest::new(id, query)) {
-                                        eligible_devices.extend(documents);
-                                    }
+                                    eligible_devices.extend(query_documents(engine, id, query).unwrap_or_default());
                                 }
                                 let fabric_defaults = or_reject!(load_fabric_defaults(engine, id));
                                 let fabric_default_devices = active_devices_for_assignments(engine, id, &fabric_defaults);
@@ -4372,6 +4374,8 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     "fabricDefaults": fabric_defaults,
                                     "fabricDefaultDevices": fabric_default_devices,
                                     "fabricCanManage": fabric_can_manage,
+                                    "placeRole": access.role().map(PlaceRole::as_str),
+                                    "publicAccess": JsonValue::Null,
                                 }));
                             }
                             RoutedOperation::PlaceResourceSet(Routed { id, input: PlaceResourceSetInput { place_id, identity_id: node_identity_id, device_id: node_device_id, capability, role, service_role, storage_role } }) => {
@@ -4431,7 +4435,6 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 let context = match resolve_query_execution_context(
                                     engine, id, authentication.principal(),
                                     RequestedExecutionContext { place_id, app_instance_id },
-                                    !settings.authorization_mode.is_enforced(),
                                 ) {
                                     Ok(context) => context,
                                     Err(response) => reject_response!(response),
@@ -4439,7 +4442,8 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 reply!(id, serde_json::json!({
                                     "placeId": context.place_id,
                                     "appInstanceId": context.app_instance_id,
-                                    "placeRole": context.place_role.as_str(),
+                                    "placeRole": context.access.role().map(PlaceRole::as_str),
+                                    "publicAccess": context.access.public_access().map(PublicAccess::as_str),
                                 }));
                             }
                             RoutedOperation::AppCreate(Routed { id, input: AppCreateInput { app_id, place_id, name, version, definition, created_at }, }) => {
@@ -4475,12 +4479,20 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 reply!(id, serde_json::json!({"appId": app_id, "placeId": place_id, "instanceId": instance_id, "name": name, "version": version, "definition": definition, "createdBy": identity_id, "state": "active", "createdAt": created_at}));
                             }
                                 RoutedOperation::AppList(Routed { id, .. }) => {
-                                if settings.authorization_mode.is_enforced() { identity_or_reject!(id, "an authenticated identity is required to list Apps"); }
                                 let documents = query_documents_or_reject!(id, "on _apps | where state == \"active\" | sort name");
+                                // Without an identity under enforcement, reading an App definition is a read
+                                // on a public Place where it is instantiated: only those Apps are listed.
+                                let documents = if settings.authorization_mode.is_enforced() && principal_identity_id(authentication.principal()).is_none() {
+                                    let readable = or_reject!(public_place_app_ids(engine, id));
+                                    documents.into_iter().filter(|document| document.str_field("appId").is_some_and(|app_id| readable.contains(app_id))).collect()
+                                } else { documents };
                                 reply!(id, serde_json::json!({ "apps": documents }));
                             }
                                 RoutedOperation::AppGet(Routed { id, input: AppIdInput { app_id } }) => {
-                                if settings.authorization_mode.is_enforced() { identity_or_reject!(id, "an authenticated identity is required to read an App"); }
+                                if settings.authorization_mode.is_enforced() && principal_identity_id(authentication.principal()).is_none()
+                                    && !or_reject!(public_place_app_ids(engine, id)).contains(&app_id) {
+                                    reject!(id, "authorization.required", "an authenticated identity is required to read an App outside public Places");
+                                }
                                 reply!(id, or_reject!(load_app_definition(engine, id, &app_id)));
                             }
                                 RoutedOperation::AppUpdate(Routed { id, input: AppUpdateInput { app_id, place_id, name, version, definition, maintainers, updated_at }, }) => {
@@ -4496,7 +4508,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     if links.is_empty() {
                                         reject!(id, "app.not_in_place", "the App is not attached to this Place");
                                     }
-                                    let owner_place_id = app.get("ownerPlaceId").and_then(JsonValue::as_str);
+                                    let owner_place_id = app.str_field("ownerPlaceId");
                                     if owner_place_id.is_some_and(|owner| owner != place_id) {
                                         reject!(id, "app.update_forbidden", "this Place does not own the App definition");
                                     }
@@ -4577,12 +4589,12 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                             }
                                 RoutedOperation::AppInstanceList(Routed { id, input: PlaceIdInput { place_id } }) => {
                                 let place = or_reject!(load_place(engine, id, &place_id));
-                                let role = or_reject!(resolve_place_access_for_principal(engine, id, authentication.principal(), &place, !settings.authorization_mode.is_enforced()));
+                                let access = or_reject!(resolve_place_access_for_principal(engine, id, authentication.principal(), &place));
                                 let documents = query_documents_or_reject!(id, format!(
                                     "on _app_instances | where placeId == {} and state == \"active\" | sort createdAt",
                                     query_string(&place_id),
                                 ));
-                                reply!(id, serde_json::json!({"placeId": place_id, "role": role.as_str(), "instances": documents}));
+                                reply!(id, serde_json::json!({"placeId": place_id, "role": access.role().map(PlaceRole::as_str), "publicAccess": access.public_access().map(PublicAccess::as_str), "instances": documents}));
                             }
                                 RoutedOperation::AppInstanceRemove(Routed { id, input: AppInstanceRemoveInput { instance_id, removed_at }, }) => {
                                 let identity_id = identity_or_reject!(id, "an authenticated identity is required to remove an App");
@@ -4599,9 +4611,8 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                 reply!(id, serde_json::json!({ "instanceId": instance_id, "placeId": instance.place_id, "state": "removed", "removedAt": removed_at, }),);
                             }
                                 RoutedOperation::DataAnalyze(Routed { id, input: DataAnalyzeInput { place_id, files_instance_id, file_id, worker_result, .. } }) => {
-                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to analyze data");
-                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
-                                    if !role.can_write(){reject!(id,"authorization.denied","data analysis requires write access to the Place");}
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let access=or_reject!(resolve_place_access_for_principal(engine,id,authentication.principal(),&place));
+                                    if !access.can_write(){reject!(id,"authorization.denied","data analysis requires write access to the Place");}
                                     let result=if let Some(result)=worker_result {
                                         result
                                     } else if settings.service_capabilities.contains(ServiceCapability::DataImport) {
@@ -4609,30 +4620,29 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     } else {
                                         reject!(id,"capability.unavailable","data.analyze requires a data.import worker result on this database node");
                                     };
-                                    let fingerprint=result.get("fingerprint").and_then(JsonValue::as_str).unwrap_or_default();
+                                    let fingerprint=result.str_field("fingerprint").unwrap_or_default();
                                     let mappings=if fingerprint.is_empty(){Vec::new()}else{query_documents_or_reject!(id,format!("on _data_mappings | where placeId == {} and fingerprint == {} and state == \"active\" | limit 5",query_string(&place_id),query_string(fingerprint)))};
                                     let mut response=result; if let Some(object)=response.as_object_mut(){object.insert("recognized".into(),JsonValue::Bool(!mappings.is_empty())); object.insert("mappings".into(),JsonValue::Array(mappings));}
                                     reply!(id,response);
                                 }
                                 RoutedOperation::DataMappingSave(Routed { id, input: DataMappingSaveInput { place_id, fingerprint, name, target_app_id, target_table, definition } }) => {
-                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to save a mapping");
-                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
-                                    if !role.can_write(){reject!(id,"authorization.denied","saving a Mapping requires write access to the Place");}
+                                    let actor=principal_actor(authentication.principal());
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let access=or_reject!(resolve_place_access_for_principal(engine,id,authentication.principal(),&place));
+                                    if !access.can_write(){reject!(id,"authorization.denied","saving a Mapping requires write access to the Place");}
                                     let mapping_id=UuidV7Generator::new().next_id().to_string(); let now=unix_time_millis();
-                                    let query=format!("on _data_mappings | insert {{mappingId:{},placeId:{},fingerprint:{},name:{},targetAppId:{},targetTable:{},definition:{},createdBy:{},state:\"active\",createdAt:{}}}",query_string(&mapping_id),query_string(&place_id),query_string(&fingerprint),query_string(&name),query_string(&target_app_id),query_string(&target_table),serde_json::to_string(&definition).expect("mapping serializes"),query_string(identity_id),now);
+                                    let query=format!("on _data_mappings | insert {{mappingId:{},placeId:{},fingerprint:{},name:{},targetAppId:{},targetTable:{},definition:{},createdBy:{},state:\"active\",createdAt:{}}}",query_string(&mapping_id),query_string(&place_id),query_string(&fingerprint),query_string(&name),query_string(&target_app_id),query_string(&target_table),serde_json::to_string(&definition).expect("mapping serializes"),query_string(&actor),now);
                                     execute_query_or_reject!(id,query); reply!(id,serde_json::json!({"mappingId":mapping_id,"fingerprint":fingerprint,"name":name,"targetAppId":target_app_id,"targetTable":target_table,"definition":definition}));
                                 }
                                 RoutedOperation::DataMappingList(Routed { id, input: DataMappingListInput { place_id, fingerprint } }) => {
-                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to list mappings");
-                                    let place=or_reject!(load_place(engine,id,&place_id)); let _role=place_role_or_reject!(id,identity_id,&place);
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let _access=or_reject!(resolve_place_access_for_principal(engine,id,authentication.principal(),&place));
                                     let fingerprint_filter=fingerprint.as_deref().map(|value|format!(" and fingerprint == {}",query_string(value))).unwrap_or_default();
                                     let mappings=query_documents_or_reject!(id,format!("on _data_mappings | where placeId == {}{} and state == \"active\"",query_string(&place_id),fingerprint_filter));
                                     reply!(id,serde_json::json!({"placeId":place_id,"mappings":mappings}));
                                 }
                                 RoutedOperation::DataMappingUpdate(Routed { id, input: DataMappingUpdateInput { place_id, mapping_id, name, target_app_id, target_table, definition } }) => {
-                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to update a mapping");
-                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
-                                    if !role.can_write(){reject!(id,"authorization.denied","updating a Mapping requires write access to the Place");}
+                                    let actor=principal_actor(authentication.principal());
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let access=or_reject!(resolve_place_access_for_principal(engine,id,authentication.principal(),&place));
+                                    if !access.can_write(){reject!(id,"authorization.denied","updating a Mapping requires write access to the Place");}
                                     let existing=query_documents_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&mapping_id),query_string(&place_id)));
                                     if existing.is_empty(){reject!(id,"data.mapping_not_found","mapping was not found in this Place");}
                                     let mut assignments=Vec::new();
@@ -4640,28 +4650,27 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     if let Some(value)=target_app_id { assignments.push(format!("targetAppId = {}",query_string(&value))); }
                                     if let Some(value)=target_table { assignments.push(format!("targetTable = {}",query_string(&value))); }
                                     if let Some(value)=definition { assignments.push(format!("definition = {}",serde_json::to_string(&value).expect("mapping definition serializes"))); }
-                                    assignments.push(format!("updatedBy = {}",query_string(identity_id))); assignments.push(format!("updatedAt = {}",unix_time_millis()));
+                                    assignments.push(format!("updatedBy = {}",query_string(&actor))); assignments.push(format!("updatedAt = {}",unix_time_millis()));
                                     execute_query_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | set {}",query_string(&mapping_id),query_string(&place_id),assignments.join(", ")));
                                     let mapping=query_documents_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&mapping_id),query_string(&place_id))).into_iter().next();
                                     reply!(id,serde_json::json!({"mapping":mapping}));
                                 }
                                 RoutedOperation::DataMappingDelete(Routed { id, input: DataMappingDeleteInput { place_id, mapping_id } }) => {
-                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to delete a mapping");
-                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
-                                    if !role.can_write(){reject!(id,"authorization.denied","deleting a Mapping requires write access to the Place");}
+                                    let actor=principal_actor(authentication.principal());
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let access=or_reject!(resolve_place_access_for_principal(engine,id,authentication.principal(),&place));
+                                    if !access.can_write(){reject!(id,"authorization.denied","deleting a Mapping requires write access to the Place");}
                                     let existing=query_documents_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&mapping_id),query_string(&place_id)));
                                     if existing.is_empty(){reject!(id,"data.mapping_not_found","mapping was not found in this Place");}
                                     let deleted_at=unix_time_millis();
-                                    execute_query_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | set state = \"deleted\", deletedBy = {}, deletedAt = {}",query_string(&mapping_id),query_string(&place_id),query_string(identity_id),deleted_at));
+                                    execute_query_or_reject!(id,format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\" | set state = \"deleted\", deletedBy = {}, deletedAt = {}",query_string(&mapping_id),query_string(&place_id),query_string(&actor),deleted_at));
                                     reply!(id,serde_json::json!({"mappingId":mapping_id,"placeId":place_id,"state":"deleted","deletedAt":deleted_at}));
                                 }
                                 RoutedOperation::DataImport(Routed { id, input: DataImportInput { place_id, files_instance_id, file_id, target_instance_id, table, mapping, mode, worker_result, plan_only } }) => {
-                                    let identity_id=identity_or_reject!(id,"an authenticated identity is required to import data");
-                                    let place=or_reject!(load_place(engine,id,&place_id)); let role=place_role_or_reject!(id,identity_id,&place);
-                                    if !role.can_write(){reject!(id,"authorization.denied","data import requires write access to the Place");}
+                                    let place=or_reject!(load_place(engine,id,&place_id)); let access=or_reject!(resolve_place_access_for_principal(engine,id,authentication.principal(),&place));
+                                    if !access.can_write(){reject!(id,"authorization.denied","data import requires write access to the Place");}
                                     let instance_docs=query_documents_or_reject!(id,format!("on _app_instances | where instanceId == {} and placeId == {} and state == \"active\" | limit 1",query_string(&target_instance_id),query_string(&place_id)));
                                     let Some(instance_doc)=instance_docs.first() else {reject!(id,"app.instance_not_found","target App instance was not found in this Place");};
-                                    let app_id=instance_doc.get("appId").and_then(JsonValue::as_str).unwrap_or_default(); if app_id.is_empty(){reject!(id,"app.invalid_instance_record","target App instance has no appId");}
+                                    let app_id=instance_doc.str_field("appId").unwrap_or_default(); if app_id.is_empty(){reject!(id,"app.invalid_instance_record","target App instance has no appId");}
                                     let app=or_reject!(load_app_definition(engine,id,app_id)); let collection=match resolve_app_table_collection(&app,&table){Some(v)=>v,None=>reject!(id,"data.invalid_target","target table is not declared by the App")};
                                     let result=if let Some(result)=worker_result {
                                         result
@@ -4670,7 +4679,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                     } else {
                                         reject!(id,"capability.unavailable","data.import requires a data.import worker result on this database node");
                                     };
-                                    let documents=result.get("documents").and_then(JsonValue::as_array).cloned().unwrap_or_default();
+                                    let documents=result.array_field("documents").cloned().unwrap_or_default();
                                     if documents.iter().any(|document| !document.is_object()) {
                                         reject!(id,"data.invalid_worker_output","data worker returned a non-object document");
                                     }
@@ -4684,7 +4693,8 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                             "status":"planned",
                                             "placeId":place_id,
                                             "appInstanceId":target_instance_id,
-                                            "placeRole":role.as_str(),
+                                            "placeRole":access.role().map(PlaceRole::as_str),
+                                            "publicAccess":access.public_access().map(PublicAccess::as_str),
                                             "collection":collection,
                                             "mode":mode,
                                             "rows":documents.len(),
@@ -4705,8 +4715,7 @@ fn handle_standard_operation( mut writer: &mut TcpStream, settings: &ConnectionS
                                         principal:authentication.principal().clone(),
                                         place_id:place_id.clone(),
                                         app_instance_id:Some(target_instance_id.clone()),
-                                        place_role:role,
-                                        public_access:None,
+                                        access,
                                     };
 
                                     if mode=="replace" || mode=="replace_all" {
@@ -4818,40 +4827,21 @@ fn pending_auth_subject(authentication: &ConnectionAuth) -> Option<(String, Stri
 
 fn try_load_device_credential( engine: &Engine, request_id: RequestId, identity_id: &str, device_id: &str, ) -> Result<Option<DeviceCredential>, QueryResponse> {
     let query = format!( "on _devices | where deviceId == {} and identityId == {} | limit 1", query_string(device_id), query_string(identity_id), );
-    let response = execute_request(engine, QueryRequest::new(request_id, query));
-    match response {
-        QueryResponse::Ok { documents, .. } => {
-            let Some(document) = documents.into_iter().next() else {
-                return Ok(None);
-            };
-            let text = |field: &str| {
-                document
-                    .get(field)
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned)
-            };
-            let credential = DeviceCredential {
-                identity_id: text("identityId").unwrap_or_default(),
-                device_id: text("deviceId").unwrap_or_default(),
-                public_key: text("publicKey").unwrap_or_default(),
-                algorithm: text("algorithm").unwrap_or_default(),
-                encoding: text("encoding").unwrap_or_default(),
-                active: document.get("state").and_then(JsonValue::as_str) == Some("active"),
-            };
-            if credential.identity_id.is_empty()
-                || credential.device_id.is_empty()
-                || credential.public_key.is_empty()
-            {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "auth.invalid_device_record",
-                    "device credential is incomplete",
-                ));
-            }
-            Ok(Some(credential))
-        }
-        error @ QueryResponse::Error { .. } => Err(error),
+    let Some(document) = query_first(engine, request_id, query)? else {
+        return Ok(None);
+    };
+    let credential = DeviceCredential {
+        identity_id: document.string_field("identityId"),
+        device_id: document.string_field("deviceId"),
+        public_key: document.string_field("publicKey"),
+        algorithm: document.string_field("algorithm"),
+        encoding: document.string_field("encoding"),
+        active: document.str_field("state") == Some("active"),
+    };
+    if credential.identity_id.is_empty() || credential.device_id.is_empty() || credential.public_key.is_empty() {
+        return Err(QueryResponse::request_error(request_id, "auth.invalid_device_record", "device credential is incomplete"));
     }
+    Ok(Some(credential))
 }
 
 fn load_device_credential( engine: &Engine, request_id: RequestId, identity_id: &str, device_id: &str, ) -> Result<DeviceCredential, QueryResponse> {
@@ -4875,26 +4865,26 @@ fn place_resource_capability_allowed(value: &str) -> bool {
 
 
 fn resource_assignment_service_role(entry: &JsonValue) -> Option<&str> {
-    if let Some(role) = entry.get("serviceRole").and_then(JsonValue::as_str) {
+    if let Some(role) = entry.str_field("serviceRole") {
         return match role {
             "primary" | "replica" => Some(role),
             _ => None,
         };
     }
-    match entry.get("role").and_then(JsonValue::as_str) {
+    match entry.str_field("role") {
         Some(role @ ("primary" | "replica")) => Some(role),
         _ => None,
     }
 }
 
 fn resource_assignment_storage_role(entry: &JsonValue) -> Option<&str> {
-    if let Some(role) = entry.get("storageRole").and_then(JsonValue::as_str) {
+    if let Some(role) = entry.str_field("storageRole") {
         return match role {
             "provider" | "sync" => Some(role),
             _ => None,
         };
     }
-    match entry.get("role").and_then(JsonValue::as_str) {
+    match entry.str_field("role") {
         Some(role @ ("provider" | "sync")) => Some(role),
         _ => None,
     }
@@ -4911,14 +4901,14 @@ fn upsert_resource_assignment( mut assignments: Vec<JsonValue>, assigned_by: &st
         let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
         let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
         let same_device = stored_device.is_none() || stored_device == Some(device_id);
-        same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability)
+        same_identity && same_device && entry.str_field("capability") == Some(capability)
     }).cloned();
 
     assignments.retain(|entry| {
         let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
         let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
         let same_device = stored_device.is_none() || stored_device == Some(device_id);
-        !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability))
+        !(same_identity && same_device && entry.str_field("capability") == Some(capability))
     });
 
     if capability == "files" {
@@ -4948,7 +4938,7 @@ fn upsert_resource_assignment( mut assignments: Vec<JsonValue>, assigned_by: &st
         }
         if next_service_role.as_deref() == Some("primary") {
             assignments.retain(|entry| {
-                entry.get("capability").and_then(JsonValue::as_str) != Some("files")
+                entry.str_field("capability") != Some("files")
                     || resource_assignment_service_role(entry) != Some("primary")
             });
         }
@@ -4981,8 +4971,8 @@ fn upsert_resource_assignment( mut assignments: Vec<JsonValue>, assigned_by: &st
     }
     if role == "primary" {
         assignments.retain(|entry| {
-            entry.get("capability").and_then(JsonValue::as_str) != Some(capability)
-                || entry.get("role").and_then(JsonValue::as_str) != Some("primary")
+            entry.str_field("capability") != Some(capability)
+                || entry.str_field("role") != Some("primary")
         });
     }
     assignments.push(serde_json::json!({
@@ -5001,7 +4991,7 @@ fn remove_resource_assignment( mut assignments: Vec<JsonValue>, identity_id: &st
         let same_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str) == Some(identity_id);
         let stored_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
         let same_device = stored_device.is_none() || stored_device == Some(device_id);
-        !(same_identity && same_device && entry.get("capability").and_then(JsonValue::as_str) == Some(capability))
+        !(same_identity && same_device && entry.str_field("capability") == Some(capability))
     });
     assignments
 }
@@ -5011,17 +5001,10 @@ fn load_fabric_defaults(engine: &Engine, request_id: RequestId) -> Result<Vec<Js
         "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
         query_string(FABRIC_DEFAULTS_ID),
     );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => Ok(documents
-            .first()
-            .and_then(|document| document.get("resourceAssignments"))
-            .and_then(JsonValue::as_array)
-            .cloned()
-            .unwrap_or_default()),
-        // Older stores legitimately do not have this collection yet. Treat that
-        // as "no defaults"; the first fabric.resource.set will create the record.
-        QueryResponse::Error { .. } => Ok(Vec::new()),
-    }
+    // Older stores legitimately do not have this collection yet. Treat that
+    // as "no defaults"; the first fabric.resource.set will create the record.
+    let document = query_first(engine, request_id, query).ok().flatten();
+    Ok(document.and_then(|document| document.array_field("resourceAssignments").cloned()).unwrap_or_default())
 }
 
 fn save_fabric_defaults(engine: &Engine, request_id: RequestId, assignments: &[JsonValue]) -> Result<(), QueryResponse> {
@@ -5031,11 +5014,7 @@ fn save_fabric_defaults(engine: &Engine, request_id: RequestId, assignments: &[J
         "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
         query_string(FABRIC_DEFAULTS_ID),
     );
-    let exists = matches!(
-        execute_request(engine, QueryRequest::new(request_id, lookup)),
-        QueryResponse::Ok { documents, .. } if !documents.is_empty()
-    );
-    let query = if exists {
+    let query = if query_has_rows(engine, request_id, lookup) {
         format!(
             "on _fabric_resources | where fabricId == {} and state == \"active\" | set resourceAssignments = {encoded}, updatedAt = {now}",
             query_string(FABRIC_DEFAULTS_ID),
@@ -5046,10 +5025,7 @@ fn save_fabric_defaults(engine: &Engine, request_id: RequestId, assignments: &[J
             query_string(FABRIC_DEFAULTS_ID),
         )
     };
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { .. } => Ok(()),
-        error @ QueryResponse::Error { .. } => Err(error),
-    }
+    query_documents(engine, request_id, query).map(drop)
 }
 
 fn active_devices_for_assignments(engine: &Engine, request_id: RequestId, assignments: &[JsonValue]) -> Vec<JsonValue> {
@@ -5063,9 +5039,7 @@ fn active_devices_for_assignments(engine: &Engine, request_id: RequestId, assign
             "on _devices | where identityId == {} and deviceId == {} and state == \"active\" | select identityId, deviceId, publicKey | limit 1",
             query_string(identity_id), query_string(device_id),
         );
-        if let QueryResponse::Ok { documents, .. } = execute_request(engine, QueryRequest::new(request_id, query)) {
-            devices.extend(documents);
-        }
+        devices.extend(query_documents(engine, request_id, query).unwrap_or_default());
     }
     devices
 }
@@ -5110,6 +5084,11 @@ struct AppInstanceRecord {
     place_id: String,
 }
 
+/// Stable attribution for records written by a principal (`anonymous` without identity).
+fn principal_actor(principal: &Principal) -> String {
+    principal_identity_id(principal).unwrap_or("anonymous").to_owned()
+}
+
 fn principal_identity_id(principal: &Principal) -> Option<&str> {
     match principal {
         Principal::Identity { identity_id, .. } => Some(identity_id.as_str()),
@@ -5119,92 +5098,67 @@ fn principal_identity_id(principal: &Principal) -> Option<&str> {
 
 fn load_place( engine: &Engine, request_id: RequestId, place_id: &str, ) -> Result<PlaceRecord, QueryResponse> {
     let query = format!( "on _places | where placeId == {} and state == \"active\" | limit 1", query_string(place_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => {
-            let Some(document) = documents.into_iter().next() else {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "place.not_found",
-                    "Place was not found",
-                ));
-            };
-            let place_id = document
-                .get("placeId")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let name = document
-                .get("name")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let mood = document
-                .get("mood")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let title = document.get("title").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
-            let subtitle = document.get("subtitle").and_then(JsonValue::as_str).unwrap_or_default().to_owned();
-            let color_scheme = document.get("colorScheme").and_then(JsonValue::as_str).unwrap_or("glacier").to_owned();
-            let app_order = document.get("appOrder").and_then(JsonValue::as_array).map(|items| items.iter().filter_map(JsonValue::as_str).map(str::to_owned).collect()).unwrap_or_default();
-            let resource_assignments = document.get("resourceAssignments").and_then(JsonValue::as_array).cloned().unwrap_or_default();
-            let owner_identity_id = document
-                .get("ownerIdentityId")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let public_access = match document.get("publicAccess").and_then(JsonValue::as_str) {
-                None => None,
-                Some("readonly") => Some(PublicAccess::Readonly),
-                Some("readwrite") => Some(PublicAccess::Readwrite),
-                Some(_) => {
-                    return Err(QueryResponse::request_error(
-                        request_id,
-                        "place.invalid_record",
-                        "Place publicAccess must be readonly or readwrite",
-                    ));
-                }
-            };
-            let created_at = document.get("createdAt").and_then(JsonValue::as_u64);
-            if place_id.is_empty() || name.is_empty() || owner_identity_id.is_empty() {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "place.invalid_record",
-                    "Place record is incomplete",
-                ));
-            }
-            Ok(PlaceRecord {
-                place_id,
-                name,
-                mood,
-                title,
-                subtitle,
-                color_scheme,
-                app_order,
-                resource_assignments,
-                owner_identity_id,
-                public_access,
-                created_at,
-            })
+    let Some(document) = query_first(engine, request_id, query)? else {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "place.not_found",
+            "Place was not found",
+        ));
+    };
+    let place_id = document.string_field("placeId");
+    let name = document.string_field("name");
+    let mood = document.string_field("mood");
+    let title = document.string_field("title");
+    let subtitle = document.string_field("subtitle");
+    let color_scheme = document.str_field("colorScheme").unwrap_or("glacier").to_owned();
+    let app_order = document.array_field("appOrder").map(|items| items.iter().filter_map(JsonValue::as_str).map(str::to_owned).collect()).unwrap_or_default();
+    let resource_assignments = document.array_field("resourceAssignments").cloned().unwrap_or_default();
+    let owner_identity_id = document.string_field("ownerIdentityId");
+    let public_access = match document.str_field("publicAccess") {
+        None => None,
+        Some("readonly") => Some(PublicAccess::Readonly),
+        Some("readwrite") => Some(PublicAccess::Readwrite),
+        Some(_) => {
+            return Err(QueryResponse::request_error(
+                request_id,
+                "place.invalid_record",
+                "Place publicAccess must be readonly or readwrite",
+            ));
         }
-        error @ QueryResponse::Error { .. } => Err(error),
+    };
+    let created_at = document.u64_field("createdAt");
+    if place_id.is_empty() || name.is_empty() || owner_identity_id.is_empty() {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "place.invalid_record",
+            "Place record is incomplete",
+        ));
     }
+    Ok(PlaceRecord {
+        place_id,
+        name,
+        mood,
+        title,
+        subtitle,
+        color_scheme,
+        app_order,
+        resource_assignments,
+        owner_identity_id,
+        public_access,
+        created_at,
+    })
 }
 
 fn app_record_exists( engine: &Engine, request_id: RequestId, app_id: &str, ) -> Result<bool, QueryResponse> {
     let query = format!( "on _apps | where appId == {} | limit 1", query_string(app_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => Ok(!documents.is_empty()),
-        error @ QueryResponse::Error { .. } => Err(error),
-    }
+    query_documents(engine, request_id, query).map(|documents| !documents.is_empty())
 }
 
 fn app_maintainers(app: &JsonValue) -> Vec<String> {
-    if let Some(values) = app.get("maintainers").and_then(JsonValue::as_array) {
+    if let Some(values) = app.array_field("maintainers") {
         return values.iter().filter_map(JsonValue::as_str).map(str::to_owned).collect();
     }
-    app.get("maintainersJson")
-        .and_then(JsonValue::as_str)
+    app.str_field("maintainersJson")
         .and_then(|serialized| serde_json::from_str::<Vec<String>>(serialized).ok())
         .unwrap_or_default()
 }
@@ -5215,48 +5169,34 @@ fn app_identity_is_maintainer(app: &JsonValue, identity_id: &str) -> bool {
 
 fn load_app_definition( engine: &Engine, request_id: RequestId, app_id: &str, ) -> Result<JsonValue, QueryResponse> {
     let query = format!( "on _apps | where appId == {} and state == \"active\" | limit 1", query_string(app_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => {
-            let Some(document) = documents.into_iter().next() else {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "app.not_found",
-                    "App was not found",
-                ));
-            };
-            Ok(document)
-        }
-        error @ QueryResponse::Error { .. } => Err(error),
-    }
+    let Some(document) = query_first(engine, request_id, query)? else {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "app.not_found",
+            "App was not found",
+        ));
+    };
+    Ok(document)
 }
 
 fn load_app_instance( engine: &Engine, request_id: RequestId, instance_id: &str, ) -> Result<AppInstanceRecord, QueryResponse> {
     let query = format!( "on _app_instances | where instanceId == {} and state == \"active\" | limit 1", query_string(instance_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => {
-            let Some(document) = documents.into_iter().next() else {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "app.instance_not_found",
-                    "App instance was not found",
-                ));
-            };
-            let place_id = document
-                .get("placeId")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if place_id.is_empty() {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "app.invalid_instance_record",
-                    "App instance has no valid Place",
-                ));
-            }
-            Ok(AppInstanceRecord { place_id })
-        }
-        error @ QueryResponse::Error { .. } => Err(error),
+    let Some(document) = query_first(engine, request_id, query)? else {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "app.instance_not_found",
+            "App instance was not found",
+        ));
+    };
+    let place_id = document.string_field("placeId");
+    if place_id.is_empty() {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "app.invalid_instance_record",
+            "App instance has no valid Place",
+        ));
     }
+    Ok(AppInstanceRecord { place_id })
 }
 
 fn place_access_sharing_id(place_id: &str, identity_id: &str) -> String {
@@ -5265,79 +5205,70 @@ fn place_access_sharing_id(place_id: &str, identity_id: &str) -> String {
 
 fn list_place_access( engine: &Engine, request_id: RequestId, place: &PlaceRecord, ) -> Result<Vec<serde_json::Value>, QueryResponse> {
     let query = format!( "on _sharings | where owner == {} | select sharingId, target, permissions, placeRole, state | sort target", query_string(&place.owner_identity_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => {
-            use std::collections::BTreeMap;
-            let mut entries: BTreeMap<String, PlaceRole> = BTreeMap::new();
-            for document in documents {
-                let state = document
-                    .get("state")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default();
-                if state != "accepted" && state != "active" {
-                    continue;
-                }
-                let Some(target) = document.get("target").and_then(JsonValue::as_str) else {
-                    continue;
-                };
-                // `placeRole` is a scalar optimization used by managed Place access
-                // records. It is only scoped by the stable sharingId. Without checking
-                // that id, an access entry for another Place owned by the same identity
-                // would leak into this Place's access list.
-                let expected_sharing_id = place_access_sharing_id(&place.place_id, target);
-                if document.get("sharingId").and_then(JsonValue::as_str) == Some(expected_sharing_id.as_str()) {
-                    if let Some(candidate) = document
-                        .get("placeRole")
-                        .and_then(JsonValue::as_str)
-                        .and_then(PlaceRole::parse)
-                    {
-                        entries.insert(target.to_owned(), candidate);
-                        continue;
-                    }
-                }
-                let Some(permissions) = document.get("permissions").and_then(JsonValue::as_array)
-                else {
-                    continue;
-                };
-                for permission in permissions {
-                    let Some(permission) = permission.as_str() else {
-                        continue;
-                    };
-                    let Some((place_id, candidate)) = parse_sharing_permission(permission) else {
-                        continue;
-                    };
-                    if place_id != place.place_id {
-                        continue;
-                    }
-                    let current = entries.get(target).copied();
-                    let selected = match (current, candidate) {
-                        (Some(PlaceRole::Owner), _) | (_, PlaceRole::Owner) => PlaceRole::Owner,
-                        (Some(PlaceRole::Resident), _) | (_, PlaceRole::Resident) => PlaceRole::Resident,
-                        _ => PlaceRole::Member,
-                    };
-                    entries.insert(target.to_owned(), selected);
-                }
-            }
-            Ok(entries
-                .into_iter()
-                .map(|(identity_id, role)| {
-                    serde_json::json!({
-                        "identityId": identity_id,
-                        "role": role.as_str(),
-                        "state": "active",
-                    })
-                })
-                .collect())
+    let documents = query_documents(engine, request_id, query)?;
+    use std::collections::BTreeMap;
+    let mut entries: BTreeMap<String, PlaceRole> = BTreeMap::new();
+    for document in documents {
+        let state = document.str_field("state").unwrap_or_default();
+        if state != "accepted" && state != "active" {
+            continue;
         }
-        error @ QueryResponse::Error { .. } => Err(error),
+        let Some(target) = document.str_field("target") else {
+            continue;
+        };
+        // `placeRole` is a scalar optimization used by managed Place access
+        // records. It is only scoped by the stable sharingId. Without checking
+        // that id, an access entry for another Place owned by the same identity
+        // would leak into this Place's access list.
+        let expected_sharing_id = place_access_sharing_id(&place.place_id, target);
+        if document.str_field("sharingId") == Some(expected_sharing_id.as_str()) {
+            if let Some(candidate) = document.str_field("placeRole")
+                .and_then(PlaceRole::parse)
+            {
+                entries.insert(target.to_owned(), candidate);
+                continue;
+            }
+        }
+        let Some(permissions) = document.array_field("permissions")
+        else {
+            continue;
+        };
+        for permission in permissions {
+            let Some(permission) = permission.as_str() else {
+                continue;
+            };
+            let Some((place_id, candidate)) = parse_sharing_permission(permission) else {
+                continue;
+            };
+            if place_id != place.place_id {
+                continue;
+            }
+            let current = entries.get(target).copied();
+            let selected = match (current, candidate) {
+                (Some(PlaceRole::Owner), _) | (_, PlaceRole::Owner) => PlaceRole::Owner,
+                (Some(PlaceRole::Resident), _) | (_, PlaceRole::Resident) => PlaceRole::Resident,
+                _ => PlaceRole::Member,
+            };
+            entries.insert(target.to_owned(), selected);
+        }
     }
+    Ok(entries
+        .into_iter()
+        .map(|(identity_id, role)| {
+            serde_json::json!({
+                "identityId": identity_id,
+                "role": role.as_str(),
+                "state": "active",
+            })
+        })
+        .collect())
 }
 
 fn place_audience( engine: &Engine, request_id: RequestId, place_id: &str, ) -> Result<Audience, QueryResponse> {
     let place = load_place(engine, request_id, place_id)?;
     let mut identities = vec![place.owner_identity_id.clone()];
     for entry in list_place_access(engine, request_id, &place)? {
-        if let Some(identity_id) = entry.get("identityId").and_then(JsonValue::as_str) {
+        if let Some(identity_id) = entry.str_field("identityId") {
             identities.push(identity_id.to_owned());
         }
     }
@@ -5349,78 +5280,69 @@ fn resolve_place_role( engine: &Engine, request_id: RequestId, identity_id: &str
         return Ok(Some(PlaceRole::Owner));
     }
     let query = format!( "on _sharings | where owner == {} and target == {} | select sharingId, permissions, placeRole, state", query_string(&place.owner_identity_id), query_string(identity_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => {
-            let mut role = None;
-            for document in documents {
-                let state = document
-                    .get("state")
-                    .and_then(JsonValue::as_str)
-                    .unwrap_or_default();
-                if state != "accepted" && state != "active" {
-                    continue;
-                }
-                // A scalar `placeRole` belongs to one managed Place access record.
-                // Scope it by sharingId so a grant on another Place cannot authorize
-                // this Place merely because owner and target identities are the same.
-                let expected_sharing_id = place_access_sharing_id(&place.place_id, identity_id);
-                if document.get("sharingId").and_then(JsonValue::as_str) == Some(expected_sharing_id.as_str()) {
-                    if let Some(candidate) = document
-                        .get("placeRole")
-                        .and_then(JsonValue::as_str)
-                        .and_then(PlaceRole::parse)
-                    {
-                        role = Some(candidate);
-                        continue;
-                    }
-                }
-                let Some(permissions) = document.get("permissions").and_then(JsonValue::as_array)
-                else {
-                    continue;
-                };
-                for permission in permissions {
-                    let Some(permission) = permission.as_str() else {
-                        continue;
-                    };
-                    let Some((place_id, candidate)) = parse_sharing_permission(permission) else {
-                        continue;
-                    };
-                    if place_id != place.place_id {
-                        continue;
-                    }
-                    role = match (role, candidate) {
-                        (Some(PlaceRole::Owner), _) | (_, PlaceRole::Owner) => Some(PlaceRole::Owner),
-                        (Some(PlaceRole::Resident), _) | (_, PlaceRole::Resident) => Some(PlaceRole::Resident),
-                        _ => Some(PlaceRole::Member),
-                    };
-                }
-            }
-            Ok(role)
+    let documents = query_documents(engine, request_id, query)?;
+    let mut role = None;
+    for document in documents {
+        let state = document.str_field("state").unwrap_or_default();
+        if state != "accepted" && state != "active" {
+            continue;
         }
-        error @ QueryResponse::Error { .. } => Err(error),
+        // A scalar `placeRole` belongs to one managed Place access record.
+        // Scope it by sharingId so a grant on another Place cannot authorize
+        // this Place merely because owner and target identities are the same.
+        let expected_sharing_id = place_access_sharing_id(&place.place_id, identity_id);
+        if document.str_field("sharingId") == Some(expected_sharing_id.as_str()) {
+            if let Some(candidate) = document.str_field("placeRole")
+                .and_then(PlaceRole::parse)
+            {
+                role = Some(candidate);
+                continue;
+            }
+        }
+        let Some(permissions) = document.array_field("permissions")
+        else {
+            continue;
+        };
+        for permission in permissions {
+            let Some(permission) = permission.as_str() else {
+                continue;
+            };
+            let Some((place_id, candidate)) = parse_sharing_permission(permission) else {
+                continue;
+            };
+            if place_id != place.place_id {
+                continue;
+            }
+            role = match (role, candidate) {
+                (Some(PlaceRole::Owner), _) | (_, PlaceRole::Owner) => Some(PlaceRole::Owner),
+                (Some(PlaceRole::Resident), _) | (_, PlaceRole::Resident) => Some(PlaceRole::Resident),
+                _ => Some(PlaceRole::Member),
+            };
+        }
     }
+    Ok(role)
 }
 
-fn resolve_place_access_for_principal( engine: &Engine, request_id: RequestId, principal: &Principal, place: &PlaceRecord, allow_public: bool, ) -> Result<PlaceRole, QueryResponse> {
+/// Resolves what grants `principal` access to `place`: its scope role first, otherwise the
+/// Place public policy. The public policy applies whatever the authorization mode and is
+/// never translated into a role.
+fn resolve_place_access_for_principal( engine: &Engine, request_id: RequestId, principal: &Principal, place: &PlaceRecord, ) -> Result<PlaceAccess, QueryResponse> {
     if let Some(identity_id) = principal_identity_id(principal) {
-        return resolve_place_role(engine, request_id, identity_id, place)?.ok_or_else(|| {
-            QueryResponse::request_error(
-                request_id,
-                "authorization.denied",
-                format!("identity {:?} has no access to Place {:?}", identity_id, place.place_id),
-            )
-        });
-    }
-
-    if allow_public {
+        if let Some(role) = resolve_place_role(engine, request_id, identity_id, place)? {
+            return Ok(PlaceAccess::Role(role));
+        }
         if let Some(access) = place.public_access {
-            return Ok(access.place_role());
+            return Ok(PlaceAccess::Public(access));
         }
         return Err(QueryResponse::request_error(
             request_id,
-            "place.not_public",
-            "Place is not publicly accessible",
+            "authorization.denied",
+            format!("identity {:?} has no access to Place {:?}", identity_id, place.place_id),
         ));
+    }
+
+    if let Some(access) = place.public_access {
+        return Ok(PlaceAccess::Public(access));
     }
 
     Err(QueryResponse::request_error(
@@ -5430,17 +5352,23 @@ fn resolve_place_access_for_principal( engine: &Engine, request_id: RequestId, p
     ))
 }
 
+/// App identifiers instantiated in at least one public Place.
+fn public_place_app_ids(engine: &Engine, request_id: RequestId) -> Result<std::collections::BTreeSet<String>, QueryResponse> {
+    let mut app_ids = std::collections::BTreeSet::new();
+    for place in list_public_places(engine, request_id)? {
+        let Some(place_id) = place.str_field("placeId") else { continue; };
+        let query = format!("on _app_instances | where placeId == {} and state == \"active\" | select appId", query_string(place_id));
+        let documents = query_documents(engine, request_id, query)?;
+        app_ids.extend(documents.iter().filter_map(|document| document.str_field("appId").map(str::to_owned)));
+    }
+    Ok(app_ids)
+}
+
 fn list_public_places(engine: &Engine, request_id: RequestId) -> Result<Vec<JsonValue>, QueryResponse> {
-    let places = match execute_request(
-        engine,
-        QueryRequest::new(request_id, "on _places | where state == \"active\" | sort createdAt"),
-    ) {
-        QueryResponse::Ok { documents, .. } => documents,
-        error @ QueryResponse::Error { .. } => return Err(error),
-    };
+    let places = query_documents(engine, request_id, "on _places | where state == \"active\" | sort createdAt")?;
     let mut visible = Vec::new();
     for document in places {
-        let Some(place_id) = document.get("placeId").and_then(JsonValue::as_str) else { continue; };
+        let Some(place_id) = document.str_field("placeId") else { continue; };
         let place = match load_place(engine, request_id, place_id) { Ok(place) => place, Err(_) => continue };
         if place.public_access.is_some() { visible.push(place.to_json(None)); }
     }
@@ -5499,7 +5427,7 @@ fn list_storage_collections( snapshot: &dyn StorageRead, stats: bool, place_id: 
     if place_id.is_none() {
         for name in vcollections::ALL {
             if !collections.iter().any(|item| {
-                item.get("name").and_then(JsonValue::as_str) == Some(name)
+                item.str_field("name") == Some(name)
             }) {
                 collections.push(serde_json::json!({
                     "name": name,
@@ -5513,15 +5441,9 @@ fn list_storage_collections( snapshot: &dyn StorageRead, stats: bool, place_id: 
     Ok(collections)
 }
 
-fn resolve_query_execution_context( engine: &Engine, request_id: RequestId, principal: &Principal, requested: RequestedExecutionContext, allow_public: bool, ) -> Result<ExecutionContext, QueryResponse> {
+fn resolve_query_execution_context( engine: &Engine, request_id: RequestId, principal: &Principal, requested: RequestedExecutionContext, ) -> Result<ExecutionContext, QueryResponse> {
     let place = load_place(engine, request_id, &requested.place_id)?;
-    let place_role = resolve_place_access_for_principal(
-        engine,
-        request_id,
-        principal,
-        &place,
-        allow_public,
-    )?;
+    let access = resolve_place_access_for_principal(engine, request_id, principal, &place)?;
 
     if let Some(app_instance_id) = requested.app_instance_id.as_deref() {
         let instance = load_app_instance(engine, request_id, app_instance_id)?;
@@ -5541,39 +5463,22 @@ fn resolve_query_execution_context( engine: &Engine, request_id: RequestId, prin
         principal: principal.clone(),
         place_id: requested.place_id,
         app_instance_id: requested.app_instance_id,
-        place_role,
-        public_access: if matches!(principal, Principal::Anonymous) { place.public_access } else { None },
+        access,
     })
 }
 
-fn list_places_for_identity( engine: &Engine, request_id: RequestId, identity_id: &str, ) -> Result<Vec<JsonValue>, QueryResponse> {
-    let places = match execute_request(
-        engine,
-        QueryRequest::new(
-            request_id,
-            "on _places | where state == \"active\" | sort createdAt",
-        ),
-    ) {
-        QueryResponse::Ok { documents, .. } => documents,
-        error @ QueryResponse::Error { .. } => return Err(error),
-    };
-
+/// Places in the identity scope (with their role) and public Places, in creation order.
+/// A public Place outside the scope carries no role: its `publicAccess` is the only grant.
+fn list_places_for_identity_and_public( engine: &Engine, request_id: RequestId, identity_id: &str, ) -> Result<Vec<JsonValue>, QueryResponse> {
+    let places = query_documents(engine, request_id, "on _places | where state == \"active\" | sort createdAt")?;
     let mut visible = Vec::new();
     for document in places {
-        let place_id = document
-            .get("placeId")
-            .and_then(JsonValue::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        if place_id.is_empty() {
-            continue;
-        }
-        let place = match load_place(engine, request_id, &place_id) {
-            Ok(place) => place,
-            Err(_) => continue,
-        };
-        if let Some(role) = resolve_place_role(engine, request_id, identity_id, &place)? {
-            visible.push(place.to_json(Some(role)));
+        let Some(place_id) = document.str_field("placeId") else { continue; };
+        let place = match load_place(engine, request_id, place_id) { Ok(place) => place, Err(_) => continue };
+        match resolve_place_role(engine, request_id, identity_id, &place)? {
+            Some(role) => visible.push(place.to_json(Some(role))),
+            None if place.public_access.is_some() => visible.push(place.to_json(None)),
+            None => {}
         }
     }
     Ok(visible)
@@ -5587,36 +5492,23 @@ struct SharingRecord {
 
 fn load_sharing( engine: &Engine, request_id: RequestId, sharing_id: &str, ) -> Result<SharingRecord, QueryResponse> {
     let query = format!( "on _sharings | where sharingId == {} | limit 1", query_string(sharing_id), );
-    match execute_request(engine, QueryRequest::new(request_id, query)) {
-        QueryResponse::Ok { documents, .. } => {
-            let Some(document) = documents.into_iter().next() else {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "sharing.not_found",
-                    "sharing relation was not found",
-                ));
-            };
-            let owner = document
-                .get("owner")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            let target = document
-                .get("target")
-                .and_then(JsonValue::as_str)
-                .unwrap_or_default()
-                .to_owned();
-            if owner.is_empty() || target.is_empty() {
-                return Err(QueryResponse::request_error(
-                    request_id,
-                    "sharing.invalid_record",
-                    "sharing relation has no valid owner or target",
-                ));
-            }
-            Ok(SharingRecord { owner, target })
-        }
-        error @ QueryResponse::Error { .. } => Err(error),
+    let Some(document) = query_first(engine, request_id, query)? else {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "sharing.not_found",
+            "sharing relation was not found",
+        ));
+    };
+    let owner = document.string_field("owner");
+    let target = document.string_field("target");
+    if owner.is_empty() || target.is_empty() {
+        return Err(QueryResponse::request_error(
+            request_id,
+            "sharing.invalid_record",
+            "sharing relation has no valid owner or target",
+        ));
     }
+    Ok(SharingRecord { owner, target })
 }
 
 fn write_auth_error( writer: &mut TcpStream, request_id: RequestId, error: crate::AuthError, ) -> Result<(), ConnectionError> {
@@ -5842,19 +5734,13 @@ fn enrollment_events_permission_query(identity_id: &str, created_at: u64) -> Str
 }
 
 fn file_scope_component(value:&str)->String{
-    let mut encoded=String::with_capacity(value.len()*2);
-    const HEX:&[u8;16]=b"0123456789abcdef";
-    for byte in value.bytes(){
-        encoded.push(char::from(HEX[usize::from(byte>>4)]));
-        encoded.push(char::from(HEX[usize::from(byte&0x0f)]));
-    }
-    encoded
+    crate::helpers::hex(value.as_bytes())
 }
 
 
 fn resolve_app_table_collection(app:&JsonValue, table:&str)->Option<String>{
     let definition=app.get("definition")?; let model=definition.get("model")?; let table_def=model.get("tables")?.get(table)?; let collection_alias=table_def.get("collection")?.as_str()?; let declaration=model.get("collections")?.get(collection_alias)?;
-    declaration.as_str().or_else(||declaration.get("name").and_then(JsonValue::as_str)).map(str::to_owned)
+    declaration.as_str().or_else(||declaration.str_field("name")).map(str::to_owned)
 }
 
 fn run_data_worker_for_path(id:RequestId,path:&Path,operation:&str,mapping:Option<&JsonValue>)->Result<JsonValue,QueryResponse>{
@@ -5865,12 +5751,12 @@ fn run_data_worker_for_path(id:RequestId,path:&Path,operation:&str,mapping:Optio
     if let Some(mut stdin)=child.stdin.take(){serde_json::to_writer(&mut stdin,&request).map_err(|e|QueryResponse::request_error(id,"worker.protocol_error",e.to_string()))?;}
     let output=child.wait_with_output().map_err(|e|QueryResponse::request_error(id,"worker.failed",e.to_string()))?;
     let value:JsonValue=serde_json::from_slice(&output.stdout).map_err(|e|QueryResponse::request_error(id,"worker.protocol_error",format!("invalid worker JSON: {e}; stderr={}",String::from_utf8_lossy(&output.stderr))))?;
-    if !output.status.success() || value.get("status").and_then(JsonValue::as_str)==Some("error"){return Err(QueryResponse::request_error(id,"worker.failed",value.get("error").and_then(|v|v.get("message")).and_then(JsonValue::as_str).unwrap_or("data worker failed")));}
+    if !output.status.success() || value.str_field("status")==Some("error"){return Err(QueryResponse::request_error(id,"worker.failed",value.get("error").and_then(|v|v.get("message")).and_then(JsonValue::as_str).unwrap_or("data worker failed")));}
     Ok(value)
 }
 
 fn run_data_worker_for_file(settings:&ConnectionSettings,engine:&Engine,id:RequestId,place_id:&str,files_instance_id:&str,file_id:&str,operation:&str,mapping:Option<&JsonValue>)->Result<JsonValue,QueryResponse>{
-    let _context=resolve_file_context(engine,id,&Principal::Anonymous,true,place_id,files_instance_id,false).ok(); // actual caller authorization is checked before this helper
+    let _context=resolve_file_context(engine,id,&Principal::Anonymous,place_id,files_instance_id,false).ok(); // actual caller authorization is checked before this helper
     let store=scoped_native_file_store(settings,id,place_id,files_instance_id)?; let entry=load_file_entry(engine,id,place_id,files_instance_id,file_id)?;
     let mut source=store.read(&entry.remote_id,None).map_err(|e|QueryResponse::request_error(id,"file.store_error",e.to_string()))?;
     let extension=Path::new(&entry.name).extension().and_then(|v|v.to_str()).unwrap_or("dat"); let temp=env::temp_dir().join(format!("og-data-{}-{}.{}",std::process::id(),unix_time_millis(),extension));
@@ -5959,9 +5845,9 @@ fn archive_current_file( engine:&Engine,settings:&ConnectionSettings,id:RequestI
 
 static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn resolve_file_context( engine:&Engine, id:RequestId, principal:&Principal, allow_public:bool, place_id:&str, instance_id:&str, write:bool )->Result<ExecutionContext,QueryResponse>{
-    let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:Some(instance_id.to_owned())},allow_public)?;
-    if write && !context.place_role.can_write(){
+fn resolve_file_context( engine:&Engine, id:RequestId, principal:&Principal, place_id:&str, instance_id:&str, write:bool )->Result<ExecutionContext,QueryResponse>{
+    let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:Some(instance_id.to_owned())})?;
+    if write && !context.access.can_write(){
         return Err(QueryResponse::request_error(id,"authorization.denied","Place access is read-only for Files"));
     }
     Ok(context)
@@ -5992,7 +5878,7 @@ fn json_to_file_entry(value:&JsonValue)->Result<FileEntry,&'static str>{
         remote_id:string("remoteId").ok_or("missing remoteId")?,
         parent_id:string("parentId").map(FileId::from),
         name:string("name").ok_or("missing name")?,kind,
-        metadata:crate::files::FileMetadata{size:object.get("size").and_then(JsonValue::as_u64),content_type:string("contentType"),etag:string("etag"),created_at:object.get("createdAt").and_then(JsonValue::as_u64),modified_at:object.get("modifiedAt").and_then(JsonValue::as_u64)},
+        metadata:crate::files::FileMetadata{size:object.u64_field("size"),content_type:string("contentType"),etag:string("etag"),created_at:object.u64_field("createdAt"),modified_at:object.u64_field("modifiedAt")},
         place_id:string("_place").ok_or("missing _place")?,app_instance_id:string("_app_instance").ok_or("missing _app_instance")?,
     })
 }
@@ -6017,7 +5903,7 @@ fn list_file_children_raw(engine:&Engine,id:RequestId,place_id:&str,instance_id:
 fn list_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:Option<&str>)->Result<Vec<JsonValue>,QueryResponse>{
     Ok(list_file_children_raw(engine,id,place_id,instance_id,parent_id)?
         .into_iter()
-        .filter(|document|document.get("trashed").and_then(JsonValue::as_bool)!=Some(true))
+        .filter(|document|document.bool_field("trashed")!=Some(true))
         .collect())
 }
 
@@ -6027,20 +5913,20 @@ fn list_trashed_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_
     match execute_request(engine,QueryRequest::new(id,query)){
         QueryResponse::Ok{documents,..}=>{
             let trashed_ids=documents.iter()
-                .filter(|document|document.get("trashed").and_then(JsonValue::as_bool)==Some(true))
-                .filter_map(|document|document.get("fileId").and_then(JsonValue::as_str))
+                .filter(|document|document.bool_field("trashed")==Some(true))
+                .filter_map(|document|document.str_field("fileId"))
                 .map(str::to_owned)
                 .collect::<std::collections::BTreeSet<_>>();
             let mut entries=documents.into_iter()
                 .filter(|document|{
-                    if document.get("trashed").and_then(JsonValue::as_bool)!=Some(true){return false;}
-                    match document.get("parentId").and_then(JsonValue::as_str){
+                    if document.bool_field("trashed")!=Some(true){return false;}
+                    match document.str_field("parentId"){
                         Some(parent)=>!trashed_ids.contains(parent),
                         None=>true,
                     }
                 })
                 .collect::<Vec<_>>();
-            entries.sort_by_key(|document|std::cmp::Reverse(document.get("trashedAt").and_then(JsonValue::as_u64).unwrap_or(0)));
+            entries.sort_by_key(|document|std::cmp::Reverse(document.u64_field("trashedAt").unwrap_or(0)));
             Ok(entries)
         }
         error@QueryResponse::Error{..}=>Err(error),
@@ -6107,7 +5993,7 @@ fn ensure_file_trash_root(store:&dyn FileStore,id:RequestId)->Result<String,Quer
 
 fn trash_file_entry(engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<JsonValue,QueryResponse>{
     let mut json=load_file_entry_json(engine,id,place_id,instance_id,file_id)?;
-    if json.get("trashed").and_then(JsonValue::as_bool)==Some(true){return Ok(json);}
+    if json.bool_field("trashed")==Some(true){return Ok(json);}
     let entry=json_to_file_entry(&json).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
     let store=scoped_native_file_store(settings,id,place_id,instance_id)?;
     let trash_root=ensure_file_trash_root(&store,id)?;
@@ -6133,25 +6019,24 @@ fn trash_file_entry(engine:&Engine,settings:&ConnectionSettings,id:RequestId,pla
 
 #[cfg(feature = "files")]
 fn file_is_trashed(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<bool,QueryResponse>{
-    Ok(load_file_entry_json(engine,id,place_id,instance_id,file_id)?
-        .get("trashed").and_then(JsonValue::as_bool)==Some(true))
+    Ok(load_file_entry_json(engine,id,place_id,instance_id,file_id)?.bool_field("trashed")==Some(true))
 }
 
 #[cfg(feature = "files")]
 fn restore_file_entry( engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str )->Result<JsonValue,QueryResponse>{
     let mut json=load_file_entry_json(engine,id,place_id,instance_id,file_id)?;
-    if json.get("trashed").and_then(JsonValue::as_bool)!=Some(true){
+    if json.bool_field("trashed")!=Some(true){
         return Err(QueryResponse::request_error(id,"file.not_trashed","File entry is not in the trash"));
     }
 
     let entry=json_to_file_entry(&json).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
-    let old_parent=json.get("trashedParentId").and_then(JsonValue::as_str).map(str::to_owned);
+    let old_parent=json.str_field("trashedParentId").map(str::to_owned);
     let parent=match old_parent.as_deref(){
         Some(parent_id)=>load_file_entry(engine,id,place_id,instance_id,parent_id)
             .ok()
             .filter(|_|load_file_entry_json(engine,id,place_id,instance_id,parent_id)
                 .ok()
-                .and_then(|parent|parent.get("trashed").and_then(JsonValue::as_bool))!=Some(true)),
+                .and_then(|parent|parent.bool_field("trashed"))!=Some(true)),
         None=>None,
     };
     let target_parent_id=parent.as_ref().map(|parent|parent.file_id.as_str().to_owned());
@@ -6183,10 +6068,10 @@ fn purge_file_versions( engine:&Engine,settings:&ConnectionSettings,id:RequestId
     if versions.is_empty(){return Ok(());}
     let store=scoped_native_version_store(settings,id,place_id,instance_id)?;
     for version in versions {
-        if let Some(remote_id)=version.get("remoteId").and_then(JsonValue::as_str){
+        if let Some(remote_id)=version.str_field("remoteId"){
             let _=store.delete(remote_id);
         }
-        if let Some(version_id)=version.get("versionId").and_then(JsonValue::as_str){
+        if let Some(version_id)=version.str_field("versionId"){
             delete_file_version_metadata(engine,id,place_id,instance_id,file_id,version_id)?;
         }
     }
@@ -6217,9 +6102,9 @@ fn child_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str
 #[cfg(feature = "files")]
 fn subtree_has_trashed_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:&str)->Result<bool,QueryResponse>{
     for child in list_file_children_raw(engine,id,place_id,instance_id,Some(parent_id))? {
-        if child.get("trashed").and_then(JsonValue::as_bool)==Some(true){return Ok(true);}
-        if child.get("kind").and_then(JsonValue::as_str)==Some("directory") {
-            if let Some(file_id)=child.get("fileId").and_then(JsonValue::as_str) {
+        if child.bool_field("trashed")==Some(true){return Ok(true);}
+        if child.str_field("kind")==Some("directory") {
+            if let Some(file_id)=child.str_field("fileId") {
                 if subtree_has_trashed_entries(engine,id,place_id,instance_id,file_id)?{return Ok(true);}
             }
         }
@@ -6329,10 +6214,7 @@ fn permission_exists(engine: &Engine, request: &AuthorizationRequest) -> bool {
     let action = quote_authorization_string(request.action.as_str());
     let resource = quote_authorization_string(&request.resource);
     let query = format!( "on _permissions | where identityId == {identity} and state == \"active\" and effect == \"allow\" and (action == {action} or action == \"*\") and (resource == {resource} or resource == \"*\") | limit 1" );
-    matches!(
-        execute_request(engine, QueryRequest::new(0, query)),
-        QueryResponse::Ok { documents, .. } if !documents.is_empty()
-    )
+    query_has_rows(engine, 0, query)
 }
 
 fn write_authorization_denied( writer: &mut TcpStream, id: RequestId, principal: &crate::access::auth::Principal, action: AuthorizationAction, resource: &str, ) -> Result<(), ConnectionError> {
@@ -6356,7 +6238,7 @@ fn write_authorization_denied( writer: &mut TcpStream, id: RequestId, principal:
 }
 
 fn write_place_role_denied( writer: &mut TcpStream, id: RequestId, context: &ExecutionContext, action: AuthorizationAction, resource: &str, ) -> Result<(), ConnectionError> {
-    let message = format!( "Place role {:?} is not allowed to perform {} on {:?} in Place {:?}", context.place_role.as_str(), action.as_str(), resource, context.place_id, );
+    let message = format!( "Place grant {:?} is not allowed to perform {} on {:?} in Place {:?}", context.access.as_str(), action.as_str(), resource, context.place_id, );
     write_response(
         writer,
         &QueryResponse::request_error(id, "authorization.denied", message),
@@ -6433,25 +6315,19 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
         let mut next_retry: Option<Duration> = None;
 
         for document in documents {
-            let available_at = document
-                .get("availableAt")
-                .and_then(JsonValue::as_u64)
-                .unwrap_or(now);
+            let available_at = document.u64_field("availableAt").unwrap_or(now);
             if available_at > now {
                 let delay = Duration::from_millis(available_at.saturating_sub(now));
                 next_retry = Some(next_retry.map_or(delay, |current| current.min(delay)));
                 break;
             }
 
-            let Some(row_id) = document.get("_id").and_then(JsonValue::as_str) else {
+            let Some(row_id) = document.str_field("_id") else {
                 debug::log(DebugTopic::Events, None, "outbox invalid row missing _id");
                 return Some(EVENT_OUTBOX_MAX_IDLE_RECOVERY);
             };
-            let event_id = document
-                .get("eventId")
-                .and_then(JsonValue::as_str)
-                .unwrap_or(row_id);
-            let Some(event_type) = document.get("type").and_then(JsonValue::as_str) else {
+            let event_id = document.str_field("eventId").unwrap_or(row_id);
+            let Some(event_type) = document.str_field("type") else {
                 let discard = format!(
                     "on _event_outbox | where _id == {} | delete",
                     query_string(row_id),
@@ -6546,6 +6422,24 @@ fn start_debug_memory_reporter(engine: Arc<Engine>) {
 
 fn execute_request(engine: &Engine, request: QueryRequest) -> QueryResponse {
     execute_request_scoped(engine, request, None)
+}
+
+/// Runs `query`, returning its documents or the error response.
+fn query_documents(engine: &Engine, request_id: impl Into<RequestId>, query: impl Into<String>) -> Result<Vec<JsonValue>, QueryResponse> {
+    match execute_request(engine, QueryRequest::new(request_id, query)) {
+        QueryResponse::Ok { documents, .. } => Ok(documents),
+        error @ QueryResponse::Error { .. } => Err(error),
+    }
+}
+
+/// Runs `query`, returning its first document if any.
+fn query_first(engine: &Engine, request_id: impl Into<RequestId>, query: impl Into<String>) -> Result<Option<JsonValue>, QueryResponse> {
+    query_documents(engine, request_id, query).map(|documents| documents.into_iter().next())
+}
+
+/// True when `query` succeeds and returns at least one document.
+fn query_has_rows(engine: &Engine, request_id: impl Into<RequestId>, query: impl Into<String>) -> bool {
+    query_documents(engine, request_id, query).is_ok_and(|documents| !documents.is_empty())
 }
 
 fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Option<&ExecutionContext>, ) -> QueryResponse {
@@ -6907,6 +6801,14 @@ impl EnrollmentMode {
             }),
         }
     }
+    /// Stable public name. The enrollment token itself is never exposed.
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::Token(_) => "token",
+        }
+    }
     fn allows(&self, token: Option<&str>) -> bool {
         match self {
             Self::Closed => false,
@@ -7208,7 +7110,7 @@ impl<'a> FileSyncSource<'a> {
         let request = OperationRequest::new(id, op, data);
         let websocket = self.gateway.as_mut().ok_or_else(|| "upstream Gateway is not connected".to_owned())?;
         let response = gateway_response_for_request(websocket, &request)?;
-        if response.get("status").and_then(JsonValue::as_str) == Some("error") || response.get("error").is_some() {
+        if response.str_field("status") == Some("error") || response.get("error").is_some() {
             let error = response.get("error").cloned().unwrap_or(JsonValue::Null);
             return Err(format!("{op} failed upstream: {error}"));
         }
@@ -7219,7 +7121,7 @@ impl<'a> FileSyncSource<'a> {
         if self.gateway.is_some() {
             let data = self.gateway_data("place.get", serde_json::json!({"placeId": place_id}))?;
             let place = data.get("place").unwrap_or(&data);
-            return place.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty())
+            return place.str_field("name").filter(|value| !value.is_empty())
                 .map(str::to_owned)
                 .ok_or_else(|| format!("Place {place_id} has no visible name"));
         }
@@ -7231,8 +7133,7 @@ impl<'a> FileSyncSource<'a> {
 
     fn place_has_sync_assignment(&mut self, place_id: &str, identity_id: &str, device_id: &str) -> Result<bool, String> {
         let assignments = if self.gateway.is_some() {
-            self.gateway_data("place.resource.list", serde_json::json!({"placeId": place_id}))?
-                .get("assignments").and_then(JsonValue::as_array).cloned()
+            self.gateway_data("place.resource.list", serde_json::json!({"placeId": place_id}))?.array_field("assignments").cloned()
                 .ok_or_else(|| format!("place.resource.list returned no assignments for Place {place_id}"))?
         } else {
             let id = self.next_request_id();
@@ -7241,7 +7142,7 @@ impl<'a> FileSyncSource<'a> {
         Ok(assignments.iter().any(|entry| {
             let entry_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str);
             let entry_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-            let capability = entry.get("capability").and_then(JsonValue::as_str);
+            let capability = entry.str_field("capability");
             let storage_role = resource_assignment_storage_role(entry);
             entry_identity == Some(identity_id) && entry_device == Some(device_id) && capability == Some("files") && storage_role == Some("sync")
         }))
@@ -7252,17 +7153,16 @@ impl<'a> FileSyncSource<'a> {
             // place.list already carries the authoritative resourceAssignments.
             // Resolve every sync-enabled Place in one round-trip instead of one
             // place.resource.list request per Place on every reconciliation.
-            let places = self.gateway_data("place.list", serde_json::json!({}))?
-                .get("places").and_then(JsonValue::as_array).cloned()
+            let places = self.gateway_data("place.list", serde_json::json!({}))?.array_field("places").cloned()
                 .ok_or_else(|| "place.list returned no places array".to_owned())?;
             let mut result = Vec::new();
             for place in places {
                 let Some(place_id) = place.get("placeId").or_else(|| place.get("id")).and_then(JsonValue::as_str) else { continue; };
-                let assignments = place.get("resourceAssignments").and_then(JsonValue::as_array);
+                let assignments = place.array_field("resourceAssignments");
                 let sync = assignments.is_some_and(|assignments| assignments.iter().any(|entry| {
                     let entry_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str);
                     let entry_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-                    let capability = entry.get("capability").and_then(JsonValue::as_str);
+                    let capability = entry.str_field("capability");
                     let storage_role = resource_assignment_storage_role(entry);
                     entry_identity == Some(identity_id)
                         && entry_device == Some(device_id)
@@ -7281,8 +7181,7 @@ impl<'a> FileSyncSource<'a> {
 
     fn apps(&mut self) -> Result<HashMap<String, FileSyncAppProjection>, String> {
         let documents = if self.gateway.is_some() {
-            self.gateway_data("app.list", serde_json::json!({}))?
-                .get("apps").and_then(JsonValue::as_array).cloned()
+            self.gateway_data("app.list", serde_json::json!({}))?.array_field("apps").cloned()
                 .ok_or_else(|| "app.list returned no apps array".to_owned())?
         } else {
             let id = self.next_request_id();
@@ -7293,8 +7192,8 @@ impl<'a> FileSyncSource<'a> {
         };
         let mut apps = HashMap::new();
         for document in documents {
-            let Some(app_id) = document.get("appId").and_then(JsonValue::as_str) else { continue; };
-            let name = document.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty()).unwrap_or(app_id).to_owned();
+            let Some(app_id) = document.str_field("appId") else { continue; };
+            let name = document.str_field("name").filter(|value| !value.is_empty()).unwrap_or(app_id).to_owned();
             let place_root_projection = file_sync_app_place_root_projection(&document);
             apps.insert(app_id.to_owned(), FileSyncAppProjection { name, place_root_projection });
         }
@@ -7303,8 +7202,7 @@ impl<'a> FileSyncSource<'a> {
 
     fn instances(&mut self, place_id: &str) -> Result<HashMap<String, FileSyncInstanceProjection>, String> {
         let documents = if self.gateway.is_some() {
-            self.gateway_data("app.instance.list", serde_json::json!({"placeId": place_id}))?
-                .get("instances").and_then(JsonValue::as_array).cloned()
+            self.gateway_data("app.instance.list", serde_json::json!({"placeId": place_id}))?.array_field("instances").cloned()
                 .ok_or_else(|| format!("app.instance.list returned no instances array for Place {place_id}"))?
         } else {
             let id = self.next_request_id();
@@ -7316,9 +7214,9 @@ impl<'a> FileSyncSource<'a> {
         };
         let mut instances = HashMap::new();
         for document in documents {
-            let Some(instance_id) = document.get("instanceId").and_then(JsonValue::as_str) else { continue; };
-            let Some(app_id) = document.get("appId").and_then(JsonValue::as_str) else { continue; };
-            let name = document.get("name").and_then(JsonValue::as_str).filter(|value| !value.is_empty()).unwrap_or("Main").to_owned();
+            let Some(instance_id) = document.str_field("instanceId") else { continue; };
+            let Some(app_id) = document.str_field("appId") else { continue; };
+            let name = document.str_field("name").filter(|value| !value.is_empty()).unwrap_or("Main").to_owned();
             instances.insert(instance_id.to_owned(), FileSyncInstanceProjection { app_id: app_id.to_owned(), name });
         }
         Ok(instances)
@@ -7610,14 +7508,14 @@ fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &OperationRe
         match message {
             WebSocketMessage::Text(payload) => {
                 let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                if message.get("kind").and_then(JsonValue::as_str) != Some("response") || message.get("id") != Some(&request_id) {
+                if message.str_field("kind") != Some("response") || message.get("id") != Some(&request_id) {
                     continue;
                 }
-                if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
+                if message.str_field("status") == Some("error") || message.get("error").is_some() {
                     let _ = fs::remove_file(&temporary);
                     return Err(format!("file.read failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
                 }
-                if message.get("status").and_then(JsonValue::as_str) == Some("complete") {
+                if message.str_field("status") == Some("complete") {
                     let Some(expected) = expected else { return Err("file.read completed without a raw header".to_owned()); };
                     if received != expected {
                         let _ = fs::remove_file(&temporary);
@@ -7673,9 +7571,7 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
     let mut input = fs::File::open(source).map_err(|error| error.to_string())?;
     let expected = input.metadata().map_err(|error| error.to_string())?.len();
     let requested = request
-        .data
-        .get("size")
-        .and_then(JsonValue::as_u64)
+        .data.u64_field("size")
         .ok_or_else(|| "file.write request has no byte count".to_owned())?;
     if requested != expected {
         return Err(format!(
@@ -7692,15 +7588,15 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
         match message {
             WebSocketMessage::Text(payload) => {
                 let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                if message.get("kind").and_then(JsonValue::as_str) != Some("response") || message.get("id") != Some(&request_id) {
+                if message.str_field("kind") != Some("response") || message.get("id") != Some(&request_id) {
                     continue;
                 }
-                if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
+                if message.str_field("status") == Some("error") || message.get("error").is_some() {
                     return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
                 }
                 let ready = message.get("data")
-                    .is_some_and(|data| data.get("stream").and_then(JsonValue::as_str) == Some("raw")
-                        && data.get("ready").and_then(JsonValue::as_bool) == Some(true));
+                    .is_some_and(|data| data.str_field("stream") == Some("raw")
+                        && data.bool_field("ready") == Some(true));
                 if !ready {
                     continue;
                 }
@@ -7741,10 +7637,10 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
         match message {
             WebSocketMessage::Text(payload) => {
                 let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                if message.get("kind").and_then(JsonValue::as_str) != Some("response") || message.get("id") != Some(&request_id) {
+                if message.str_field("kind") != Some("response") || message.get("id") != Some(&request_id) {
                     continue;
                 }
-                if message.get("status").and_then(JsonValue::as_str) == Some("error") || message.get("error").is_some() {
+                if message.str_field("status") == Some("error") || message.get("error").is_some() {
                     return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
                 }
                 // file.write is a two-response BinaryIn operation:
@@ -7756,10 +7652,10 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
                 // OperationResponse::new() deliberately uses status="ok", so waiting
                 // for "complete" here leaves the sync stuck forever after the first
                 // successfully persisted file.
-                if message.get("status").and_then(JsonValue::as_str) == Some("ok") {
+                if message.str_field("status") == Some("ok") {
                     let data = message.get("data").cloned()
                         .ok_or_else(|| "file.write completed without data".to_owned())?;
-                    if data.get("ready").and_then(JsonValue::as_bool) == Some(true) {
+                    if data.bool_field("ready") == Some(true) {
                         // Defensive: a duplicate readiness response is not terminal.
                         continue;
                     }
@@ -7774,17 +7670,8 @@ fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request: &Operatio
 }
 
 fn atomic_sync_write(destination: &Path, source: &mut dyn Read) -> Result<u64, String> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let temporary = sync_temporary_path(destination);
-    let mut output = fs::OpenOptions::new().write(true).create(true).truncate(true).open(&temporary).map_err(|error| error.to_string())?;
-    let copied = io::copy(source, &mut output).map_err(|error| error.to_string())?;
-    output.flush().map_err(|error| error.to_string())?;
-    output.sync_all().map_err(|error| error.to_string())?;
-    drop(output);
-    replace_sync_file(&temporary, destination)?;
-    Ok(copied)
+    write_file_atomic(destination, &sync_temporary_path(destination), |output| io::copy(source, output))
+        .map_err(|error| error.to_string())
 }
 
 fn sync_temporary_path(destination: &Path) -> PathBuf {
@@ -7802,8 +7689,7 @@ fn replace_sync_file(temporary: &Path, destination: &Path) -> Result<(), String>
 fn file_sync_local_metadata(path: &Path) -> Result<(Option<u64>, Option<u64>), String> {
     let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
     let size = metadata.is_file().then_some(metadata.len());
-    let modified = metadata.modified().ok().and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+    let modified = metadata.modified().ok().and_then(system_time_millis);
     Ok((size, modified))
 }
 
@@ -7820,34 +7706,25 @@ fn file_sync_local_matches(path: &Path, entry: &FileSyncIndexEntry) -> bool {
 }
 
 fn file_sync_local_fingerprint(path: &Path) -> Result<String, String> {
-    fn update(hash: &mut u64, bytes: &[u8]) {
-        for byte in bytes {
-            *hash ^= u64::from(*byte);
-            *hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
     let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
     if metadata.file_type().is_symlink() {
         return Err(format!("symbolic links are not supported by Files sync: {}", path.display()));
     }
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = FNV1A64_OFFSET;
     if metadata.is_file() {
         // Move correlation must stay cheap for large files. Size + mtime is
         // name-independent and avoids reading the file contents a second time.
-        update(&mut hash, b"F");
-        update(&mut hash, &metadata.len().to_le_bytes());
+        hash = fnv1a64_continue(hash, b"F");
+        hash = fnv1a64_continue(hash, &metadata.len().to_le_bytes());
     } else if metadata.is_dir() {
         // Never recursively fingerprint directories: the scanner already walks
         // every entry once, and recursive hashes make nested trees O(n²).
-        update(&mut hash, b"D");
+        hash = fnv1a64_continue(hash, b"D");
     } else {
         return Err(format!("unsupported filesystem entry in Files sync: {}", path.display()));
     }
-    let modified = metadata.modified().ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or_default();
-    update(&mut hash, &modified.to_le_bytes());
+    let modified = metadata.modified().ok().and_then(system_time_millis).unwrap_or_default();
+    hash = fnv1a64_continue(hash, &modified.to_le_bytes());
     Ok(format!("fnv1a64-meta:{hash:016x}"))
 }
 
@@ -8638,7 +8515,7 @@ fn run_upstream_event_relay_session( settings: &ConnectionSettings, event_engine
         serde_json::json!({"types": ["*"]}),
     );
     let response = gateway_response_for_request(&mut websocket, &request)?;
-    if response.get("status").and_then(JsonValue::as_str) == Some("error") || response.get("error").is_some() {
+    if response.str_field("status") == Some("error") || response.get("error").is_some() {
         return Err(format!("events.subscribe rejected: {}", response.get("error").cloned().unwrap_or(JsonValue::Null)));
     }
     if let Ok(mut runtime) = settings.file_sync.lock() {
@@ -8651,7 +8528,7 @@ fn run_upstream_event_relay_session( settings: &ConnectionSettings, event_engine
         let Some(message) = read_gateway_message(&mut websocket)? else {
             return Err("Gateway event channel closed".to_owned());
         };
-        if message.get("kind").and_then(JsonValue::as_str) != Some("event") {
+        if message.str_field("kind") != Some("event") {
             continue;
         }
         // Preserve the Core event envelope (id, audience, timestamp, payload).
@@ -9332,6 +9209,66 @@ mod tests {
     use super::*;
     use crate::storage::CollectionId;
 
+    fn public_places_test_engine() -> Engine {
+        let engine = app_bootstrap_test_engine();
+        for query in [
+            "on _places | insert {placeId: \"private\", name: \"Private\", mood: \"\", ownerIdentityId: \"owner\", state: \"active\", createdAt: 1}",
+            "on _places | insert {placeId: \"public-ro\", name: \"Public RO\", mood: \"\", ownerIdentityId: \"owner\", state: \"active\", createdAt: 2, publicAccess: \"readonly\"}",
+            "on _places | insert {placeId: \"public-rw\", name: \"Public RW\", mood: \"\", ownerIdentityId: \"owner\", state: \"active\", createdAt: 3, publicAccess: \"readwrite\"}",
+            "on _app_instances | insert {instanceId: \"i-public\", placeId: \"public-ro\", appId: \"app.public\", state: \"active\", createdAt: 1}",
+            "on _app_instances | insert {instanceId: \"i-private\", placeId: \"private\", appId: \"app.private\", state: \"active\", createdAt: 2}",
+        ] {
+            assert!(execute_request(&engine, QueryRequest::new(RequestId::Number(1), query)).is_ok(), "{query}");
+        }
+        engine
+    }
+
+    fn identity(identity_id: &str) -> Principal {
+        Principal::Identity { identity_id: identity_id.to_owned(), device_id: format!("{identity_id}-device") }
+    }
+
+    #[test] fn public_policy_grants_access_without_translating_it_into_a_role() {
+        let engine = public_places_test_engine();
+        let access = |principal: &Principal, place_id: &str| {
+            let place = load_place(&engine, RequestId::Number(1), place_id).expect("place loads");
+            resolve_place_access_for_principal(&engine, RequestId::Number(1), principal, &place)
+        };
+        assert_eq!(access(&Principal::Anonymous, "public-ro").ok(), Some(PlaceAccess::Public(PublicAccess::Readonly)));
+        assert_eq!(access(&Principal::Anonymous, "public-rw").ok(), Some(PlaceAccess::Public(PublicAccess::Readwrite)));
+        assert!(access(&Principal::Anonymous, "private").is_err());
+        assert_eq!(access(&identity("stranger"), "public-rw").ok(), Some(PlaceAccess::Public(PublicAccess::Readwrite)));
+        assert!(access(&identity("stranger"), "private").is_err());
+        assert_eq!(access(&identity("owner"), "public-ro").ok(), Some(PlaceAccess::Role(PlaceRole::Owner)));
+    }
+
+    #[test] fn place_list_returns_scope_plus_public_places() {
+        let engine = public_places_test_engine();
+        let ids = |places: Vec<JsonValue>| places.iter().filter_map(|place| place.str_field("placeId").map(str::to_owned)).collect::<Vec<_>>();
+        assert_eq!(ids(list_public_places(&engine, RequestId::Number(1)).unwrap()), vec!["public-ro", "public-rw"]);
+        let stranger = list_places_for_identity_and_public(&engine, RequestId::Number(1), "stranger").unwrap();
+        assert_eq!(ids(stranger.clone()), vec!["public-ro", "public-rw"]);
+        assert!(stranger.iter().all(|place| place.get("role").is_some_and(JsonValue::is_null)));
+        let owner = list_places_for_identity_and_public(&engine, RequestId::Number(1), "owner").unwrap();
+        assert_eq!(ids(owner.clone()), vec!["private", "public-ro", "public-rw"]);
+        assert!(owner.iter().all(|place| place.str_field("role") == Some("owner")));
+    }
+
+    #[test] fn public_app_definitions_are_limited_to_public_places() {
+        let engine = public_places_test_engine();
+        let app_ids = public_place_app_ids(&engine, RequestId::Number(1)).unwrap();
+        assert!(app_ids.contains("app.public"));
+        assert!(!app_ids.contains("app.private"));
+    }
+
+    #[test] fn files_context_keeps_public_read_only_places_read_only() {
+        let engine = public_places_test_engine();
+        {
+            let (place_id, instance_id) = ("public-ro", "i-public");
+            assert!(resolve_file_context(&engine, RequestId::Number(1), &Principal::Anonymous, place_id, instance_id, false).is_ok());
+            assert!(resolve_file_context(&engine, RequestId::Number(1), &Principal::Anonymous, place_id, instance_id, true).is_err());
+        }
+    }
+
     fn app_bootstrap_test_engine() -> Engine {
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
         let runtime = Arc::new(build_runtime().expect("runtime builds"));
@@ -9345,9 +9282,9 @@ mod tests {
     #[test] fn gateway_device_registration_is_idempotent_and_exact() { let engine = app_bootstrap_test_engine(); ensure_gateway_device_registration(&engine, "gateway-identity", "gateway-device", "gateway-key") .expect("Gateway enrollment persists"); ensure_gateway_device_registration(&engine, "gateway-identity", "gateway-device", "gateway-key") .expect("Gateway enrollment is idempotent"); assert!(registered_identity_matches(&engine, "gateway-identity", "gateway-key")); assert!(registered_device_matches(&engine, "gateway-identity", "gateway-device", "gateway-key")); assert!(!registered_device_matches(&engine, "gateway-identity", "gateway-device", "other-key")); }
     #[cfg(feature = "fabric")] #[test] fn gateway_enrollment_hmac_matches_sha256_reference_vector() { assert_eq!( hmac_sha256_base64(b"key", b"The quick brown fox jumps over the lazy dog"), "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg=" ); }
     #[test] fn app_bootstrap_with_empty_manifest_is_a_noop() { let engine = app_bootstrap_test_engine(); bootstrap_apps(&engine, &[]).expect("empty App manifest bootstraps"); assert!(!app_record_exists(&engine, RequestId::Number(1), "system.files") .expect("App lookup succeeds")); }
-    #[test] fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() { let engine = app_bootstrap_test_engine(); let v1 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test".to_owned(), version: "1.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test", "version": "1.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds"); let drifted = execute_request( &engine, QueryRequest::new( 2, r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#, ), ); assert!(drifted.is_ok()); let custom = execute_request( &engine, QueryRequest::new( 3, r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#, ), ); assert!(custom.is_ok()); let v2 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test v2".to_owned(), version: "2.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test v2", "version": "2.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds"); let response = execute_request( &engine, QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); }; let managed = documents.first().expect("managed App exists"); assert_eq!(managed.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(managed.get("name").and_then(JsonValue::as_str), Some("System test v2")); assert_eq!(managed.get("version").and_then(JsonValue::as_str), Some("2.0.0")); assert_eq!(managed.get("updatedBy").and_then(JsonValue::as_str), Some("system")); assert_eq!(managed.get("definition"), Some(&v2.definition)); let response = execute_request( &engine, QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); }; let unmanaged = documents.first().expect("custom App exists"); assert_eq!(unmanaged.get("state").and_then(JsonValue::as_str), Some("active")); assert_eq!(unmanaged.get("name").and_then(JsonValue::as_str), Some("Custom")); assert_eq!(unmanaged.get("version").and_then(JsonValue::as_str), Some("7.0.0")); assert_eq!(unmanaged.get("createdBy").and_then(JsonValue::as_str), Some("user")); assert!(unmanaged.get("updatedBy").is_none()); }
-    #[test] fn place_scoped_collection_listing_filters_and_counts_by_place() { let engine = app_bootstrap_test_engine(); for (id, collection, place_id) in [ (20, "shared_items", "place-a"), (21, "shared_items", "place-a"), (22, "shared_items", "place-b"), (23, "other_items", "place-b"), ] { let response = execute_request( &engine, QueryRequest::new( id, format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)), ), ); assert!(response.is_ok()); } let snapshot = engine.storage().read().expect("snapshot opens"); let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"), None) .expect("Place collections list succeeds"); assert_eq!(collections.len(), 1); assert_eq!(collections[0].get("name").and_then(JsonValue::as_str), Some("shared_items")); assert_eq!(collections[0].get("documents").and_then(JsonValue::as_u64), Some(2)); }
-    #[test] fn place_only_query_scope_spans_instances_without_leaking_other_places() { let engine = app_bootstrap_test_engine(); let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext { principal: Principal::Anonymous, place_id: place_id.to_owned(), app_instance_id: app_instance_id.map(str::to_owned), place_role: PlaceRole::Owner, public_access: None, }; for (id, place_id, app_instance_id, name) in [ (10, "place-a", "app-1", "one"), (11, "place-a", "app-2", "two"), (12, "place-b", "app-3", "other"), ] { let response = execute_request_scoped( &engine, QueryRequest::new(id, format!("on studio_scope_test | insert {{name: {}}}", query_string(name))), Some(&context(place_id, Some(app_instance_id))), ); assert!(response.is_ok()); } let place_response = execute_request_scoped( &engine, QueryRequest::new(13, "on studio_scope_test | sort name"), Some(&context("place-a", None)), ); let QueryResponse::Ok { documents, .. } = place_response else { panic!("Place scoped query must succeed"); }; assert_eq!(documents.len(), 2); assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one")); assert_eq!(documents[1].get("name").and_then(JsonValue::as_str), Some("two")); assert!(documents.iter().all(|document| document.get("_place").and_then(JsonValue::as_str) == Some("place-a"))); let app_response = execute_request_scoped( &engine, QueryRequest::new(14, "on studio_scope_test | sort name"), Some(&context("place-a", Some("app-1"))), ); let QueryResponse::Ok { documents, .. } = app_response else { panic!("AppInstance scoped query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!(documents[0].get("name").and_then(JsonValue::as_str), Some("one")); }
+    #[test] fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() { let engine = app_bootstrap_test_engine(); let v1 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test".to_owned(), version: "1.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test", "version": "1.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds"); let drifted = execute_request( &engine, QueryRequest::new( 2, r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#, ), ); assert!(drifted.is_ok()); let custom = execute_request( &engine, QueryRequest::new( 3, r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#, ), ); assert!(custom.is_ok()); let v2 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test v2".to_owned(), version: "2.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test v2", "version": "2.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds"); let response = execute_request( &engine, QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); }; let managed = documents.first().expect("managed App exists"); assert_eq!(managed.str_field("state"), Some("active")); assert_eq!(managed.str_field("name"), Some("System test v2")); assert_eq!(managed.str_field("version"), Some("2.0.0")); assert_eq!(managed.str_field("updatedBy"), Some("system")); assert_eq!(managed.get("definition"), Some(&v2.definition)); let response = execute_request( &engine, QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); }; let unmanaged = documents.first().expect("custom App exists"); assert_eq!(unmanaged.str_field("state"), Some("active")); assert_eq!(unmanaged.str_field("name"), Some("Custom")); assert_eq!(unmanaged.str_field("version"), Some("7.0.0")); assert_eq!(unmanaged.str_field("createdBy"), Some("user")); assert!(unmanaged.get("updatedBy").is_none()); }
+    #[test] fn place_scoped_collection_listing_filters_and_counts_by_place() { let engine = app_bootstrap_test_engine(); for (id, collection, place_id) in [ (20, "shared_items", "place-a"), (21, "shared_items", "place-a"), (22, "shared_items", "place-b"), (23, "other_items", "place-b"), ] { let response = execute_request( &engine, QueryRequest::new( id, format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)), ), ); assert!(response.is_ok()); } let snapshot = engine.storage().read().expect("snapshot opens"); let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"), None) .expect("Place collections list succeeds"); assert_eq!(collections.len(), 1); assert_eq!(collections[0].str_field("name"), Some("shared_items")); assert_eq!(collections[0].u64_field("documents"), Some(2)); }
+    #[test] fn place_only_query_scope_spans_instances_without_leaking_other_places() { let engine = app_bootstrap_test_engine(); let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext { principal: Principal::Anonymous, place_id: place_id.to_owned(), app_instance_id: app_instance_id.map(str::to_owned), access: PlaceAccess::Role(PlaceRole::Owner), }; for (id, place_id, app_instance_id, name) in [ (10, "place-a", "app-1", "one"), (11, "place-a", "app-2", "two"), (12, "place-b", "app-3", "other"), ] { let response = execute_request_scoped( &engine, QueryRequest::new(id, format!("on studio_scope_test | insert {{name: {}}}", query_string(name))), Some(&context(place_id, Some(app_instance_id))), ); assert!(response.is_ok()); } let place_response = execute_request_scoped( &engine, QueryRequest::new(13, "on studio_scope_test | sort name"), Some(&context("place-a", None)), ); let QueryResponse::Ok { documents, .. } = place_response else { panic!("Place scoped query must succeed"); }; assert_eq!(documents.len(), 2); assert_eq!(documents[0].str_field("name"), Some("one")); assert_eq!(documents[1].str_field("name"), Some("two")); assert!(documents.iter().all(|document| document.str_field("_place") == Some("place-a"))); let app_response = execute_request_scoped( &engine, QueryRequest::new(14, "on studio_scope_test | sort name"), Some(&context("place-a", Some("app-1"))), ); let QueryResponse::Ok { documents, .. } = app_response else { panic!("AppInstance scoped query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!(documents[0].str_field("name"), Some("one")); }
     #[test] fn file_sync_place_root_projection_is_definition_driven() { let declared = serde_json::json!({ "appId": "custom.files", "definition": { "id": "custom.files", "kind": "custom.anything", "files": {"projection": "place-root"} } }); assert!(file_sync_app_place_root_projection(&declared)); let serialized = serde_json::json!({ "definition": r#"{"files":{"projection":"place-root"}}"# }); assert!(file_sync_app_place_root_projection(&serialized)); let legacy_identity_only = serde_json::json!({ "appId": "system.files", "definition": {"kind": "system.files"} }); assert!(!file_sync_app_place_root_projection(&legacy_identity_only)); assert!(!file_sync_app_place_root_projection(&serde_json::json!({ "definition": {"files": {"projection": "app"}} }))); }
     #[test] fn borrowed_partial_document_encodes_large_js_safe_integers_as_numbers() { let document = Document::from_fields([ ("created_at", Value::from(1_785_680_802_608_u64)), ("small", Value::from(42_u64)), ("negative", Value::from(-5_000_000_000_i64)), ]); let response = BorrowedPlainDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id: RequestId::string("query-1").unwrap(), data: BorrowedDocument(&document), }; let payload = rmp_serde::to_vec_named(&response).unwrap(); let decoded: JsonValue = rmp_serde::from_slice(&payload).unwrap(); assert!(decoded["data"]["created_at"].is_f64()); assert!(decoded["data"]["negative"].is_f64()); assert!(decoded["data"]["small"].is_u64()); }
     #[test] fn enrollment_grants_event_subscription_permission() { let query = enrollment_events_permission_query("identity-a", 42); assert_eq!( query, r#"on _permissions | insert {identityId: "identity-a", action: "events.subscribe", resource: "*", effect: "allow", state: "active", createdAt: 42}"# ); }

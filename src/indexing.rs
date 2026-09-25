@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::{
-    helpers::u128_to_u64_saturating,
+    helpers::{fnv1a64_continue, lock_unpoisoned, u128_to_u64_saturating, FNV1A64_OFFSET},
     query::{ExecutionStatistics, PhysicalAccess, PhysicalPlan},
     storage::CollectionId,
 };
@@ -145,9 +145,7 @@ impl IndexingEngine {
                 while let Ok(event) = receiver.recv() {
                     match event {
                         IndexingEvent::QueryExecuted(observation) => {
-                            let mut state = worker_aggregates
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut state = lock_unpoisoned(&worker_aggregates);
                             let aggregate =
                                 state.entry(observation.fingerprint).or_insert_with(|| {
                                     QueryAggregate {
@@ -212,10 +210,7 @@ impl IndexingEngine {
             let _ = acknowledged.recv();
         }
 
-        let queries = self
-            .aggregates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let queries = lock_unpoisoned(&self.aggregates)
             .clone();
         IndexingSnapshot {
             queries,
@@ -249,16 +244,8 @@ impl Hasher for StableHasher {
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        let mut hash = if self.0 == 0 {
-            0xcbf2_9ce4_8422_2325
-        } else {
-            self.0
-        };
-        for byte in bytes {
-            hash ^= u64::from(*byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        self.0 = hash;
+        let hash = if self.0 == 0 { FNV1A64_OFFSET } else { self.0 };
+        self.0 = fnv1a64_continue(hash, bytes);
     }
 }
 

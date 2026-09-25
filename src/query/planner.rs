@@ -322,6 +322,71 @@ impl PlannerSubPipeline {
     }
 }
 
+/// Rewrites a top-level stage so `<source alias>.field` reads `field`.
+///
+/// At the root the source document is the only one in scope, so the alias is a
+/// pure qualifier. `lookup`, `union`, `load`, `insert`, `into` and `out` are left untouched:
+/// inside a sub-pipeline the alias names the outer document and is resolved at
+/// run time.
+fn strip_source_alias(stage: &PlannerStage, alias: &str) -> PlannerStage {
+    if matches!(stage.name().as_str(), "lookup" | "join" | "union" | "load" | "insert" | "into" | "out") {
+        return stage.clone();
+    }
+    let arguments = strip_alias_prefix(stage.arguments(), alias);
+    match stage.subpipeline() {
+        Some(body) => PlannerStage::with_subpipeline(
+            stage.name().clone(),
+            arguments,
+            PlannerSubPipeline::new(
+                body.stages().iter().map(|child| strip_source_alias(child, alias)),
+                body.span(),
+            ),
+            stage.span(),
+        ),
+        None => PlannerStage::new(stage.name().clone(), arguments, stage.span()),
+    }
+}
+
+/// Removes `alias.` before a field name, outside string literals and
+/// without touching longer identifiers or already-qualified paths.
+fn strip_alias_prefix(text: &str, alias: &str) -> String {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    let chars = text.chars().collect::<Vec<_>>();
+    let alias_chars = alias.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+    while index < chars.len() {
+        let c = chars[index];
+        if let Some(open) = quote {
+            out.push(c);
+            if c == '\\' && index + 1 < chars.len() {
+                out.push(chars[index + 1]);
+                index += 1;
+            } else if c == open {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if index == 0 || !(is_word(chars[index - 1]) || chars[index - 1] == '.') {
+            let end = index + alias_chars.len();
+            if chars[index..].starts_with(&alias_chars)
+                && chars.get(end) == Some(&'.')
+                && chars.get(end + 1).is_some_and(|next| next.is_alphabetic() || *next == '_')
+            {
+                index = end + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        index += 1;
+    }
+    out
+}
+
 /// Semantic query planner.
 #[derive(Clone, Debug, Default)]
 pub struct Planner {
@@ -373,7 +438,15 @@ impl Planner {
         let mut builder = LogicalPlan::builder(source);
 
         for (index, stage) in pipeline.stages().iter().enumerate() {
-            let operator = self.compile_stage(StageLocation::root(index), stage)?;
+            let unqualified;
+            let stage = match pipeline.source_alias() {
+                Some(alias) => {
+                    unqualified = strip_source_alias(stage, alias);
+                    &unqualified
+                }
+                None => stage,
+            };
+            let operator = self.compile_stage(StageLocation::root(index), stage, pipeline.source_alias())?;
 
             builder.push(operator).map_err(|error| {
                 self.logical_plan_error(StageLocation::root(index), stage, error)
@@ -391,7 +464,10 @@ impl Planner {
         })
     }
 
-    fn compile_stage( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
+    /// `scope_alias` names the document the stage runs on (the source alias at
+    /// the top level, the enclosing lookup/union alias inside sub-pipelines);
+    /// nested lookups use it to resolve correlated fields.
+    fn compile_stage( &self, location: StageLocation, stage: &PlannerStage, scope_alias: Option<&str>, ) -> PlanningResult<LogicalOperator> {
         match stage.name().as_str() {
             "where" => self.compile_where(location, stage),
             "near" => self.compile_near(location, stage),
@@ -399,7 +475,7 @@ impl Planner {
             "sample" => self.compile_sample(location, stage),
             "set" => self.compile_set(location, stage),
             "derive" => self.compile_derive(location, stage),
-            "lookup" | "join" => self.compile_lookup(location, stage),
+            "lookup" | "join" => self.compile_lookup(location, stage, scope_alias),
             "union" => self.compile_union(location, stage),
             "load" => self.compile_load(location, stage),
             "limit" => self.compile_limit(location, stage),
@@ -415,6 +491,7 @@ impl Planner {
             "count" => self.compile_count(location, stage),
             "delete" => self.compile_delete(location, stage),
             "insert" => self.compile_insert(location, stage),
+            "into" | "out" => self.compile_into(location, stage),
             "group" => self.compile_group(location, stage),
             "pivot" => self.compile_pivot(location, stage),
 
@@ -525,20 +602,22 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
-    fn compile_lookup( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
+    fn compile_lookup( &self, location: StageLocation, stage: &PlannerStage, outer_alias: Option<&str>, ) -> PlanningResult<LogicalOperator> {
         let arguments = self.required_arguments(location, stage)?;
         let subpipeline = self.required_subpipeline(location, stage)?;
 
         let header = parse_lookup_header(arguments)
             .map_err(|message| self.invalid_syntax(location, stage, message))?;
 
-        let compiled = self.compile_lookup_body(location, stage, subpipeline)?;
+        let compiled = self.compile_lookup_body(location, stage, subpipeline, header.alias)?;
 
         let mut payload = String::new();
         payload.push_str("source=");
         write_length_prefixed(&mut payload, header.collection);
         payload.push_str(";alias=");
         write_optional_length_prefixed(&mut payload, header.alias);
+        payload.push_str(";outer=");
+        write_optional_length_prefixed(&mut payload, outer_alias);
         payload.push_str(";into=");
         write_length_prefixed(&mut payload, compiled.into);
         payload.push_str(";pipeline=");
@@ -821,6 +900,27 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(location, stage, error))
     }
 
+    /// `into <collection>` (alias `out`): terminal stage that inserts the pipeline result
+    /// into another collection. Lowered as a mutating extension operator and
+    /// executed by the executor as a read phase followed by one atomic write.
+    fn compile_into( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
+        self.require_simple(location, stage)?;
+        let arguments = self.required_arguments(location, stage)?;
+        let collection = CollectionName::parse(arguments)
+            .map_err(|error| self.logical_plan_error(location, stage, error))?
+            .to_string();
+        if collection.starts_with('_') {
+            return Err(self.invalid_syntax(
+                location,
+                stage,
+                "into cannot target a system collection",
+            ));
+        }
+        let name = StageName::parse("into")
+            .map_err(|error| self.invalid_syntax(location, stage, error.to_string()))?;
+        Ok(LogicalOperator::custom(name, collection, true))
+    }
+
     fn compile_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
         let mut fields = Vec::new();
         match stage.subpipeline() {
@@ -1038,7 +1138,7 @@ impl Planner {
             .map_err(|error| self.logical_plan_error(parent_location, parent_stage, error))
     }
 
-    fn compile_lookup_body<'a>( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &'a PlannerSubPipeline, ) -> PlanningResult<CompiledLookup<'a>> {
+    fn compile_lookup_body<'a>( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &'a PlannerSubPipeline, scope_alias: Option<&str>, ) -> PlanningResult<CompiledLookup<'a>> {
         let mut into = None;
         let mut compiled = Vec::new();
 
@@ -1077,7 +1177,7 @@ impl Planner {
                 }
 
                 _ => {
-                    compiled.push(self.compile_nested_read_stage(location, parent_stage, child)?);
+                    compiled.push(self.compile_nested_read_stage(location, parent_stage, child, scope_alias)?);
                 }
             }
         }
@@ -1144,7 +1244,7 @@ impl Planner {
                 ));
             }
 
-            compiled.push(self.compile_nested_read_stage(location, parent_stage, child)?);
+            compiled.push(self.compile_nested_read_stage(location, parent_stage, child, source.alias)?);
         }
 
         Ok(CompiledUnion {
@@ -1236,8 +1336,8 @@ impl Planner {
         Ok(output)
     }
 
-    fn compile_nested_read_stage( &self, location: StageLocation, parent_stage: &PlannerStage, stage: &PlannerStage, ) -> PlanningResult<CompiledStage> {
-        let operator = self.compile_stage(location, stage)?;
+    fn compile_nested_read_stage( &self, location: StageLocation, parent_stage: &PlannerStage, stage: &PlannerStage, scope_alias: Option<&str>, ) -> PlanningResult<CompiledStage> {
+        let operator = self.compile_stage(location, stage, scope_alias)?;
         if operator.is_mutating() || operator.is_terminal() {
             return Err(PlannerError::new(
                 PlannerErrorKind::InvalidCompoundChild {
@@ -2247,4 +2347,5 @@ mod tests {
     #[test] fn rejects_custom_compound_stage() { let planner = Planner::with_options(PlannerOptions::new(true)); let error = planner .plan(&PlannerPipeline::new( "users", [compound("inspect", "", vec![stage("where", "true")])], )) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::CompoundCustomStage { .. } )); }
     #[test] fn stage_locations_are_recursive() { let location = StageLocation::root(2).child(4).child(1); assert_eq!(location.to_string(), "2.4.1"); assert_eq!(location.depth(), 3); assert_eq!(location.index(0), Some(2)); assert_eq!(location.index(2), Some(1)); assert_eq!(location.index(3), None); }
     #[test] fn expression_parser_is_still_used_for_where() { let expression = parse_expression("age >= 18").unwrap(); assert_eq!( plan_one("where", "age >= 18") .operator(0) .unwrap() .predicate(), Some(&expression), ); }
+    #[test] fn compound_group_plans_keys_and_several_measures() { let source = "on orders | group | by region as zone, month | sum qty as units | sum price | end"; let ast = crate::query::parse(source).unwrap(); let plan = Planner::new().plan_ast(source, &ast).unwrap(); assert_eq!(plan.operator(0).and_then(LogicalOperator::group_keys).map(<[ExpressionFieldPath]>::len), Some(4)); }
 }

@@ -334,6 +334,20 @@ pub enum AccessPolicy {
     DynamicPermission(AuthorizationAction),
 }
 
+impl AccessPolicy {
+    /// Stable wire name, advertised with the operation contracts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Authenticated => "authenticated",
+            Self::Query => "query",
+            Self::Permission { .. } => "permission",
+            Self::DynamicPermission(_) => "dynamic_permission",
+        }
+    }
+}
+
 /// Static metadata for one built-in operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OperationDescriptor {
@@ -411,7 +425,7 @@ macro_rules! define_operations {
             #[must_use]
             pub const fn provider_capability(self) -> Option<ServiceCapability> {
                 match self {
-                    Self::CoreHealth | Self::CoreOperations | Self::NodeStatus | Self::Ping => None,
+                    Self::CoreHealth | Self::CoreOperations | Self::CoreDiscover | Self::NodeStatus | Self::Ping => None,
                     Self::FabricResourceList | Self::FabricResourceSet | Self::FabricResourceRemove => Some(ServiceCapability::Auth),
                     Self::DataWorkerRun => Some(ServiceCapability::DataImport),
                     Self::DataAnalyze | Self::DataImport | Self::DataMappingSave | Self::DataMappingList | Self::DataMappingUpdate | Self::DataMappingDelete => Some(ServiceCapability::Database),
@@ -445,7 +459,7 @@ macro_rules! define_operations {
             #[must_use]
             pub const fn implementation_capabilities(self) -> ServiceCapabilities {
                 match self {
-                    Self::CoreHealth | Self::CoreOperations | Self::NodeStatus | Self::Ping => ServiceCapabilities::NONE,
+                    Self::CoreHealth | Self::CoreOperations | Self::CoreDiscover | Self::NodeStatus | Self::Ping => ServiceCapabilities::NONE,
                     Self::FabricResourceList | Self::FabricResourceSet | Self::FabricResourceRemove => AUTH,
                     // data.analyze/data.import are control-plane operations: authorization,
                     // mappings and destination writes live on a database provider. The actual

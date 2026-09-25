@@ -2114,7 +2114,24 @@ fn write_expression(output: &mut String, expression: &Expression) {
             output.push(')');
         }
         ExpressionKind::Group(inner) => write_expression(output, inner),
+        ExpressionKind::Array(items) => write_expressions(output, "array(", items),
+        ExpressionKind::Call { function, arguments } => {
+            output.push_str("call(");
+            write_string(output, function);
+            write_expressions(output, ",", arguments);
+        }
     }
+}
+
+fn write_expressions(output: &mut String, prefix: &str, expressions: &[Expression]) {
+    output.push_str(prefix);
+    for (index, expression) in expressions.iter().enumerate() {
+        if index > 0 {
+            output.push(',');
+        }
+        write_expression(output, expression);
+    }
+    output.push(')');
 }
 
 fn write_literal(output: &mut String, literal: &Literal) {
@@ -2164,6 +2181,8 @@ const fn canonical_binary_operator(operator: BinaryOperator) -> &'static str {
         BinaryOperator::Multiply => "multiply",
         BinaryOperator::Divide => "divide",
         BinaryOperator::Remainder => "remainder",
+        BinaryOperator::In => "in",
+        BinaryOperator::NotIn => "not-in",
     }
 }
 

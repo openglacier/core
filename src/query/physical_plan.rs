@@ -419,6 +419,8 @@ pub enum PhysicalOperator {
     Lookup {
         collection: CollectionId,
         alias: Option<Arc<str>>,
+        /// Alias of the document being enriched, for correlated predicates.
+        outer_alias: Option<Arc<str>>,
         into: Arc<str>,
         pipeline: PhysicalSubPipeline,
     },
@@ -478,6 +480,15 @@ pub enum PhysicalOperator {
         arguments: Arc<str>,
         writes: bool,
         changes_cardinality: bool,
+        /// Declared maximum number of rows the stage lets through, in order.
+        row_bound: Option<usize>,
+        /// Declared: the stage leaves the fields of the rows it keeps untouched.
+        preserves_fields: bool,
+        /// Declared: the stage requires exactly `row_bound` rows (`single`).
+        exact_rows: bool,
+        /// Declared: the stage turns one row into zero or more rows, in
+        /// order, without buffering (`unwind`).
+        expands_rows: bool,
     },
 }
 
@@ -521,9 +532,20 @@ impl PhysicalOperator {
         Ok(Self::Lookup {
             collection,
             alias,
+            outer_alias: None,
             into: Arc::from(into),
             pipeline,
         })
+    }
+
+    /// Names the enriched document so sub-pipeline predicates can reference
+    /// it as `<outer alias>.field` (for example `o.user == u.name`).
+    #[must_use]
+    pub fn with_outer_alias(mut self, alias: Option<&str>) -> Self {
+        if let Self::Lookup { outer_alias, .. } = &mut self {
+            *outer_alias = alias.map(Arc::from);
+        }
+        self
     }
 
     /// Creates a validated union operator.
@@ -690,7 +712,64 @@ impl PhysicalOperator {
             arguments: Arc::from(arguments),
             writes,
             changes_cardinality,
+            row_bound: None,
+            preserves_fields: false,
+            exact_rows: false,
+            expands_rows: false,
         })
+    }
+
+    /// Declares that a read-only, row-local extension operator lets at most
+    /// `bound` rows through, preserving their order, and whether it leaves
+    /// their fields untouched.
+    ///
+    /// Executors consume the bound through [`ExecutionProperties`], exactly
+    /// like `limit`, so the stage needs no dedicated execution path. A
+    /// field-preserving bound is a pure reducer and can also bound a blocking
+    /// stage (for example Top-1 after `sort`).
+    #[must_use]
+    pub fn with_row_bound(mut self, bound: usize, keeps_fields: bool) -> Self {
+        if let Self::Custom { writes: false, changes_cardinality: false, row_bound, preserves_fields, .. } = &mut self {
+            *row_bound = Some(bound);
+            *preserves_fields = keeps_fields;
+        }
+        self
+    }
+
+    /// Declares that a read-only blocking extension operator retains at most
+    /// `count` rows (for example `sample n`), so executors can run it with
+    /// memory bounded by `count` instead of the input size.
+    #[must_use]
+    pub fn with_retained_rows(mut self, count: usize) -> Self {
+        if let Self::Custom { writes: false, changes_cardinality: true, row_bound, .. } = &mut self {
+            *row_bound = Some(count);
+        }
+        self
+    }
+
+    /// Declares that a read-only, row-local extension operator requires
+    /// exactly `count` input rows. Executors fail the query otherwise, through
+    /// the same row-bound property that `limit` uses.
+    #[must_use]
+    pub fn with_exact_rows(self, count: usize, keeps_fields: bool) -> Self {
+        let mut operator = self.with_row_bound(count, keeps_fields);
+        if let Self::Custom { row_bound: Some(_), exact_rows, .. } = &mut operator {
+            *exact_rows = true;
+        }
+        operator
+    }
+
+    /// Declares that a read-only extension operator emits zero or more rows
+    /// for each input row, in input order, without buffering (`unwind`).
+    ///
+    /// Streaming executors run such a stage mid-chain: the rows it emits
+    /// continue through the following stages one at a time.
+    #[must_use]
+    pub fn with_row_expansion(mut self) -> Self {
+        if let Self::Custom { writes: false, changes_cardinality: false, row_bound: None, expands_rows, .. } = &mut self {
+            *expands_rows = true;
+        }
+        self
     }
 
     /// Returns the resolved execution properties for this operator instance.
@@ -903,6 +982,60 @@ impl PhysicalOperator {
                 NoOrder,
                 UnknownFields,
                 M,
+                Set,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Custom {
+                writes: false,
+                changes_cardinality: true,
+                row_bound: Some(bound),
+                ..
+            } => (
+                B,
+                Reduce,
+                AtMost(*bound),
+                NoOrder,
+                SameFields,
+                L,
+                Set,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Custom {
+                writes: false,
+                expands_rows: true,
+                ..
+            } => (
+                S,
+                Expand,
+                U,
+                Preserved,
+                UnknownFields,
+                L,
+                Set,
+                R,
+                NoPv,
+                Materialize,
+                NoReuse,
+            ),
+            Self::Custom {
+                writes: false,
+                row_bound: Some(bound),
+                preserves_fields,
+                exact_rows,
+                ..
+            } => (
+                S,
+                Reduce,
+                if *exact_rows { Exact(*bound) } else { AtMost(*bound) },
+                Preserved,
+                if *preserves_fields { SameFields } else { UnknownFields },
+                L,
                 Set,
                 R,
                 NoPv,
@@ -1952,4 +2085,6 @@ mod tests {
     #[test] fn row_local_read_only_custom_operator_is_streaming() { let operator = PhysicalOperator::custom( StageName::parse("select").unwrap(), "CAFacture - COGS as Marge", false, false, ) .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::Streaming )); assert!(!matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); }
     #[test] fn cardinality_changing_custom_operator_is_set_level() { let operator = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true) .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); assert!(matches!( operator.execution_properties().scope, super::super::execution_properties::Scope::Set )); }
     #[test] fn classifies_streaming_and_blocking_memory_contracts() { let collection = CollectionId::parse("users").unwrap(); let streaming = PhysicalPlan::new( PhysicalSource::collection_scan(collection.clone()), [PhysicalOperator::limit(2)], ) .unwrap(); assert_eq!( streaming.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming.is_memory_streaming()); let blocking = PhysicalPlan::new( PhysicalSource::collection_scan(collection), [PhysicalOperator::sort([SortKey::ascending(field(&["name"]))]).unwrap()], ) .unwrap(); assert_eq!( blocking.memory_execution_mode(), MemoryExecutionMode::GovernedBlocking ); assert!(!blocking.is_memory_streaming()); let streaming_count = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), [ PhysicalOperator::filter(parse_expression("active == true").unwrap()), PhysicalOperator::count("count").unwrap(), ], ) .unwrap(); assert_eq!( streaming_count.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming_count.is_memory_streaming()); }
+    #[test] fn declared_row_bound_is_consumed_through_properties() { let name = StageName::parse("first").unwrap(); let pure = PhysicalOperator::custom(name.clone(), "", false, false).unwrap().with_row_bound(1, true); assert_eq!(pure.execution_properties().stream_row_bound(), Some(1)); assert_eq!(pure.execution_properties().linear_bound(), Some(1)); let projecting = PhysicalOperator::custom(name.clone(), "profile", false, false).unwrap().with_row_bound(1, false); assert_eq!(projecting.execution_properties().stream_row_bound(), Some(1)); assert_eq!(projecting.execution_properties().linear_bound(), None); let writing = PhysicalOperator::custom(name, "", true, false).unwrap().with_row_bound(1, true); assert_eq!(writing.execution_properties().stream_row_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().stream_row_bound(), Some(3)); }
+    #[test] fn sample_and_single_declare_their_row_properties() { let single = PhysicalOperator::custom(StageName::parse("single").unwrap(), "", false, false).unwrap().with_exact_rows(1, true); assert_eq!(single.execution_properties().exact_rows(), Some(1)); assert_eq!(single.execution_properties().stream_row_bound(), Some(1)); assert_eq!(single.execution_properties().linear_bound(), None); let sample = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true).unwrap().with_retained_rows(3); assert_eq!(sample.execution_properties().retained_rows(), Some(3)); assert_eq!(sample.execution_properties().stream_row_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().retained_rows(), None); }
 }

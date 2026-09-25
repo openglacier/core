@@ -94,12 +94,7 @@ impl DocumentId {
 
     #[cfg(test)]
     pub(crate) fn from_test_label(label: &str) -> Self {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for byte in label.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        Self::synthetic(0x7465_7374, hash)
+        Self::synthetic(0x7465_7374, crate::helpers::fnv1a64(label.as_bytes()))
     }
 }
 

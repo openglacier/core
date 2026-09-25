@@ -291,6 +291,43 @@ impl From<ParseError> for QueryParseError {
     }
 }
 
+/// When a stage opens a sub-pipeline closed by `| end`.
+///
+/// This is a syntactic property of the stage name, independent of its
+/// semantics: the planner decides what the nested stages mean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubPipelinePolicy {
+    /// The stage is always compound (`lookup`, `join`, `union`, `pivot`).
+    Always,
+    /// The stage is compound when its header has no arguments (`load`, `group`);
+    /// with arguments it is the compact single-line form.
+    WhenHeaderEmpty,
+    /// The stage is always simple.
+    Never,
+}
+
+impl SubPipelinePolicy {
+    /// Returns the sub-pipeline policy of a stage name.
+    #[must_use]
+    pub fn of_stage(name: &str) -> Self {
+        match name {
+            "lookup" | "join" | "union" | "pivot" => Self::Always,
+            "load" | "group" => Self::WhenHeaderEmpty,
+            _ => Self::Never,
+        }
+    }
+
+    /// Returns whether a stage with this policy and header opens a sub-pipeline.
+    #[must_use]
+    pub const fn opens(self, arguments_span: Span) -> bool {
+        match self {
+            Self::Always => true,
+            Self::WhenHeaderEmpty => arguments_span.is_empty(),
+            Self::Never => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Parser<'stream, 'source> {
     stream: &'stream TokenStream<'source>,
@@ -681,7 +718,8 @@ impl<'stream, 'source> Parser<'stream, 'source> {
             self.parse_stage_arguments(name_token.span().end())?;
         let header_end = last_argument_span.map_or(name_token.span().end(), Span::end);
         let header_span = Span::new(pipe.span().start(), header_end);
-        if self.stage_opens_subpipeline(name_token.kind(), arguments_span) {
+        let name_text = self.stream.lexeme(name_token).unwrap_or_default();
+        if SubPipelinePolicy::of_stage(name_text).opens(arguments_span) {
             let subpipeline = self.parse_subpipeline(header_span)?;
             let stage_span = Span::new(pipe.span().start(), subpipeline.span().end());
             Ok(StageAst::with_subpipeline(
@@ -832,20 +870,6 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         };
 
         Ok((arguments_span, last_span))
-    }
-
-    /// Indique si le stage courant ouvre un sous-pipeline.
-    ///
-    /// `lookup`, `union` et `pivot` sont toujours composés. `load` n'est composé
-    /// que lorsque son en-tête est vide ; une forme compacte conserve ses
-    /// arguments dans le stage simple.
-    const fn stage_opens_subpipeline(&self, kind: TokenKind, arguments_span: Span) -> bool {
-        match kind {
-            TokenKind::Lookup | TokenKind::Join | TokenKind::Union | TokenKind::Pivot => true,
-
-            TokenKind::Load => arguments_span.is_empty(),
-            _ => false,
-        }
     }
 
     /// Consomme un token d'une catégorie précise.
@@ -1064,4 +1088,7 @@ mod tests {
     | columns month
     | values revenue
     | aggregate sum"#; let error = parse(source).unwrap_err(); assert!(matches!( error.as_parse_error().map(ParseError::kind), Some(ParseErrorKind::UnclosedSubPipeline { .. }), )); }
+    #[test] fn subpipeline_policy_is_a_stage_property() { assert_eq!(SubPipelinePolicy::of_stage("lookup"), SubPipelinePolicy::Always); assert_eq!(SubPipelinePolicy::of_stage("pivot"), SubPipelinePolicy::Always); assert_eq!(SubPipelinePolicy::of_stage("group"), SubPipelinePolicy::WhenHeaderEmpty); assert_eq!(SubPipelinePolicy::of_stage("load"), SubPipelinePolicy::WhenHeaderEmpty); assert_eq!(SubPipelinePolicy::of_stage("where"), SubPipelinePolicy::Never); assert!(SubPipelinePolicy::WhenHeaderEmpty.opens(Span::at(3))); assert!(!SubPipelinePolicy::WhenHeaderEmpty.opens(Span::new(3, 5))); }
+    #[test] fn group_without_header_opens_a_subpipeline() { let compound = parse_ok("on orders | group | by region | sum qty | sum price | end | sort qty"); assert_eq!(compound.stage_count(), 2); let group = compound.stage(0).unwrap(); assert_eq!(group.subpipeline().map(SubPipelineAst::stage_count), Some(3)); let compact = parse_ok("on orders | group region, qty"); assert!(compact.stage(0).unwrap().subpipeline().is_none()); }
+    #[test] fn symbolic_operators_are_not_stage_names() { let error = parse_error("on users | + x"); assert!(matches!(error.kind(), ParseErrorKind::ExpectedStageName { found: TokenKind::Operator })); }
 }

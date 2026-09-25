@@ -67,7 +67,15 @@ impl AuthorizationRequest {
 
 /// Query access inferred from the parsed pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryAccess { pub collection: String, pub action: AuthorizationAction, }
+pub struct QueryAccess {
+    /// Collection the action is authorized against. For a query ending in
+    /// `into`, this is the collection written to, not the one read from.
+    pub collection: String,
+    pub action: AuthorizationAction,
+    /// Source collection that must additionally be readable when `collection`
+    /// is the target of an `into` stage.
+    pub source_read: Option<String>,
+}
 
 impl QueryAccess {
     /// Parses one query and classifies it as read or write.
@@ -79,14 +87,30 @@ impl QueryAccess {
             .ok_or_else(|| "query source collection is unavailable".to_owned())?
             .to_owned();
 
-        let mutating = pipeline.stages().iter().any(|stage| {
+        let into_target = pipeline
+            .stages()
+            .iter()
+            .find(|stage| {
+                stage
+                    .name_text(source)
+                    .is_some_and(|name| name.eq_ignore_ascii_case("into") || name.eq_ignore_ascii_case("out"))
+            })
+            .and_then(|stage| stage.arguments_text(source))
+            .map(|target| target.trim().to_owned());
+
+        let mutating = into_target.is_some() || pipeline.stages().iter().any(|stage| {
             stage
                 .name_text(source)
                 .map(str::to_ascii_lowercase)
                 .is_some_and(|name| matches!(name.as_str(), "insert" | "set" | "delete" | "load"))
         });
+        let (collection, source_read) = match into_target {
+            Some(target) => (target, Some(collection)),
+            None => (collection, None),
+        };
         Ok(Self {
             collection,
+            source_read,
             action: if mutating {
                 AuthorizationAction::QueryWrite
             } else {
@@ -125,6 +149,7 @@ mod tests {
     use super::*;
     #[test] fn read_only_query_is_classified_as_query_read() { let access = QueryAccess::analyze("on users | where active == true | limit 1").unwrap(); assert_eq!(access.collection, "users"); assert_eq!(access.action, AuthorizationAction::QueryRead); }
     #[test] fn mutating_query_is_classified_as_query_write() { for query in [ "on users | insert {name: Alice}", "on users | set active = true", "on users | delete", "on users | load []", ] { let access = QueryAccess::analyze(query).unwrap(); assert_eq!(access.action, AuthorizationAction::QueryWrite, "{query}"); } }
+    #[test] fn into_query_is_a_write_on_its_target_and_a_read_on_its_source() { let access = QueryAccess::analyze("on users | where active == true | into archive").unwrap(); assert_eq!(access.action, AuthorizationAction::QueryWrite); assert_eq!(access.collection, "archive"); assert_eq!(access.source_read.as_deref(), Some("users")); assert_eq!(QueryAccess::analyze("on users").unwrap().source_read, None); let aliased = QueryAccess::analyze("on users | out archive").unwrap(); assert_eq!((aliased.action, aliased.collection.as_str()), (AuthorizationAction::QueryWrite, "archive")); }
     #[test] fn anonymous_principal_cannot_build_permission_request() { let access = QueryAccess::analyze("on users").unwrap(); assert!(access.request_for(&Principal::Anonymous).is_none()); }
     #[test] fn authenticated_principal_builds_permission_request() { let access = QueryAccess::analyze("on users").unwrap(); let request = access .request_for(&Principal::Identity { identity_id: "identity-a".to_owned(), device_id: "device-a".to_owned(), }) .unwrap(); assert_eq!(request.identity_id, "identity-a"); assert_eq!(request.action, AuthorizationAction::QueryRead); assert_eq!(request.resource, "users"); }
     #[test] fn app_manage_action_is_stable() { assert_eq!(AuthorizationAction::AppManage.as_str(), "app.manage"); }

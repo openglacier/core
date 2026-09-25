@@ -8,7 +8,7 @@ pub use crate::error::QueryRuntimeBuildError;
 use super::executor::PreparedInsertDocument;
 use super::{
     CustomOperatorResult, ExecutionError, ExecutionResult, ExecutionRuntime, Expression,
-    ExpressionFieldPath, ExpressionFieldResolver, IncrementalGroupAccumulator, LookupDocuments,
+    ExpressionFieldPath, ExpressionFieldResolver, IncrementalGroupAccumulator, IncrementalPivotAccumulator, LookupDocuments, LookupFields,
     PhysicalLoadMode, SetAssignment, SortKey, StageName, StreamingLoadMutation, SyntheticDocument,
 };
 use crate::{
@@ -73,6 +73,10 @@ type GroupHandler = dyn Fn(&[ExpressionFieldPath], &[Arc<Document>]) -> Executio
     + Send
     + Sync;
 
+type IncrementalPivotHandler = dyn Fn(&PivotSpecification) -> ExecutionResult<Box<dyn IncrementalPivotAccumulator>>
+    + Send
+    + Sync;
+
 type IncrementalGroupHandler = dyn Fn(&[ExpressionFieldPath]) -> ExecutionResult<Box<dyn IncrementalGroupAccumulator>>
     + Send
     + Sync;
@@ -111,6 +115,7 @@ pub struct QueryRuntime {
     count: Option<Arc<CountHandler>>,
     group: Option<Arc<GroupHandler>>,
     incremental_group: Option<Arc<IncrementalGroupHandler>>,
+    incremental_pivot: Option<Arc<IncrementalPivotHandler>>,
     pivot: Option<Arc<PivotHandler>>,
     insert: Option<Arc<InsertHandler>>,
     custom: Option<Arc<CustomHandler>>,
@@ -144,6 +149,7 @@ impl QueryRuntime {
             count: None,
             group: None,
             incremental_group: None,
+            incremental_pivot: None,
             pivot: None,
             insert: None,
             custom: None,
@@ -356,6 +362,19 @@ impl QueryRuntime {
         self
     }
 
+    /// Installs capability-driven incremental pivot aggregation.
+    #[must_use]
+    pub fn with_incremental_pivot<P>(mut self, pivot: P) -> Self
+    where
+        P: Fn(&PivotSpecification) -> ExecutionResult<Box<dyn IncrementalPivotAccumulator>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.incremental_pivot = Some(Arc::new(pivot));
+        self
+    }
+
     /// Installs capability-driven incremental group aggregation.
     #[must_use]
     pub fn with_incremental_group<G>(mut self, group: G) -> Self
@@ -524,6 +543,7 @@ impl fmt::Debug for QueryRuntime {
             .field("count", &self.supports_count())
             .field("group", &self.supports_group())
             .field("incremental_group", &self.incremental_group.is_some())
+            .field("incremental_pivot", &self.incremental_pivot.is_some())
             .field("pivot", &self.supports_pivot())
             .field("insert", &self.supports_insert())
             .field("custom", &self.supports_custom())
@@ -546,10 +566,13 @@ impl ExecutionRuntime for QueryRuntime {
         }
     }
 
-    fn evaluate_lookup_predicate( &self, expression: &Expression, outer: &Document, inner_alias: Option<&str>, inner: &Document, ) -> ExecutionResult<bool> {
-        match &self.lookup_predicate {
-            Some(predicate) => predicate(expression, outer, inner_alias, inner),
-            None => (self.predicate)(expression, inner),
+    fn evaluate_lookup_predicate( &self, expression: &Expression, scope: &LookupFields<'_>, ) -> ExecutionResult<bool> {
+        match (&self.lookup_predicate, &self.resolved_predicate) {
+            (Some(predicate), _) => predicate(expression, scope.outer, scope.inner_alias, scope.inner),
+            // The lookup scope is an ordinary field resolver: correlated
+            // predicates need no dedicated handler.
+            (None, Some(resolved)) => resolved(expression, scope),
+            (None, None) => (self.predicate)(expression, scope.inner),
         }
     }
 
@@ -690,6 +713,13 @@ impl ExecutionRuntime for QueryRuntime {
                 "insert",
                 "typed insert document has no configured runtime handler",
             )),
+        }
+    }
+
+    fn incremental_pivot_accumulator( &self, specification: &PivotSpecification, ) -> ExecutionResult<Option<Box<dyn IncrementalPivotAccumulator>>> {
+        match &self.incremental_pivot {
+            Some(pivot) => pivot(specification).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -964,6 +994,7 @@ impl QueryRuntimeBuilder {
             count: self.count,
             group: self.group,
             incremental_group: self.incremental_group,
+            incremental_pivot: None,
             pivot: self.pivot,
             insert: self.insert,
             custom: self.custom,

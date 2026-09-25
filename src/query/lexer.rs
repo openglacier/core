@@ -274,7 +274,15 @@ impl<'source> Lexer<'source> {
         match character {
             '|' => {
                 self.advance_char();
-                Ok(self.token(TokenKind::Pipe, start))
+                // `||` is the boolean operator; a stage separator is always a single `|`.
+                let kind = if self.consume_char('|') { TokenKind::Operator } else { TokenKind::Pipe };
+                Ok(self.token(kind, start))
+            }
+
+            '&' if self.peek_next_char() == Some('&') => {
+                self.advance_char();
+                self.advance_char();
+                Ok(self.token(TokenKind::Operator, start))
             }
 
             '.' => {
@@ -342,7 +350,7 @@ impl<'source> Lexer<'source> {
 
             '+' | '-' | '*' | '/' | '%' => {
                 self.advance_char();
-                Ok(self.token(TokenKind::Identifier, start))
+                Ok(self.token(TokenKind::Operator, start))
             }
 
             character if character.is_ascii_digit() => self.lex_number(start),
@@ -378,6 +386,9 @@ impl<'source> Lexer<'source> {
         self.advance_char();
         if self.consume_char('=') {
             Ok(self.token(TokenKind::NotEqual, start))
+        } else if self.source.trim() != "!" {
+            // Prefix boolean negation; a source made of `!` alone stays an error.
+            Ok(self.token(TokenKind::Operator, start))
         } else {
             Err(LexError::new(
                 LexErrorKind::ExpectedEqualsAfterBang,
@@ -708,4 +719,7 @@ mod tests {
     #[test] fn different_literals_keep_same_lexical_shape() { let first = lex("from users | where age >= 18").unwrap(); let second = lex("from users | where age >= 42").unwrap(); assert_eq!( first.kinds().collect::<Vec<_>>(), second.kinds().collect::<Vec<_>>(), ); assert_ne!( first .significant_tokens() .map(|token| first.lexeme(token).unwrap()) .collect::<Vec<_>>(), second .significant_tokens() .map(|token| second.lexeme(token).unwrap()) .collect::<Vec<_>>(), ); }
     #[test] fn different_identifiers_are_not_hidden_by_token_stream() { let users = lex("from users | where age > 18").unwrap(); let orders = lex("from orders | where total > 18").unwrap(); assert_eq!( users.kinds().collect::<Vec<_>>(), orders.kinds().collect::<Vec<_>>(), ); assert_ne!( users .significant_tokens() .map(|token| users.lexeme(token).unwrap()) .collect::<Vec<_>>(), orders .significant_tokens() .map(|token| orders.lexeme(token).unwrap()) .collect::<Vec<_>>(), ); }
     #[test] fn errors_are_displayed_with_spans() { let error = lex("@").unwrap_err(); assert_eq!(error.to_string(), "unexpected character `@` at 0..1",); }
+    #[test] fn lexes_symbolic_operators_as_operator_tokens() { assert_eq!( kinds("where a || b && !c + 1"), vec![ TokenKind::Where, TokenKind::Identifier, TokenKind::Operator, TokenKind::Identifier, TokenKind::Operator, TokenKind::Operator, TokenKind::Identifier, TokenKind::Operator, TokenKind::Number, TokenKind::End, ], ); assert_eq!(lexemes("a || b && !c"), vec!["a", "||", "b", "&&", "!", "c"]); }
+    #[test] fn double_pipe_is_not_a_stage_separator() { let pipes = kinds("on users | where a || b | limit 1").into_iter().filter(|kind| *kind == TokenKind::Pipe).count(); assert_eq!(pipes, 2); assert_eq!(kinds("| |"), vec![TokenKind::Pipe, TokenKind::Pipe, TokenKind::End]); }
+    #[test] fn single_ampersand_is_rejected() { let error = lex("a & b").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnexpectedCharacter { character: '&' }); }
 }

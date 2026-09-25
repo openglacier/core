@@ -15,6 +15,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::helpers::write_file_atomic;
+
 /// Reserved user-facing namespace for files owned by non-primary Apps.
 pub const APP_FILES_DIRECTORY: &str = "Apps";
 /// Name used when the primary Files tree itself contains a root entry named
@@ -310,21 +312,9 @@ fn load_json<T>(path: &Path) -> io::Result<Option<T>> where T: for<'de> Deserial
 }
 
 fn save_json<T>(path: &Path, value: &T) -> io::Result<()> where T: Serialize, {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("tmp");
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut output = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&temporary)?;
-    output.write_all(&bytes)?;
-    output.flush()?;
-    output.sync_all()?;
-    fs::rename(temporary, path)
+    write_file_atomic(path, &path.with_extension("tmp"), |output| output.write_all(&bytes))
 }
 
 #[cfg(test)]

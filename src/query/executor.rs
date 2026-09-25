@@ -1,24 +1,23 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 //! Physical query plan execution.
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp::Ordering, error::Error as StdError, fmt, io, mem::size_of, sync::Arc};
 
 use crate::{
     compare,
-    helpers::{document_scope_matches, enforce_document_scope, PLACE_SCOPE_FIELD},
+    helpers::{document_scope_matches, enforce_document_scope, fnv1a64, unix_time_nanos, PLACE_SCOPE_FIELD},
     memory::{MemoryClass, MemoryGovernor, MemoryReservation, MemoryReservationError},
     model::{CoercionPolicy, Document, Number, Value},
     spill::{SpillEngine, SpillRun, SpillRunReader},
     storage::{
-        CommitResult, DocumentId, DocumentVersion, ProjectedValueRef, ScanOptions, StorageEngine,
+        CollectionId, CommitResult, DocumentId, DocumentVersion, ProjectedValueRef, ScanOptions, StorageEngine,
         StorageError, StorageMutation, StorageRead, StorageTransaction, StoredDocument,
-        VersionPrecondition,
+        UuidV7Generator, VersionPrecondition,
     },
 };
 
 use super::{
-    Expression, ExpressionFieldPath, ExpressionFieldResolver, PhysicalAccess, PhysicalLoadMode,
+    Expression, ExpressionFieldPath, ExpressionFieldResolver, LookupFields, PhysicalAccess, PhysicalLoadMode,
     PhysicalOperator, PhysicalPlan, PhysicalSubPipeline, SetAssignment, SortKey, StageName,
 };
 
@@ -224,6 +223,21 @@ impl LookupDocuments {
 ///
 /// Default implementations report unsupported operators so a minimal runtime
 /// only needs to implement predicate evaluation and `set`.
+/// Incremental state of one pivot.
+///
+/// Implementations retain only aggregate cells, one per (row key, column), never
+/// the source rows.
+pub trait IncrementalPivotAccumulator: Send {
+    /// Folds one document into the pivot.
+    fn push(&mut self, document: &Document) -> ExecutionResult<()>;
+
+    /// Estimated bytes currently retained by the aggregate state.
+    fn retained_bytes(&self) -> usize;
+
+    /// Produces the pivot result documents.
+    fn finish(self: Box<Self>) -> ExecutionResult<Vec<SyntheticDocument>>;
+}
+
 /// Incremental state for one grouped key.
 ///
 /// Implementations retain only aggregate state, never the complete source rows.
@@ -305,12 +319,11 @@ pub trait ExecutionRuntime: Send + Sync {
 
     /// Evaluates a predicate inside a lookup sub-pipeline.
     ///
-    /// `outer` is the document currently being enriched. `inner_alias` is the
-    /// alias declared by the lookup header, when present. The default
-    /// implementation evaluates the predicate against the inner document only.
-    fn evaluate_lookup_predicate( &self, expression: &Expression, outer: &Document, inner_alias: Option<&str>, inner: &Document, ) -> ExecutionResult<bool> {
-        let _ = (outer, inner_alias);
-        self.evaluate_predicate(expression, inner)
+    /// `scope` resolves `<inner alias>.field` on the joined document and
+    /// `<outer alias>.field` on the document being enriched. The default
+    /// implementation evaluates the predicate against the joined document only.
+    fn evaluate_lookup_predicate( &self, expression: &Expression, scope: &LookupFields<'_>, ) -> ExecutionResult<bool> {
+        self.evaluate_predicate(expression, scope.inner)
     }
 
     /// Attaches the result of a lookup to the outer document.
@@ -461,6 +474,13 @@ pub trait ExecutionRuntime: Send + Sync {
         ))
     }
 
+    /// Starts an incremental pivot, or `None` when the runtime only pivots a
+    /// complete document set.
+    fn incremental_pivot_accumulator( &self, specification: &PivotSpecification, ) -> ExecutionResult<Option<Box<dyn IncrementalPivotAccumulator>>> {
+        let _ = specification;
+        Ok(None)
+    }
+
     /// Applies a pivot to the complete intermediate document set.
     ///
     /// The runtime owns value extraction, aggregate semantics, column naming,
@@ -569,11 +589,94 @@ impl Executor {
                 "streaming load is not yet supported inside an App Instance scope",
             ));
         }
+        if let Some(target) = into_target(plan) {
+            return self.execute_into(storage, runtime, plan, target, scope);
+        }
         if plan.is_write() {
             self.execute_write(storage, runtime, plan, scope)
         } else {
             self.execute_read(storage, runtime, plan, scope)
         }
+    }
+
+    /// Runs the pipeline before a terminal `into` as a read, then inserts the
+    /// resulting rows into `target` in one atomic batch.
+    ///
+    /// Every row receives a fresh UUID v7 identifier, whatever its origin, so
+    /// the operation never overwrites a target document and preserves the row
+    /// order in identifier order. `_id` is storage metadata and is not copied
+    /// into the stored document.
+    fn execute_into( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, target: &str, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
+        let target = CollectionId::parse(target).map_err(ExecutionError::storage)?;
+        if target.as_str().starts_with('_') {
+            return Err(ExecutionError::unsupported_operator(
+                "into",
+                "into cannot target a system collection",
+            ));
+        }
+        if &target == plan.source().collection() {
+            return Err(ExecutionError::unsupported_operator(
+                "into",
+                "into target must differ from the source collection",
+            ));
+        }
+
+        let read_plan = PhysicalPlan::new(
+            plan.source().clone(),
+            plan.operators()[..plan.operators().len() - 1].iter().cloned(),
+        )
+        .map_err(|error| ExecutionError::evaluation(error.to_string()))?;
+        if read_plan.is_write() {
+            return Err(ExecutionError::unsupported_operator(
+                "into",
+                "into cannot follow a mutating stage",
+            ));
+        }
+        let read = self.execute_read(storage, runtime, &read_plan, scope)?;
+        let statistics = read.statistics;
+        // The result set and its insert batch stay resident until the commit.
+        let _reservation = reserve_query_memory(
+            &self.memory_governor,
+            "into",
+            estimated_rows_bytes(read.rows.len()),
+        )?;
+
+        let ids = UuidV7Generator::new();
+        let mutations = read
+            .rows
+            .into_iter()
+            .map(|row| {
+                let mut document = row.shared_document();
+                if document.contains_key("_id") {
+                    let mut owned = document.as_ref().clone();
+                    owned.remove("_id");
+                    document = Arc::new(owned);
+                }
+                if let Some(scope) = scope {
+                    document = scope.enforce(document.as_ref());
+                }
+                StorageMutation::insert(ids.next_id(), document)
+            })
+            .collect::<Vec<_>>();
+
+        let commit = if mutations.is_empty() {
+            None
+        } else {
+            Some(
+                storage
+                    .apply_batch_atomic_summary(&target, mutations)
+                    .map_err(ExecutionError::storage)?,
+            )
+        };
+        Ok(ExecutionOutput {
+            rows: Vec::new(),
+            statistics: ExecutionStatistics {
+                returned: 0,
+                inserted: commit.map_or(0, CommitResult::inserted),
+                ..statistics
+            },
+            commit,
+        })
     }
 
     fn execute_read( &self, storage: &dyn StorageEngine, runtime: &dyn ExecutionRuntime, plan: &PhysicalPlan, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
@@ -1166,6 +1269,7 @@ pub enum ExecutionStrategy {
     ExternalDistinct,
     InMemoryGroup,
     ExternalGroup,
+    InMemoryPivot,
 }
 
 impl ExecutionStrategy {
@@ -1183,6 +1287,7 @@ impl ExecutionStrategy {
             Self::ExternalDistinct => "external_distinct",
             Self::InMemoryGroup => "in_memory_group",
             Self::ExternalGroup => "external_group",
+            Self::InMemoryPivot => "in_memory_pivot",
         }
     }
 
@@ -1199,6 +1304,7 @@ impl ExecutionStrategy {
             Self::ExternalDistinct => 1 << 8,
             Self::InMemoryGroup => 1 << 9,
             Self::ExternalGroup => 1 << 10,
+            Self::InMemoryPivot => 1 << 11,
         }
     }
 }
@@ -1219,7 +1325,7 @@ impl ExecutionStrategies {
     }
 
     pub fn iter(self) -> impl Iterator<Item = ExecutionStrategy> {
-        const ALL: [ExecutionStrategy; 11] = [
+        const ALL: [ExecutionStrategy; 12] = [
             ExecutionStrategy::CollectionScan,
             ExecutionStrategy::PrimaryKeyLookup,
             ExecutionStrategy::DirectCount,
@@ -1231,6 +1337,7 @@ impl ExecutionStrategies {
             ExecutionStrategy::ExternalDistinct,
             ExecutionStrategy::InMemoryGroup,
             ExecutionStrategy::ExternalGroup,
+            ExecutionStrategy::InMemoryPivot,
         ];
         ALL.into_iter()
             .filter(move |strategy| self.contains(*strategy))
@@ -1600,6 +1707,7 @@ fn execute_pipeline( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, 
 struct LookupContext<'a> {
     outer: &'a Document,
     inner_alias: Option<&'a str>,
+    outer_alias: Option<&'a str>,
 }
 
 fn is_set_level_operator(operator: &PhysicalOperator) -> bool {
@@ -1623,9 +1731,12 @@ fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntim
                     let accepted = match lookup_context {
                         Some(context) => runtime.evaluate_lookup_predicate(
                             predicate,
-                            context.outer,
-                            context.inner_alias,
-                            &evaluation_document,
+                            &LookupFields {
+                                inner: &evaluation_document,
+                                inner_alias: context.inner_alias,
+                                outer: context.outer,
+                                outer_alias: context.outer_alias,
+                            },
                         )?,
                         None => runtime.evaluate_predicate(predicate, &evaluation_document)?,
                     };
@@ -1645,6 +1756,7 @@ fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntim
                 PhysicalOperator::Lookup {
                     collection,
                     alias,
+                    outer_alias,
                     into,
                     pipeline,
                 } => {
@@ -1653,6 +1765,7 @@ fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntim
                         runtime,
                         collection,
                         alias.as_deref(),
+                        outer_alias.as_deref(),
                         pipeline,
                         row.document(),
                         memory_governor,
@@ -1721,7 +1834,7 @@ fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntim
     state.add_filtered(removed)
 }
 
-fn execute_lookup( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, collection: &crate::storage::CollectionId, alias: Option<&str>, pipeline: &PhysicalSubPipeline, outer: &Document, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<LookupDocuments> {
+fn execute_lookup( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, collection: &crate::storage::CollectionId, alias: Option<&str>, outer_alias: Option<&str>, pipeline: &PhysicalSubPipeline, outer: &Document, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<LookupDocuments> {
     let rows = storage
         .scan(collection, ScanOptions::default())
         .map_err(ExecutionError::storage)?;
@@ -1744,6 +1857,7 @@ fn execute_lookup( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, co
         Some(LookupContext {
             outer,
             inner_alias: alias,
+            outer_alias,
         }),
         memory_governor,
         scope,
@@ -1789,6 +1903,7 @@ fn execute_set_level_operator( storage: &dyn StorageRead, runtime: &dyn Executio
                 lookup_context.map(|context| LookupContext {
                     outer: context.outer,
                     inner_alias: alias.as_deref().or(context.inner_alias),
+                    outer_alias: context.outer_alias,
                 }),
                 memory_governor,
                 scope,
@@ -1963,28 +2078,57 @@ fn execute_set_level_operator( storage: &dyn StorageRead, runtime: &dyn Executio
 
 fn sample_rows(rows: &mut Vec<ExecutionRow>, count: usize) -> usize {
     let original_len = rows.len();
-    let keep = count.min(original_len);
-    let mut random = sample_seed();
+    let mut reservoir = Reservoir::new(count);
+    rows.drain(..).for_each(|row| reservoir.push(row));
+    *rows = reservoir.into_items();
+    original_len - rows.len()
+}
 
-    for index in 0..keep {
-        random = random
-            .wrapping_add(0x9e37_79b9_7f4a_7c15)
-            .rotate_left(27)
-            .wrapping_mul(0x94d0_49bb_1331_11eb);
-        let remaining = original_len - index;
-        let chosen = index + (random as usize % remaining);
-        rows.swap(index, chosen);
+/// Uniform random sample of at most `capacity` items from a stream of unknown
+/// length (reservoir sampling, algorithm R). Memory stays bounded by
+/// `capacity` whatever the input size.
+#[derive(Debug)]
+pub struct Reservoir<T> {
+    capacity: usize,
+    seen: u64,
+    state: u64,
+    items: Vec<T>,
+}
+
+impl<T> Reservoir<T> {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self { capacity, seen: 0, state: sample_seed(), items: Vec::with_capacity(capacity.min(4096)) }
     }
 
-    rows.truncate(keep);
-    original_len - keep
+    pub fn push(&mut self, item: T) {
+        self.seen += 1;
+        if self.items.len() < self.capacity {
+            self.items.push(item);
+            return;
+        }
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15).rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+        if let Ok(slot) = usize::try_from(self.state % self.seen) {
+            if slot < self.capacity {
+                self.items[slot] = item;
+            }
+        }
+    }
+
+    /// Number of items offered so far.
+    #[must_use]
+    pub const fn seen(&self) -> u64 {
+        self.seen
+    }
+
+    #[must_use]
+    pub fn into_items(self) -> Vec<T> {
+        self.items
+    }
 }
 
 fn sample_seed() -> u64 {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let nanos = unix_time_nanos();
     (nanos as u64) ^ ((nanos >> 64) as u64) ^ u64::from(std::process::id())
 }
 
@@ -2835,6 +2979,19 @@ fn streaming_load_specification(plan: &PhysicalPlan) -> Option<(PhysicalLoadMode
     })
 }
 
+/// Returns the target collection of a terminal `into` operator.
+fn into_target(plan: &PhysicalPlan) -> Option<&str> {
+    match plan.operators().last() {
+        Some(PhysicalOperator::Custom {
+            name,
+            arguments,
+            writes: true,
+            ..
+        }) if name.as_str() == "into" => Some(arguments),
+        _ => None,
+    }
+}
+
 fn insert_document(plan: &PhysicalPlan) -> Option<&LogicalInsertDocument> {
     plan.operators().iter().find_map(|operator| match operator {
         PhysicalOperator::Insert { document } => Some(document),
@@ -2856,13 +3013,7 @@ fn synthetic_id(value: &str) -> ExecutionResult<DocumentId> {
     // Derive a stable namespace from the label and let `DocumentId::synthetic`
     // construct a standards-compliant UUID v7 value without touching the
     // persisted-document generator.
-    let mut namespace = 0xcbf2_9ce4_8422_2325u64;
-    for byte in value.bytes() {
-        namespace ^= u64::from(byte);
-        namespace = namespace.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    Ok(DocumentId::synthetic(namespace, 1))
+    Ok(DocumentId::synthetic(fnv1a64(value.as_bytes()), 1))
 }
 
 fn usize_to_u64(value: usize) -> ExecutionResult<u64> {
@@ -2923,4 +3074,5 @@ mod tests {
     #[test] fn place_document_scope_matches_all_instances_in_the_place() { let scope = DocumentScope::for_place("place-a"); let app_one = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-1")), ]); let app_two = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-2")), ]); let place_only = Document::from_fields([("_place", Value::from("place-a"))]); let other_place = Document::from_fields([ ("_place", Value::from("place-b")), ("_app_instance", Value::from("app-1")), ]); assert!(scope.matches(&app_one)); assert!(scope.matches(&app_two)); assert!(scope.matches(&place_only)); assert!(!scope.matches(&other_place)); }
     #[test] fn place_document_scope_forces_place_without_overwriting_app_instance() { let scope = DocumentScope::for_place("place-a"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-2")), ("name", Value::from("item")), ]); let scoped = scope.enforce(&document); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-2"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
     #[test] fn execution_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Executor>(); assert_send_and_sync::<DocumentScope>(); assert_send_and_sync::<ExecutionOutput>(); assert_send_and_sync::<ExecutionRow>(); assert_send_and_sync::<ExecutionRowOrigin>(); assert_send_and_sync::<ExecutionError>(); assert_send_and_sync::<ExecutionStatistics>(); assert_send_and_sync::<PreparedInsertDocument>(); assert_send_and_sync::<SyntheticDocument>(); assert_send_and_sync::<LookupDocuments>(); assert_send_and_sync::<StreamingLoadMutation>(); }
+    #[test] fn reservoir_keeps_a_bounded_sample_of_distinct_inputs() { let mut reservoir = Reservoir::new(5); for value in 0..1000 { reservoir.push(value); } assert_eq!(reservoir.seen(), 1000); let mut items = reservoir.into_items(); assert_eq!(items.len(), 5); items.sort_unstable(); items.dedup(); assert_eq!(items.len(), 5); let mut small = Reservoir::new(5); small.push(1); assert_eq!(small.into_items(), [1]); assert!(Reservoir::<u8>::new(0).into_items().is_empty()); }
 }

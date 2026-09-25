@@ -52,6 +52,8 @@ pub enum TokenKind {
     LessEqual,
     Greater,
     GreaterEqual,
+    /// Symbolic expression operator: `+ - * / % && || !`.
+    Operator,
     End,
 }
 
@@ -244,6 +246,7 @@ impl TokenKind {
             Self::LessEqual => "`<=`",
             Self::Greater => "`>`",
             Self::GreaterEqual => "`>=`",
+            Self::Operator => "operator",
             Self::End => "end of input",
         }
     }

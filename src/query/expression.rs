@@ -98,10 +98,7 @@ impl Expression {
     pub const fn as_literal(&self) -> Option<&Literal> {
         match &self.kind {
             ExpressionKind::Literal(literal) => Some(literal),
-            ExpressionKind::Field(_)
-            | ExpressionKind::Unary { .. }
-            | ExpressionKind::Binary { .. }
-            | ExpressionKind::Group(_) => None,
+            _ => None,
         }
     }
 
@@ -110,10 +107,7 @@ impl Expression {
     pub const fn as_field(&self) -> Option<&ExpressionFieldPath> {
         match &self.kind {
             ExpressionKind::Field(path) => Some(path),
-            ExpressionKind::Literal(_)
-            | ExpressionKind::Unary { .. }
-            | ExpressionKind::Binary { .. }
-            | ExpressionKind::Group(_) => None,
+            _ => None,
         }
     }
 
@@ -152,10 +146,7 @@ impl Expression {
     pub fn as_unary(&self) -> Option<(UnaryOperator, &Self)> {
         match &self.kind {
             ExpressionKind::Unary { operator, operand } => Some((*operator, operand.as_ref())),
-            ExpressionKind::Literal(_)
-            | ExpressionKind::Field(_)
-            | ExpressionKind::Binary { .. }
-            | ExpressionKind::Group(_) => None,
+            _ => None,
         }
     }
 
@@ -168,10 +159,7 @@ impl Expression {
                 operator,
                 right,
             } => Some((left.as_ref(), *operator, right.as_ref())),
-            ExpressionKind::Literal(_)
-            | ExpressionKind::Field(_)
-            | ExpressionKind::Unary { .. }
-            | ExpressionKind::Group(_) => None,
+            _ => None,
         }
     }
 
@@ -180,10 +168,7 @@ impl Expression {
     pub fn as_group(&self) -> Option<&Self> {
         match &self.kind {
             ExpressionKind::Group(expression) => Some(expression.as_ref()),
-            ExpressionKind::Literal(_)
-            | ExpressionKind::Field(_)
-            | ExpressionKind::Unary { .. }
-            | ExpressionKind::Binary { .. } => None,
+            _ => None,
         }
     }
 
@@ -205,9 +190,7 @@ impl Expression {
 
     /// Returns a stable structural view of this expression.
     ///
-    /// Unlike the evaluation-specific `ExpressionNode`, this view covers every
-    /// syntax form accepted by the parser, including arithmetic operators and
-    /// explicit groups.
+    /// This view covers every syntax form accepted by the parser.
     #[must_use]
     pub fn view(&self) -> ExpressionView<'_> {
         match &self.kind {
@@ -227,7 +210,35 @@ impl Expression {
                 right: right.as_ref(),
             },
             ExpressionKind::Group(expression) => ExpressionView::Group(expression.as_ref()),
+            ExpressionKind::Array(items) => ExpressionView::Array(items),
+            ExpressionKind::Call { function, arguments } => ExpressionView::Call {
+                function,
+                arguments,
+            },
         }
+    }
+
+    /// Visits the direct sub-expressions, in source order.
+    pub fn for_each_child<'a>(&'a self, visit: &mut dyn FnMut(&'a Self)) {
+        match &self.kind {
+            ExpressionKind::Literal(_) | ExpressionKind::Field(_) => {}
+            ExpressionKind::Unary { operand, .. } | ExpressionKind::Group(operand) => visit(operand),
+            ExpressionKind::Binary { left, right, .. } => {
+                visit(left);
+                visit(right);
+            }
+            ExpressionKind::Array(items) | ExpressionKind::Call { arguments: items, .. } => {
+                items.iter().for_each(visit);
+            }
+        }
+    }
+
+    /// Visits every field path referenced anywhere in the expression.
+    pub fn for_each_field<'a>(&'a self, visit: &mut dyn FnMut(&'a ExpressionFieldPath)) {
+        if let ExpressionKind::Field(path) = &self.kind {
+            visit(path);
+        }
+        self.for_each_child(&mut |child| child.for_each_field(visit));
     }
 }
 
@@ -259,6 +270,15 @@ pub enum ExpressionKind {
     /// The group is preserved in the syntax tree so diagnostics and future
     /// syntax-sensitive tooling can distinguish explicit parentheses.
     Group(Box<Expression>),
+
+    /// Array built from element expressions: `[a, b + 1, "x"]`.
+    Array(Vec<Expression>),
+
+    /// Function call: `round(price * qty, 2)`.
+    Call {
+        function: Arc<str>,
+        arguments: Vec<Expression>,
+    },
 }
 
 /// Borrowed structural view of an expression.
@@ -279,6 +299,11 @@ pub enum ExpressionView<'a> {
         right: &'a Expression,
     },
     Group(&'a Expression),
+    Array(&'a [Expression]),
+    Call {
+        function: &'a str,
+        arguments: &'a [Expression],
+    },
 }
 
 impl ExpressionView<'_> {
@@ -529,6 +554,11 @@ pub enum BinaryOperator {
     Multiply,
     Divide,
     Remainder,
+
+    /// Membership: `value in array`.
+    In,
+    /// Negated membership: `value not in array`.
+    NotIn,
 }
 
 impl BinaryOperator {
@@ -550,6 +580,8 @@ impl BinaryOperator {
             Self::Multiply => "*",
             Self::Divide => "/",
             Self::Remainder => "%",
+            Self::In => "in",
+            Self::NotIn => "not in",
         }
     }
 
@@ -563,7 +595,9 @@ impl BinaryOperator {
             Self::LessThan
             | Self::LessThanOrEqual
             | Self::GreaterThan
-            | Self::GreaterThanOrEqual => 4,
+            | Self::GreaterThanOrEqual
+            | Self::In
+            | Self::NotIn => 4,
             Self::Add | Self::Subtract => 5,
             Self::Multiply | Self::Divide | Self::Remainder => 6,
         }
@@ -587,6 +621,12 @@ impl BinaryOperator {
                 | Self::GreaterThan
                 | Self::GreaterThanOrEqual
         )
+    }
+
+    /// Returns whether this is a membership operator (`in`, `not in`).
+    #[must_use]
+    pub const fn is_membership(self) -> bool {
+        matches!(self, Self::In | Self::NotIn)
     }
 
     /// Returns whether this is an arithmetic operator.
@@ -679,8 +719,13 @@ impl<'source> ExpressionParser<'source> {
         let mut left = self.parse_unary()?;
 
         loop {
-            let Some(operator) = binary_operator(self.current.kind) else {
-                break;
+            let operator = match binary_operator(self.current.kind) {
+                Some(operator) => operator,
+                // `not in` is the only infix use of `not`.
+                None if self.current.kind == ExpressionTokenKind::Bang && self.next_is(ExpressionTokenKind::In) => {
+                    BinaryOperator::NotIn
+                }
+                None => break,
             };
 
             let precedence = operator.precedence();
@@ -689,6 +734,9 @@ impl<'source> ExpressionParser<'source> {
                 break;
             }
 
+            if operator == BinaryOperator::NotIn {
+                self.advance()?;
+            }
             self.advance()?;
 
             let right = self.parse_precedence(precedence + 1)?;
@@ -723,6 +771,10 @@ impl<'source> ExpressionParser<'source> {
             | ExpressionTokenKind::Null
             | ExpressionTokenKind::LeftParen
             | ExpressionTokenKind::RightParen
+            | ExpressionTokenKind::LeftBracket
+            | ExpressionTokenKind::RightBracket
+            | ExpressionTokenKind::Comma
+            | ExpressionTokenKind::In
             | ExpressionTokenKind::Dot
             | ExpressionTokenKind::Star
             | ExpressionTokenKind::Slash
@@ -745,6 +797,19 @@ impl<'source> ExpressionParser<'source> {
         let start = self.current.span.start();
 
         self.advance()?;
+
+        // A sign directly applied to a numeric literal is part of the literal:
+        // `-5` is the number -5, not a negation evaluated at runtime. Every
+        // evaluator therefore accepts signed constants, including predicates.
+        if matches!(operator, UnaryOperator::Negate | UnaryOperator::Positive)
+            && self.current.kind == ExpressionTokenKind::Number
+        {
+            let span = Span::new(start, self.current.span.end());
+            let digits = self.current.text(self.source);
+            let text = if operator == UnaryOperator::Negate { format!("-{digits}") } else { digits.to_owned() };
+            self.advance()?;
+            return Ok(Expression::new(ExpressionKind::Literal(Literal::Number(Arc::from(text))), span));
+        }
 
         let operand = self.parse_unary()?;
         let span = Span::new(start, operand.span().end());
@@ -821,12 +886,17 @@ impl<'source> ExpressionParser<'source> {
 
             ExpressionTokenKind::LeftParen => self.parse_group(),
 
+            ExpressionTokenKind::LeftBracket => self.parse_array(),
+
             ExpressionTokenKind::End => Err(ExpressionError::unexpected_end(
                 self.current.span,
                 "expression",
             )),
 
             ExpressionTokenKind::RightParen
+            | ExpressionTokenKind::RightBracket
+            | ExpressionTokenKind::Comma
+            | ExpressionTokenKind::In
             | ExpressionTokenKind::Dot
             | ExpressionTokenKind::Plus
             | ExpressionTokenKind::Minus
@@ -857,6 +927,10 @@ impl<'source> ExpressionParser<'source> {
         segments.push(Arc::<str>::from(self.current.text(self.source)));
 
         self.advance()?;
+
+        if self.current.kind == ExpressionTokenKind::LeftParen {
+            return self.parse_call(Arc::clone(&segments[0]), start);
+        }
 
         while self.current.kind == ExpressionTokenKind::Dot {
             self.advance()?;
@@ -918,6 +992,50 @@ impl<'source> ExpressionParser<'source> {
         ))
     }
 
+    /// Parses `name(arg, ...)`; the current token is the opening parenthesis.
+    fn parse_call(&mut self, function: Arc<str>, start: usize) -> ExpressionResult<Expression> {
+        self.advance()?;
+        let (arguments, end) = self.parse_list(ExpressionTokenKind::RightParen, "',' or ')'")?;
+        super::eval::check_call(&function, arguments.len())
+            .map_err(|message| ExpressionError::new(ExpressionErrorKind::InvalidCall { message: Arc::from(message) }, Span::new(start, end)))?;
+        Ok(Expression::new(ExpressionKind::Call { function, arguments }, Span::new(start, end)))
+    }
+
+    /// Parses `[item, ...]`; the current token is the opening bracket.
+    fn parse_array(&mut self) -> ExpressionResult<Expression> {
+        let start = self.current.span.start();
+        self.advance()?;
+        let (items, end) = self.parse_list(ExpressionTokenKind::RightBracket, "',' or ']'")?;
+        Ok(Expression::new(ExpressionKind::Array(items), Span::new(start, end)))
+    }
+
+    /// Parses comma-separated expressions up to `close`, which is consumed.
+    fn parse_list(&mut self, close: ExpressionTokenKind, expected: &'static str) -> ExpressionResult<(Vec<Expression>, usize)> {
+        let mut items = Vec::new();
+        if self.current.kind != close {
+            loop {
+                items.push(self.parse_precedence(1)?);
+                if self.current.kind != ExpressionTokenKind::Comma {
+                    break;
+                }
+                self.advance()?;
+            }
+        }
+        if self.current.kind != close {
+            return Err(match self.current.kind {
+                ExpressionTokenKind::End => ExpressionError::unexpected_end(self.current.span, expected),
+                _ => ExpressionError::unexpected_token(self.current.span, self.current.text(self.source), expected),
+            });
+        }
+        let end = self.current.span.end();
+        self.advance()?;
+        Ok((items, end))
+    }
+
+    fn next_is(&self, kind: ExpressionTokenKind) -> bool {
+        self.lexer.clone().next_token().is_ok_and(|token| token.kind == kind)
+    }
+
     fn advance(&mut self) -> ExpressionResult<()> {
         self.current = self.lexer.next_token()?;
         Ok(())
@@ -952,6 +1070,8 @@ const fn binary_operator(kind: ExpressionTokenKind) -> Option<BinaryOperator> {
 
         ExpressionTokenKind::Percent => Some(BinaryOperator::Remainder),
 
+        ExpressionTokenKind::In => Some(BinaryOperator::In),
+
         ExpressionTokenKind::Identifier
         | ExpressionTokenKind::Number
         | ExpressionTokenKind::String
@@ -960,6 +1080,9 @@ const fn binary_operator(kind: ExpressionTokenKind) -> Option<BinaryOperator> {
         | ExpressionTokenKind::Null
         | ExpressionTokenKind::LeftParen
         | ExpressionTokenKind::RightParen
+        | ExpressionTokenKind::LeftBracket
+        | ExpressionTokenKind::RightBracket
+        | ExpressionTokenKind::Comma
         | ExpressionTokenKind::Dot
         | ExpressionTokenKind::Bang
         | ExpressionTokenKind::End => None,
@@ -978,7 +1101,11 @@ enum ExpressionTokenKind {
 
     LeftParen,
     RightParen,
+    LeftBracket,
+    RightBracket,
+    Comma,
     Dot,
+    In,
 
     Plus,
     Minus,
@@ -1077,11 +1204,19 @@ impl<'source> ExpressionLexer<'source> {
 
             '.' => {
                 self.advance();
-
                 Ok(ExpressionToken::new(
                     ExpressionTokenKind::Dot,
                     Span::new(start, self.offset),
                 ))
+            }
+            '[' | ']' | ',' => {
+                self.advance();
+                let kind = match character {
+                    '[' => ExpressionTokenKind::LeftBracket,
+                    ']' => ExpressionTokenKind::RightBracket,
+                    _ => ExpressionTokenKind::Comma,
+                };
+                Ok(ExpressionToken::new(kind, Span::new(start, self.offset)))
             }
 
             '+' => {
@@ -1240,6 +1375,7 @@ impl<'source> ExpressionLexer<'source> {
             "and" => ExpressionTokenKind::AndAnd,
             "or" => ExpressionTokenKind::OrOr,
             "not" => ExpressionTokenKind::Bang,
+            "in" => ExpressionTokenKind::In,
             _ => ExpressionTokenKind::Identifier,
         };
 
@@ -1571,6 +1707,8 @@ impl fmt::Display for ExpressionError {
             ExpressionErrorKind::SinglePipe => {
                 formatter.write_str("single '|' is not supported inside an expression; use '||'")
             }
+
+            ExpressionErrorKind::InvalidCall { message } => formatter.write_str(message),
         }
     }
 }
@@ -1613,6 +1751,11 @@ pub enum ExpressionErrorKind {
     SingleEqual,
     SingleAmpersand,
     SinglePipe,
+
+    /// Unknown function or wrong number of arguments.
+    InvalidCall {
+        message: Arc<str>,
+    },
 }
 
 #[cfg(test)]
@@ -1645,7 +1788,8 @@ mod tests {
 
     #[test] fn parses_unary_not() { let expression = parse_expression("!active").unwrap(); let ExpressionKind::Unary { operator, operand } = expression.kind() else { panic!("expected unary expression"); }; assert_eq!(*operator, UnaryOperator::Not); assert_eq!(operand.as_field().unwrap().first(), "active",); }
 
-    #[test] fn parses_unary_negation() { let expression = parse_expression("-18").unwrap(); let ExpressionKind::Unary { operator, operand } = expression.kind() else { panic!("expected unary expression"); }; assert_eq!(*operator, UnaryOperator::Negate); assert_eq!(operand.as_literal().unwrap().as_number_text(), Some("18"),); }
+    #[test] fn parses_unary_negation() { let expression = parse_expression("-age").unwrap(); let ExpressionKind::Unary { operator, operand } = expression.kind() else { panic!("expected unary expression"); }; assert_eq!(*operator, UnaryOperator::Negate); assert_eq!(operand.as_field().unwrap().first(), "age"); }
+    #[test] fn folds_signed_numeric_literals() { let negative = parse_expression("-18").unwrap(); assert_eq!(negative.as_literal().unwrap().as_number_text(), Some("-18")); assert_eq!(negative.span(), Span::new(0, 3)); let positive = parse_expression("+2.5").unwrap(); assert_eq!(positive.as_literal().unwrap().as_number_text(), Some("2.5")); let ExpressionKind::Binary { right, .. } = parse_expression("age > -1").unwrap().kind().clone() else { panic!("expected comparison"); }; assert_eq!(right.as_literal().unwrap().as_number_text(), Some("-1")); let ExpressionKind::Binary { operator, .. } = parse_expression("a - 1").unwrap().kind().clone() else { panic!("expected subtraction"); }; assert_eq!(operator, BinaryOperator::Subtract); }
 
     #[test] fn parses_comparison() { let expression = parse_expression("age >= 18").unwrap(); let ExpressionKind::Binary { left, operator, right, } = expression.kind() else { panic!("expected binary expression"); }; assert_eq!(*operator, BinaryOperator::GreaterThanOrEqual,); assert_eq!(left.as_field().unwrap().first(), "age",); assert_eq!(right.as_literal().unwrap().as_number_text(), Some("18"),); }
 
@@ -1750,4 +1894,5 @@ mod tests {
     }
 
     #[test] fn symbolic_and_word_boolean_operators_build_equivalent_trees() { let words = parse_expression("a == 1 and (b == 2 or not disabled)").unwrap(); let symbols = parse_expression("a == 1 && (b == 2 || !disabled)").unwrap(); assert_same_expression_structure(&words, &symbols); }
+    #[test] fn parses_calls_arrays_and_membership() { let expression = parse_expression("round(price * qty, 2) not in [1, a.b]").unwrap(); let ExpressionKind::Binary { left, operator, right } = expression.kind() else { panic!("expected membership"); }; assert_eq!(*operator, BinaryOperator::NotIn); assert!(matches!(left.view(), ExpressionView::Call { function: "round", arguments } if arguments.len() == 2)); assert!(matches!(right.view(), ExpressionView::Array(items) if items.len() == 2)); let mut fields = Vec::new(); expression.for_each_field(&mut |field| fields.push(field.to_string())); assert_eq!(fields, ["price", "qty", "a.b"]); assert!(matches!(parse_expression("x in tags").unwrap().kind(), ExpressionKind::Binary { operator: BinaryOperator::In, .. })); assert!(parse_expression("f(").is_err()); assert!(parse_expression("[1, ").is_err()); }
 }
