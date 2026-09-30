@@ -148,7 +148,7 @@ on data
 
 > **Note:** this compound form is supported: exactly one `by`, then any number of `sum` directives. `group` opens a sub-pipeline when its header is empty, which is the same syntactic property `load` has (see [`SubPipelinePolicy`](#53-compound-stages-and-end)).
 
-For compact `group`, one item is a grouping key. With two or more items, every item except the last is a grouping dimension and the last item is summed. Therefore `group x, y, z` groups by `(x, y)` and sums `z`. `as` can rename every dimension and the summed value. Use the compound `group | by ... | sum ...` form when several aggregate measures are required.
+For compact `group`, one item is a grouping key. With two or more items, every item except the last is a grouping dimension and the last item is summed. Therefore `group x, y, z` groups by `(x, y)` and sums `z`. `as` can rename every dimension and the summed value. Use the compound `group | by ... | sum ... | avg ... | end` form for several measures or for other aggregates (`avg`, `min`, `max`, `first`, `last`, `count`).
 
 Every stage has a single responsibility.
 
@@ -162,21 +162,22 @@ Every stage has a single responsibility.
 | where | Filter documents | :white_check_mark: | :white_check_mark: | |
 | near | Vector nearby lookup | :white_check_mark: | :white_check_mark: | Adds `_distance` (cosine). Combine with `sort _distance \| limit k` |
 | derive | Compute new fields | :white_check_mark: | :white_check_mark: | Any expression; assignments chain left to right |
-| join | Load related documents | :white_check_mark: | :white_check_mark: | Alias : lookup. Correlated predicates: `o.user == u.name` |
-| unwind | Expand arrays | :white_check_mark: | :white_check_mark: | Streams mid-chain: one row per array item, in order |
+| join | Load related documents | :white_check_mark: | :white_check_mark: | Alias : lookup. Correlated predicates: `o.user == u.name`. One-line equality form: `lookup orders on user == name into orders` |
+| unwind | Expand arrays | :white_check_mark: | :white_check_mark: | Streams mid-chain: one row per array item, in order. Options `with index <field>`, `keep empty` |
 | root | Change root to specified field | :white_check_mark: | :white_check_mark: | |
-| group | Build groups | :white_check_mark: | :white_check_mark: | Compact form, or compound `\| by … \| sum … \| end` for several measures |
+| group | Build groups | :white_check_mark: | :white_check_mark: | Compact form, or compound `\| by … \| sum\|avg\|min\|max\|first\|last\|count … \| end` for several measures |
+| bucket | Count rows per value range | :white_check_mark: | :white_check_mark: | `bucket age by [0, 18, 65] [default "other"] [as band]` |
 | set | Update documents or chunks | :white_check_mark: | :white_check_mark: | Terminal, transactional, full expressions (`age = age + 1`) |
-| insert | Create one or more documents | :white_check_mark: | | One object per query; use `load` for batches |
+| insert | Create one or more documents | :white_check_mark: | :white_check_mark: | One object, or an array of objects inserted atomically |
 | load | Load documents or chunks | :white_check_mark: | | Streaming form `with replace\|update\|merge` + `chunk` |
-| into | Insert the result into another collection | :white_check_mark: | | Terminal: `on users \| where active \| into archive`. One atomic insert with fresh `_id`s; target must differ from the source and cannot be a system collection. Needs write access on the target and read access on the source |
+| into | Insert the result into another collection | :white_check_mark: | :white_check_mark: | Alias : out. Terminal: `on users \| where active \| into archive`. One atomic insert with fresh `_id`s; target must differ from the source and cannot be a system collection. Needs write access on the target and read access on the source |
 | pivot | Pivot data | :white_check_mark: | :white_check_mark: | Expect rows, columns, values and aggregate function. Keeps one aggregate cell per row key and column, never the rows |
 | aggregate | Compute aggregates | not working | | Not a stage: use `group`, `count` or `pivot` |
 | select | Project fields | :white_check_mark: | | Alias : project. Accepts `expression as alias` |
 | rename | Rename fields | :white_check_mark: | | |
 | drop | Remove fields | :white_check_mark: | | |
 | distinct | Remove duplicates | :white_check_mark: | | |
-| sort | Order documents | :white_check_mark: | | |
+| sort | Order documents | :white_check_mark: | :white_check_mark: | Keys may be expressions: `sort price * qty desc` |
 | skip | Skip documents | :white_check_mark: | | Alias : offset |
 | limit | Limit result size | :white_check_mark: | | |
 | first | Return first document | :white_check_mark: | :white_check_mark: | Declared row bound of 1: stops the scan, works in `lookup`/`union`, `sort \| first` is a Top-1 |
@@ -185,6 +186,8 @@ Every stage has a single responsibility.
 | count | Count results | :white_check_mark: | | `count as <alias>` |
 | delete | Delete documents | :white_check_mark: | | Terminal, transactional |
 | union | Append another pipeline | :white_check_mark: | | `\| union \| on <collection> … \| end` |
+| explain | Describe the plan instead of running the query | :white_check_mark: | :white_check_mark: | Query prefix, not a stage: `explain on users \| where …` |
+| let | Declare reusable variables | :white_check_mark: | :white_check_mark: | Header before `on`: `let $min = 18 \| on users \| where age >= $min`. Evaluated once per query |
 | .collections | Show a list of collections | :white_check_mark: | | ogcli operation `.collections.list`, option `{"stats": true}` |
 | .backup | Create backup | :white_check_mark: | | ogcli operation `.backup.create {"name": …}`; `.backup.inspect` reads metadata |
 | .restore | Restore backup | :white_check_mark: | | ogcli operation `.backup.restore {"name": …, "replace": true}` |
@@ -212,7 +215,7 @@ Supported concepts include:
 
 Expressions should never depend on the stage where they appear.
 
-> **Current state:** done. One grammar and **one evaluator** (`query::eval`) serve every stage: `where`, `set`, `derive`, `select … as`, `lookup` correlation and projected scans. The language covers literals, field paths, arrays, comparisons, `in`/`not in`, boolean logic, arithmetic and function calls, and any construct can nest inside any other. Only parameters remain to do. See [Expressions](#4-expressions).
+> **Current state:** done. One grammar and **one evaluator** (`query::eval`) serve every stage: `where`, `set`, `derive`, `select … as`, `lookup` correlation and projected scans. The language covers literals, field paths, arrays, comparisons, `in`/`not in`, boolean logic, arithmetic and function calls, and any construct can nest inside any other. Parameters (`$name`) are bound by the request. See [Expressions](#4-expressions) and [Parameters](#54-parameters-name).
 
 ---
 
@@ -231,7 +234,7 @@ Examples:
 
 Adding a new function should not require grammar changes.
 
-> **Current state:** 21 built-in functions are available in every stage (numeric, text, collections, conditionals, null handling). Names and argument counts are checked when the query is parsed. See [4.4 Functions](#44-functions). Aggregation over documents stays in stages: `count`, `group` (count and sums) and `pivot`.
+> **Current state:** 65 built-in functions are available in every stage (numeric, conversions, text, arrays, objects, dates, conditionals, null handling). Names and argument counts are checked when the query is parsed. See [4.4 Functions](#44-functions). Aggregation over documents stays in stages: `count`, `group` (sum, avg, min, max, first, last, count), `bucket` and `pivot`.
 
 ---
 
@@ -247,7 +250,7 @@ where status == $status
 
 Parameter binding belongs to the execution context rather than the parser.
 
-> **Current state:** not implemented. `$` is rejected by the lexer (`unexpected character '$'`). Build the query text on the client and quote strings as JSON strings.
+> **Current state:** implemented. The `query.execute` request carries a `params` object; each `$name` outside string literals is replaced by the escaped literal of its value before authorization and planning, so a value can never inject syntax. `ogcli --param name=value` sets them. See [5.4 Parameters](#54-parameters-name).
 
 ---
 
@@ -398,8 +401,8 @@ Several measures at once, with the compound `group`:
 on orders | group | by region | sum qty as units | sum price as list_value | end
 ```
 ```json
-{"list_value":119.5,"region":"EU","units":8.0}
-{"list_value":359.5,"region":"US","units":8.0}
+{"list_value":119.5,"region":"EU","units":8}
+{"list_value":359.5,"region":"US","units":8}
 ```
 
 Expressions are one language everywhere: arithmetic, membership and functions work in filters, projections and updates alike:
@@ -421,10 +424,10 @@ Multi-dimensional grouping with renamed keys:
 on orders | group region as zone, month, qty as units | sort units desc
 ```
 ```json
-{"month":"2026-01","units":7.0,"zone":"EU"}
-{"month":"2026-01","units":7.0,"zone":"US"}
-{"month":"2026-02","units":1.0,"zone":"EU"}
-{"month":"2026-02","units":1.0,"zone":"US"}
+{"month":"2026-01","units":7,"zone":"EU"}
+{"month":"2026-01","units":7,"zone":"US"}
+{"month":"2026-02","units":1,"zone":"EU"}
+{"month":"2026-02","units":1,"zone":"US"}
 ```
 
 Vector similarity search (k-NN by cosine distance):
@@ -527,7 +530,8 @@ on données | insert {prénom: "Élodie"}
 on données | where prénom == "Élodie" | select prénom
 ```
 
-- **Field paths** use dots: `profile.country`, `a.b.c`. Each segment must be a valid identifier. A key containing a space or hyphen can be *stored* (`insert {"display name": "Zed"}`) but cannot be *referenced* in an expression.
+- **Field paths** use dots: `profile.country`, `a.b.c`. Each segment must be a valid identifier. A key containing a space or hyphen can be *stored* (`insert {"display name": "Zed"}`) but cannot be referenced as a path: read it with `get(document_field, "display name")`.
+- A `?` after a path segment makes the path optional: `nick?`, `profile?.country` (see [3.4](#34-missing-fields-are-strict)).
 - **Collection names** can also be dotted (`on shop.orders`).
 
 ### 2.4 Keywords
@@ -542,7 +546,7 @@ and  or  not  true  false  null
 
 Other stage names (`select`, `sort`, `group`, `limit`, …) are ordinary identifiers that are recognised in stage position.
 
-Inside expressions, `in` is also reserved (membership operator). Function names are not reserved: `round(x)` is a call and `round` alone is a field.
+Inside expressions, `in` is also reserved (membership operator). `between` is recognised only after an operand (`age between 18 and 30`), so it remains usable as a field name. Function names are not reserved: `round(x)` is a call and `round` alone is a field.
 
 ### 2.5 Literals
 
@@ -552,9 +556,9 @@ Inside expressions, `in` is also reserved (membership operator). Function names 
 | Boolean | `true`, `false` | |
 | Integer | `0`, `42`, `18446744073709551615` | Stored as signed 64-bit when it fits, otherwise unsigned 64-bit |
 | Float | `9.5`, `.75`, `1e3`, `1.5e-10` | Finite IEEE-754 doubles. `1` and `1.0` are distinct spellings but compare equal |
-| String | `"Paris"`, `"a\"b"`, `"line\nbreak"` | Double quotes only. Escapes: `\" \\ \/ \b \f \n \r \t`. No raw newline inside a string |
+| String | `"Paris"`, `"a\"b"`, `"line\nbreak"`, `"\u00e9t\u00e9"` | Double quotes only. JSON escapes: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (a surrogate pair such as `\ud83d\ude00` is one character). No raw newline inside a string |
 | Array | `[1, 2]`, `["a", qty * 2, lower(name)]` | Elements are any expressions. Pure JSON arrays also work in `insert`, `near` and `load` payloads |
-| Object (JSON) | `{"a": 1}`, `{name: "Alice", profile: {country: "FR"}}` | `insert` also accepts unquoted keys |
+| Object (JSON) | `{"a": 1}`, `{name: "Alice", profile: {country: "FR"}}` | Anywhere in an expression with quoted keys (`merge(profile, {"level": 2})`); `insert` also accepts unquoted keys |
 
 ### 2.6 Numbers and signs
 
@@ -569,6 +573,8 @@ A leading `+` or `-` directly applied to a numeric literal is part of the litera
 | `&&`, `\|\|`, `!` | Symbolic synonyms of `and`, `or`, `not`. A lone `&` is rejected |
 | `+ - * / %` | Arithmetic |
 | `in`, `not in` | Membership in an array (literal or field) |
+| `between … and …`, `not between … and …` | Inclusive range test: `age between 18 and 30` |
+| `?` | Optional field path: `nick?` reads `null` when the field is missing |
 | `name(…)` | Function call |
 | `( )` | Grouping |
 | `[ ]` | Array constructor |
@@ -623,10 +629,12 @@ Streaming results emitted before the failing document have already been sent, so
 Missing is not `null`, and the language gives you explicit tools for optional fields:
 - `exists(nickname)` is `true` or `false` and never fails.
 - `coalesce(nickname, name)` returns its first present, non-null argument.
-- `and`, `or` and `if` evaluate lazily, so `exists(x) and x > 3` and `if(exists(x), x, 0)` are safe.
+- `and`, `or`, `if` and `case` evaluate lazily, so `exists(x) and x > 3` and `if(exists(x), x, 0)` are safe.
+- A `?` after a path segment reads a missing field as `null`: `nick?`, `profile?.country` (the whole path becomes optional). `==` and `!=` accept `null` on either side, so `where nick? == "Zed"` simply does not match documents without `nick`.
 
 ```text
 on users | select name, coalesce(nick, name) as display, exists(nickname) as has_nick
+on users | where profile?.level == "gold" | select name, nick? as nick
 ```
 
 Other exceptions:
@@ -647,9 +655,11 @@ Other exceptions:
 | Binary | `age >= 18`, `price * qty` |
 | Group | `(city == "Paris" or city == "Lyon")` |
 | Membership | `status in ["paid", "pending"]`, `"dev" in tags`, `region not in ["US"]` |
+| Range | `age between 18 and 30`, `price not between 10 and 20` |
+| Optional path | `nick?`, `profile?.country` |
 | Array | `[qty, qty * 2, "x"]` |
 | Function call | `round(price * qty, 2)`, `coalesce(nick, name)` |
-| JSON object literal | `{"a": 1}` (whole expression only) |
+| JSON object literal | `{"a": 1}`, `merge(meta, {"v": 2})` (quoted keys) |
 
 Every form nests inside every other: `round(div(price * qty, qty - 1, 0), 2)`, `upper(concat(name, "@", lower(city)))`, `max([a, b, c]) in allowed`.
 
@@ -661,20 +671,21 @@ From lowest to highest. Binary operators are left-associative.
 |---|---|
 | 1 | `or`, `\|\|` |
 | 2 | `and`, `&&` |
-| 3 | `==` `!=` |
-| 4 | `<` `<=` `>` `>=` `in` `not in` |
-| 5 | `+` `-` |
-| 6 | `*` `/` `%` |
-| 7 (prefix) | `not`/`!`, unary `-`, unary `+` |
+| 3 (prefix) | `not`, `!` |
+| 4 | `==` `!=` |
+| 5 | `<` `<=` `>` `>=` `in` `not in` `between … and …` |
+| 6 | `+` `-` |
+| 7 | `*` `/` `%` |
+| 8 (prefix) | unary `-`, unary `+` |
 
-Because prefix operators bind tightest, `not city == "Berlin"` parses as `(not city) == "Berlin"` and fails. Write **`not (city == "Berlin")`** or **`city != "Berlin"`** instead.
+Like in SQL and Python, `not` binds looser than comparisons: `not city == "Berlin"` means `not (city == "Berlin")`, and `not active and age > 18` means `(not active) and age > 18`.
 
 ```text
 on users | where age > 30 || profile.country == "DE" | select name
 -- {"name":"Alice"}
 -- {"name":"Carol"}
 
-on users | where !(age < 18) && active | select name
+on users | where not age < 18 && active | select name
 -- {"name":"Alice"}
 -- {"name":"Carol"}
 -- {"name":"Dan"}
@@ -733,24 +744,87 @@ invalid expression "nope(age) > 1" for stage "where": unknown function `nope`; a
 invalid expression "abs(age, 2) > 1" for stage "where": function `abs` expects 1 argument(s), got 2
 ```
 
+**Numeric**
+
 | Function | Result | Example → result |
 |---|---|---|
 | `abs(x)` | Absolute value, integer kept | `abs(-qty)` → `3` |
 | `sqrt(x)` | Square root (float); negative input is an error | `sqrt(16)` → `4.0` |
 | `pow(x, y)` | Power; integer when exact | `pow(qty, 2)` → `9` |
 | `round(x [, digits])` | Rounds half away from zero. Integer without `digits`, float with `digits` (0 to 15) | `round(13.333, 2)` → `13.33` |
+| `trunc(x [, digits])` | Rounds toward zero, same rules as `round` | `trunc(-2.7)` → `-2` |
 | `floor(x)`, `ceil(x)` | Rounded down / up, as an integer | `floor(12.5)` → `12` |
+| `sign(x)` | `-1`, `0` or `1` | `sign(-qty)` → `-1` |
+| `ln(x)`, `log10(x)`, `log(x, base)`, `exp(x)` | Logarithms (positive input) and exponential, as floats | `log(8, 2)` → `3.0` |
 | `min(a, b, …)`, `max(a, b, …)` | Smallest / largest argument; with one array argument, over its elements | `max(age, 30)`, `max(scores)` |
+| `sum(a, b, …)`, `avg(a, b, …)` | Sum (integer while every term is) / mean; with one array argument, over its elements; `null` items are skipped | `sum(scores)`, `avg([])` → `null` |
 | `div(a, b [, fallback])` | Safe division: `fallback` when `b` is 0 (`null` without fallback), else `a / b` | `div(price, qty - 1, 0)` |
+
+**Logic, missing values and conversions**
+
+| Function | Result | Example → result |
+|---|---|---|
 | `if(cond, then, else)` | Only the chosen branch is evaluated | `if(age >= 18, "adult", "minor")` |
+| `case(c1, v1, c2, v2, …, [default])` | Value of the first true condition, else `default` (or `null`); lazy | `case(qty > 5, "bulk", qty > 1, "few", "one")` |
 | `coalesce(a, b, …)` | First argument that is present and not `null` | `coalesce(nick, name)` |
 | `exists(x)` | Whether `x` is present (never fails) | `exists(nickname)` |
+| `optional(x)` | `x`, or `null` when missing; what `x?` means | `optional(nick)` |
+| `nullif(a, b)` | `null` when `a == b`, else `a` | `nullif(status, "")` |
+| `between(x, low, high)` | `low <= x <= high`; what `x between low and high` means | |
+| `bucket(x, [b0, b1, …] [, default])` | Lower bound `b(i)` of the range `[b(i), b(i+1))` holding `x`, else `default` (or `null`) | `bucket(age, [0, 18, 65])` → `18` |
+| `to_int(x)` | Integer from a number (truncated), a numeric string, a boolean; `null` stays `null` | `to_int("42")` → `42` |
+| `to_float(x)` | Float from a number, a numeric string or a boolean | `to_float("2.5")` → `2.5` |
+| `to_string(x)` | Text; numbers, booleans, arrays and objects are written as JSON | `to_string(qty)` → `"3"` |
+| `to_bool(x)` | From a boolean, a number (non-zero), or `true/false/1/0/yes/no` | `to_bool("yes")` → `true` |
+| `type(x)` | `"null"`, `"bool"`, `"number"`, `"string"`, `"array"` or `"object"` | `type(profile)` → `"object"` |
+
+**Text** (positions count characters, not bytes; a negative start counts from the end)
+
+| Function | Result | Example → result |
+|---|---|---|
 | `len(x)` | Characters of a string, items of an array, keys of an object | `len(tags)` → `2` |
-| `lower(s)`, `upper(s)`, `trim(s)` | Text transforms | `upper(trim(name))` |
+| `lower(s)`, `upper(s)`, `trim(s)`, `ltrim(s)`, `rtrim(s)` | Text transforms | `upper(trim(name))` |
 | `concat(a, b, …)` | Joins text (numbers and booleans are written as text, `null` is skipped); if every argument is an array, concatenates the arrays | `concat(name, "@", city)`, `concat(tags, ["new"])` |
+| `substr(s, start [, length])` | Substring | `substr("Paris", 0, 3)` → `"Par"` |
+| `split(s, separator)` | Array of parts; an empty separator splits characters | `split("a,b", ",")` → `["a", "b"]` |
+| `replace(s, from, to)` | Replaces every occurrence | `replace(city, " ", "-")` |
+| `index_of(x, y)` | Position of `y` in a string or an array, `-1` when absent | `index_of(tags, "dev")` → `1` |
+| `pad_left(s, width [, fill])`, `pad_right(…)` | Pads to `width` characters with `fill` (default space) | `pad_left(to_string(qty), 3, "0")` → `"003"` |
 | `contains(x, y)` | Substring test on strings, element test on arrays | `contains(name, "li")`, `contains(tags, "dev")` |
 | `starts_with(s, p)`, `ends_with(s, p)` | Prefix / suffix test | `starts_with(city, "Pa")` |
-| `type(x)` | `"null"`, `"bool"`, `"number"`, `"string"`, `"array"` or `"object"` | `type(profile)` → `"object"` |
+
+**Arrays**
+
+| Function | Result | Example → result |
+|---|---|---|
+| `at(array, i)` | Item `i` (negative from the end), `null` when out of range | `at(tags, -1)` → `"dev"` |
+| `slice(array, start [, length])` | Sub-array | `slice(tags, 1)` |
+| `reverse(x)` | Reversed array or string | `reverse(tags)` |
+| `sort_array(array [, "asc"\|"desc"])` | Sorted copy; items must be comparable | `sort_array(scores, "desc")` |
+| `unique(array)` | Distinct items, first occurrence kept | `unique([1, 1, 2])` → `[1, 2]` |
+| `flatten(array)` | Flattens one level | `flatten([[1], 2])` → `[1, 2]` |
+| `range(start, end [, step])` | Integers from `start` up to (excluding) `end`; at most 1,000,000 items | `range(0, 6, 2)` → `[0, 2, 4]` |
+
+**Objects**
+
+| Function | Result | Example → result |
+|---|---|---|
+| `keys(o)`, `values(o)` | Keys (sorted) / values of an object | `keys(profile)` → `["country", "score"]` |
+| `get(o, key [, default])` | Value under any key, including keys that are not identifiers | `get(meta, "display name", "")` |
+| `has(o, key)` | Whether the key is present | `has(profile, "score")` |
+| `merge(o1, o2, …)` | Shallow merge, later objects win; `null` arguments are skipped | `merge(profile, {"level": 2})` |
+
+**Dates.** There is no date type: a timestamp is a number of milliseconds since the Unix epoch, or an ISO-8601 string (`2026-03-09`, `2026-03`, `2026-03-09T10:00:00Z`, `2026-03-09 10:00:00+02:00`). Every computation is in UTC. Units are `year`, `quarter`, `month`, `week` (weeks start on Monday), `day`, `hour`, `minute`, `second`, `millisecond`, singular or plural.
+
+| Function | Result | Example → result |
+|---|---|---|
+| `now()` | Current time, epoch milliseconds | |
+| `parse_date(t)` | Epoch milliseconds | `parse_date("1970-01-02")` → `86400000` |
+| `date_trunc(t, unit)` | Start of the unit, epoch milliseconds | `date_trunc(at, "month")` |
+| `date_add(t, n, unit)` | Epoch milliseconds; adding months clamps the day | `date_add("2026-01-31", 1, "month")` → 2026-02-28 |
+| `date_diff(start, end, unit)` | Unit boundaries crossed from `start` to `end` | `date_diff("2025-12-31", "2026-01-01", "year")` → `1` |
+| `date_part(t, part)` | `year`, `quarter`, `month`, `week` (ISO), `day`, `day_of_week` (1 = Monday), `day_of_year`, `hour`, `minute`, `second`, `millisecond` | `date_part(at, "day_of_week")` |
+| `date_format(t [, pattern])` | Text; default ISO-8601. Directives `%Y %m %d %H %M %S %L` (ms) `%j %u %V %F %T %%` | `date_format(at, "%Y-%m")` → `"2026-03"` |
 
 ```text
 on users | select name, upper(concat(name, "@", lower(city))) as handle, coalesce(nick, name) as display, if(age >= 18, "adult", "minor") as bracket
@@ -804,7 +878,8 @@ Whether a stage opens a **sub-pipeline** is a syntactic property of its name (`S
 
 | Policy | Stages | Meaning |
 |---|---|---|
-| `Always` | `lookup`/`join`, `union`, `pivot` | Always compound |
+| `Always` | `union`, `pivot` | Always compound |
+| `UnlessHeaderHasInto` | `lookup`/`join` | Compound, except the one-line form whose header contains `into` |
 | `WhenHeaderEmpty` | `load`, `group` | Compound when written without arguments; compact single-line form otherwise |
 | `Never` | every other stage | Always simple |
 
@@ -822,6 +897,68 @@ on users
 - A missing `| end` is an error (`sub-pipeline opened by stage at … is missing '| end'`).
 - An `end` without an open sub-pipeline is also an error.
 - Sub-pipelines can nest.
+
+### 5.4 Parameters (`$name`)
+
+A query can reference named parameters. Their values travel next to the query in the `query.execute` request:
+
+```json
+{"query": "on users | where age >= $min and city in $cities | limit $n",
+ "params": {"min": 18, "cities": ["Paris", "Lyon"], "n": 10}}
+```
+
+```text
+ogcli --param min=18 --param 'cities=["Paris","Lyon"]' --param n=10 'on users | where age >= $min and city in $cities | limit $n'
+```
+
+- Each `$name` outside a string literal is replaced by the literal of its value before the query is authorized, planned or run. Strings are quoted and escaped, so a value never changes the structure of the query: `$name` bound to `x" | delete` stays one string.
+- Any JSON value works: numbers, strings, booleans, `null`, arrays (for `in`), objects (for `insert`). A parameter can appear wherever its literal could (`limit $n`, `near embedding, $vector`).
+- An unbound `$name` fails the request (`variable $name is not bound; …`); unused parameters are ignored. With `ogcli`, `VALUE` is parsed as JSON when it can be, otherwise taken as a string.
+
+### 5.5 Variables (`let`)
+
+A query can start with one or more `let` headers that name values reused by its stages:
+
+```text
+let <$name> = <expression>, <$name> = <expression>, ...
+| [let ... |]
+on <collection> | ...
+```
+
+```text
+let $threshold = 50, $since = parse_date("2026-02-01")
+| on orders
+| where price * qty > $threshold and parse_date(at) >= $since
+| derive margin = price * qty - $threshold
+| select order_id, margin
+```
+```json
+{"margin":49.5,"order_id":2}
+{"margin":200.0,"order_id":4}
+```
+
+- Each expression is evaluated **once per query**, before planning, then used wherever `$name` appears: `where`, `derive`, `set`, `select`, `sort`, `limit`, sub-pipelines. `let $now = now()` therefore gives every row the same instant.
+- An expression may use any function, request parameters and variables declared before it (`let $max = $min * 2`, or a later `let` header). It cannot read document fields: `let $x = qty` is rejected.
+- A name is bound once: redeclaring a variable, or declaring a name also passed in `params`, is an error.
+- Variables are bound like parameters (as escaped literals), so the plan, `explain` and authorization see the resulting values: `explain let $n = 2 | on orders | limit $n` shows `limit 2`.
+
+### 5.6 `explain`
+
+Prefixing a query with `explain` plans it without running it and returns one document describing the plan. Authorization is the same as for the query itself.
+
+```text
+explain on orders | where qty > 1 | sort price * qty desc | limit 3
+```
+```json
+{"access":"collection_scan","collection":"orders","executor":"governed_blocking","mode":"governed_blocking","operators":[{"detail":"qty > 1","stage":"filter"},{"detail":"__og_sort_0 = price * qty","stage":"derive"},{"detail":"__og_sort_0 desc","stage":"sort"},{"detail":"__og_sort_0","stage":"drop"},{"detail":"3","stage":"limit"}],"read_only":true}
+```
+
+| Field | Meaning |
+|---|---|
+| `access` | `collection_scan` or `primary_key_lookup` |
+| `executor` | `streaming`, `governed_blocking`, `transactional` (writes), or `rejected` when the shape has no bounded executor ([7.2](#72-execution-shapes-accepted-by-ogd-memory-contract)) |
+| `mode` | Memory contract of the plan |
+| `operators` | Physical operators in order, with shorthand forms expanded |
 
 ---
 
@@ -993,14 +1130,16 @@ on products | where category == "office" | near embedding, [0.0, 1.0, 0.0] | sel
 #### `sort`
 
 ```text
-sort <field.path> [asc|desc], ...
+sort <key> [asc|desc], ...
+key := <field.path> | <expression>
 ```
 
-Stable ordering on one or more keys. The default direction is `asc`. `sort` is **blocking**: it must see every input document before emitting any. Followed by `limit N`, it runs as a bounded **Top-N** that keeps only N rows in memory.
+Stable ordering on one or more keys. A key can be any expression: `sort price * qty desc`, `sort len(name), name`. An expression key is computed into a hidden field by a `derive`, sorted on, then dropped, so it follows the same execution rules as `derive … | sort …`. The default direction is `asc`. Missing fields and `null` sort before every other value in ascending order, and after them in descending order. `sort` is **blocking**: it must see every input document before emitting any. Followed by `limit N`, it runs as a bounded **Top-N** that keeps only N rows in memory.
 
 ```text
 on orders | sort price desc | limit 2
 on orders | derive total = price * qty | sort total desc | limit 3
+on orders | sort price * qty desc | limit 3          -- same, without keeping `total`
 on users  | select name, city | sort city
 ```
 
@@ -1074,6 +1213,27 @@ on orders | where status == "paid" | select order_id | sample 2
 on orders | select order_id | sample 3 | limit 2
 ```
 
+#### `unwind`
+
+```text
+unwind <field.path> [with index <field.path>] [keep empty]
+```
+
+Emits one row per item of the array at the path, with the item in place of the array, in order. A row whose field is missing or not an array passes through unchanged; a row whose array is empty is dropped. `unwind` streams mid-pipeline and works inside `lookup` sub-pipelines.
+
+- `with index <field>` stores the 0-based position of each item (`null` on rows that were not expanded).
+- `keep empty` keeps rows whose array is empty or `null`, with the field set to `null`.
+
+```text
+on users | unwind tags with index position | select name, tags, position
+-- {"name":"Alice","position":0,"tags":"admin"}
+-- {"name":"Alice","position":1,"tags":"dev"}
+-- {"name":"Bob","position":0,"tags":"dev"}
+-- {"name":"Dan","position":0,"tags":"ops"}
+on users | unwind tags keep empty | where tags == null | select name
+-- {"name":"Carol"}
+```
+
 ### Deduplication and counting
 
 #### `distinct`
@@ -1134,34 +1294,46 @@ on orders | group status
 
 ```text
 on orders | group region, qty
--- {"qty":8.0,"region":"EU"}
--- {"qty":8.0,"region":"US"}
+-- {"qty":8,"region":"EU"}
+-- {"qty":8,"region":"US"}
 
 on orders | group region as zone, status as state, qty as units
--- {"state":"paid","units":3.0,"zone":"EU"} …
+-- {"state":"paid","units":3,"zone":"EU"} …
 
 on orders | where status == "paid" | group user as customer, qty | sort qty desc
--- {"customer":"Carol","qty":5.0}
--- {"customer":"Alice","qty":3.0}
+-- {"customer":"Carol","qty":5}
+-- {"customer":"Alice","qty":3}
 
 on orders | group product | sort count desc | limit 2
 -- {"count":3,"product":"P1"}
 -- {"count":2,"product":"P2"}
 ```
 
-Groups are emitted in group-key order. `group | limit N` is bounded: only the N smallest live keys are kept (see the execution rule in Part I). Sums are floats. Summing a computed value takes two steps, `derive` then `group`, as in the tour.
+Groups are emitted in group-key order. `group | limit N` is bounded: only the N smallest live keys are kept (see the execution rule in Part I). A sum stays an integer while every term is an integer and the total fits in 64 bits; otherwise it is a float. Non-numeric values are ignored by sums. Grouping keys are field paths: to group or aggregate a computed value, `derive` it first, as in the tour.
 
 **Compound form**, for several measures:
 
 ```text
 group
 | by <key> [as <alias>], ...
-| sum <field> [as <alias>]
-| sum <field> [as <alias>]
+| sum|avg|min|max|first|last <field> [as <alias>]
+| count [<field>] [as <alias>]
+| ...
 | end
 ```
 
-`by` is required and appears exactly once. `sum` appears zero or more times; with no `sum`, the group emits `count`. The compound form is the compact form's big brother: it produces the same kind of rows, with any number of summed measures.
+`by` is required and appears exactly once. Measures appear zero or more times, in any order:
+
+| Measure | Result | Default alias |
+|---|---|---|
+| `sum <field>` | Sum of the numeric values (integer while exact); the field is omitted when the group has no number | `<field>` |
+| `avg <field>` | Mean of the numeric values, `null` when there are none | `avg_<field>` |
+| `min <field>`, `max <field>` | Smallest / largest non-null value; values must be comparable (numbers, strings or booleans) | `min_<field>`, `max_<field>` |
+| `first <field>`, `last <field>` | Value on the first / last row of the group, in input order (`null` when missing) | `first_<field>`, `last_<field>` |
+| `count` | Number of rows | `count` |
+| `count <field>` | Number of rows where the field is present and not `null` | `count_<field>` |
+
+With no measure, the group emits `count`. Every measure runs on the same bounded, spillable executor as the compact form.
 
 ```text
 on orders
@@ -1175,14 +1347,35 @@ on orders
 | sort revenue desc
 ```
 ```json
-{"month":"2026-02","region":"US","revenue":250.0,"units":1.0}
-{"month":"2026-02","region":"EU","revenue":99.5,"units":1.0}
-{"month":"2026-01","region":"EU","revenue":70.0,"units":7.0}
-{"month":"2026-01","region":"US","revenue":40.0,"units":4.0}
+{"month":"2026-02","region":"US","revenue":250.0,"units":1}
+{"month":"2026-02","region":"EU","revenue":99.5,"units":1}
+{"month":"2026-01","region":"EU","revenue":70.0,"units":7}
+{"month":"2026-01","region":"US","revenue":40.0,"units":4}
 ```
 
 ```text
 on orders | group | by status | end          -- same as `group status`
+
+on orders | group | by region | avg price as mean | max qty | count as rows | end
+-- {"max_qty":5,"mean":39.833333333333336,"region":"EU","rows":3}
+-- {"max_qty":4,"mean":119.83333333333333,"region":"US","rows":3}
+```
+
+#### `bucket`
+
+```text
+bucket <expression> by [<b0>, <b1>, ...] [default <value>] [as <alias>]
+```
+
+Counts rows per range `[b(i), b(i+1))`: each row falls in the bucket named by its lower bound. Rows outside every range go to `default`, or to `null` without it. The alias defaults to `bucket`. Boundaries must be strictly ascending. `bucket` is shorthand for `derive <alias> = bucket(<expression>, [...], <default>) | group <alias>`, so it follows the rules of `group`.
+
+```text
+on users | bucket age by [0, 18, 40] default "40+" as band
+```
+```json
+{"band":0,"count":1}
+{"band":18,"count":2}
+{"band":"40+","count":1}
 ```
 
 #### `pivot`
@@ -1191,12 +1384,14 @@ on orders | group | by status | end          -- same as `group status`
 pivot
 | rows    <field>, ...
 | columns <field>, ...
-| values  <field>, ...
+| values  <field> [as <alias>] | <expression> as <alias>, ...
 | aggregate sum|count|avg|average|min|minimum|max|maximum|first|last
 | end
 ```
 
-Each directive appears exactly once. `pivot` is a terminal stage. It runs in `ogd` on a bounded executor of the `group` family: the prefix streams and only the aggregate cells are retained (one per row key and column). The state is charged to the query working set; a pivot with too many distinct rows × columns fails with `pivot cells exceed the governed query working set` (it does not spill, unlike `group`).
+`values` takes one or more measures, written like `select` items: a field, or any expression with an alias (`CAFacture - COGS as marge`). With one measure, each cell is named after its column; with several, `<column>.<name>`, where the name is the alias or the field's last segment, and names must be unique. An expression value is computed by a hidden `derive` before the pivot, so it runs on the same streamed prefix.
+
+Each directive appears exactly once. `pivot` is a terminal stage. Cells use the same aggregates as the compound `group`: sums stay integers when exact (a cell with no number is `0`), non-numeric values are ignored by `sum`/`avg`, missing values are skipped by every aggregate except `count`, which counts rows. It runs in `ogd` on a bounded executor of the `group` family: the prefix streams and only the aggregate cells are retained (one per row key and column). The state is charged to the query working set; a pivot with too many distinct rows × columns fails with `pivot cells exceed the governed query working set` (it does not spill, unlike `group`).
 
 ### Combining collections
 
@@ -1253,6 +1448,19 @@ on orders as o | lookup products as p | where p.code == o.product | select label
 -- {…,"order_id":1,"product":[{"category":"office","label":"Pen"}],…}
 ```
 
+**One-line equality form.** When the join is a single equality, the sub-pipeline can be omitted:
+
+```text
+lookup <collection> [as <alias>] on <joined field> == <outer field> into <field>
+```
+
+```text
+on orders | lookup products on code == product into product
+on users as u | lookup orders as o on o.user == u.name into orders
+```
+
+The left side reads the joined collection and the right side the document being enriched; unqualified names are qualified accordingly. Rows where either field is missing do not match. It expands to `lookup <collection> | where exists(…) and exists(…) and <joined> == <outer> | into <field> | end`.
+
 The correlation is not a special case: the sub-pipeline's filters are evaluated by the common evaluator over a *lookup field scope*, a field resolver that routes each alias to its document.
 
 `ogd` limitations:
@@ -1286,11 +1494,18 @@ Every write runs in **one transaction**: all mutations commit, or none do. Write
 insert { <key>: <value>, ... }
 ```
 
-Inserts **one** document and returns it with its generated `_id`. Keys may be unquoted identifiers or JSON strings. Values are JSON (nested objects and arrays included). `insert` must be the only stage of its pipeline. For several documents, use `load`.
+Inserts **one** document and returns it with its generated `_id`. Keys may be unquoted identifiers or JSON strings. Values are JSON (nested objects and arrays included). `insert` must be the only stage of its pipeline.
+
+```text
+insert [ { <key>: <value>, ... }, ... ]
+```
+
+With an array, `insert` writes every object in one transaction. It runs as a streaming `load` in `merge` mode: rows without `_id` get a fresh one, and a row carrying the `_id` of an existing document is merged into it.
 
 ```text
 on users | insert {name: "Frank", age: 52, tags: ["new"], profile: {country: "IT"}, active: true}
 -- {"_id":"01a0d795-…","active":true,"age":52,"name":"Frank","profile":{"country":"IT"},"tags":["new"]}
+on users | insert [{name: "Gus", age: 20}, {name: "Hal", age: 33}]
 ```
 
 #### `set`
@@ -1322,6 +1537,23 @@ Deletes every document that reaches it. It takes no arguments.
 ```text
 on orders | where status == "cancelled" | delete
 on staging | delete                           -- empties the collection
+```
+
+#### `into` (alias `out`)
+
+```text
+into <collection>
+```
+
+Terminal. Inserts every row that reaches it into another collection, in one transaction, and returns no rows (the counters report `inserted`). Each stored row gets a fresh `_id`, even when the pipeline kept the source `_id`; the source collection is never modified.
+
+- The target must differ from the source and cannot be a system collection (`_…`).
+- Authorization requires write access on the target and read access on the source.
+- The rows are materialized before the write and charged to the query memory budget.
+
+```text
+on users | where active | into archive
+on orders | group | by region | sum qty as units | end | into region_totals
 ```
 
 #### `load`: bulk import and upsert
@@ -1372,7 +1604,7 @@ The compact form `load <target>` (with arguments and no sub-pipeline) is a runti
 |---|---|
 | `select`, `sort`, `limit`, `skip`, `distinct`, `count`, `group`, `pivot`, `load`, `delete`, `insert` appear at most once | `logical <op> operator is duplicated` |
 | Nothing may follow a terminal stage: `set`, `delete`, `insert`, `load`, `count`, `pivot` | `appears after a terminal operator` |
-| `insert` must be the only stage | `insert … must be the only operator` |
+| `insert` must be the only stage (a batch `insert [...]` too, planned as `load`) | `insert … must be the only operator` |
 | `load` must be the first stage | `logical load operator at index N must be first` |
 | Unknown stage names are rejected | `unknown stage "frobnicate"` |
 | Stage arguments are validated before any storage access | `invalid limit syntax … expected a non-negative integer` |
@@ -1389,7 +1621,7 @@ The compact form `load <target>` (with arguments and no sub-pipeline) is a runti
    - `sample N` (retains at most N rows);
    - `lookup` or `union` whose sub-pipeline is made only of filter, projection, skip, limit and row-bound stages.
 
-   The tail is any run of row-local stages applied one row at a time to the core's output: `where`, `select`, `derive`, `skip`, `limit`, `first`, `single`, `unwind`, …, optionally ending with `count`. A leading `skip k` / `limit n` (or `first`) of the tail, possibly separated by projections, is pushed into the core: `sort k | skip 10 | limit 5` runs as a bounded Top-15, `sort k | first name` as a Top-1 followed by the projection.
+   The tail is any run of row-local stages applied one row at a time to the core's output: `where`, `select`, `derive`, `skip`, `limit`, `first`, `single`, `unwind`, …, optionally ending with `count`. A leading `skip k` / `limit n` (or `first`) of the tail is pushed into the core, even when stages that turn each row into exactly one row (`select`, `derive`, `rename`, `drop`, `root`) sit in between; stages that can drop rows (`where`, `near`) stop the push: `sort k | skip 10 | limit 5` runs as a bounded Top-15, `sort k | first name` as a Top-1 followed by the projection.
    - `… | sort k | skip 10 | limit 5`, `… | sort k | first name`
    - `… | group … | select …`, `… | group … | count`
    - `… | sample N | select …`, `… | sample N | count`
@@ -1470,6 +1702,7 @@ ogcli [--address HOST:PORT] [--compact] [-q] ['QUERY']
 - With piped stdin, it runs one query per line.
 - On a terminal, it opens a REPL.
 - `-q` prints only the documents, and `--compact` prints one JSON document per line.
+- `--param NAME=VALUE` binds `$NAME` (repeatable); see [5.4](#54-parameters-name).
 
 A line starting with `.` sends a raw protocol operation (`.OPERATION [JSON payload]`). These are not query stages:
 
@@ -1557,6 +1790,24 @@ on orders | where status == "paid" | sample 100
 -- Purge a collection
 on staging | delete
 
+-- Average basket and last order per customer
+on orders | group | by user | avg price as basket | last order_id | end
+
+-- Orders per month from an ISO timestamp field
+on orders | derive month = date_format(created_at, "%Y-%m") | group month
+
+-- Age bands
+on users | bucket age by [0, 18, 30, 50, 120] as band
+
+-- Parameterized lookup (with "params": {"name": "Alice"})
+on users | where name == $name | lookup orders on user == name into orders
+
+-- One threshold reused by several stages
+let $big = 100 | on orders | where price * qty > $big | derive excess = price * qty - $big
+
+-- See how a query will run
+explain on orders | sort price * qty desc | limit 10
+
 -- Engine health
 on _memory | where scope == "global" | select pressure_state, current_bytes, peak_bytes, spill_runs_active
 ```
@@ -1569,15 +1820,14 @@ This list is kept honest on purpose. Every item was observed on a live `ogd` bui
 
 | Area | Limitation | Workaround |
 |---|---|---|
-| Parameters (`$name`) | Not implemented | Client-side query construction |
-| Missing fields | A missing field fails the query, except in `exists` / `coalesce` | `exists(x) and …`, `coalesce(x, default)` |
+| Parameters and `let` (`$name`) | Bound as literals before planning: each distinct set of values is planned (and cached) separately | None needed |
+| Missing fields | A missing field fails the query, except in `exists`, `coalesce` and optional paths | `x?`, `exists(x) and …`, `coalesce(x, default)` |
 | `lookup`, `union` | Only a streaming tail (`where`, `select`, `limit`, `count`, …) may follow; a blocking stage after them is rejected | Put `sort`, `group`, `distinct` before them |
-| `unwind` | Fails in streaming execution (`streaming custom operator unexpectedly expanded rows`) | None yet |
 | `pivot` | Aggregate cells must fit the query working set (no spill) | Filter or `select` before it to cut row/column cardinality |
 | Blocking stages | Only the shapes listed in [7.2](#72-execution-shapes-accepted-by-ogd-memory-contract) are accepted | Reorder as shown there |
-| `insert` | One document per query | `load` for batches |
+| `group` keys | Field paths only | `derive` the computed key first |
 | `aggregate` | Not a stage | `group`, `count`, `pivot` |
-| Date/Time | No native type | Unix milliseconds or ISO-8601 strings |
+| Date/Time | No native type; date functions read epoch milliseconds or ISO-8601 strings, in UTC | `date_*` functions |
 
 ---
 
@@ -1586,6 +1836,9 @@ This list is kept honest on purpose. Every item was observed on a live `ogd` bui
 The pipeline layer (lexer and parser) is below. The planner then interprets each stage's argument text with the stage-specific grammar from [section 6](#6-stage-reference).
 
 ```ebnf
+request      = [ "explain" ] , { let-header } , query ;   (* `$name` values are bound before parsing *)
+let-header   = "let" , variable , "=" , expression , { "," , variable , "=" , expression } , "|" ;
+variable     = "$" , identifier ;
 query        = source , { "|" , stage } ;
 source       = ( "on" | "from" ) , collection , [ "as" , identifier ] ;
 collection   = identifier , { "." , identifier } ;
@@ -1593,7 +1846,7 @@ collection   = identifier , { "." , identifier } ;
 stage        = simple-stage | compound-stage ;
 simple-stage = stage-name , arguments ;
 compound-stage
-             = ( "lookup" | "join" ) , arguments , sub-pipeline
+             = ( "lookup" | "join" ) , arguments , sub-pipeline   (* unless the header contains `into` *)
              | "union" , sub-pipeline
              | "pivot" , sub-pipeline
              | ( "load" | "group" ) , sub-pipeline ;   (* header-less form only *)
@@ -1602,17 +1855,20 @@ arguments    = { token } ;                        (* up to the next top-level "|
 
 expression   = or-expr | json-literal ;
 or-expr      = and-expr , { ( "or" | "||" ) , and-expr } ;
-and-expr     = eq-expr , { ( "and" | "&&" ) , eq-expr } ;
+and-expr     = not-expr , { ( "and" | "&&" ) , not-expr } ;
+not-expr     = ( "not" | "!" ) , eq-expr | eq-expr ;
 eq-expr      = rel-expr , { ( "==" | "!=" ) , rel-expr } ;
-rel-expr     = add-expr , { ( "<" | "<=" | ">" | ">=" | "in" | "not" , "in" ) , add-expr } ;
+rel-expr     = add-expr , { ( "<" | "<=" | ">" | ">=" | "in" | "not" , "in" ) , add-expr
+                          | [ "not" ] , "between" , add-expr , ( "and" | "&&" ) , add-expr } ;
 add-expr     = mul-expr , { ( "+" | "-" ) , mul-expr } ;
 mul-expr     = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary        = ( "-" | "+" ) , number                  (* folded into a signed literal *)
-             | ( "not" | "!" | "-" | "+" ) , unary | primary ;
-primary      = literal | call | field-path | array | "(" , expression , ")" ;
+             | ( "-" | "+" ) , unary | not-expr | primary ;
+primary      = literal | call | field-path | array | object | "(" , expression , ")" ;
+object       = "{" , JSON members with quoted keys , "}" ;
 call         = identifier , "(" , [ expression , { "," , expression } ] , ")" ;
 array        = "[" , [ expression , { "," , expression } ] , "]" ;
-field-path   = identifier , { "." , identifier } ;
+field-path   = identifier , [ "?" ] , { "." , identifier , [ "?" ] } ;   (* any "?" makes the path optional *)
 literal      = "null" | "true" | "false" | number | string ;
 
 identifier   = ( letter | "_" ) , { letter | digit | "_" } ;   (* Unicode letters *)

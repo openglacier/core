@@ -34,14 +34,19 @@ pub use stage::{
     StageName, StageRegistry, StageResult,
 };
 
+mod dates;
 mod eval;
 mod expression;
+mod functions;
 mod json_value;
+mod params;
 
 pub use eval::{
-    check_call, evaluate, evaluate_document, evaluate_predicate, value_expression_runtime,
-    DocumentFields, ExpressionFieldResolver, LookupFields, SemanticValue,
+    apply_assignments, check_call, evaluate, evaluate_document, evaluate_predicate, DocumentFields,
+    ExpressionFieldResolver, Function, LookupFields, SemanticValue,
 };
+
+pub use params::{bind_parameters, prepare_query, split_explain};
 
 pub use expression::{
     parse_expression, BinaryOperator, Expression, ExpressionError, ExpressionErrorKind,
@@ -73,11 +78,12 @@ mod execution_properties;
 
 pub use execution_properties::{
     Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Materialization, Order,
-    ProjectedAccess, ProjectionReuse, Scope, Shape,
+    ProjectedAccess, ProjectionReuse, Reads, Scope, Shape,
 };
 
 mod physical_plan;
 
+pub use physical_plan::source_field_demand;
 pub use physical_plan::{
     ExecutionMode, MemoryExecutionMode, PhysicalAccess, PhysicalFieldContext, PhysicalLoadMode,
     PhysicalOperator, PhysicalOperatorKind, PhysicalPlan, PhysicalPlanBuilder, PhysicalPlanError,
@@ -106,25 +112,31 @@ mod lowerer;
 
 pub use lowerer::ScanPlanLowerer;
 
-mod runtime;
-
-pub use runtime::{QueryRuntime, QueryRuntimeBuildError, QueryRuntimeBuilder};
-
 mod insert_materializer;
 
 pub use insert_materializer::InsertDocumentMaterializer;
 
 mod projected_values;
 
+mod totality;
+
+mod batch;
+
+pub use batch::{Abort, BatchProgram, BatchRunner, Column, Tag, BATCH_ROWS};
+
+pub use totality::{total_kinds, Kinds};
+
 pub use projected_values::{
     AccessVector, ProjectedPredicate, ProjectedValueLayout, ProjectedValuePipeline,
-    ProjectedValueRow,
+    ProjectedValueRow, SlotProgram, SlotRow,
 };
 
 mod runtime_materializer;
 
-pub(crate) use runtime_materializer::{group_field_layout, NearSpec};
-pub use runtime_materializer::{QueryRuntimeMaterializationExt, RuntimeMaterializer};
+pub(crate) use runtime_materializer::{describe_group_fields, group_field_layout, NearSpec};
+pub use runtime_materializer::{
+    CompiledStage, DenseGroups, QueryRuntime, RuntimeMaterializer, SlotExpansion,
+};
 
 pub mod planner_cache;
 pub use planner_cache::{PlannerCache, PlannerCacheStats};

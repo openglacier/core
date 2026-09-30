@@ -13,8 +13,9 @@ pub use coercion::{
     CoercedNumberPair, CoercionFailure, CoercionPolicy, CoercionResult,
 };
 pub use compare::{
-    compare, compare_numbers, equals, greater_than, greater_than_or_equal, less_than,
-    less_than_or_equal, not_equals, physically_equals, CompareFailure, CompareResult, Comparison,
+    compare, compare_for_sort, compare_numbers, equals, greater_than, greater_than_or_equal,
+    less_than, less_than_or_equal, not_equals, physically_equals, CompareFailure, CompareResult,
+    Comparison,
 };
 pub use document::{Document, FieldName};
 pub use field_path::{FieldPath, FieldPathSegment, ResolvedValue};

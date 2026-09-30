@@ -4,10 +4,7 @@ use std::sync::Arc;
 
 use og_core::{
     engine::Engine,
-    query::{
-        value_expression_runtime, PlannerPipeline, PlannerStage, QueryRuntimeMaterializationExt,
-        ScanPlanLowerer, Span, StageName,
-    },
+    query::{PlannerPipeline, PlannerStage, QueryRuntime, ScanPlanLowerer, Span, StageName},
     storage::{CollectionId, DocumentId, MemoryStorage, StorageEngine},
     Document, Value,
 };
@@ -34,11 +31,7 @@ fn engine_with_rows(
     }
     transaction.commit().unwrap();
 
-    let runtime = Arc::new(
-        value_expression_runtime()
-            .unwrap()
-            .with_default_materialization("test"),
-    );
+    let runtime = Arc::new(QueryRuntime::new());
     Engine::new(storage, runtime, Arc::new(ScanPlanLowerer::new()))
 }
 

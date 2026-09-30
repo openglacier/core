@@ -1,7 +1,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 //! Capability-aware value comparison.
 
-use super::{ coerce_value_pair_to_numbers, CoercedNumber, CoercionFailure, CoercionPolicy, Number, Value, };
+use super::{ coerce_value_pair_to_numbers, coercion::{signed_to_exact_float, unsigned_to_exact_float}, CoercedNumber, CoercionFailure, CoercionPolicy, Number, Value, };
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -128,10 +128,22 @@ pub fn compare(left: &Value, right: &Value, policy: CoercionPolicy) -> CompareRe
         (Value::String(left), Value::String(right)) => {
             Ok(Comparison::from_ordering(left.cmp(right)))
         }
-        (Value::Number(_), Value::Number(_) | Value::String(_))
+        (Value::Number(left), Value::Number(right)) => compare_number_values(*left, *right, policy),
+        (Value::Number(_), Value::String(_))
         | (Value::String(_), Value::Number(_)) => compare_numeric_values(left, right, policy),
 
         _ => Err(CompareFailure::IncompatibleValues),
+    }
+}
+
+/// Orders two values for `sort`: `null` sorts before every other value, like a
+/// missing field, and the other values follow [`compare`].
+pub fn compare_for_sort(left: &Value, right: &Value, policy: CoercionPolicy) -> CompareResult<Comparison> {
+    match (left, right) {
+        (Value::Null, Value::Null) => Ok(Comparison::Equal),
+        (Value::Null, _) => Ok(Comparison::Less),
+        (_, Value::Null) => Ok(Comparison::Greater),
+        _ => compare(left, right, policy),
     }
 }
 
@@ -177,6 +189,27 @@ pub fn compare_numbers( left: Number, right: Number, policy: CoercionPolicy, ) -
 fn compare_numeric_values( left: &Value, right: &Value, policy: CoercionPolicy, ) -> CompareResult<Comparison> {
     let pair = coerce_value_pair_to_numbers(left, right, policy)?;
     compare_coerced_numbers(pair.left(), pair.right())
+}
+
+/// Same result as coercing both numbers to a common representation, without
+/// building the intermediate pair: comparisons run on every row.
+#[inline]
+fn compare_number_values(left: Number, right: Number, policy: CoercionPolicy) -> CompareResult<Comparison> {
+    use Number::{Float, Signed, Unsigned};
+    let floats = |left: f64, right: f64| {
+        left.partial_cmp(&right).map(Comparison::from_ordering).ok_or(CompareFailure::IncompatibleValues)
+    };
+    match (left, right) {
+        (Signed(left), Signed(right)) => Ok(Comparison::from_ordering(left.cmp(&right))),
+        (Unsigned(left), Unsigned(right)) => Ok(Comparison::from_ordering(left.cmp(&right))),
+        (Float(left), Float(right)) => floats(left, right),
+        _ if !policy.allows_numeric_conversion() => Err(CoercionFailure::ForbiddenByPolicy.into()),
+        (Float(left), Unsigned(right)) => floats(left, unsigned_to_exact_float(right)?),
+        (Unsigned(left), Float(right)) => floats(unsigned_to_exact_float(left)?, right),
+        (Float(left), Signed(right)) => floats(left, signed_to_exact_float(right)?),
+        (Signed(left), Float(right)) => floats(signed_to_exact_float(left)?, right),
+        _ => compare_numeric_values(&Value::Number(left), &Value::Number(right), policy),
+    }
 }
 
 fn compare_coerced_numbers(left: CoercedNumber, right: CoercedNumber) -> CompareResult<Comparison> {
@@ -229,5 +262,6 @@ mod tests {
     #[test] fn comparison_can_be_reversed() { assert_eq!(Comparison::Less.reverse(), Comparison::Greater); assert_eq!(Comparison::Equal.reverse(), Comparison::Equal); assert_eq!(Comparison::Greater.reverse(), Comparison::Less); }
     #[test] fn relational_helpers_delegate_to_operational_comparison() { let left = Value::from(18_i64); let right = Value::from("20"); assert_eq!(less_than(&left, &right, CoercionPolicy::Implicit), Ok(true),); assert_eq!( less_than_or_equal(&left, &right, CoercionPolicy::Implicit), Ok(true), ); assert_eq!( greater_than(&left, &right, CoercionPolicy::Implicit), Ok(false), ); assert_eq!( greater_than_or_equal(&left, &right, CoercionPolicy::Implicit), Ok(false), ); }
     #[test] fn physical_equality_never_applies_coercion() { assert!(!physically_equals(&Value::from(18_i64), &Value::from("18"),)); assert_eq!( equals( &Value::from(18_i64), &Value::from("18"), CoercionPolicy::Implicit, ), Ok(true), ); }
+    #[test] fn sort_orders_null_before_every_other_value() { assert_eq!( compare_for_sort( &Value::Null, &Value::from(1_i64), CoercionPolicy::Numeric, ), Ok(Comparison::Less) ); assert_eq!( compare_for_sort( &Value::from("a"), &Value::Null, CoercionPolicy::Numeric, ), Ok(Comparison::Greater) ); assert_eq!( compare_for_sort( &Value::Null, &Value::Null, CoercionPolicy::Numeric, ), Ok(Comparison::Equal) ); assert_eq!( compare_for_sort( &Value::from(true), &Value::from("true"), CoercionPolicy::Numeric, ), Err(CompareFailure::IncompatibleValues) ); }
     #[test] fn compare_failure_exposes_its_category() { let incompatible = CompareFailure::IncompatibleValues; assert!(incompatible.is_incompatible_values()); assert_eq!(incompatible.coercion_failure(), None); let coercion = CompareFailure::Coercion(CoercionFailure::PrecisionLoss); assert!(!coercion.is_incompatible_values()); assert_eq!( coercion.coercion_failure(), Some(CoercionFailure::PrecisionLoss), ); }
 }

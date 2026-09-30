@@ -348,7 +348,8 @@ impl<'source> Lexer<'source> {
                 ))
             }
 
-            '+' | '-' | '*' | '/' | '%' => {
+            // `?` marks an optional field path (`nick?`, `profile?.country`).
+            '+' | '-' | '*' | '/' | '%' | '?' => {
                 self.advance_char();
                 Ok(self.token(TokenKind::Operator, start))
             }
@@ -474,6 +475,17 @@ impl<'source> Lexer<'source> {
         };
         if matches!(character, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
             self.advance_char();
+            return Ok(());
+        }
+        // `\uXXXX`: four hex digits (surrogate pairs are checked when decoded).
+        if character == 'u' {
+            self.advance_char();
+            for _ in 0..4 {
+                if !self.peek_char().is_some_and(|digit| digit.is_ascii_hexdigit()) {
+                    return Err(LexError::new(LexErrorKind::InvalidEscape { character }, Span::new(start, self.cursor)));
+                }
+                self.advance_char();
+            }
             return Ok(());
         }
         Err(LexError::new(
@@ -705,6 +717,7 @@ mod tests {
     #[test] fn lexes_unicode_strings() { let source = r#""Paris" "été" "東京""#; assert_eq!(lexemes(source), vec![r#""Paris""#, r#""été""#, r#""東京""#],); }
     #[test] fn rejects_unterminated_string() { let error = lex(r#""Paris"#).unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnterminatedString,); assert_eq!(error.span(), Span::new(0, r#""Paris"#.len()),); }
     #[test] fn rejects_multiline_string() { let error = lex("\"first\nsecond\"").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnterminatedString,); assert_eq!(error.span(), Span::new(0, 6)); }
+    #[test] fn accepts_unicode_escapes() { assert!(lex(r#""a\u0001\uD83D\uDE00""#).is_ok()); assert!(matches!(lex(r#""\u12x4""#).unwrap_err().kind(), LexErrorKind::InvalidEscape { character: 'u' })); }
     #[test] fn rejects_invalid_escape() { let error = lex(r#""invalid\q""#).unwrap_err(); assert_eq!( error.kind(), &LexErrorKind::InvalidEscape { character: 'q' }, ); assert_eq!(error.span(), Span::new(8, 10)); }
     #[test] fn rejects_unterminated_escape() { let error = lex("\"value\\").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::UnterminatedEscape,); assert_eq!(error.span(), Span::new(6, 7)); }
     #[test] fn rejects_bang_without_equals() { let error = lex("!").unwrap_err(); assert_eq!(error.kind(), &LexErrorKind::ExpectedEqualsAfterBang,); assert_eq!(error.span(), Span::new(0, 1)); }

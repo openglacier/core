@@ -9,7 +9,7 @@ use std::{
 use serde::{ de::{DeserializeSeed, SeqAccess, Visitor}, Deserialize, Serialize, };
 use super::{glacier_mmap::GlacierReadOnlyMap, StorageBackend};
 use crate::helpers::{elapsed_micros, elapsed_nanos, fnv1a64 as checksum64, fnv1a64_continue as checksum64_continue, lock_unpoisoned, u64_to_usize_saturating, usize_to_u64_saturating, FNV1A64_OFFSET};
-use crate::model::{Document, Number, Value};
+use crate::model::{Document, Number, PhysicalKind, Value};
 use crate::storage::{
     project_document, CollectionId, CommitResult, DeleteResult, DocumentId, DocumentVersion,
     FieldPath, InsertResult, ProjectedValueRef, ReplaceResult, ScanDirection, ScanOptions,
@@ -196,7 +196,7 @@ impl<'a> Iterator for InlineIndexVersionsRev<'a> {
     }
 }
 
-const PRIMARY_HEAD_CAPACITY: usize = BOUNDED_LIMIT_SELECTION_MAX;
+const PRIMARY_HEAD_CAPACITY: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
 struct PrimaryHeadEntry {
@@ -2418,95 +2418,33 @@ impl StorageBackend for GlacierBackend {
     }
 }
 
-const BOUNDED_LIMIT_SELECTION_MAX: usize = 4096;
-
-fn select_visible_entries_bounded( state: &GlacierState, collection_index: &CollectionIndex, generation: u64, direction: ScanDirection, limit: usize, ) -> Vec<(DocumentId, RecordPointer)> {
-    if limit == 0 {
-        return Vec::new();
-    }
-
-    let mut selected: Vec<(DocumentId, RecordPointer)> = Vec::with_capacity(limit);
-    collection_index.for_each_id_version(state, generation, |id, version| {
-        let Some(pointer) = version.pointer else {
-            return;
-        };
-
-        if selected.len() < limit {
-            selected.push((id, pointer));
-            return;
-        }
-
-        let mut worst_index = 0usize;
-        for index in 1..selected.len() {
-            let worse = match direction {
-                ScanDirection::Forward => selected[index].0 > selected[worst_index].0,
-                ScanDirection::Reverse => selected[index].0 < selected[worst_index].0,
-            };
-            if worse {
-                worst_index = index;
-            }
-        }
-
-        let improves = match direction {
-            ScanDirection::Forward => id < selected[worst_index].0,
-            ScanDirection::Reverse => id > selected[worst_index].0,
-        };
-        if improves {
-            selected[worst_index] = (id, pointer);
-        }
-    });
-
-    selected.sort_unstable_by_key(|left| left.0);
-    if direction == ScanDirection::Reverse {
-        selected.reverse();
-    }
-    selected
-}
-
-fn collect_visible_entries_ordered( state: &GlacierState, collection_index: &CollectionIndex, generation: u64, direction: ScanDirection, limit: Option<usize>, ) -> Vec<(DocumentId, RecordPointer)> {
-    let mut entries = Vec::with_capacity(
-        limit.unwrap_or_else(|| visible_count(collection_index, generation) as usize),
-    );
-    collection_index.for_each_id_version(state, generation, |id, version| {
-        if let Some(pointer) = version.pointer {
-            entries.push((id, pointer));
-        }
-    });
-    entries.sort_unstable_by_key(|left| left.0);
-    if direction == ScanDirection::Reverse {
-        entries.reverse();
-    }
-    if let Some(limit) = limit {
-        entries.truncate(limit);
-    }
-    entries
-}
-
 #[derive(Clone, Copy)]
 struct VisibleExceptionEntry {
     id: DocumentId,
-    pointer: Option<RecordPointer>,
+    /// Visible version and record, `None` when deleted at the snapshot.
+    visible: Option<(DocumentVersion, RecordPointer)>,
 }
+
+/// Receives the visible rows of an ordered primary stream; returns whether
+/// the stream continues.
+type PrimaryEmit<'a> = dyn FnMut(DocumentId, DocumentVersion, RecordPointer) -> StorageResult<bool> + 'a;
 
 /// Streams an ordered cold primary index without materializing one pointer per
 /// document. Large Glacier collections are intentionally represented by the
 /// disk primary sidecar; full scans must preserve that O(1) memory property.
-fn scan_disk_primary_ordered_each( store_path: &Path, disk: &DiskPrimaryIndex, generation: u64, clear_generation: u64, mut exceptions: Vec<VisibleExceptionEntry>, direction: ScanDirection, metrics: &GlacierReadMetrics, visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>, ) -> StorageResult<u64> {
+fn stream_disk_primary_ordered( disk: &DiskPrimaryIndex, generation: u64, clear_generation: u64, mut exceptions: Vec<VisibleExceptionEntry>, direction: ScanDirection, emit: &mut PrimaryEmit<'_>, ) -> StorageResult<()> {
     exceptions.sort_unstable_by_key(|entry| entry.id);
     let mut primary =
         File::open(&disk.path).map_err(io_error("open primary index scan", &disk.path))?;
-    let mut data = File::open(store_path).map_err(io_error("open data", store_path))?;
     let mut bytes = [0u8; PRIMARY_INDEX_ENTRY_BYTES as usize];
-    let mut rows = 0u64;
-
-    let mut emit = |pointer: Option<RecordPointer>| -> StorageResult<bool> {
-        let Some(pointer) = pointer else {
-            return Ok(true);
-        };
-        rows = rows.saturating_add(1);
-        visitor(read_stored_document_from_file_profiled(
-            &mut data, store_path, pointer, metrics,
-        )?)
+    let mut emit = |id: DocumentId, visible: Option<(DocumentVersion, RecordPointer)>| -> StorageResult<bool> {
+        match visible {
+            Some((version, pointer)) => emit(id, version, pointer),
+            None => Ok(true),
+        }
+    };
+    let visible = |entry: &CompactPrimaryEntry| {
+        (entry.generation <= generation && entry.generation > clear_generation).then_some((entry.version, entry.pointer))
     };
 
     match direction {
@@ -2523,24 +2461,26 @@ fn scan_disk_primary_ordered_each( store_path: &Path, disk: &DiskPrimaryIndex, g
                 while exception_index < exceptions.len()
                     && exceptions[exception_index].id < entry.id
                 {
-                    if !emit(exceptions[exception_index].pointer)? {
-                        return Ok(rows);
+                    let exception = exceptions[exception_index];
+                    if !emit(exception.id, exception.visible)? {
+                        return Ok(());
                     }
                     exception_index += 1;
                 }
                 if exception_index < exceptions.len() && exceptions[exception_index].id == entry.id
                 {
-                    if !emit(exceptions[exception_index].pointer)? {
-                        return Ok(rows);
+                    let exception = exceptions[exception_index];
+                    if !emit(exception.id, exception.visible)? {
+                        return Ok(());
                     }
                     exception_index += 1;
-                } else if entry.generation <= generation && entry.generation > clear_generation
-                    && !emit(Some(entry.pointer))? {
-                        return Ok(rows);
-                    }
+                } else if !emit(entry.id, visible(&entry))? {
+                    return Ok(());
+                }
             }
             while exception_index < exceptions.len() {
-                if !emit(exceptions[exception_index].pointer)? {
+                let exception = exceptions[exception_index];
+                if !emit(exception.id, exception.visible)? {
                     break;
                 }
                 exception_index += 1;
@@ -2561,35 +2501,184 @@ fn scan_disk_primary_ordered_each( store_path: &Path, disk: &DiskPrimaryIndex, g
                 let entry = decode_compact_primary_entry(&bytes);
                 while exception_index > 0 && exceptions[exception_index - 1].id > entry.id {
                     exception_index -= 1;
-                    if !emit(exceptions[exception_index].pointer)? {
-                        return Ok(rows);
+                    let exception = exceptions[exception_index];
+                    if !emit(exception.id, exception.visible)? {
+                        return Ok(());
                     }
                 }
                 if exception_index > 0 && exceptions[exception_index - 1].id == entry.id {
                     exception_index -= 1;
-                    if !emit(exceptions[exception_index].pointer)? {
-                        return Ok(rows);
+                    let exception = exceptions[exception_index];
+                    if !emit(exception.id, exception.visible)? {
+                        return Ok(());
                     }
-                } else if entry.generation <= generation && entry.generation > clear_generation
-                    && !emit(Some(entry.pointer))? {
-                        return Ok(rows);
-                    }
+                } else if !emit(entry.id, visible(&entry))? {
+                    return Ok(());
+                }
             }
             while exception_index > 0 {
                 exception_index -= 1;
-                if !emit(exceptions[exception_index].pointer)? {
+                let exception = exceptions[exception_index];
+                if !emit(exception.id, exception.visible)? {
                     break;
                 }
             }
         }
     }
-    Ok(rows)
+    Ok(())
 }
 
 #[derive(Clone)]
 struct GlacierSnapshot {
     backend: GlacierBackend,
     generation: u64,
+}
+
+/// First chunk of a resident primary scan; chunks double up to the maximum,
+/// so a `… | limit 10` reads a few entries and a full scan takes the state
+/// lock once per 64Ki rows.
+const MEMORY_PRIMARY_SCAN_FIRST_CHUNK: usize = 64;
+const MEMORY_PRIMARY_SCAN_MAX_CHUNK: usize = 64 * 1024;
+
+impl GlacierSnapshot {
+    /// Streams the resident primary index in id order, merged with the
+    /// visible exceptions, a chunk at a time under a short state read lock.
+    /// The resident primary only grows at its end (ids increase); if it
+    /// moves to a disk sidecar while the stream runs, the rest of the stream
+    /// falls back to a collected, sorted pass over the ids not yet emitted.
+    fn stream_memory_primary_ordered( &self, collection: &CollectionId, clear_generation: u64, mut exceptions: Vec<VisibleExceptionEntry>, direction: ScanDirection, emit: &mut PrimaryEmit<'_>, ) -> StorageResult<()> {
+        let forward = direction == ScanDirection::Forward;
+        exceptions.sort_unstable_by_key(|entry| entry.id);
+        if !forward {
+            exceptions.reverse();
+        }
+        let before = |left: DocumentId, right: DocumentId| if forward { left < right } else { left > right };
+        let mut emit = |id: DocumentId, visible: Option<(DocumentVersion, RecordPointer)>| -> StorageResult<bool> {
+            match visible {
+                Some((version, pointer)) => emit(id, version, pointer),
+                None => Ok(true),
+            }
+        };
+
+        let mut exception_index = 0usize;
+        let mut last: Option<DocumentId> = None;
+        let mut chunk: Vec<CompactPrimaryEntry> = Vec::new();
+        let mut chunk_len = MEMORY_PRIMARY_SCAN_FIRST_CHUNK;
+        loop {
+            chunk.clear();
+            // `None`: the collection is gone.
+            let exhausted = {
+                let state = self.backend.state_read()?;
+                match state.collections.get(collection) {
+                    Some(index) if index.disk_primary.is_none() => {
+                        let primary = &index.primary;
+                        if forward {
+                            let start = last.map_or(0, |last| primary.partition_point(|entry| entry.id <= last));
+                            let end = start.saturating_add(chunk_len).min(primary.len());
+                            chunk.extend_from_slice(&primary[start..end]);
+                            Some(end == primary.len())
+                        } else {
+                            let end = last.map_or(primary.len(), |last| primary.partition_point(|entry| entry.id < last));
+                            let start = end.saturating_sub(chunk_len);
+                            chunk.extend(primary[start..end].iter().rev().copied());
+                            Some(start == 0)
+                        }
+                    }
+                    Some(index) => {
+                        let mut rest = Vec::new();
+                        index.for_each_id_version(&state, self.generation, |id, version| {
+                            if let Some(pointer) = version.pointer {
+                                if last.is_none_or(|last| before(last, id)) {
+                                    rest.push((id, version.version, pointer));
+                                }
+                            }
+                        });
+                        drop(state);
+                        rest.sort_unstable_by_key(|entry| entry.0);
+                        if !forward {
+                            rest.reverse();
+                        }
+                        for (id, version, pointer) in rest {
+                            if !emit(id, Some((version, pointer)))? {
+                                break;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    None => None,
+                }
+            };
+            let Some(exhausted) = exhausted else {
+                return Ok(());
+            };
+            for entry in &chunk {
+                while exception_index < exceptions.len() && before(exceptions[exception_index].id, entry.id) {
+                    let exception = exceptions[exception_index];
+                    if !emit(exception.id, exception.visible)? {
+                        return Ok(());
+                    }
+                    exception_index += 1;
+                }
+                if exception_index < exceptions.len() && exceptions[exception_index].id == entry.id {
+                    let exception = exceptions[exception_index];
+                    if !emit(exception.id, exception.visible)? {
+                        return Ok(());
+                    }
+                    exception_index += 1;
+                } else if entry.generation <= self.generation
+                    && entry.generation > clear_generation
+                    && !emit(entry.id, Some((entry.version, entry.pointer)))?
+                {
+                    return Ok(());
+                }
+            }
+            if let Some(entry) = chunk.last() {
+                last = Some(entry.id);
+            }
+            if exhausted {
+                break;
+            }
+            chunk_len = chunk_len.saturating_mul(2).min(MEMORY_PRIMARY_SCAN_MAX_CHUNK);
+        }
+        while exception_index < exceptions.len() {
+            let exception = exceptions[exception_index];
+            if !emit(exception.id, exception.visible)? {
+                break;
+            }
+            exception_index += 1;
+        }
+        Ok(())
+    }
+
+    /// Visible exceptions, clear generation and disk sidecar needed to stream
+    /// the primary index of `collection`; `None` for an unknown collection.
+    fn primary_stream_plan(&self, state: &GlacierState, collection: &CollectionId) -> Option<(Option<DiskPrimaryIndex>, u64, Vec<VisibleExceptionEntry>)> {
+        let collection_index = state.collections.get(collection)?;
+        let clear = clear_generation_at(state, self.generation);
+        let exceptions = collection_index
+            .exceptions
+            .iter()
+            .map(|(id, versions)| {
+                let visible = versions
+                    .iter_rev()
+                    .copied()
+                    .find(|version| version.generation <= self.generation && version.generation > clear)
+                    .and_then(|version| version.pointer.map(|pointer| (version.version, pointer)));
+                VisibleExceptionEntry { id: *id, visible }
+            })
+            .collect::<Vec<_>>();
+        Some((collection_index.disk_primary.clone(), clear, exceptions))
+    }
+
+    /// Streams the visible rows of `collection` in id order from its primary
+    /// index (disk sidecar or resident), reading no record.
+    fn stream_primary_ordered(&self, collection: &CollectionId, plan: (Option<DiskPrimaryIndex>, u64, Vec<VisibleExceptionEntry>), direction: ScanDirection, emit: &mut PrimaryEmit<'_>) -> StorageResult<()> {
+        let (disk, clear, exceptions) = plan;
+        match disk {
+            Some(disk) => stream_disk_primary_ordered(&disk, self.generation, clear, exceptions, direction, emit),
+            None => self.stream_memory_primary_ordered(collection, clear, exceptions, direction, emit),
+        }
+    }
 }
 
 #[inline]
@@ -2626,6 +2715,74 @@ impl StorageRead for GlacierSnapshot {
         }
     }
 
+    /// Read from the field catalog, which moves with the generation under the
+    /// state lock: exact only while no later generation was committed. The
+    /// catalog records nested fields as dotted paths, so a dotted path could
+    /// also be a top-level name holding a dot; the answer is then unknown.
+    fn top_level_fields(&self, collection: &CollectionId) -> StorageResult<Option<Vec<String>>> {
+        let state = self.backend.state_read()?;
+        if state.generation != self.generation {
+            return Ok(None);
+        }
+        let Some(stats) = state.metadata.collections.get(collection.as_str()) else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut fields = Vec::with_capacity(stats.fields.len());
+        for (path, field) in &stats.fields {
+            if field.present == 0 {
+                continue;
+            }
+            if path.contains('.') {
+                return Ok(None);
+            }
+            fields.push(path.clone());
+        }
+        Ok(Some(fields))
+    }
+
+    /// Read from the field catalog under the same generation guard as
+    /// [`Self::top_level_fields`].
+    fn field_facts(&self, collection: &CollectionId) -> StorageResult<Option<crate::storage::FieldFacts>> {
+        let state = self.backend.state_read()?;
+        if state.generation != self.generation {
+            return Ok(None);
+        }
+        let Some(stats) = state.metadata.collections.get(collection.as_str()) else {
+            return Ok(Some(crate::storage::FieldFacts::default()));
+        };
+        let mut fields = BTreeMap::new();
+        for (path, field) in &stats.fields {
+            if path.contains('.') {
+                continue;
+            }
+            let mut kinds = Vec::with_capacity(field.kinds.len());
+            for kind in field.kinds.keys() {
+                kinds.push(match kind.as_str() {
+                    "null" => PhysicalKind::Null,
+                    "bool" => PhysicalKind::Bool,
+                    "number" => PhysicalKind::Number,
+                    "string" => PhysicalKind::String,
+                    "array" => PhysicalKind::Array,
+                    "object" => PhysicalKind::Object,
+                    _ => return Ok(None),
+                });
+            }
+            fields.insert(path.clone(), crate::storage::FieldFact { present: field.present, kinds });
+        }
+        Ok(Some(crate::storage::FieldFacts::new(stats.documents, fields)))
+    }
+
+    fn visit_row_ids( &self, collection: &CollectionId, visitor: &mut dyn FnMut(DocumentId, DocumentVersion) -> StorageResult<bool>, ) -> StorageResult<()> {
+        let plan = {
+            let state = self.backend.state_read()?;
+            self.primary_stream_plan(&state, collection)
+        };
+        match plan {
+            Some(plan) => self.stream_primary_ordered(collection, plan, ScanDirection::Forward, &mut |id, version, _| visitor(id, version)),
+            None => Ok(()),
+        }
+    }
+
     fn get( &self, collection: &CollectionId, id: &DocumentId, ) -> StorageResult<Option<StoredDocument>> {
         match self
             .backend
@@ -2655,60 +2812,51 @@ impl StorageRead for GlacierSnapshot {
             .fetch_add(1, Ordering::Relaxed);
         let prepare_started = Instant::now();
 
-        // A full scan over a cold primary index is already physically ordered.
-        // Never expand it into an O(document_count) pointer vector: that used to
-        // consume ~32 bytes per document (~500 MiB for 16.7M rows) per concurrent
-        // query, completely bypassing the memory governor. Only the comparatively
-        // small exception set is materialized for the ordered merge.
-        if options.limit().is_none() {
-            let cold_scan = {
-                let state = self.backend.state_read()?;
-                let Some(collection_index) = state.collections.get(collection) else {
-                    return Ok(());
-                };
-                collection_index.disk_primary.as_ref().map(|disk| {
-                    let clear = clear_generation_at(&state, self.generation);
-                    let exceptions = collection_index
-                        .exceptions
-                        .iter()
-                        .map(|(id, versions)| {
-                            let pointer = versions
-                                .iter_rev()
-                                .copied()
-                                .find(|version| {
-                                    version.generation <= self.generation
-                                        && version.generation > clear
-                                })
-                                .and_then(|version| version.pointer);
-                            VisibleExceptionEntry { id: *id, pointer }
-                        })
-                        .collect::<Vec<_>>();
-                    (disk.clone(), clear, exceptions)
-                })
+        // A scan is streamed in primary order: from the ordered disk sidecar,
+        // or from the resident primary index a chunk at a time. Never expand
+        // it into an O(document_count) pointer vector: that used to consume
+        // ~32 bytes per document (~500 MiB for 16.7M rows) per concurrent
+        // query, bypassing the memory governor, and cost ~170 ms before the
+        // first row of a `… | limit 10`. Only the comparatively small
+        // exception set is materialized for the ordered merge. A `limit`
+        // stops the stream, unless the in-memory primary head holds the rows.
+        let streamed = {
+            let state = self.backend.state_read()?;
+            let Some(collection_index) = state.collections.get(collection) else {
+                return Ok(());
             };
-            if let Some((disk, clear, exceptions)) = cold_scan {
-                metrics
-                    .generic_scan_each_prepare_us
-                    .fetch_add(elapsed_micros(prepare_started), Ordering::Relaxed);
-                let pointer_loop_started = Instant::now();
-                let rows = scan_disk_primary_ordered_each(
-                    &self.backend.inner.path,
-                    &disk,
-                    self.generation,
-                    clear,
-                    exceptions,
-                    options.direction(),
-                    metrics,
-                    visitor,
-                )?;
-                metrics
-                    .generic_scan_each_rows
-                    .fetch_add(rows, Ordering::Relaxed);
-                metrics
-                    .generic_scan_each_pointer_loop_us
-                    .fetch_add(elapsed_micros(pointer_loop_started), Ordering::Relaxed);
+            let head_answers = options.limit().is_some_and(|limit| {
+                options.direction() == ScanDirection::Forward
+                    && self.generation == state.generation
+                    && collection_index.primary_head_valid
+                    && limit <= PRIMARY_HEAD_CAPACITY
+            });
+            (!head_answers).then(|| self.primary_stream_plan(&state, collection)).flatten()
+        };
+        if let Some(plan) = streamed {
+            metrics
+                .generic_scan_each_prepare_us
+                .fetch_add(elapsed_micros(prepare_started), Ordering::Relaxed);
+            let pointer_loop_started = Instant::now();
+            let mut remaining = options.limit().unwrap_or(usize::MAX);
+            if remaining == 0 {
                 return Ok(());
             }
+            let path = &self.backend.inner.path;
+            let mut data = File::open(path).map_err(io_error("open data", path))?;
+            let mut rows = 0u64;
+            self.stream_primary_ordered(collection, plan, options.direction(), &mut |_, _, pointer| {
+                rows = rows.saturating_add(1);
+                remaining -= 1;
+                Ok(visitor(read_stored_document_from_file_profiled(&mut data, path, pointer, metrics)?)? && remaining > 0)
+            })?;
+            metrics
+                .generic_scan_each_rows
+                .fetch_add(rows, Ordering::Relaxed);
+            metrics
+                .generic_scan_each_pointer_loop_us
+                .fetch_add(elapsed_micros(pointer_loop_started), Ordering::Relaxed);
+            return Ok(());
         }
 
         let entries = {
@@ -2716,71 +2864,12 @@ impl StorageRead for GlacierSnapshot {
             let Some(collection_index) = state.collections.get(collection) else {
                 return Ok(());
             };
-
-            if let Some(limit) = options.limit() {
-                if options.direction() == ScanDirection::Forward
-                    && self.generation == state.generation
-                {
-                    if let Some(entries) = primary_head_entries(collection_index, limit) {
-                        self.backend
-                            .inner
-                            .read_metrics
-                            .primary_head_scans
-                            .fetch_add(1, Ordering::Relaxed);
-                        entries
-                    } else if limit <= BOUNDED_LIMIT_SELECTION_MAX {
-                        self.backend
-                            .inner
-                            .read_metrics
-                            .bounded_limit_scans
-                            .fetch_add(1, Ordering::Relaxed);
-                        select_visible_entries_bounded(
-                            &state,
-                            collection_index,
-                            self.generation,
-                            options.direction(),
-                            limit,
-                        )
-                    } else {
-                        collect_visible_entries_ordered(
-                            &state,
-                            collection_index,
-                            self.generation,
-                            options.direction(),
-                            Some(limit),
-                        )
-                    }
-                } else if limit <= BOUNDED_LIMIT_SELECTION_MAX {
-                    self.backend
-                        .inner
-                        .read_metrics
-                        .bounded_limit_scans
-                        .fetch_add(1, Ordering::Relaxed);
-                    select_visible_entries_bounded(
-                        &state,
-                        collection_index,
-                        self.generation,
-                        options.direction(),
-                        limit,
-                    )
-                } else {
-                    collect_visible_entries_ordered(
-                        &state,
-                        collection_index,
-                        self.generation,
-                        options.direction(),
-                        Some(limit),
-                    )
-                }
-            } else {
-                collect_visible_entries_ordered(
-                    &state,
-                    collection_index,
-                    self.generation,
-                    options.direction(),
-                    None,
-                )
-            }
+            self.backend
+                .inner
+                .read_metrics
+                .primary_head_scans
+                .fetch_add(1, Ordering::Relaxed);
+            primary_head_entries(collection_index, options.limit().unwrap_or(0)).unwrap_or_default()
         };
         metrics
             .generic_scan_each_prepare_us
@@ -3338,6 +3427,85 @@ enum BorrowedProjectedImageValue<'a> {
     String(#[serde(borrow)] &'a str),
     Array(serde::de::IgnoredAny),
     Object(serde::de::IgnoredAny),
+}
+
+/// Scalar payload read straight from its MessagePack bytes; strings stay
+/// unvalidated bytes until a caller needs a `&str`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RawProjectedScalar<'a> {
+    Null,
+    Bool(bool),
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    String(&'a [u8]),
+}
+
+/// Decodes the `rmp_serde` encoding of a scalar `ImageValue` without serde:
+/// `"Null"`, or a one-entry map `{"<variant>": <value>}`. Serde would check
+/// the variant name as UTF-8 on every row, numbers included. Returns `None`
+/// for any other shape, which callers hand to the serde decoder, so an
+/// unexpected encoding still decodes (or fails) exactly as before.
+fn raw_projected_scalar(bytes: &[u8]) -> Option<RawProjectedScalar<'_>> {
+    const NULL: &[u8] = b"\xa4Null";
+    if bytes == NULL {
+        return Some(RawProjectedScalar::Null);
+    }
+    let rest = bytes.strip_prefix(&[0x81])?;
+    let (tag, payload) = match rest.first()? {
+        0xa4 if rest.get(1..5)? == b"Bool" => (0, &rest[5..]),
+        0xa6 if rest.get(1..7)? == b"Signed" => (1, &rest[7..]),
+        0xa8 if rest.get(1..9)? == b"Unsigned" => (2, &rest[9..]),
+        0xa5 if rest.get(1..6)? == b"Float" => (3, &rest[6..]),
+        0xa6 if rest.get(1..7)? == b"String" => (4, &rest[7..]),
+        _ => return None,
+    };
+    let (marker, body) = payload.split_first()?;
+    let exact = |len: usize| (body.len() == len).then_some(body);
+    let be = |len: usize| -> Option<u64> { exact(len).map(|body| body.iter().fold(0_u64, |acc, byte| acc << 8 | u64::from(*byte))) };
+    let integer = || -> Option<i128> {
+        Some(match *marker {
+            0x00..=0x7f if body.is_empty() => i128::from(*marker),
+            0xe0..=0xff if body.is_empty() => i128::from(*marker as i8),
+            0xcc => i128::from(be(1)?),
+            0xcd => i128::from(be(2)?),
+            0xce => i128::from(be(4)?),
+            0xcf => i128::from(be(8)?),
+            0xd0 => i128::from(be(1)? as u8 as i8),
+            0xd1 => i128::from(be(2)? as u16 as i16),
+            0xd2 => i128::from(be(4)? as u32 as i32),
+            0xd3 => i128::from(be(8)? as i64),
+            _ => return None,
+        })
+    };
+    match tag {
+        0 => match (*marker, body.is_empty()) {
+            (0xc2, true) => Some(RawProjectedScalar::Bool(false)),
+            (0xc3, true) => Some(RawProjectedScalar::Bool(true)),
+            _ => None,
+        },
+        1 => i64::try_from(integer()?).ok().map(RawProjectedScalar::Signed),
+        2 => u64::try_from(integer()?).ok().map(RawProjectedScalar::Unsigned),
+        3 => match *marker {
+            0xcb => Some(RawProjectedScalar::Float(f64::from_bits(be(8)?))),
+            0xca => Some(RawProjectedScalar::Float(f64::from(f32::from_bits(be(4)? as u32)))),
+            _ => None,
+        },
+        _ => {
+            let (len, text) = match *marker {
+                0xa0..=0xbf => (usize::from(*marker & 0x1f), body),
+                0xd9 => (usize::from(*body.first()?), body.get(1..)?),
+                0xda => (usize::from(u16::from_be_bytes(body.get(..2)?.try_into().ok()?)), body.get(2..)?),
+                0xdb => (usize::try_from(u32::from_be_bytes(body.get(..4)?.try_into().ok()?)).ok()?, body.get(4..)?),
+                _ => return None,
+            };
+            (text.len() == len).then_some(RawProjectedScalar::String(text))
+        }
+    }
+}
+
+fn projected_utf8(bytes: &[u8]) -> StorageResult<&str> {
+    std::str::from_utf8(bytes).map_err(|_| StorageError::backend("GlacierStorage projected string is not valid UTF-8"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5244,6 +5412,21 @@ fn decode_projected_image_value_ref_known_kind( bytes: &[u8], kind: u8, ) -> Sto
 }
 
 fn decode_projected_image_value_ref<'a>( bytes: &'a [u8], ) -> StorageResult<(ProjectedValueRef<'a>, ProjectedValueKind)> {
+    if let Some(raw) = raw_projected_scalar(bytes) {
+        return Ok(match raw {
+            RawProjectedScalar::Null => (ProjectedValueRef::Null, ProjectedValueKind::Null),
+            RawProjectedScalar::Bool(value) => (ProjectedValueRef::Bool(value), ProjectedValueKind::Bool),
+            RawProjectedScalar::Signed(value) => (ProjectedValueRef::Signed(value), ProjectedValueKind::Signed),
+            RawProjectedScalar::Unsigned(value) => (ProjectedValueRef::Unsigned(value), ProjectedValueKind::Unsigned),
+            RawProjectedScalar::Float(value) => {
+                if !value.is_finite() {
+                    return Err(StorageError::backend("stored projected float is not finite"));
+                }
+                (ProjectedValueRef::Float(value), ProjectedValueKind::Float)
+            }
+            RawProjectedScalar::String(text) => (ProjectedValueRef::String(projected_utf8(text)?), ProjectedValueKind::StringBorrowed),
+        });
+    }
     let value: BorrowedProjectedImageValue<'a> = rmp_serde::from_slice(bytes).map_err(|error| {
         StorageError::backend(format!(
             "cannot decode GlacierStorage borrowed projected field: {error}"
@@ -7801,6 +7984,27 @@ fn decode_projected_image_value_reusing_string_known_kind( bytes: &[u8], kind: u
 }
 
 fn decode_projected_image_value_reusing_string( bytes: &[u8], string_cache: &mut Option<Arc<str>>, ) -> StorageResult<(Value, ProjectedValueKind)> {
+    if let Some(raw) = raw_projected_scalar(bytes) {
+        return match raw {
+            RawProjectedScalar::Null => Ok((Value::Null, ProjectedValueKind::Null)),
+            RawProjectedScalar::Bool(value) => Ok((Value::Bool(value), ProjectedValueKind::Bool)),
+            RawProjectedScalar::Signed(value) => Ok((Value::signed(value), ProjectedValueKind::Signed)),
+            RawProjectedScalar::Unsigned(value) => Ok((Value::unsigned(value), ProjectedValueKind::Unsigned)),
+            RawProjectedScalar::Float(value) => Value::float(value)
+                .map(|value| (value, ProjectedValueKind::Float))
+                .map_err(|error| StorageError::backend(error.to_string())),
+            // A cache hit compares bytes with a string validated when it was cached.
+            RawProjectedScalar::String(text) => Ok(match string_cache {
+                Some(cached) if cached.as_bytes() == text => (Value::String(Arc::clone(cached)), ProjectedValueKind::StringHit),
+                _ => {
+                    let kind = if string_cache.is_some() { ProjectedValueKind::StringReplacement } else { ProjectedValueKind::StringMiss };
+                    let owned = Arc::<str>::from(projected_utf8(text)?);
+                    *string_cache = Some(Arc::clone(&owned));
+                    (Value::String(owned), kind)
+                }
+            }),
+        };
+    }
     let value: BorrowedProjectedImageValue<'_> = rmp_serde::from_slice(bytes).map_err(|error| {
         StorageError::backend(format!(
             "cannot decode GlacierStorage projected field: {error}"
@@ -7914,6 +8118,7 @@ mod tests {
         ))
     }
 
+    #[test] fn raw_projected_scalar_matches_serde_decoding() { let strings = ["".to_owned(), "12-2025".to_owned(), "é".repeat(20), "x".repeat(300), "y".repeat(70_000)]; let mut images = vec![ImageValue::Null, ImageValue::Bool(true), ImageValue::Bool(false), ImageValue::Float(229.07), ImageValue::Float(-0.0), ImageValue::Float(f64::MAX)]; for value in [0_i64, 1, 127, 128, -1, -32, -33, -128, -129, 255, 256, 65_535, 65_536, -32_768, -32_769, i64::from(u32::MAX), i64::from(i32::MIN) - 1, i64::MAX, i64::MIN] { images.push(ImageValue::Signed(value)); } for value in [0_u64, 127, 128, 255, 256, 65_536, u64::from(u32::MAX) + 1, u64::MAX] { images.push(ImageValue::Unsigned(value)); } images.extend(strings.into_iter().map(ImageValue::String)); for image in images { let bytes = rmp_serde::to_vec(&image).unwrap(); let raw = raw_projected_scalar(&bytes).unwrap_or_else(|| panic!("{image:?} not decoded: {bytes:02x?}")); let expected = match rmp_serde::from_slice::<BorrowedProjectedImageValue<'_>>(&bytes).unwrap() { BorrowedProjectedImageValue::Null => RawProjectedScalar::Null, BorrowedProjectedImageValue::Bool(v) => RawProjectedScalar::Bool(v), BorrowedProjectedImageValue::Signed(v) => RawProjectedScalar::Signed(v), BorrowedProjectedImageValue::Unsigned(v) => RawProjectedScalar::Unsigned(v), BorrowedProjectedImageValue::Float(v) => RawProjectedScalar::Float(v), BorrowedProjectedImageValue::String(v) => RawProjectedScalar::String(v.as_bytes()), _ => unreachable!() }; assert_eq!(raw, expected, "{image:?}"); } for complex in [ImageValue::Array(vec![ImageValue::Null]), ImageValue::Object(Vec::new())] { assert!(raw_projected_scalar(&rmp_serde::to_vec(&complex).unwrap()).is_none()); } let mut invalid = rmp_serde::to_vec(&ImageValue::String("ab".to_owned())).unwrap(); let last = invalid.len() - 1; invalid[last] = 0xff; assert!(decode_projected_image_value_ref(&invalid).is_err()); assert!(decode_projected_image_value_reusing_string(&invalid, &mut None).is_err()); let mut truncated = rmp_serde::to_vec(&ImageValue::Float(1.5)).unwrap(); truncated.pop(); assert!(raw_projected_scalar(&truncated).is_none()); }
     #[test] fn projected_scalar_string_reuses_owned_arc() { let bytes = rmp_serde::to_vec(&ImageValue::String("12-2025".to_owned())).unwrap(); let mut cache = None; let (first, first_kind) = decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap(); let (second, second_kind) = decode_projected_image_value_reusing_string(&bytes, &mut cache).unwrap(); let (Value::String(first), Value::String(second)) = (first, second) else { panic!("projected scalar decoder did not return strings"); }; assert!(matches!(first_kind, ProjectedValueKind::StringMiss)); assert!(matches!(second_kind, ProjectedValueKind::StringHit)); assert!(Arc::ptr_eq(&first, &second)); }
     #[test] fn projected_known_array_kind_uses_complex_decoder() { let bytes = rmp_serde::to_vec(&ImageValue::Array(vec![ImageValue::Float(1.0), ImageValue::Float(2.0)])).unwrap(); let (borrowed, borrowed_kind) = decode_projected_image_value_ref_known_kind(&bytes, 6).unwrap(); assert!(matches!(borrowed_kind, ProjectedValueKind::Complex)); assert!(matches!(borrowed, ProjectedValueRef::Owned(Value::Array(_)))); let mut cache = None; let (owned, owned_kind) = decode_projected_image_value_reusing_string_known_kind(&bytes, 6, &mut cache).unwrap(); assert!(matches!(owned_kind, ProjectedValueKind::Complex)); assert!(matches!(owned, Value::Array(_))); }
     #[test] fn creates_and_reopens_page_backed_store() { let path = temp_path("create"); let first = GlacierBackend::open(&path).unwrap(); assert_eq!(first.format_info().version(), 5); let second = GlacierBackend::open(&path).unwrap(); assert_eq!( second.format_info().store_id(), first.format_info().store_id() ); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
@@ -7921,6 +8126,7 @@ mod tests {
     #[test] fn snapshot_remains_generation_stable() { let path = temp_path("snapshot"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let id1 = UuidV7Generator::new().next_id(); let id2 = UuidV7Generator::new().next_id(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id1, Arc::new(Document::new()))], ) .unwrap(); let snapshot = storage.read().unwrap(); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id2, Arc::new(Document::new()))], ) .unwrap(); assert_eq!(snapshot.count(&users).unwrap(), 1); assert_eq!(storage.read().unwrap().count(&users).unwrap(), 2); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn batch_coalesces_count_history_per_generation() { let path = temp_path("count-history-coalesced"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let generator = UuidV7Generator::new(); let mutations = (0..3) .map(|_| StorageMutation::insert(generator.next_id(), Arc::new(Document::new()))) .collect::<Vec<_>>(); storage .apply_batch_atomic_summary(&users, mutations) .unwrap(); let state = storage.state_read().unwrap(); let collection = state.collections.get(&users).unwrap(); assert_eq!(collection.count_history.len(), 1); assert_eq!(visible_count(collection, state.generation), 3); drop(state); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn startup_metrics_describe_rebuilt_segments_and_records() { let path = temp_path("startup-metrics"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let metrics = reopened.startup_metrics(); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
+    #[test] fn resident_primary_scan_streams_in_id_order_with_exceptions_and_limits() { let path = temp_path("resident-primary-stream"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let ids = UuidV7Generator::new().reserve(200).collect::<Vec<_>>(); let mutations = ids.iter().enumerate().map(|(n, id)| { let mut document = Document::new(); document.insert("n", Value::signed(n as i64)); StorageMutation::insert(*id, Arc::new(document)) }).collect(); storage.apply_batch_atomic_summary(&users, mutations).unwrap(); let mut replaced = Document::new(); replaced.insert("n", Value::signed(-5)); storage.apply_batch_atomic_summary(&users, vec![StorageMutation::replace(ids[5], Arc::new(replaced), VersionPrecondition::Any)]).unwrap(); let mut transaction = storage.begin().unwrap(); transaction.delete(&users, &ids[7], VersionPrecondition::Any).unwrap(); transaction.commit().unwrap(); let read = storage.read().unwrap(); let late = UuidV7Generator::new().next_id(); storage.apply_batch_atomic_summary(&users, vec![StorageMutation::insert(late, Arc::new(Document::new()))]).unwrap(); assert!(storage.state_read().unwrap().collections.get(&users).unwrap().disk_primary.is_none()); let scan = |options: ScanOptions| read.scan(&users, options).unwrap().iter().map(|stored| (*stored.id(), stored.document().get("n").cloned())).collect::<Vec<_>>(); let forward = scan(ScanOptions::default()); let expected = ids.iter().enumerate().filter(|(n, _)| *n != 7).map(|(n, id)| (*id, Some(Value::signed(if n == 5 { -5 } else { n as i64 })))).collect::<Vec<_>>(); assert_eq!(forward, expected); let mut reverse = scan(ScanOptions::default().with_direction(ScanDirection::Reverse)); reverse.reverse(); assert_eq!(reverse, expected); assert_eq!(scan(ScanOptions::default().with_limit(3)), expected[..3].to_vec()); assert_eq!(scan(ScanOptions::default().with_limit(150)), expected[..150].to_vec()); let tail = scan(ScanOptions::default().with_direction(ScanDirection::Reverse).with_limit(3)); assert_eq!(tail, expected.iter().rev().take(3).cloned().collect::<Vec<_>>()); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn projected_scan_metrics_count_physical_read_work() { let path = temp_path("read-metrics"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); doc.insert("city", Value::string("Paris")); storage .apply_batch_atomic_summary(&users, vec![StorageMutation::insert(id, Arc::new(doc))]) .unwrap(); let read = storage.read().unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let mut visited = 0u64; read.scan_projected_unordered_each(&users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }) .unwrap(); let metrics = storage.read_metrics(); assert_eq!(visited, 1); assert_eq!(metrics.scans, 1); assert_eq!(metrics.segments, 1); assert_eq!(metrics.records, 1); assert_eq!(metrics.projected_records, 1); assert_eq!(metrics.decoded_fields, 1); assert_eq!(metrics.mmap_segments, 0); assert_eq!(metrics.mmap_bypass_segments, 1); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[cfg(all(target_pointer_width = "64", target_family = "unix"))] #[test] fn projected_scan_reuses_mmap_and_refreshes_after_append() { let path = temp_path("read-mmap"); let users = CollectionId::parse("users").unwrap(); let storage = GlacierBackend::open(&path).unwrap(); let fields = [FieldPath::parse("name").unwrap()]; let first_id = UuidV7Generator::new().next_id(); let mut first = Document::new(); first.insert("name", Value::string("Alice")); first.insert( "payload", Value::string("x".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(first_id, Arc::new(first))], ) .unwrap(); let read = storage.read().unwrap(); for _ in 0..2 { let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 1); } let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 0); assert_eq!(metrics.segment_catalog_refreshes, 1); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 2); assert!(metrics.mmap_bytes >= (MIN_MMAP_SEGMENT_PAYLOAD_BYTES as u64) * 2); assert_eq!(metrics.mmap_fallback_segments, 0); let second_id = UuidV7Generator::new().next_id(); let mut second = Document::new(); second.insert("name", Value::string("Bob")); second.insert( "payload", Value::string("y".repeat(MIN_MMAP_SEGMENT_PAYLOAD_BYTES * 2)), ); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(second_id, Arc::new(second))], ) .unwrap(); let read = storage.read().unwrap(); let mut visited = 0u64; read.scan_projected_unordered_each( &users, ScanOptions::default(), &fields, &mut |_| { visited += 1; Ok(true) }, ) .unwrap(); assert_eq!(visited, 2); let metrics = storage.read_metrics(); assert_eq!(metrics.mmap_map_creates, 1); assert_eq!(metrics.mmap_reuses, 1); assert_eq!(metrics.mmap_remaps, 1); assert_eq!(metrics.segment_catalog_refreshes, 2); assert_eq!(metrics.segment_catalog_hits, 1); assert_eq!(metrics.segment_catalog_rebuilds, 0); assert_eq!(metrics.mmap_segments, 4); assert_eq!(metrics.mmap_fallback_segments, 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
     #[test] fn startup_replay_seeds_segment_catalog_validation() { let path = temp_path("segment-catalog-startup"); let users = CollectionId::parse("users").unwrap(); let id = UuidV7Generator::new().next_id(); { let storage = GlacierBackend::open(&path).unwrap(); let mut doc = Document::new(); doc.insert("name", Value::string("Alice")); storage .apply_batch_atomic_summary( &users, vec![StorageMutation::insert(id, Arc::new(doc))], ) .unwrap(); } let reopened = GlacierBackend::open(&path).unwrap(); let startup = reopened.startup_metrics(); assert_eq!(startup.segment_catalog_segments, 1); let catalog = lock_unpoisoned(&reopened.inner.segment_catalog); assert_eq!(catalog.segments.len(), 1); let entry = &catalog.segments[0]; assert!(entry.directory_verified.load(Ordering::Acquire)); assert_eq!(entry.known_insert_collection(), Some("users")); drop(catalog); let resident = reopened.resident_memory(); assert_eq!(resident.segment_catalog_entries, 1); assert!(resident.segment_catalog_estimated_bytes > 0); let _ = fs::remove_file(&path); let _ = fs::remove_file(checkpoint_path(&path)); }
@@ -7943,7 +8149,6 @@ mod tests {
     #[test] fn primary_cache_reservation_is_opportunistic_and_bounded() { let governor = MemoryGovernor::with_process_limit(256 * 1024 * 1024); let (entries, reservation) = opportunistic_primary_cache_reservation(Some(&governor)); assert!(entries > 0); assert!(reservation.is_some()); assert!( governor .snapshot() .classes .iter() .find(|class| class.class == MemoryClass::PageCache) .unwrap() .current_bytes <= governor.profile().managed_budget_bytes.unwrap() / PRIMARY_CACHE_FRACTION_DENOMINATOR ); }
     #[test] fn compact_primary_keeps_ordered_ids_inline_and_spills_only_exceptions() { let generator = UuidV7Generator::new(); let ids = generator.reserve(4).collect::<Vec<_>>(); let mut index = CollectionIndex::default(); for (ordinal, id) in ids.iter().copied().enumerate() { index.insert_new( id, IndexVersion { generation: 1, version: DocumentVersion::INITIAL, pointer: Some(RecordPointer { offset: 100 + ordinal as u64, length: 10, }), }, ); } assert_eq!(index.primary.len(), 4); assert!(index.exceptions.is_empty()); let replacement = IndexVersion { generation: 2, version: DocumentVersion::new(2), pointer: Some(RecordPointer { offset: 999, length: 11, }), }; index.push_existing(ids[1], replacement); assert_eq!(index.primary.len(), 4); assert_eq!(index.exceptions.len(), 1); let mut state = GlacierState::default(); state.generation = 2; let visible = index.visible_version(&state, 2, &ids[1]).unwrap(); assert_eq!(visible.generation, 2); assert_eq!(visible.pointer.unwrap().offset, 999); }
     #[test] fn inline_index_versions_allocate_history_only_after_second_version() { let first = IndexVersion { generation: 1, version: DocumentVersion::INITIAL, pointer: Some(RecordPointer { offset: 100, length: 10, }), }; let second = IndexVersion { generation: 2, version: DocumentVersion::new(2), pointer: Some(RecordPointer { offset: 200, length: 11, }), }; let mut versions = InlineIndexVersions::new(first); assert_eq!(versions.len(), 1); assert_eq!(versions.heap_capacity(), 0); assert_eq!(versions.iter_rev().next().copied().unwrap().generation, 1); versions.push(second); assert_eq!(versions.len(), 2); assert!(versions.heap_capacity() >= 2); let replayed = versions .iter_rev() .map(|version| version.generation) .collect::<Vec<_>>(); assert_eq!(replayed, vec![2, 1]); }
-    #[test] fn bounded_limit_selection_preserves_primary_id_order() { let mut state = GlacierState::default(); state.generation = 1; let collection = CollectionId::parse("users").unwrap(); let mut index = CollectionIndex::default(); let mut ids = UuidV7Generator::new().reserve(5).collect::<Vec<_>>(); ids.reverse(); for (ordinal, id) in ids.into_iter().enumerate() { index.insert_new( id, IndexVersion { generation: 1, version: DocumentVersion::INITIAL, pointer: Some(RecordPointer { offset: 100 + ordinal as u64, length: 10, }), }, ); } index.count_history.push((1, 5)); state.collections.insert(collection.clone(), index); let index = state.collections.get(&collection).unwrap(); let forward = select_visible_entries_bounded(&state, index, 1, ScanDirection::Forward, 2); assert_eq!(forward.len(), 2); assert!(forward[0].0 < forward[1].0); let reverse = select_visible_entries_bounded(&state, index, 1, ScanDirection::Reverse, 2); assert_eq!(reverse.len(), 2); assert!(reverse[0].0 > reverse[1].0); assert!(reverse[0].0 > forward[1].0); }
     #[test] fn checkpointless_open_does_not_make_historical_bytes_immediately_due() { let replay_offset = GLACIER_SUPERBLOCK_BYTES as u64; let data_len = 6 * 1024 * 1024 * 1024u64; let next = next_checkpoint_offset_after_open(false, replay_offset, data_len); assert_eq!(next, data_len.saturating_mul(2)); assert!(next > data_len.saturating_add(1)); }
     #[test] fn checkpointed_open_keeps_growth_relative_to_checkpoint_boundary() { let replay_offset = 512 * 1024 * 1024u64; let data_len = replay_offset + 64 * 1024 * 1024u64; let next = next_checkpoint_offset_after_open(true, replay_offset, data_len); assert_eq!(next, replay_offset.saturating_mul(2)); }
     #[test] fn automatic_checkpoint_interval_grows_geometrically() { assert_eq!( automatic_checkpoint_interval(0), MIN_CHECKPOINT_INTERVAL_BYTES ); assert_eq!( automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES / 2), MIN_CHECKPOINT_INTERVAL_BYTES ); assert_eq!( automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES), MIN_CHECKPOINT_INTERVAL_BYTES ); assert_eq!( automatic_checkpoint_interval(MIN_CHECKPOINT_INTERVAL_BYTES * 4), MIN_CHECKPOINT_INTERVAL_BYTES * 4 ); }

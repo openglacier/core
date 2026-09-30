@@ -97,6 +97,23 @@ pub enum ProjectedValueRef<'a> {
     Owned(Value),
 }
 
+impl<'a> ProjectedValueRef<'a> {
+    /// Borrows a decoded value: scalars and strings without copying, arrays
+    /// and objects as a shared (reference-counted) clone.
+    #[must_use]
+    pub fn borrowed(value: &'a Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Bool(value) => Self::Bool(*value),
+            Value::Number(crate::Number::Signed(value)) => Self::Signed(*value),
+            Value::Number(crate::Number::Unsigned(value)) => Self::Unsigned(*value),
+            Value::Number(crate::Number::Float(value)) => Self::Float(*value),
+            Value::String(value) => Self::String(value),
+            other => Self::Owned(other.clone()),
+        }
+    }
+}
+
 impl ProjectedValueRef<'_> {
     #[must_use]
     pub fn to_value(&self) -> Value {
@@ -337,6 +354,48 @@ impl VersionPrecondition {
     }
 }
 
+/// Exact per-field facts of one collection at one storage snapshot
+/// ([`StorageRead::field_facts`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FieldFacts {
+    documents: u64,
+    fields: std::collections::BTreeMap<String, FieldFact>,
+}
+
+/// How many documents hold one top-level field, and the physical kinds of
+/// its values (`null` included).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldFact {
+    pub present: u64,
+    pub kinds: Vec<crate::model::PhysicalKind>,
+}
+
+impl FieldFacts {
+    #[must_use]
+    pub const fn new(documents: u64, fields: std::collections::BTreeMap<String, FieldFact>) -> Self {
+        Self { documents, fields }
+    }
+
+    /// Visible documents of the collection.
+    #[must_use]
+    pub const fn documents(&self) -> u64 {
+        self.documents
+    }
+
+    /// Physical kinds a top-level field takes when every visible document
+    /// holds it; `None` when some document lacks it or its kinds are unknown.
+    #[must_use]
+    pub fn kinds_when_always_present(&self, field: &str) -> Option<&[crate::model::PhysicalKind]> {
+        if self.documents == 0 {
+            return None;
+        }
+        self.fields
+            .get(field)
+            .filter(|fact| fact.present == self.documents)
+            .map(|fact| fact.kinds.as_slice())
+    }
+}
+
 /// Options controlling a collection scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanOptions {
@@ -547,6 +606,34 @@ pub trait StorageRead {
     /// this only when they provide a native implementation.
     fn support(&self, _capability: StorageReadCapability) -> StorageSupport {
         StorageSupport::Supported
+    }
+
+    /// Every top-level field present in at least one document of the
+    /// collection visible to this view, in name order; `None` when the view
+    /// cannot tell exactly. May list fields no visible document holds, never
+    /// omit one that some visible document holds.
+    fn top_level_fields(&self, _collection: &CollectionId) -> StorageResult<Option<Vec<String>>> {
+        Ok(None)
+    }
+
+    /// Exact facts about the top-level fields of the collection visible to
+    /// this view: how many documents hold each field and which physical
+    /// kinds its values take; `None` when the view cannot tell exactly.
+    fn field_facts(&self, _collection: &CollectionId) -> StorageResult<Option<FieldFacts>> {
+        Ok(None)
+    }
+
+    /// Visits the identifier and version of every visible document, without
+    /// reading documents when the backend indexes them; stops when `visitor`
+    /// returns `false`. The order is unspecified.
+    fn visit_row_ids(
+        &self,
+        collection: &CollectionId,
+        visitor: &mut dyn FnMut(DocumentId, DocumentVersion) -> StorageResult<bool>,
+    ) -> StorageResult<()> {
+        self.scan_projected_row_refs_unordered_each(collection, ScanOptions::default(), &[], &mut |id, version, _| {
+            visitor(id, version)
+        })
     }
 
     /// Returns a document by collection and identifier.

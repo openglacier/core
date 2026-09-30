@@ -576,6 +576,13 @@ impl MemoryGovernor {
         self.inner.profile
     }
 
+    /// Bytes currently held by live reservations. Unlike [`Self::snapshot`],
+    /// this never reads process metrics and is cheap enough to poll.
+    #[must_use]
+    pub fn reserved_bytes(&self) -> usize {
+        self.inner.current_bytes.load(Ordering::Acquire)
+    }
+
     /// Registers a weak revocation hook for one governed class.
     ///
     /// The caller retains the strong [`Arc`] and therefore controls the hook
@@ -739,6 +746,15 @@ impl MemoryGovernor {
             failed_reservations: self.inner.failed_reservations.load(Ordering::Acquire),
             classes,
         }
+    }
+
+    /// Bytes left under the governor limit (`None` without a limit), without
+    /// reading process metrics: [`Self::snapshot`] reads `/proc`, whose cost
+    /// grows with the pages mapped by the process.
+    #[must_use]
+    pub fn available_bytes(&self) -> Option<usize> {
+        let current_bytes = self.inner.current_bytes.load(Ordering::Acquire);
+        self.inner.limit_bytes.map(|limit| limit.saturating_sub(current_bytes))
     }
 
     /// Returns current Linux process memory metrics when `/proc` is available.

@@ -95,13 +95,688 @@ use crate::{
         PlannerCache, PlannerCacheStats, PlannerError, PlannerPipeline, ProjectedRowLocator,
         ProjectedRowSet, ProjectedValueLayout, ProjectedValuePipeline, NearSpec, SortDirection, SortKey, vcollections,
     },
-    spill::{SpillEngine, SpillRun, SpillRunReader},
+    spill::{RunMerge, SpillEngine, SpillRun, SpillRunReader},
     storage::{
         CollectionId, DocumentId, DocumentVersion, MemoryStorage, ProjectedValueRef, ScanOptions,
         StorageEngine, StorageError, StorageRead, StorageTransaction, StoredDocument,
     },
     Document, Value,
 };
+
+/// Whether a stage keeps a subset of rows chosen by their order (`limit`,
+/// `skip`, `first`, `single`): a set-scoped reducer.
+fn keeps_rows_by_order(operator: &PhysicalOperator) -> bool {
+    let properties = operator.execution_properties();
+    matches!(properties.cardinality, crate::query::CardinalityEffect::Reduce)
+        && matches!(properties.scope, crate::query::Scope::Set)
+}
+
+/// Whether a stage can be replayed on one hydrated row: read-only, streaming,
+/// row-local and turning a row into at most one row.
+fn replays_one_row(operator: &PhysicalOperator) -> bool {
+    let properties = operator.execution_properties();
+    matches!(properties.flow, crate::query::Flow::Streaming)
+        && matches!(properties.scope, crate::query::Scope::Row)
+        && matches!(
+            properties.cardinality,
+            crate::query::CardinalityEffect::Preserve | crate::query::CardinalityEffect::Reduce
+        )
+        && !properties.writes()
+}
+
+/// Prefix for a blocking core that retains only a few rows (Top-N, sample).
+///
+/// When the consumer needs whole rows and every prefix stage replays one row
+/// at a time, the core can retain rows read as partial documents holding only
+/// what the prefix and `core_reads` need (`true`: retained rows must then be
+/// hydrated). Otherwise the prefix is used as it is.
+fn retaining_prefix(prefix: &PhysicalPlan, core_reads: Vec<crate::query::ExpressionFieldPath>) -> (PhysicalPlan, bool) {
+    if prefix.field_demand().is_none() && prefix.operators().iter().all(replays_one_row) {
+        (prefix.clone().with_order_free_consumer(Some(core_reads)), true)
+    } else {
+        (prefix.clone(), false)
+    }
+}
+
+/// Equality correlation of a lookup: the sub-pipeline starts with a `where`
+/// whose first conjunct, after optional `exists(…)` guards, is
+/// `joined == outer`. Rows of the joined collection whose key differs cannot
+/// pass that `where`, so an index on `joined` finds every row that can.
+struct LookupEquality {
+    joined: crate::query::ExpressionFieldPath,
+    outer: crate::query::ExpressionFieldPath,
+}
+
+impl LookupEquality {
+    fn detect(pipeline: &PhysicalSubPipeline, outer_alias: Option<&str>) -> Option<Self> {
+        let [PhysicalOperator::Filter { predicate }, ..] = pipeline.operators() else {
+            return None;
+        };
+        let outer_alias = outer_alias?;
+        let mut conjuncts = Vec::new();
+        collect_conjuncts(predicate, &mut conjuncts);
+        for conjunct in conjuncts {
+            match conjunct.view() {
+                // `exists` never fails: skipping rows cannot hide an error.
+                crate::query::ExpressionView::Call { function: "exists", .. } => {}
+                crate::query::ExpressionView::Binary { left, operator: crate::query::BinaryOperator::Equal, right } => {
+                    let (left, right) = (left.ungrouped().as_field()?, right.ungrouped().as_field()?);
+                    let is_outer = |field: &crate::query::ExpressionFieldPath| field.first() == outer_alias;
+                    return match (is_outer(left), is_outer(right)) {
+                        (false, true) => Some(Self { joined: left.clone(), outer: right.clone() }),
+                        (true, false) => Some(Self { joined: right.clone(), outer: left.clone() }),
+                        _ => None,
+                    };
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+}
+
+/// Conjuncts of a predicate in evaluation order (`a and b and c` → a, b, c).
+fn collect_conjuncts<'a>(expression: &'a crate::query::Expression, output: &mut Vec<&'a crate::query::Expression>) {
+    let expression = expression.ungrouped();
+    match expression.view() {
+        crate::query::ExpressionView::Binary { left, operator: crate::query::BinaryOperator::And, right } => {
+            collect_conjuncts(left, output);
+            collect_conjuncts(right, output);
+        }
+        _ => output.push(expression),
+    }
+}
+
+/// Kind of an equality key, for the kinds whose comparison raises an error.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    Number,
+    String,
+    Other,
+}
+
+/// Hash key grouping values that `==` may find equal. Numbers of any kind
+/// share their numeric value; a bucket may hold a few extra rows, which the
+/// `where` then rejects.
+fn equality_key(value: &Value) -> (KeyKind, Vec<u8>) {
+    match value {
+        Value::Number(number) => {
+            let value = match *number {
+                crate::Number::Signed(value) => value as f64,
+                crate::Number::Unsigned(value) => value as f64,
+                crate::Number::Float(value) => value,
+            };
+            let value = if value == 0.0 { 0.0 } else { value };
+            let mut key = vec![b'n'];
+            key.extend_from_slice(&value.to_bits().to_be_bytes());
+            (KeyKind::Number, key)
+        }
+        Value::String(text) => {
+            let mut key = vec![b's'];
+            key.extend_from_slice(text.as_bytes());
+            (KeyKind::String, key)
+        }
+        Value::Null => (KeyKind::Other, vec![b'z']),
+        Value::Bool(flag) => (KeyKind::Other, vec![b'b', u8::from(*flag)]),
+        other => {
+            let mut key = vec![b'j'];
+            key.extend_from_slice(crate::helpers::value_to_json(other).to_string().as_bytes());
+            (KeyKind::Other, key)
+        }
+    }
+}
+
+/// One indexed row: loaded, or known by locator until a probe needs it.
+enum IndexedRow {
+    Loaded(ExecutionRow),
+    Pending(ProjectedRowLocator),
+}
+
+/// Joined rows indexed on their equality key, in collection order.
+struct LookupIndex {
+    /// Rows of the joined collection read to build the index.
+    scanned: u64,
+    rows: Vec<IndexedRow>,
+    buckets: HashMap<Vec<u8>, Vec<u32>>,
+    /// Rows whose key is a number or a string: comparing those two kinds
+    /// raises an error, so they stay candidates for keys of the other kind.
+    numbers: Vec<u32>,
+    strings: Vec<u32>,
+    /// Rows without the key: the `where` decides (a guard, or an error).
+    missing: Vec<u32>,
+}
+
+impl LookupIndex {
+    fn push(&mut self, row: IndexedRow, key: Option<(KeyKind, Vec<u8>)>) {
+        let position = self.rows.len() as u32;
+        self.rows.push(row);
+        match key {
+            None => self.missing.push(position),
+            Some((kind, key)) => {
+                self.buckets.entry(key).or_default().push(position);
+                match kind {
+                    KeyKind::Number => self.numbers.push(position),
+                    KeyKind::String => self.strings.push(position),
+                    KeyKind::Other => {}
+                }
+            }
+        }
+    }
+
+    /// Positions of every row that can pass the correlation for `outer_key`,
+    /// in collection order.
+    fn candidates(&self, outer_key: Option<&Value>) -> Vec<u32> {
+        let Some(outer_key) = outer_key else {
+            return (0..self.rows.len() as u32).collect();
+        };
+        let (kind, key) = equality_key(outer_key);
+        let mut candidates = self.missing.clone();
+        candidates.extend(self.buckets.get(&key).into_iter().flatten());
+        match kind {
+            KeyKind::Number => candidates.extend(&self.strings),
+            KeyKind::String => candidates.extend(&self.numbers),
+            KeyKind::Other => {}
+        }
+        candidates.sort_unstable();
+        candidates
+    }
+}
+
+/// Outer rows retained by a lookup whose outer side is bounded
+/// ([`prefix_row_bound`]): up to this many, their keys are collected first so
+/// the index only holds joined rows that can match one of them.
+const SEMI_JOIN_MAX_OUTER_ROWS: usize = 4096;
+
+/// Keys of every outer row of a bounded lookup. A joined row is indexed when
+/// it could be a candidate for one of them (see [`LookupIndex::candidates`]):
+/// its key is missing, equal to an outer key, or a number (string) while an
+/// outer key is a string (number), a pairing whose comparison raises.
+#[derive(Default)]
+struct LookupKeyFilter {
+    numbers: std::collections::HashSet<u64>,
+    strings: std::collections::HashSet<Arc<str>>,
+    others: std::collections::HashSet<Vec<u8>>,
+}
+
+impl LookupKeyFilter {
+    fn insert(&mut self, value: &Value) {
+        match value {
+            Value::Number(number) => { self.numbers.insert(number_key_bits(*number)); }
+            Value::String(text) => { self.strings.insert(Arc::clone(text)); }
+            other => { self.others.insert(equality_key(other).1); }
+        }
+    }
+
+    fn admits(&self, key: Option<&Value>) -> bool {
+        match key {
+            None => true,
+            Some(Value::Number(number)) => self.admits_number(*number),
+            Some(Value::String(text)) => self.admits_string(text),
+            Some(other) => self.others.contains(&equality_key(other).1),
+        }
+    }
+
+    /// [`Self::admits`] on a borrowed storage value.
+    fn admits_ref(&self, key: Option<&crate::storage::ProjectedValueRef<'_>>) -> bool {
+        use crate::storage::ProjectedValueRef;
+        match key {
+            None => true,
+            Some(ProjectedValueRef::String(text)) => self.admits_string(text),
+            Some(ProjectedValueRef::Float(value)) => self.admits_number(crate::Number::Float(*value)),
+            Some(ProjectedValueRef::Signed(value)) => self.admits_number(crate::Number::Signed(*value)),
+            Some(ProjectedValueRef::Unsigned(value)) => self.admits_number(crate::Number::Unsigned(*value)),
+            Some(other) => self.admits(Some(&other.to_value())),
+        }
+    }
+
+    fn admits_number(&self, number: crate::Number) -> bool {
+        !self.strings.is_empty() || self.numbers.contains(&number_key_bits(number))
+    }
+
+    fn admits_string(&self, text: &str) -> bool {
+        // A few keys compare faster than they hash.
+        !self.numbers.is_empty()
+            || if self.strings.len() <= 8 { self.strings.iter().any(|key| key.as_ref() == text) } else { self.strings.contains(text) }
+    }
+}
+
+/// Numeric value of a key as [`equality_key`] hashes it.
+fn number_key_bits(number: crate::Number) -> u64 {
+    let value = match number {
+        crate::Number::Signed(value) => value as f64,
+        crate::Number::Unsigned(value) => value as f64,
+        crate::Number::Float(value) => value,
+    };
+    if value == 0.0 { 0.0_f64.to_bits() } else { value.to_bits() }
+}
+
+/// How many rows `prefix` emits at most: the smallest row bound of its
+/// stages, when no later stage can emit more rows than it receives.
+fn prefix_row_bound(prefix: &PhysicalPlan) -> Option<usize> {
+    let mut bound = None;
+    for operator in prefix.operators() {
+        let properties = operator.execution_properties();
+        if matches!(properties.cardinality, crate::query::CardinalityEffect::Expand | crate::query::CardinalityEffect::Unknown) {
+            bound = None;
+        }
+        if let Some(count) = properties.stream_row_bound() {
+            bound = Some(bound.map_or(count, |bound: usize| bound.min(count)));
+        }
+    }
+    bound
+}
+
+thread_local! {
+    /// Set when a scan on this thread built partial documents; blocking cores
+    /// read it to report [`ExecutionStrategy::PartialDocuments`].
+    static PARTIAL_DOCUMENTS_USED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Returns and clears whether partial documents were built on this thread.
+fn take_partial_documents_used() -> bool {
+    PARTIAL_DOCUMENTS_USED.with(|used| used.replace(false))
+}
+
+/// Top-level stored fields to decode for a field demand, or `None` when the
+/// storage cannot read chosen fields natively. Nested paths are read through
+/// their top-level field; `_id` comes from the row identifier.
+fn partial_source_fields(read: &dyn crate::storage::StorageRead, demand: &[crate::query::ExpressionFieldPath]) -> Option<Vec<crate::query::ExpressionFieldPath>> {
+    if read.support(StorageReadCapability::ProjectedValuesGatedUnordered) != crate::storage::StorageSupport::Native {
+        return None;
+    }
+    let mut fields = Vec::new();
+    for field in demand.iter().filter(|field| field.first() != "_id") {
+        let top = crate::query::ExpressionFieldPath::new([field.first()]).ok()?;
+        if !fields.contains(&top) {
+            fields.push(top);
+        }
+    }
+    Some(fields)
+}
+
+/// Multiply-rotate hasher with a murmur3 final mix: grouping codes stored
+/// as floats have zero low mantissa bits, which a bare multiplicative hash
+/// would send to the same buckets.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut word = [0u8; 8];
+            word[..chunk.len()].copy_from_slice(chunk);
+            self.write_u64(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.write_u64(u64::from(value));
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        let mut hash = self.0;
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        hash ^= hash >> 33;
+        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        hash ^ (hash >> 33)
+    }
+}
+
+type KeyMap<K> = HashMap<K, u32, std::hash::BuildHasherDefault<KeyHasher>>;
+
+/// In-memory `group` fed from batches or rows: a group is found by its typed
+/// key (one scalar column: tag and bits, or borrowed text), and its encoded
+/// key is built once, when the group is created. Output order, the `group |
+/// limit` frontier and the working-set estimate use that encoded key, as the
+/// row-at-a-time consumer does.
+struct TypedGroups<'a> {
+    keys: &'a [crate::query::ExpressionFieldPath],
+    /// Position of each grouping key among the group input fields.
+    key_indexes: &'a [usize],
+    budget: usize,
+    limit: Option<usize>,
+    scalars: KeyMap<(u8, u64)>,
+    texts: KeyMap<Box<str>>,
+    encoded: KeyMap<Box<[u8]>>,
+    /// Encoded key of each group, `None` once evicted.
+    groups: Vec<Option<Arc<[u8]>>>,
+    dense: crate::query::DenseGroups,
+    ordered: BTreeMap<Arc<[u8]>, u32>,
+    estimated_bytes: usize,
+    exceeded: bool,
+    materializer: crate::query::RuntimeMaterializer,
+    key_buffer: Vec<u8>,
+    /// Group of the previous row's scalar or text key: rows sharing a key
+    /// often follow each other.
+    last_scalar: Option<((u8, u64), u32)>,
+    last_text: Option<(String, u32)>,
+}
+
+/// Typed key of one row: what `TypedGroups` looks groups up by.
+enum RowKey<'k> {
+    Scalar(u8, u64),
+    Text(&'k str),
+    Encoded,
+}
+
+impl<'a> TypedGroups<'a> {
+    fn new(dense: crate::query::DenseGroups, keys: &'a [crate::query::ExpressionFieldPath], key_indexes: &'a [usize], budget: usize, limit: Option<usize>) -> Self {
+        Self {
+            keys,
+            key_indexes,
+            budget,
+            limit,
+            scalars: KeyMap::default(),
+            texts: KeyMap::default(),
+            encoded: KeyMap::default(),
+            groups: Vec::new(),
+            dense,
+            ordered: BTreeMap::new(),
+            estimated_bytes: 0,
+            exceeded: false,
+            materializer: crate::query::RuntimeMaterializer::new(),
+            key_buffer: Vec::with_capacity(64),
+            last_scalar: None,
+            last_text: None,
+        }
+    }
+
+    fn row_key<'k>(&self, values: &[Option<ProjectedValueRef<'k>>]) -> RowKey<'k> {
+        let [index] = self.key_indexes else { return RowKey::Encoded };
+        match values[*index] {
+            None => RowKey::Scalar(0, 0),
+            Some(ProjectedValueRef::Null) => RowKey::Scalar(1, 0),
+            Some(ProjectedValueRef::Bool(value)) => RowKey::Scalar(2, u64::from(value)),
+            Some(ProjectedValueRef::Signed(value)) => RowKey::Scalar(3, value as u64),
+            Some(ProjectedValueRef::Unsigned(value)) => RowKey::Scalar(4, value),
+            Some(ProjectedValueRef::Float(value)) => RowKey::Scalar(5, value.to_bits()),
+            Some(ProjectedValueRef::String(text)) => RowKey::Text(text),
+            Some(ProjectedValueRef::Owned(_)) => RowKey::Encoded,
+        }
+    }
+
+    /// Folds one row, its group input fields in `values`.
+    fn push(&mut self, values: &[Option<ProjectedValueRef<'_>>]) -> Result<(), StorageError> {
+        if self.exceeded {
+            return Ok(());
+        }
+        let key = self.row_key(values);
+        match &key {
+            RowKey::Scalar(tag, bits) => {
+                if let Some((last, group)) = self.last_scalar {
+                    if last == (*tag, *bits) {
+                        return self.dense.push(group, values).map_err(backend_storage_error);
+                    }
+                }
+            }
+            RowKey::Text(text) => {
+                if let Some((last, group)) = &self.last_text {
+                    if last.as_str() == *text {
+                        return self.dense.push(*group, values).map_err(backend_storage_error);
+                    }
+                }
+            }
+            RowKey::Encoded => {}
+        }
+        let found = match &key {
+            RowKey::Scalar(tag, bits) => self.scalars.get(&(*tag, *bits)),
+            RowKey::Text(text) => self.texts.get(*text),
+            RowKey::Encoded => {
+                self.materializer.write_projected_ref_distinct_key_indexes(values, self.key_indexes, &mut self.key_buffer);
+                // A key above every kept group of a full bounded group is
+                // no group: it is left out without a lookup.
+                if self.limit.is_some_and(|limit| self.ordered.len() >= limit)
+                    && self.ordered.last_key_value().is_some_and(|(largest, _)| self.key_buffer.as_slice() > largest.as_ref())
+                {
+                    return Ok(());
+                }
+                self.encoded.get(self.key_buffer.as_slice())
+            }
+        }
+        .copied();
+        let group = match found {
+            Some(group) => group,
+            None => {
+                if !matches!(key, RowKey::Encoded) {
+                    self.materializer.write_projected_ref_distinct_key_indexes(values, self.key_indexes, &mut self.key_buffer);
+                }
+                let Some(group) = self.create(&key, values)? else { return Ok(()) };
+                group
+            }
+        };
+        match key {
+            RowKey::Scalar(tag, bits) => self.last_scalar = Some(((tag, bits), group)),
+            RowKey::Text(text) => {
+                let (last, last_group) = self.last_text.get_or_insert_with(|| (String::new(), group));
+                last.clear();
+                last.push_str(text);
+                *last_group = group;
+            }
+            RowKey::Encoded => {}
+        }
+        self.dense.push(group, values).map_err(backend_storage_error)
+    }
+
+    /// Creates the group whose encoded key is in `key_buffer`; `None` when
+    /// the row is left out (bounded group) or the working set is exceeded.
+    fn create(&mut self, key: &RowKey<'_>, values: &[Option<ProjectedValueRef<'_>>]) -> Result<Option<u32>, StorageError> {
+        let state_estimate = group_state_estimate(self.key_buffer.len(), self.keys.len());
+        if let Some(limit) = self.limit {
+            if self.ordered.len() >= limit {
+                let (largest, evicted) = self.ordered.last_key_value().expect("bounded group frontier exists");
+                if self.key_buffer.as_slice() >= largest.as_ref() {
+                    return Ok(None);
+                }
+                let (largest_len, evicted) = (largest.len(), *evicted);
+                self.ordered.pop_last();
+                self.forget(evicted);
+                self.estimated_bytes = self.estimated_bytes.saturating_sub(group_state_estimate(largest_len, self.keys.len()));
+            }
+            if self.estimated_bytes.saturating_add(state_estimate) > self.budget {
+                return Err(StorageError::backend("bounded group limit exceeds the governed working set"));
+            }
+        } else if self.estimated_bytes.saturating_add(state_estimate) > self.budget {
+            self.exceeded = true;
+            self.groups.clear();
+            return Ok(None);
+        }
+        self.estimated_bytes = self.estimated_bytes.saturating_add(state_estimate);
+        let group = self.dense.add(values);
+        let encoded: Arc<[u8]> = Arc::from(self.key_buffer.as_slice());
+        match key {
+            RowKey::Scalar(tag, bits) => { self.scalars.insert((*tag, *bits), group); }
+            RowKey::Text(text) => { self.texts.insert(Box::from(*text), group); }
+            RowKey::Encoded => { self.encoded.insert(Box::from(self.key_buffer.as_slice()), group); }
+        }
+        if self.limit.is_some() {
+            self.ordered.insert(Arc::clone(&encoded), group);
+        }
+        self.groups.push(Some(encoded));
+        Ok(Some(group))
+    }
+
+    /// Drops an evicted group and its index entry.
+    fn forget(&mut self, group: u32) {
+        self.groups[group as usize] = None;
+        self.dense.evict(group);
+        self.last_scalar = self.last_scalar.filter(|(_, last)| *last != group);
+        self.last_text = self.last_text.take().filter(|(_, last)| *last != group);
+        self.scalars.retain(|_, candidate| *candidate != group);
+        self.texts.retain(|_, candidate| *candidate != group);
+        self.encoded.retain(|_, candidate| *candidate != group);
+    }
+
+    /// Groups in encoded-key order, as rows; `None` when the working set
+    /// was exceeded.
+    fn finish(self) -> EngineResult<Option<Vec<ExecutionRow>>> {
+        if self.exceeded {
+            return Ok(None);
+        }
+        let mut dense = self.dense;
+        let mut groups = self.groups.into_iter().enumerate().filter_map(|(group, key)| Some((key?, group as u32))).collect::<Vec<_>>();
+        groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(index, (_, group))| {
+                let ordinal = usize_to_u64_saturating(index).saturating_add(1);
+                Ok(ExecutionRow::synthetic(dense.finish(group, ordinal).map_err(EngineError::execution)?))
+            })
+            .collect::<EngineResult<Vec<_>>>()
+            .map(Some)
+    }
+}
+
+/// Reads `source_fields` of `collection` in batches and runs `program` on
+/// each ([`crate::query::BatchRunner`]). A batch that ran is handed to
+/// `on_batch`; a batch that aborted is replayed row by row through
+/// `on_row` (the row-at-a-time path), with its source values. Both run
+/// inside the storage visitor, as the row-at-a-time path does, so an error
+/// surfaces exactly as it would there. Returns the rows read.
+fn scan_batched(
+    read: &dyn crate::storage::StorageRead,
+    collection: &CollectionId,
+    options: ScanOptions,
+    storage_fields: &[crate::FieldPath],
+    program: &Arc<crate::query::BatchProgram>,
+    on_batch: &mut dyn FnMut(&crate::query::BatchRunner) -> Result<bool, StorageError>,
+    on_row: &mut dyn FnMut(DocumentId, DocumentVersion, &[Option<Value>]) -> Result<bool, StorageError>,
+) -> Result<u64, StorageError> {
+    let mut runner = crate::query::BatchRunner::new(Arc::clone(program));
+    let mut values = Vec::new();
+    let mut scanned = 0u64;
+    let mut flush = |runner: &mut crate::query::BatchRunner| -> Result<bool, StorageError> {
+        scanned = scanned.saturating_add(runner.len() as u64);
+        let more = if runner.run().is_ok() {
+            on_batch(runner)?
+        } else {
+            let mut more = true;
+            for row in 0..runner.len() {
+                let (id, version) = runner.id(row);
+                runner.source_values(row, &mut values);
+                if !on_row(id, version, &values)? {
+                    more = false;
+                    break;
+                }
+            }
+            more
+        };
+        runner.clear();
+        Ok(more)
+    };
+    let mut stopped = false;
+    read.scan_projected_row_refs_unordered_each(collection, options, storage_fields, &mut |id, version, row| {
+        runner.push(id, version, row);
+        if runner.is_full() && !flush(&mut runner)? {
+            stopped = true;
+            return Ok(false);
+        }
+        Ok(true)
+    })?;
+    if !stopped && !runner.is_empty() {
+        flush(&mut runner)?;
+    }
+    Ok(scanned)
+}
+
+/// First stage of `prefix` from which every later stage is proven total
+/// ([`crate::query::CompiledStage::total_effects`]) from the storage's exact
+/// field facts: those stages may run after a reservoir instead of before it.
+/// Fields written by an earlier stage have unknown kinds.
+fn sample_commuting_start(read: &dyn crate::storage::StorageRead, prefix: &PhysicalPlan) -> EngineResult<usize> {
+    let operators = prefix.operators();
+    let movable = |operator: &PhysicalOperator| matches!(operator, PhysicalOperator::Custom { writes: false, compiled: Some(_), .. }) && !operator.reads_document_id();
+    let first = operators.iter().rposition(|operator| !movable(operator)).map_or(0, |position| position + 1);
+    if first == operators.len() {
+        return Ok(first);
+    }
+    let Some(facts) = read.field_facts(prefix.source().collection()).map_err(storage_engine_error)? else {
+        return Ok(operators.len());
+    };
+    'start: for start in first..operators.len() {
+        let mut written = Vec::<(crate::query::ExpressionFieldPath, Option<crate::query::Kinds>)>::new();
+        for operator in &operators[..start] {
+            match operator.execution_properties().fields {
+                crate::query::Fields::Preserved => {}
+                crate::query::Fields::Rewritten(fields) => written.extend(fields.iter().map(|field| (field.clone(), None))),
+                _ => continue 'start,
+            }
+        }
+        for operator in &operators[start..] {
+            let PhysicalOperator::Custom { compiled: Some(stage), .. } = operator else { continue 'start };
+            let kinds = |path: &crate::query::ExpressionFieldPath| match written.iter().rev().find(|(field, _)| field.first() == path.first()) {
+                Some((_, kinds)) => kinds.filter(|_| path.len() == 1),
+                None if path.len() == 1 => facts.kinds_when_always_present(path.first()).map(crate::query::Kinds::from_kinds),
+                None => None,
+            };
+            let Some(effects) = stage.total_effects(&kinds) else { continue 'start };
+            written.extend(effects);
+        }
+        return Ok(start);
+    }
+    Ok(operators.len())
+}
+
+/// Leading filters of `prefix` as a projected gate, and its other stages as
+/// a slot program over the source fields they and `downstream` read; `None`
+/// when a stage cannot run on slots or `downstream` is not top-level.
+/// `expanding` admits stages that turn one row into several (`unwind`): the
+/// caller then runs the program with [`crate::query::SlotProgram::run_each`].
+fn slot_prefix(read: &dyn crate::storage::StorageRead, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], expanding: bool) -> EngineResult<Option<(ProjectedValuePipeline, crate::query::SlotProgram)>> {
+    let operators = prefix.operators();
+    let leading = operators.iter().take_while(|operator| matches!(operator, PhysicalOperator::Filter { .. })).count();
+    let Some(fields) = crate::query::source_field_demand(operators, Some(downstream))
+        .and_then(|demand| partial_source_fields(read, &demand))
+    else {
+        return Ok(None);
+    };
+    let Some(gate) = ProjectedValuePipeline::compile(&operators[..leading], fields).map_err(EngineError::execution)? else {
+        return Ok(None);
+    };
+    let program = if expanding {
+        crate::query::SlotProgram::compile_expanding(&operators[leading..], gate.layout().fields())
+    } else {
+        crate::query::SlotProgram::compile(&operators[leading..], gate.layout().fields())
+    };
+    let Some(program) = program else {
+        return Ok(None);
+    };
+    Ok(program.slots(downstream).is_some().then_some((gate, program)))
+}
+
+/// One row of a streamed prefix held as slot values, with its identity.
+#[derive(Clone, Copy)]
+struct SlotRowRef<'a> {
+    id: DocumentId,
+    version: DocumentVersion,
+    fields: &'a [crate::query::ExpressionFieldPath],
+    values: &'a [Option<Value>],
+}
+
+/// Document holding the decoded top-level `fields` present in `values`.
+fn partial_document(fields: &[crate::query::ExpressionFieldPath], values: &[Option<Value>]) -> Document {
+    let mut document = Document::new();
+    for (field, value) in fields.iter().zip(values) {
+        if let Some(value) = value {
+            document.insert(field.first(), value.clone());
+        }
+    }
+    document
+}
 
 #[inline]
 const fn reusable_projected_scan_options( options: ScanOptions, plan: &PhysicalPlan, projected: &ProjectedValuePipeline, ) -> ScanOptions {
@@ -185,25 +860,32 @@ const fn is_streaming_tail_operator(operator: &PhysicalOperator) -> bool {
 }
 
 /// How many rows a blocking core must produce for the streaming tail that
-/// follows it: skips and the first declared row bound add up (`skip k | limit
-/// n` needs `k + n` rows), and only projections may sit in between.
+/// follows it, when the tail bounds its output: a leading `skip k | limit n`
+/// needs `k + n` rows. Stages that turn each row into exactly one row
+/// (`select`, `derive`, `rename`, `drop`, …) may sit in between.
 fn tail_row_limit(tail: &[PhysicalOperator]) -> Option<usize> {
     let mut offset = 0usize;
     for operator in tail {
-        match operator {
-            PhysicalOperator::Skip { count } => offset = offset.saturating_add(*count),
-            PhysicalOperator::Select { .. } => {}
-            _ => {
-                let properties = operator.execution_properties();
-                // An exact-count stage must still see one row too many to fail.
-                let extra = usize::from(properties.exact_rows().is_some());
-                return properties
-                    .stream_row_bound()
-                    .map(|bound| offset.saturating_add(bound).saturating_add(extra));
-            }
+        let properties = operator.execution_properties();
+        if let PhysicalOperator::Skip { count } = operator {
+            offset = offset.saturating_add(*count);
+        } else if let Some(bound) = properties.stream_row_bound() {
+            // An exact-count stage must still see one row too many to fail.
+            let extra = usize::from(properties.exact_rows().is_some());
+            return Some(offset.saturating_add(bound).saturating_add(extra));
+        } else if !preserves_each_row(&properties) {
+            return None;
         }
     }
     None
+}
+
+/// Whether a stage turns every input row into exactly one output row.
+fn preserves_each_row(properties: &crate::query::ExecutionProperties<'_>) -> bool {
+    matches!(properties.flow, crate::query::Flow::Streaming)
+        && matches!(properties.cardinality, crate::query::CardinalityEffect::Preserve)
+        && matches!(properties.scope, crate::query::Scope::Row)
+        && !properties.writes()
 }
 
 /// Decomposition of a governed read plan: a streaming prefix, one blocking
@@ -280,6 +962,8 @@ fn governed_shape(operators: &[PhysicalOperator]) -> Option<GovernedShape<'_>> {
 /// declared row-bound budgets they have consumed so far.
 struct StreamingRowChain<'a> {
     operators: &'a [PhysicalOperator],
+    /// Per operator: whether it reads the virtual `_id` field.
+    needs_id: Vec<bool>,
     skip_remaining: Vec<Option<usize>>,
     limit_remaining: Vec<Option<usize>>,
     filtered: u64,
@@ -289,6 +973,7 @@ impl<'a> StreamingRowChain<'a> {
     fn new(operators: &'a [PhysicalOperator]) -> Self {
         Self {
             operators,
+            needs_id: operators.iter().map(PhysicalOperator::reads_document_id).collect(),
             skip_remaining: operators
                 .iter()
                 .map(|operator| match operator {
@@ -462,6 +1147,40 @@ impl Engine {
         Ok(planned)
     }
 
+    /// Plans a pipeline without running it and describes the plan: source
+    /// access, the executor the memory contract selects, and each operator.
+    pub fn explain(&self, pipeline: &PlannerPipeline) -> EngineResult<Document> {
+        let planned = self.plan(pipeline)?;
+        let physical = planned.physical();
+        let executor = if physical.is_write() {
+            "transactional"
+        } else if physical.is_memory_streaming() {
+            "streaming"
+        } else if self.supports_governed_blocking_streaming(physical) {
+            "governed_blocking"
+        } else {
+            "rejected"
+        };
+        let access = match physical.source().access() {
+            crate::query::PhysicalAccess::PrimaryKeyLookup { .. } => "primary_key_lookup",
+            _ => "collection_scan",
+        };
+        let operators = physical.operators().iter().map(|operator| {
+            Value::object(Document::from_fields([
+                ("stage", Value::string(operator.name())),
+                ("detail", Value::string(describe_operator(operator))),
+            ]))
+        });
+        let mut document = Document::new();
+        document.insert("collection", Value::string(physical.source().collection().as_str()));
+        document.insert("access", Value::string(access));
+        document.insert("read_only", Value::bool(planned.logical().is_read_only()));
+        document.insert("mode", Value::string(physical.memory_execution_mode().as_str()));
+        document.insert("executor", Value::string(executor));
+        document.insert("operators", Value::array(operators));
+        Ok(document)
+    }
+
     pub fn planner_cache_stats(&self) -> PlannerCacheStats {
         self.planner_cache.stats()
     }
@@ -554,6 +1273,31 @@ impl Engine {
                     let mut projected_count = 0u64;
                     let mut projected_scanned = 0u64;
                     let mut projected_filtered = 0u64;
+                    let batch = crate::query::BatchProgram::compile(&physical.operators()[..data_operator_len], value_pipeline.layout().fields(), &[]).map(Arc::new);
+                    if let Some(program) = batch {
+                        let counted = std::cell::Cell::new(0u64);
+                        projected_scanned = scan_batched(
+                            read.as_ref(),
+                            physical.source().collection(),
+                            reusable_projected_scan_options(*options, physical, &value_pipeline),
+                            value_pipeline.layout().storage_fields(),
+                            &program,
+                            &mut |runner| {
+                                counted.set(counted.get() + runner.selection().len() as u64);
+                                Ok(true)
+                            },
+                            &mut |_, _, values| {
+                                let accepted = value_pipeline
+                                    .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                                    .map_err(backend_storage_error)?;
+                                counted.set(counted.get() + u64::from(accepted));
+                                Ok(true)
+                            },
+                        )
+                        .map_err(storage_engine_error)?;
+                        projected_count = counted.get();
+                        projected_filtered = projected_scanned.saturating_sub(projected_count);
+                    } else {
                     read.scan_projected_values_gated_unordered_each(
                         physical.source().collection(),
                         reusable_projected_scan_options(*options, physical, &value_pipeline),
@@ -578,6 +1322,7 @@ impl Engine {
                         },
                     )
                     .map_err(storage_engine_error)?;
+                    }
 
                     emit_streaming_count(visitor, alias, projected_count)?;
                     let statistics = ExecutionStatistics::streamed_with_strategies(
@@ -603,6 +1348,7 @@ impl Engine {
         // Rows handed to the visitor, or only counted under a terminal `count`.
         let mut returned = 0_u64;
         let count_only = count_alias.is_some();
+        let mut partial_used = false;
         let mut chain = StreamingRowChain::new(&physical.operators()[..data_operator_len]);
 
         if chain.has_empty_bound() {
@@ -752,66 +1498,209 @@ impl Engine {
                     .iter()
                     .take_while(|operator| matches!(operator, PhysicalOperator::Filter { .. }))
                     .count();
-                let leading_filter_pipeline = if leading_filter_len > 0
-                    && read.support(StorageReadCapability::ProjectedValuesGatedUnordered)
-                        == crate::storage::StorageSupport::Native
+                // Partial documents: when the consumer's field demand is known
+                // (a terminal `count`, or an order-free blocking consumer), decode
+                // only the fields the stages read, and evaluate the leading
+                // filters on those values before building any document.
+                // The partial cursor is unordered: a stage keeping a subset of
+                // the rows that depends on their order (`limit`, `skip`,
+                // `first`) keeps the ordered complete-document scan.
+                let field_demand = ((physical.order_free() || count_only) && !data_operators.iter().any(keeps_rows_by_order))
+                    .then(|| crate::query::source_field_demand(physical.operators(), physical.field_demand()))
+                    .flatten();
+                let partial_pipeline = match field_demand
+                    .as_deref()
+                    .and_then(|demand| partial_source_fields(read.as_ref(), demand))
                 {
-                    ProjectedValuePipeline::compile(
-                        &data_operators[..leading_filter_len],
-                        std::iter::empty::<crate::query::ExpressionFieldPath>(),
-                    )
-                    .map_err(EngineError::execution)?
-                } else {
-                    None
-                };
-                let source_gated = leading_filter_pipeline.is_some();
-
-                let first_operator = if source_gated { leading_filter_len } else { 0 };
-                let mut process_stored = |stored: StoredDocument| {
-                    if !source_gated {
-                        scanned = scanned.saturating_add(1);
-                    }
-                    self.drive_streaming_row(
-                        &mut chain,
-                        first_operator,
-                        ExecutionRow::from_stored(stored),
-                        None,
-                        &mut |row| emit_streamed_row(visitor, count_only, &mut returned, row),
-                    )
+                    Some(fields) => ProjectedValuePipeline::compile(&data_operators[..leading_filter_len], fields)
+                        .map_err(EngineError::execution)?,
+                    None => None,
                 };
 
-                if let Some(value_pipeline) = leading_filter_pipeline {
-                    let mut gated_scanned = 0u64;
-                    let mut gated_filtered = 0u64;
-                    read.scan_projected_gated_each(
-                        physical.source().collection(),
-                        storage_options,
-                        value_pipeline.layout().storage_fields(),
-                        &mut |values| {
-                            gated_scanned = gated_scanned.saturating_add(1);
-                            let accepted = value_pipeline
-                                .accepts_with(values, |expression, resolver| {
-                                    self.runtime
-                                        .evaluate_resolved_predicate(expression, resolver)
-                                })
-                                .map_err(backend_storage_error)?;
-                            if !accepted {
-                                gated_filtered = gated_filtered.saturating_add(1);
+                if let Some(value_pipeline) = partial_pipeline {
+                    PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+                    partial_used = true;
+                    let slot_fields = value_pipeline.layout().fields();
+                    // Stages after the leading filters that run on slots keep
+                    // the row as values; a document is built only for a
+                    // consumer that receives rows.
+                    let slot_program = crate::query::SlotProgram::compile_expanding(&data_operators[leading_filter_len..], slot_fields);
+                    let mut slot_values = Vec::new();
+                    let slot_filtered = std::cell::Cell::new(0u64);
+                    let (scanned_cell, filtered_cell, returned_cell) = (std::cell::Cell::new(scanned), std::cell::Cell::new(filtered), std::cell::Cell::new(returned));
+                    let visitor_cell = std::cell::RefCell::new(&mut *visitor);
+                    let emit = |row: ExecutionRow, count_only: bool| -> Result<(), StorageError> {
+                        let mut returned = returned_cell.get();
+                        let emitted = emit_streamed_row(&mut **visitor_cell.borrow_mut(), count_only, &mut returned, row);
+                        returned_cell.set(returned);
+                        emitted
+                    };
+                    let gate = |values: &[Option<Value>]| -> Result<bool, StorageError> {
+                        scanned_cell.set(scanned_cell.get().saturating_add(1));
+                        let accepted = value_pipeline
+                            .accepts_with(values, |expression, resolver| {
+                                self.runtime.evaluate_resolved_predicate(expression, resolver)
+                            })
+                            .map_err(backend_storage_error)?;
+                        if !accepted {
+                            filtered_cell.set(filtered_cell.get().saturating_add(1));
+                        }
+                        Ok(accepted)
+                    };
+                    let mut row_visit = |id: DocumentId, version: DocumentVersion, values: &[Option<Value>]| -> Result<bool, StorageError> {
+                        if let Some(program) = &slot_program {
+                            slot_values.clear();
+                            slot_values.extend_from_slice(values);
+                            slot_values.resize(program.width(), None);
+                            // A storage error raised while emitting is kept as is.
+                            let mut emit_failure = None;
+                            let emitted = program.run_each(
+                                &mut slot_values,
+                                |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver),
+                                &mut |row_values| {
+                                    if count_only {
+                                        returned_cell.set(returned_cell.get().saturating_add(1));
+                                        return Ok(());
+                                    }
+                                    let emitted = StoredDocument::new(id, version, Arc::new(program.document(row_values)))
+                                        .and_then(|stored| emit(ExecutionRow::from_stored(stored), false));
+                                    emitted.map_err(|failure| {
+                                        emit_failure = Some(failure);
+                                        ExecutionError::evaluation("slot row emission failed")
+                                    })
+                                },
+                            );
+                            if let Some(failure) = emit_failure {
+                                return Err(failure);
                             }
-                            Ok(accepted)
-                        },
-                        &mut process_stored,
-                    )
-                    .map_err(storage_engine_error)?;
-                    scanned = scanned.saturating_add(gated_scanned);
-                    filtered = filtered.saturating_add(gated_filtered);
+                            if emitted.map_err(backend_storage_error)? == 0 {
+                                slot_filtered.set(slot_filtered.get().saturating_add(1));
+                            }
+                            return Ok(true);
+                        }
+                        let stored = StoredDocument::new(id, version, Arc::new(partial_document(slot_fields, values)))?;
+                        self.drive_streaming_row(
+                            &mut chain,
+                            leading_filter_len,
+                            ExecutionRow::from_stored(stored),
+                            None,
+                            &mut |row| emit(row, count_only),
+                        )
+                    };
+                    // Every stage runs on batches when it can; rows are then
+                    // counted, or built only for the rows that pass. A batch
+                    // that aborts is replayed through `gate` and `row_visit`.
+                    let batch = slot_program
+                        .as_ref()
+                        .and_then(|program| crate::query::BatchProgram::compile(data_operators, slot_fields, program.fields()).map(|batch| (Arc::new(batch), program)));
+                    if let Some((batch, program)) = batch {
+                        let mut output = Vec::new();
+                        let batch_scanned = scan_batched(
+                            read.as_ref(),
+                            physical.source().collection(),
+                            reusable_projected_scan_options(storage_options, physical, &value_pipeline),
+                            value_pipeline.layout().storage_fields(),
+                            &batch,
+                            &mut |runner| {
+                                let passed = runner.selection().len() as u64;
+                                filtered_cell.set(filtered_cell.get().saturating_add(runner.dropped() as u64));
+                                if count_only {
+                                    returned_cell.set(returned_cell.get().saturating_add(passed));
+                                    return Ok(true);
+                                }
+                                for &row in runner.selection() {
+                                    let (id, version) = runner.id(row as usize);
+                                    runner.output_values(row as usize, &mut output);
+                                    let stored = StoredDocument::new(id, version, Arc::new(program.document(&output)))?;
+                                    emit(ExecutionRow::from_stored(stored), false)?;
+                                }
+                                Ok(true)
+                            },
+                            &mut |id, version, values| {
+                                let accepted = gate(values)?;
+                                // Counted once with the batch below.
+                                scanned_cell.set(scanned_cell.get() - 1);
+                                if accepted { row_visit(id, version, values) } else { Ok(true) }
+                            },
+                        )
+                        .map_err(storage_engine_error)?;
+                        scanned_cell.set(scanned_cell.get().saturating_add(batch_scanned));
+                    } else {
+                        read.scan_projected_row_values_gated_unordered_each(
+                            physical.source().collection(),
+                            reusable_projected_scan_options(storage_options, physical, &value_pipeline),
+                            value_pipeline.layout().storage_fields(),
+                            value_pipeline.gate_field_count(),
+                            &mut |values| gate(values),
+                            &mut row_visit,
+                        )
+                        .map_err(storage_engine_error)?;
+                    }
+                    let slot_filtered = slot_filtered.get();
+                    (scanned, filtered, returned) = (scanned_cell.get(), filtered_cell.get(), returned_cell.get());
+                    filtered = filtered.saturating_add(slot_filtered);
                 } else {
-                    read.scan_each(
-                        physical.source().collection(),
-                        storage_options,
-                        &mut process_stored,
-                    )
-                    .map_err(storage_engine_error)?;
+                    let leading_filter_pipeline = if leading_filter_len > 0
+                        && read.support(StorageReadCapability::ProjectedValuesGatedUnordered)
+                            == crate::storage::StorageSupport::Native
+                    {
+                        ProjectedValuePipeline::compile(
+                            &data_operators[..leading_filter_len],
+                            std::iter::empty::<crate::query::ExpressionFieldPath>(),
+                        )
+                        .map_err(EngineError::execution)?
+                    } else {
+                        None
+                    };
+                    let source_gated = leading_filter_pipeline.is_some();
+
+                    let first_operator = if source_gated { leading_filter_len } else { 0 };
+                    let mut process_stored = |stored: StoredDocument| {
+                        if !source_gated {
+                            scanned = scanned.saturating_add(1);
+                        }
+                        self.drive_streaming_row(
+                            &mut chain,
+                            first_operator,
+                            ExecutionRow::from_stored(stored),
+                            None,
+                            &mut |row| emit_streamed_row(visitor, count_only, &mut returned, row),
+                        )
+                    };
+
+                    if let Some(value_pipeline) = leading_filter_pipeline {
+                        let mut gated_scanned = 0u64;
+                        let mut gated_filtered = 0u64;
+                        read.scan_projected_gated_each(
+                            physical.source().collection(),
+                            storage_options,
+                            value_pipeline.layout().storage_fields(),
+                            &mut |values| {
+                                gated_scanned = gated_scanned.saturating_add(1);
+                                let accepted = value_pipeline
+                                    .accepts_with(values, |expression, resolver| {
+                                        self.runtime
+                                            .evaluate_resolved_predicate(expression, resolver)
+                                    })
+                                    .map_err(backend_storage_error)?;
+                                if !accepted {
+                                    gated_filtered = gated_filtered.saturating_add(1);
+                                }
+                                Ok(accepted)
+                            },
+                            &mut process_stored,
+                        )
+                        .map_err(storage_engine_error)?;
+                        scanned = scanned.saturating_add(gated_scanned);
+                        filtered = filtered.saturating_add(gated_filtered);
+                    } else {
+                        read.scan_each(
+                            physical.source().collection(),
+                            storage_options,
+                            &mut process_stored,
+                        )
+                        .map_err(storage_engine_error)?;
+                    }
                 }
                 ExecutionStrategy::CollectionScan
             }
@@ -835,18 +1724,20 @@ impl Engine {
         };
         ensure_exact_rows(chain.operators, &chain.limit_remaining)?;
         let filtered = filtered.saturating_add(chain.filtered);
+        let mut strategies = ExecutionStrategies::default().with(strategy);
+        if partial_used {
+            strategies = strategies.with(ExecutionStrategy::PartialDocuments);
+        }
         let statistics = if let Some(alias) = count_alias {
             emit_streaming_count(visitor, alias, returned)?;
             ExecutionStatistics::streamed_with_strategies(
                 scanned,
                 filtered,
                 1,
-                ExecutionStrategies::default()
-                    .with(strategy)
-                    .with(ExecutionStrategy::StreamingCount),
+                strategies.with(ExecutionStrategy::StreamingCount),
             )
         } else {
-            ExecutionStatistics::streamed_pipeline(scanned, filtered, returned, strategy)
+            ExecutionStatistics::streamed_with_strategies(scanned, filtered, returned, strategies)
         };
         self.indexing.observe(QueryObservation::from_execution(
             physical,
@@ -915,7 +1806,175 @@ impl Engine {
     /// for both compound operators.  LOOKUP may provide an outer document so
     /// nested predicates keep their alias-aware semantics without materializing
     /// the secondary collection.
-    fn stream_bounded_secondary_pipeline( &self, collection: &CollectionId, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>, Option<&str>)>, union_origin: bool, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
+    /// Reads the joined collection once and indexes its rows on the joined
+    /// side of `equality`, in collection order. `None` when the rows do not
+    /// fit `budget`: the lookup then keeps its per-row scan.
+    fn build_lookup_index( &self, collection: &CollectionId, equality: &LookupEquality, inner_alias: Option<&str>, outer_alias: Option<&str>, budget: usize, filter: Option<&LookupKeyFilter>, ) -> EngineResult<Option<LookupIndex>> {
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let no_outer = Document::new();
+        let mut index = LookupIndex { scanned: 0, rows: Vec::new(), buckets: HashMap::new(), numbers: Vec::new(), strings: Vec::new(), missing: Vec::new() };
+        let mut bytes = 0usize;
+        let mut exceeded = false;
+        // The key is read the way the `where` reads it; the copy carrying the
+        // virtual `_id` is only built when the key is `_id`.
+        let joined = &equality.joined;
+        let key_path = match joined.segment(0) {
+            Some(first) if Some(first) == inner_alias => joined.iter().skip(1).collect::<Vec<_>>(),
+            _ => joined.iter().collect::<Vec<_>>(),
+        };
+        let key_is_id = key_path.first() == Some(&"_id");
+        let key_value_of = |row: &ExecutionRow| {
+            let input = row.stage_input(key_is_id);
+            let fields = crate::query::LookupFields { inner: &input, inner_alias, outer: &no_outer, outer_alias };
+            match crate::query::ExpressionFieldResolver::resolve_field(&fields, &equality.joined) {
+                crate::query::SemanticValue::Present(value) => Some(value),
+                crate::query::SemanticValue::Missing => None,
+            }
+        };
+        let admits = |key: Option<&Value>| filter.is_none_or(|filter| filter.admits(key));
+        // Late materialization: index rows read as partial documents holding
+        // only the key; probes load the complete candidate rows by `_id`.
+        let key_field = key_path.first().filter(|_| !key_is_id).and_then(|field| crate::query::ExpressionFieldPath::new([*field]).ok());
+        let partial_fields = if key_is_id { Some(Vec::new()) } else { key_field.map(|field| vec![field]) };
+        // A top-level key is read borrowed: rows a filter rejects cost no
+        // allocation.
+        if let (false, 1) = (key_is_id, key_path.len()) {
+            if let Some(fields) = partial_fields.as_ref().and_then(|fields| partial_source_fields(read.as_ref(), fields)) {
+                let layout = crate::query::ProjectedValueLayout::new(fields).map_err(EngineError::execution)?;
+                let mut keyed = Vec::new();
+                read.scan_projected_row_refs_unordered_each(collection, ScanOptions::default(), layout.storage_fields(), &mut |id, version, values| {
+                    index.scanned += 1;
+                    let key = values.first().and_then(Option::as_ref);
+                    if !filter.is_none_or(|filter| filter.admits_ref(key)) {
+                        return Ok(true);
+                    }
+                    let key = key.map(|key| equality_key(&key.to_value()));
+                    bytes = bytes.saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 96);
+                    if bytes > budget {
+                        exceeded = true;
+                        return Ok(false);
+                    }
+                    keyed.push((id, version, key));
+                    Ok(true)
+                })
+                .map_err(storage_engine_error)?;
+                if exceeded {
+                    return Ok(None);
+                }
+                keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                for (id, version, key) in keyed {
+                    index.push(IndexedRow::Pending(ProjectedRowLocator::new(id, version)), key);
+                }
+                return Ok(Some(index));
+            }
+        }
+        if let Some(fields) = partial_fields.and_then(|fields| partial_source_fields(read.as_ref(), &fields)) {
+            let layout = crate::query::ProjectedValueLayout::new(fields).map_err(EngineError::execution)?;
+            let mut keyed = Vec::new();
+            read.scan_projected_row_values_gated_unordered_each(collection, ScanOptions::default(), layout.storage_fields(), 0, &mut |_| Ok(true), &mut |id, version, values| {
+                // The key is read from its slot, walking nested segments, as
+                // the `where` would read it from the row.
+                index.scanned += 1;
+                let key = if key_is_id {
+                    let stored = StoredDocument::new(id, version, Arc::new(partial_document(layout.fields(), values)))?;
+                    let value = key_value_of(&ExecutionRow::from_stored(stored));
+                    if !admits(value.as_ref()) {
+                        return Ok(true);
+                    }
+                    value.as_ref().map(equality_key)
+                } else {
+                    let mut value = values.first().and_then(Option::as_ref);
+                    for segment in &key_path[1..] {
+                        value = value.and_then(Value::as_object).and_then(|object| object.get(segment));
+                    }
+                    if !admits(value) {
+                        return Ok(true);
+                    }
+                    value.map(equality_key)
+                };
+                bytes = bytes.saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 96);
+                if bytes > budget {
+                    exceeded = true;
+                    return Ok(false);
+                }
+                keyed.push((id, version, key));
+                Ok(true)
+            })
+            .map_err(storage_engine_error)?;
+            if exceeded {
+                return Ok(None);
+            }
+            // The cursor is unordered: restore collection (`_id`) order.
+            keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            for (id, version, key) in keyed {
+                index.push(IndexedRow::Pending(ProjectedRowLocator::new(id, version)), key);
+            }
+            return Ok(Some(index));
+        }
+        read.scan_each(collection, ScanOptions::default(), &mut |stored| {
+            let row = ExecutionRow::from_stored(stored);
+            index.scanned += 1;
+            let key = key_value_of(&row);
+            if !admits(key.as_ref()) {
+                return Ok(true);
+            }
+            let key = key.as_ref().map(equality_key);
+            bytes = bytes
+                .saturating_add(execution_row_working_bytes(&row).map_err(backend_storage_error)?)
+                .saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 48);
+            if bytes > budget {
+                exceeded = true;
+                return Ok(false);
+            }
+            index.push(IndexedRow::Loaded(row), key);
+            Ok(true)
+        })
+        .map_err(storage_engine_error)?;
+        Ok((!exceeded).then_some(index))
+    }
+
+    /// Runs the lookup sub-pipeline for one outer row over the indexed rows
+    /// that can match it, in collection order, exactly as a full scan would.
+    fn probe_lookup_index( &self, collection: &CollectionId, index: &LookupIndex, equality: &LookupEquality, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>, Option<&str>)>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
+        let (outer, inner_alias, outer_alias) = lookup_context.expect("a lookup probe has an outer row");
+        let no_inner = Document::new();
+        let fields = crate::query::LookupFields { inner: &no_inner, inner_alias, outer, outer_alias };
+        let outer_key = match crate::query::ExpressionFieldResolver::resolve_field(&fields, &equality.outer) {
+            crate::query::SemanticValue::Present(value) => Some(value),
+            crate::query::SemanticValue::Missing => None,
+        };
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let mut chain = StreamingRowChain::new(pipeline.operators());
+        let mut returned = 0u64;
+        for position in index.candidates(outer_key.as_ref()) {
+            let row = match &index.rows[position as usize] {
+                IndexedRow::Loaded(row) => row.clone(),
+                // A row changed or deleted since the index was built is skipped.
+                IndexedRow::Pending(locator) => match read.get(collection, &locator.id()).map_err(storage_engine_error)? {
+                    Some(stored) if stored.version() == locator.version() => ExecutionRow::from_stored(stored),
+                    _ => continue,
+                },
+            };
+            let more = self
+                .drive_streaming_row(&mut chain, 0, row, lookup_context, &mut |row| {
+                    visitor(row).map_err(backend_storage_error)?;
+                    returned = returned.saturating_add(1);
+                    Ok(())
+                })
+                .map_err(storage_engine_error)?;
+            if !more {
+                break;
+            }
+        }
+        ensure_exact_rows(pipeline.operators(), &chain.limit_remaining)?;
+        Ok(ExecutionStatistics::streamed_pipeline(0, chain.filtered, returned, ExecutionStrategy::CollectionScan))
+    }
+
+    /// Streams a lookup or union sub-pipeline. `union_demand` is `Some` for a
+    /// union branch (rows marked as union rows) and, when it lists fields,
+    /// lets the branch decode only those fields from an unordered cursor.
+    fn stream_bounded_secondary_pipeline( &self, collection: &CollectionId, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>, Option<&str>)>, union_demand: Option<&[crate::query::ExpressionFieldPath]>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
+        let union_origin = lookup_context.is_none();
         let read = self.storage.read().map_err(storage_engine_error)?;
         let operators = pipeline.operators();
         if !operators.iter().all(is_bounded_secondary_row_operator) {
@@ -952,7 +2011,7 @@ impl Engine {
             crate::storage::ScanOptions::default().with_limit(count)
         });
 
-        read.scan_each(collection, options, &mut |stored| {
+        let mut process = |stored: StoredDocument| {
             scanned = scanned.saturating_add(1);
             let row = if union_origin {
                 ExecutionRow::from_union(stored)
@@ -964,7 +2023,24 @@ impl Engine {
                 returned = returned.saturating_add(1);
                 Ok(())
             })
-        })
+        };
+        match union_demand.and_then(|demand| partial_source_fields(read.as_ref(), demand)) {
+            Some(fields) => {
+                PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+                let layout = crate::query::ProjectedValueLayout::new(fields).map_err(EngineError::execution)?;
+                read.scan_projected_row_values_gated_unordered_each(
+                    collection,
+                    options,
+                    layout.storage_fields(),
+                    0,
+                    &mut |_| Ok(true),
+                    &mut |id, version, values| {
+                        process(StoredDocument::new(id, version, Arc::new(partial_document(layout.fields(), values)))?)
+                    },
+                )
+            }
+            None => read.scan_each(collection, options, &mut process),
+        }
         .map_err(storage_engine_error)?;
         ensure_exact_rows(operators, &chain.limit_remaining)?;
 
@@ -1003,9 +2079,11 @@ impl Engine {
                     *remaining -= 1;
                     stop_after_row |= *remaining == 0 && exact.is_none();
                 }
+                // Lookup aliases can name `_id` indirectly: keep it there.
+                let needs_id = chain.needs_id[index] || lookup_context.is_some();
                 match operator {
                     PhysicalOperator::Filter { predicate } => {
-                        let evaluation = row.evaluation_document();
+                        let evaluation = row.stage_input(needs_id);
                         let accepted = match lookup_context {
                             Some((outer, inner_alias, outer_alias)) => self.runtime.evaluate_lookup_predicate(
                                 predicate,
@@ -1022,20 +2100,17 @@ impl Engine {
                     PhysicalOperator::Select { fields } => {
                         let selected = self
                             .runtime
-                            .apply_select(fields, &row.evaluation_document())
+                            .apply_select(fields, &row.stage_input(needs_id))
                             .map_err(backend_storage_error)?;
                         row.replace_document(selected, false);
                     }
                     PhysicalOperator::Custom {
-                        name,
-                        arguments,
                         writes: false,
                         changes_cardinality: false,
                         ..
                     } => {
-                        match self
-                            .runtime
-                            .apply_custom(name, arguments, false, &row.evaluation_document())
+                        match operator
+                            .apply_custom(self.runtime.as_ref(), &row.stage_input(needs_id))
                             .map_err(backend_storage_error)?
                         {
                             crate::query::CustomOperatorResult::Keep => {}
@@ -1179,9 +2254,182 @@ impl Engine {
         ))
     }
 
+    /// Streams the rows of a collection-scan `prefix` as values of top-level
+    /// fields to a consumer reading `downstream`: leading filters gate the
+    /// projected scan, the other stages run on slots, and no document is
+    /// built. `None` when a stage or field does not allow it.
+    fn stream_slot_rows( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], visitor: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
+            return Ok(None);
+        };
+        if self.system_collection_storage(prefix)?.is_some() {
+            return Ok(None);
+        }
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let Some((gate, program)) = slot_prefix(read.as_ref(), prefix, downstream, true)? else {
+            return Ok(None);
+        };
+        PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+        let (mut scanned, mut filtered, mut slot_filtered, mut returned) = (0u64, 0u64, 0u64, 0u64);
+        let mut row = Vec::new();
+        read.scan_projected_row_values_gated_unordered_each(
+            prefix.source().collection(),
+            reusable_projected_scan_options(*options, prefix, &gate),
+            gate.layout().storage_fields(),
+            gate.gate_field_count(),
+            &mut |values| {
+                scanned = scanned.saturating_add(1);
+                let accepted = gate
+                    .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                    .map_err(backend_storage_error)?;
+                if !accepted {
+                    filtered = filtered.saturating_add(1);
+                }
+                Ok(accepted)
+            },
+            &mut |id, version, values| {
+                row.clear();
+                row.extend_from_slice(values);
+                row.resize(program.width(), None);
+                let mut visit_failure = None;
+                let emitted = program.run_each(
+                    &mut row,
+                    |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver),
+                    &mut |values| {
+                        visitor(SlotRowRef { id, version, fields: program.fields(), values }).map_err(|failure| {
+                            visit_failure = Some(failure);
+                            ExecutionError::evaluation("slot row visit failed")
+                        })
+                    },
+                );
+                if let Some(failure) = visit_failure {
+                    return Err(backend_storage_error(failure));
+                }
+                match emitted.map_err(backend_storage_error)? {
+                    0 => slot_filtered = slot_filtered.saturating_add(1),
+                    rows => returned = returned.saturating_add(rows),
+                }
+                Ok(true)
+            },
+        )
+        .map_err(storage_engine_error)?;
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            scanned,
+            filtered.saturating_add(slot_filtered),
+            returned,
+            ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::PartialDocuments),
+        )))
+    }
+
+    /// [`Self::stream_slot_rows`] for a consumer that reads batches: when
+    /// every stage of `prefix` runs on batches, `on_batch` receives each
+    /// batch that ran (its selection holds the rows that passed, its outputs
+    /// follow the returned field order); rows of a batch that aborted, and
+    /// every row when the stages cannot run on batches, go to `on_row`.
+    /// The field order is that of [`SlotRowRef::fields`].
+    fn stream_slot_batches( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], on_batch: &mut dyn FnMut(&crate::query::BatchRunner, &[crate::query::ExpressionFieldPath]) -> EngineResult<()>, on_row: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
+            return Ok(None);
+        };
+        if self.system_collection_storage(prefix)?.is_some() {
+            return Ok(None);
+        }
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let Some((gate, program)) = slot_prefix(read.as_ref(), prefix, downstream, false)? else {
+            return self.stream_slot_rows(prefix, downstream, on_row);
+        };
+        let Some(batch) = crate::query::BatchProgram::compile(prefix.operators(), gate.layout().fields(), program.fields()).map(Arc::new) else {
+            return self.stream_slot_rows(prefix, downstream, on_row);
+        };
+        PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+        let (filtered, returned) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
+        let on_row = std::cell::RefCell::new(on_row);
+        let mut row = Vec::new();
+        let scanned = scan_batched(
+            read.as_ref(),
+            prefix.source().collection(),
+            reusable_projected_scan_options(*options, prefix, &gate),
+            gate.layout().storage_fields(),
+            &batch,
+            &mut |runner| {
+                let passed = runner.selection().len() as u64;
+                filtered.set(filtered.get() + runner.dropped() as u64);
+                returned.set(returned.get() + passed);
+                on_batch(runner, program.fields()).map_err(backend_storage_error)
+                    .map(|()| true)
+            },
+            &mut |id, version, values| {
+                let accepted = gate
+                    .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                    .map_err(backend_storage_error)?;
+                if !accepted {
+                    filtered.set(filtered.get() + 1);
+                    return Ok(true);
+                }
+                row.clear();
+                row.extend_from_slice(values);
+                row.resize(program.width(), None);
+                let mut visit_failure = None;
+                let kept = program
+                    .run(&mut row, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                    .map_err(backend_storage_error)?;
+                if !kept {
+                    filtered.set(filtered.get() + 1);
+                    return Ok(true);
+                }
+                if let Err(failure) = (on_row.borrow_mut())(SlotRowRef { id, version, fields: program.fields(), values: &row }) {
+                    visit_failure = Some(failure);
+                }
+                if let Some(failure) = visit_failure {
+                    return Err(backend_storage_error(failure));
+                }
+                returned.set(returned.get() + 1);
+                Ok(true)
+            },
+        )
+        .map_err(storage_engine_error)?;
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            scanned,
+            filtered.get(),
+            returned.get(),
+            ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::PartialDocuments),
+        )))
+    }
+
     /// Hydrates one retained locator from the same storage snapshot and
     /// reapplies any pre-blocking Select stage that was deferred by the
     /// projected access vector.
+    /// Replaces rows read as partial documents with their complete stored
+    /// documents run through `prefix` again, so computed fields match the
+    /// complete-document pipeline. Rows changed or deleted since are dropped.
+    fn hydrate_replayed_rows( &self, prefix: &PhysicalPlan, rows: Vec<ExecutionRow>, ) -> EngineResult<Vec<ExecutionRow>> {
+        self.hydrate_replayed(prefix, rows.iter().map(|row| (*row.id(), row.version())))
+    }
+
+    /// Loads each retained row by identity and replays the prefix on it, so a
+    /// consumer that ranked or sampled partial rows returns complete ones.
+    /// A row changed since it was read is dropped, as a scan would not see it.
+    fn hydrate_replayed( &self, prefix: &PhysicalPlan, locators: impl IntoIterator<Item = (DocumentId, DocumentVersion)>, ) -> EngineResult<Vec<ExecutionRow>> {
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let mut chain = StreamingRowChain::new(prefix.operators());
+        let mut hydrated = Vec::new();
+        for (id, version) in locators {
+            let Some(stored) = read
+                .get(prefix.source().collection(), &id)
+                .map_err(storage_engine_error)?
+                .filter(|stored| stored.version() == version)
+            else {
+                continue;
+            };
+            self.drive_streaming_row(&mut chain, 0, ExecutionRow::from_stored(stored), None, &mut |row| {
+                hydrated.push(row);
+                Ok(())
+            })
+            .map_err(storage_engine_error)?;
+        }
+        Ok(hydrated)
+    }
+
     fn hydrate_projected_locator( &self, read: &dyn StorageRead, collection: &CollectionId, locator: ProjectedRowLocator, projected: &ProjectedValuePipeline, ) -> EngineResult<Option<ExecutionRow>> {
         let Some(stored) = read
             .get(collection, &locator.id())
@@ -1440,6 +2688,72 @@ impl Engine {
     /// Executes a complete blocking sort from projected values when the compact
     /// locator+key working set fits the governed budget. If it does not fit, the
     /// caller falls back to the established external Document sort.
+    /// Top-N over a prefix of row-local stages read as slots (`derive`,
+    /// `select … as`, `rename`, `drop`, `where`), such as the hidden `derive`
+    /// of `sort <expression>`: only the key values of the current winners are
+    /// kept; the winners are then loaded and the prefix replayed on them.
+    fn try_slot_top_n( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], limit: usize, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
+        const MAX_KEYS: usize = 4;
+        const KEY_SLOTS: [usize; MAX_KEYS] = [0, 1, 2, 3];
+        if limit == 0 || keys.len() > MAX_KEYS || prefix.field_demand().is_some() || !prefix.operators().iter().all(replays_one_row) {
+            return Ok(None);
+        }
+        let key_fields = keys.iter().map(|key| key.field().clone()).collect::<Vec<_>>();
+        let top = std::cell::RefCell::new(BoundedProjectedTopN::new(limit));
+        let positions_of = |fields: &[crate::query::ExpressionFieldPath]| -> Vec<usize> {
+            key_fields.iter().map(|field| fields.iter().position(|slot| slot == field).expect("slot prefix holds every key")).collect()
+        };
+        let mut positions: Option<Vec<usize>> = None;
+        let mut batch_positions: Option<Vec<usize>> = None;
+        let Some(prefix_stats) = self.stream_slot_batches(
+            prefix,
+            &key_fields,
+            &mut |runner, fields| {
+                let positions = batch_positions.get_or_insert_with(|| positions_of(fields));
+                let columns = positions.iter().map(|position| runner.output(*position)).collect::<Vec<_>>();
+                let mut top = top.borrow_mut();
+                for &row in runner.selection() {
+                    let row = row as usize;
+                    let mut values: [Option<ProjectedValueRef<'_>>; MAX_KEYS] = [None, None, None, None];
+                    for (value, column) in values.iter_mut().zip(&columns) {
+                        *value = column.and_then(|column| column.value_ref(row));
+                    }
+                    let (id, version) = runner.id(row);
+                    top.push_refs(keys, &KEY_SLOTS[..keys.len()], id, version, &values[..keys.len()]).map_err(EngineError::execution)?;
+                }
+                Ok(())
+            },
+            &mut |row| {
+                let positions = positions.get_or_insert_with(|| positions_of(row.fields));
+                let mut values: [Option<ProjectedValueRef<'_>>; MAX_KEYS] = [None, None, None, None];
+                for (value, position) in values.iter_mut().zip(positions.iter()) {
+                    *value = row.values[*position].as_ref().map(ProjectedValueRef::borrowed);
+                }
+                top.borrow_mut().push_refs(keys, &KEY_SLOTS[..keys.len()], row.id, row.version, &values[..keys.len()])
+                    .map_err(EngineError::execution)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let top = top.into_inner();
+        let winners = top.into_sorted_winners(keys).map_err(EngineError::execution)?;
+        let rows = self.hydrate_replayed(prefix, winners.iter().map(|winner| (*winner.id(), winner.version())))?;
+        let returned = rows.len() as u64;
+        Ok(Some((
+            rows,
+            ExecutionStatistics::streamed_with_strategies(
+                prefix_stats.scanned(),
+                prefix_stats.filtered().saturating_add(prefix_stats.returned().saturating_sub(returned)),
+                returned,
+                ExecutionStrategies::default()
+                    .with(ExecutionStrategy::CollectionScan)
+                    .with(ExecutionStrategy::TopN)
+                    .with(ExecutionStrategy::PartialDocuments),
+            ),
+        )))
+    }
+
     fn try_projected_in_memory_sort( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], budget: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         if keys.is_empty() || !self.runtime.supports_projected_sort() {
             return Ok(None);
@@ -1524,9 +2838,41 @@ impl Engine {
     /// source locator per key and hydrates winners after deduplication. A trailing
     /// limit bounds the retained key frontier without changing key-order output.
     fn try_projected_in_memory_distinct( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], budget: usize, output_limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
-        if fields.is_empty() || !self.runtime.supports_projected_distinct() {
-            return Ok(None);
-        }
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        // Full-document distinct ranks the same keys from projected values
+        // when the view knows every top-level field of the collection: the
+        // document key encodes the present fields in name order. Only the
+        // retained rows are read back, so it needs a bound on the output and
+        // a prefix that keeps documents whole (filters).
+        let whole_document = fields.is_empty();
+        let document_fields;
+        let fields = if whole_document {
+            if output_limit.is_none()
+                || !prefix.operators().iter().all(|operator| matches!(operator, PhysicalOperator::Filter { .. }))
+            {
+                return Ok(None);
+            }
+            let Some(names) = read
+                .top_level_fields(prefix.source().collection())
+                .map_err(storage_engine_error)?
+            else {
+                return Ok(None);
+            };
+            let Ok(names) = names
+                .iter()
+                .map(|name| crate::query::ExpressionFieldPath::new([name.as_str()]))
+                .collect::<Result<Vec<_>, _>>()
+            else {
+                return Ok(None);
+            };
+            document_fields = names;
+            &document_fields[..]
+        } else {
+            if !self.runtime.supports_projected_distinct() {
+                return Ok(None);
+            }
+            fields
+        };
 
         let Some((options, projected)) =
             self.projected_collection_pipeline(prefix, fields.iter().cloned())?
@@ -1537,8 +2883,16 @@ impl Engine {
             .layout()
             .slots(fields)
             .map_err(EngineError::execution)?;
+        // Each catalog name must reach storage as that one top-level field.
+        if whole_document
+            && !fields.iter().zip(&field_slots).all(|(field, slot)| {
+                let storage = &projected.layout().storage_fields()[*slot];
+                storage.len() == 1 && storage.get(0).is_some_and(|segment| segment.as_str() == field.first())
+            })
+        {
+            return Ok(None);
+        }
 
-        let read = self.storage.read().map_err(storage_engine_error)?;
         let mut rows: BTreeMap<Arc<[u8]>, (ProjectedRowLocator, usize)> = BTreeMap::new();
         let mut key_buffer = Vec::<u8>::with_capacity(64);
         let mut estimated_bytes = 0usize;
@@ -1551,10 +2905,12 @@ impl Engine {
             &projected,
             &mut |id, version, values| {
                 key_buffer.clear();
-                let supported = self
-                    .runtime
-                    .write_projected_distinct_key(fields, values, &field_slots, &mut key_buffer)
-                    .map_err(EngineError::execution)?;
+                let supported = if whole_document {
+                    self.runtime.write_projected_document_distinct_key(fields, values, &field_slots, &mut key_buffer)
+                } else {
+                    self.runtime.write_projected_distinct_key(fields, values, &field_slots, &mut key_buffer)
+                }
+                .map_err(EngineError::execution)?;
                 if !supported {
                     return Err(EngineError::execution(ExecutionError::unsupported_operator(
                         "distinct",
@@ -1728,6 +3084,115 @@ impl Engine {
         }
     }
 
+    /// In-memory `group` over batches ([`TypedGroups`]): `None` when the
+    /// prefix cannot run on batches, `Some(None)` when the groups exceed the
+    /// working set.
+    fn try_batch_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], grouping_keys: &[crate::query::ExpressionFieldPath], required: &[crate::query::ExpressionFieldPath], budget: usize, group_limit: Option<usize>, ) -> EngineResult<Option<Option<(Vec<ExecutionRow>, ExecutionStatistics)>>> {
+        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
+            return Ok(None);
+        };
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let Some((gate, program)) = slot_prefix(read.as_ref(), prefix, required, false)? else {
+            return Ok(None);
+        };
+        let Some(batch) = crate::query::BatchProgram::compile(prefix.operators(), gate.layout().fields(), program.fields()).map(Arc::new) else {
+            return Ok(None);
+        };
+        let group_layout = ProjectedValueLayout::new(required.iter().cloned()).map_err(EngineError::execution)?;
+        let Some(sources) = program.slots(group_layout.fields()) else {
+            return Ok(None);
+        };
+        let key_indexes = group_layout.slots(grouping_keys).map_err(EngineError::execution)?;
+        let Some(dense) = self
+            .runtime
+            .incremental_group_accumulator(keys)
+            .map_err(EngineError::execution)?
+            .and_then(crate::query::IncrementalGroupAccumulator::into_dense)
+        else {
+            return Ok(None);
+        };
+        if !prefix.operators().iter().all(|operator| matches!(operator, PhysicalOperator::Filter { .. } | PhysicalOperator::Select { .. })) {
+            PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+        }
+        let groups = std::cell::RefCell::new(TypedGroups::new(dense, keys, &key_indexes, budget, group_limit));
+        // Nothing to evaluate: rows go straight from the borrowed cursor.
+        if prefix.operators().is_empty() && sources.iter().copied().eq(0..gate.layout().fields().len()) {
+            let mut scanned = 0u64;
+            read.scan_projected_value_refs_unordered_each(
+                prefix.source().collection(),
+                reusable_projected_scan_options(*options, prefix, &gate),
+                gate.layout().storage_fields(),
+                &mut |values| {
+                    scanned += 1;
+                    let mut groups = groups.borrow_mut();
+                    groups.push(values)?;
+                    Ok(!groups.exceeded)
+                },
+            )
+            .map_err(storage_engine_error)?;
+            let Some(rows) = groups.into_inner().finish()? else {
+                return Ok(Some(None));
+            };
+            return Ok(Some(Some((rows, ExecutionStatistics::streamed_pipeline(scanned, 0, scanned, ExecutionStrategy::CollectionScan)))));
+        }
+        let filtered = std::cell::Cell::new(0u64);
+        let mut row = Vec::new();
+        let scanned = scan_batched(
+            read.as_ref(),
+            prefix.source().collection(),
+            reusable_projected_scan_options(*options, prefix, &gate),
+            gate.layout().storage_fields(),
+            &batch,
+            &mut |runner| {
+                let mut groups = groups.borrow_mut();
+                if groups.exceeded {
+                    return Ok(false);
+                }
+                filtered.set(filtered.get() + runner.dropped() as u64);
+                let columns = sources.iter().map(|source| runner.output(*source)).collect::<Vec<_>>();
+                let mut values: Vec<Option<ProjectedValueRef<'_>>> = Vec::with_capacity(columns.len());
+                for &position in runner.selection() {
+                    values.clear();
+                    values.extend(columns.iter().map(|column| column.and_then(|column| column.value_ref(position as usize))));
+                    groups.push(&values)?;
+                }
+                Ok(!groups.exceeded)
+            },
+            &mut |_, _, values| {
+                let accepted = gate
+                    .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                    .map_err(backend_storage_error)?;
+                if !accepted {
+                    filtered.set(filtered.get() + 1);
+                    return Ok(true);
+                }
+                row.clear();
+                row.extend_from_slice(values);
+                row.resize(program.width(), None);
+                let kept = program
+                    .run(&mut row, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                    .map_err(backend_storage_error)?;
+                if !kept {
+                    filtered.set(filtered.get() + 1);
+                    return Ok(true);
+                }
+                let mut groups = groups.borrow_mut();
+                let values = sources.iter().map(|source| row[*source].as_ref().map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
+                groups.push(&values)?;
+                Ok(!groups.exceeded)
+            },
+        )
+        .map_err(storage_engine_error)?;
+        let Some(rows) = groups.into_inner().finish()? else {
+            return Ok(Some(None));
+        };
+        let filtered = filtered.get();
+        Ok(Some(Some((
+            rows,
+            ExecutionStatistics::streamed_pipeline(scanned, filtered, scanned.saturating_sub(filtered), ExecutionStrategy::CollectionScan),
+        ))))
+    }
+
     fn try_in_memory_incremental_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], budget: usize, group_limit: Option<usize>, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
         if self
             .runtime
@@ -1740,27 +3205,44 @@ impl Engine {
 
         let (grouping_keys, required_input_fields) =
             crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
+        if let Some(result) = self.try_batch_group(prefix, keys, &grouping_keys, &required_input_fields, budget, group_limit)? {
+            return Ok(result);
+        }
 
         // Standard projected-value access vector: any compatible streaming
         // prefix can stay on physical values until the group consumer. `.25`
         // starts with Filter stages; unsupported prefixes fall back to the
         // established Document pipeline below.
         if let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() {
-            if let Some(value_pipeline) =
-                ProjectedValuePipeline::compile(prefix.operators(), required_input_fields.clone())
-                    .map_err(EngineError::execution)?
+            let read = self.storage.read().map_err(storage_engine_error)?;
+            // A prefix with row-local stages beyond filters runs them on slots
+            // between the projected scan and the group consumer.
+            let compiled = match ProjectedValuePipeline::compile(prefix.operators(), required_input_fields.clone())
+                .map_err(EngineError::execution)?
             {
+                Some(pipeline) => Some((pipeline, None)),
+                None => slot_prefix(read.as_ref(), prefix, &required_input_fields, false)?
+                    .map(|(pipeline, program)| (pipeline, Some(program))),
+            };
+            if let Some((value_pipeline, slot_program)) = compiled {
                 let layout = value_pipeline.layout();
                 let group_layout = ProjectedValueLayout::new(required_input_fields)
                     .map_err(EngineError::execution)?;
-                let group_source_slots = layout
-                    .slots(group_layout.fields())
-                    .map_err(EngineError::execution)?;
+                let group_source_slots = match &slot_program {
+                    Some(program) => program.slots(group_layout.fields()).ok_or_else(|| {
+                        EngineError::execution(crate::query::ExecutionError::evaluation("group input is absent from the slot program"))
+                    })?,
+                    None => layout.slots(group_layout.fields()).map_err(EngineError::execution)?,
+                };
                 let key_indexes = group_layout
                     .slots(&grouping_keys)
                     .map_err(EngineError::execution)?;
+                let mut slot_values = Vec::new();
+                let mut slot_filtered = 0u64;
+                if slot_program.is_some() {
+                    PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+                }
 
-                let read = self.storage.read().map_err(storage_engine_error)?;
                 if !read
                     .support(StorageReadCapability::ProjectedValuesGatedUnordered)
                     .available()
@@ -1785,7 +3267,7 @@ impl Engine {
                 let mut group_values = vec![None; group_source_slots.len()];
                 let mut group_probe = crate::storage::GroupConsumerProbeSnapshot::default();
 
-                if value_pipeline.gate_field_count() == 0 {
+                if value_pipeline.gate_field_count() == 0 && slot_program.is_none() {
                     let storage_key_indexes = key_indexes
                         .iter()
                         .map(|index| group_source_slots[*index])
@@ -1930,6 +3412,24 @@ impl Engine {
                             if exceeded.get() {
                                 return Ok(false);
                             }
+                            let values: &[Option<crate::Value>] = match &slot_program {
+                                Some(program) => {
+                                    slot_values.clear();
+                                    slot_values.extend_from_slice(values);
+                                    slot_values.resize(program.width(), None);
+                                    let accepted = program
+                                        .run(&mut slot_values, |expression, resolver| {
+                                            self.runtime.evaluate_resolved_predicate(expression, resolver)
+                                        })
+                                        .map_err(backend_storage_error)?;
+                                    if !accepted {
+                                        slot_filtered = slot_filtered.saturating_add(1);
+                                        return Ok(true);
+                                    }
+                                    &slot_values
+                                }
+                                None => values,
+                            };
                             for (target, source) in group_values
                                 .iter_mut()
                                 .zip(group_source_slots.iter().copied())
@@ -1990,6 +3490,7 @@ impl Engine {
                     .map_err(storage_engine_error)?;
                 }
 
+                filtered = filtered.saturating_add(slot_filtered);
                 if exceeded.get() {
                     return Ok(None);
                 }
@@ -2284,6 +3785,7 @@ impl Engine {
             return Ok(None);
         }
         let shape = governed_shape(physical.operators()).expect("governed support check guarantees a shape");
+        take_partial_documents_used();
 
         // The streaming tail (`select`, `skip`, `first`, `unwind`, a terminal
         // `count`, …) runs row by row on the core's output. A leading `skip`/
@@ -2292,7 +3794,11 @@ impl Engine {
         let mut counted = 0u64;
         let mut delivered = 0u64;
         let mut open = !chain.has_empty_bound();
-        let statistics = {
+        let shared = if shape.tail.is_empty() && shape.count_alias.is_some() { self.try_shared_union_count(physical, &shape)? } else { None };
+        let statistics = if let Some((count, statistics)) = shared {
+            counted = count;
+            Some(statistics)
+        } else {
             let mut tail_visitor = |row: ExecutionRow| -> EngineResult<()> {
                 if !open {
                     return Ok(());
@@ -2313,9 +3819,17 @@ impl Engine {
             };
             self.stream_governed_core(physical, &shape, &mut tail_visitor)?
         };
-        let Some(statistics) = statistics else {
+        let Some(mut statistics) = statistics else {
             return Ok(None);
         };
+        if take_partial_documents_used() {
+            statistics = ExecutionStatistics::streamed_with_strategies(
+                statistics.scanned(),
+                statistics.filtered(),
+                statistics.returned(),
+                statistics.strategies().with(ExecutionStrategy::PartialDocuments),
+            );
+        }
         ensure_exact_rows(shape.tail, &chain.limit_remaining)?;
         if let Some(alias) = shape.count_alias {
             let document = Arc::new(Document::from_fields([(alias, Value::from(counted))]));
@@ -2335,6 +3849,75 @@ impl Engine {
         )))
     }
 
+    /// `… | union | on <same collection> | … | end | count` with row-local
+    /// stages on both sides: one scan feeds both sides' batch programs.
+    /// `None` when the shape does not apply or a batch aborts: the plan then
+    /// runs as usual, scanning each side (nothing was emitted yet).
+    fn try_shared_union_count( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, ) -> EngineResult<Option<(u64, ExecutionStatistics)>> {
+        let [PhysicalOperator::Union { collection, alias: None, pipeline }] = &physical.operators()[shape.blocking_index..shape.core_end] else {
+            return Ok(None);
+        };
+        let crate::query::PhysicalAccess::CollectionScan { options } = physical.source().access() else {
+            return Ok(None);
+        };
+        if collection != physical.source().collection() || options.limit().is_some() || self.system_collection_storage(physical)?.is_some() {
+            return Ok(None);
+        }
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let sides = [&physical.operators()[..shape.blocking_index], pipeline.operators()];
+        let mut fields = Vec::new();
+        for operators in sides {
+            let Some(demand) = crate::query::source_field_demand(operators, Some(&[])).and_then(|demand| partial_source_fields(read.as_ref(), &demand)) else {
+                return Ok(None);
+            };
+            for field in demand {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
+        }
+        let programs = sides.map(|operators| crate::query::BatchProgram::compile(operators, &fields, &[]).map(Arc::new));
+        let [Some(main), Some(branch)] = programs else {
+            return Ok(None);
+        };
+        let layout = ProjectedValueLayout::new(fields).map_err(EngineError::execution)?;
+        let mut runners = [crate::query::BatchRunner::new(main), crate::query::BatchRunner::new(branch)];
+        let (rows, passed, aborted) = (std::cell::Cell::new(0u64), [std::cell::Cell::new(0u64), std::cell::Cell::new(0u64)], std::cell::Cell::new(false));
+        let flush = |runners: &mut [crate::query::BatchRunner; 2]| {
+            rows.set(rows.get() + runners[0].len() as u64);
+            for (runner, passed) in runners.iter_mut().zip(&passed) {
+                if runner.run().is_err() {
+                    aborted.set(true);
+                }
+                passed.set(passed.get() + runner.selection().len() as u64);
+                runner.clear();
+            }
+            !aborted.get()
+        };
+        read.scan_projected_row_refs_unordered_each(collection, *options, layout.storage_fields(), &mut |id, version, values| {
+            for runner in &mut runners {
+                runner.push(id, version, values);
+            }
+            Ok(!runners[0].is_full() || flush(&mut runners))
+        })
+        .map_err(storage_engine_error)?;
+        if !aborted.get() && !runners[0].is_empty() {
+            flush(&mut runners);
+        }
+        if aborted.get() {
+            return Ok(None);
+        }
+        let (rows, passed) = (rows.get(), [passed[0].get(), passed[1].get()]);
+        PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+        let statistics = ExecutionStatistics::streamed_with_strategies(
+            rows * 2,
+            (rows - passed[0]) + (rows - passed[1]),
+            passed[0] + passed[1],
+            ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan),
+        );
+        Ok(Some((passed[0] + passed[1], statistics)))
+    }
+
     /// Runs the streaming prefix and the blocking core of a governed plan,
     /// emitting up to `shape.output_limit` rows to `visitor`.
     fn stream_governed_core( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
@@ -2352,6 +3935,15 @@ impl Engine {
             physical.projected_prefix_len().min(blocking_index),
             physical.source_projection_reuse(),
         );
+        // A core that does not keep its input order (sort, group, distinct,
+        // pivot, sample, union), or a terminal count, lets the prefix read only
+        // the fields the core and tail need, from an unordered cursor.
+        let order_free = shape.count_alias.is_some()
+            || !matches!(core[0].execution_properties().order, crate::query::Order::Preserved);
+        let consumer_demand = order_free
+            .then(|| crate::query::source_field_demand(&physical.operators()[blocking_index..], None))
+            .flatten();
+        let prefix = if order_free { prefix.with_order_free_consumer(consumer_demand.clone()) } else { prefix };
         let source_strategy = match physical.source().access() {
             crate::query::PhysicalAccess::CollectionScan { .. } => {
                 ExecutionStrategy::CollectionScan
@@ -2363,17 +3955,99 @@ impl Engine {
 
         // Blocking operators use the query profile and currently available
         // managed memory; spill follows that resource contract.
-        let snapshot = self.memory_governor.snapshot();
         let query_budget = self.memory_governor.profile().query_budget_bytes;
-        let available = snapshot.available_bytes.unwrap_or(query_budget);
+        let available = self.memory_governor.available_bytes().unwrap_or(query_budget);
         let working_budget = available.min(query_budget).max(1024 * 1024);
 
         // A stage that retains at most N rows (`sample N`) keeps a reservoir of
         // N rows while the prefix streams; memory is bounded by N.
         if let Some(capacity) = core[0].execution_properties().retained_rows() {
+            let core_reads = core[0].field_reads().unwrap_or_default();
+            let (sampling_prefix, late) = retaining_prefix(&prefix, core_reads.clone());
+            // Rows read as slots: the reservoir keeps identities only, and the
+            // retained rows are loaded and replayed through the prefix. The
+            // reservoir keeps rows whatever their values, so the stages that
+            // end the prefix and are proven total run on retained rows only.
+            // A prefix whose rows already carry a field demand (a consumer
+            // after the sample) replays as well: hydrated rows are complete.
+            if late || prefix.operators().iter().all(replays_one_row) {
+                let read = self.storage.read().map_err(storage_engine_error)?;
+                let start = sample_commuting_start(read.as_ref(), &prefix)?;
+                let plain_scan = matches!(prefix.source().access(), crate::query::PhysicalAccess::CollectionScan { options } if options.limit().is_none())
+                    && self.system_collection_storage(&prefix)?.is_none();
+                if start == 0 && plain_scan {
+                    // Nothing runs before the reservoir: draw from the
+                    // primary index, reading only the retained rows.
+                    let mut reservoir = crate::query::Reservoir::new(capacity);
+                    read.visit_row_ids(prefix.source().collection(), &mut |id, version| {
+                        reservoir.push((id, version));
+                        Ok(true)
+                    })
+                    .map_err(storage_engine_error)?;
+                    drop(read);
+                    let seen = reservoir.seen();
+                    let dropped = seen.saturating_sub(capacity as u64);
+                    let mut locators = reservoir.into_items();
+                    if let Some(limit) = output_limit {
+                        locators.truncate(limit);
+                    }
+                    let rows = self.hydrate_replayed(&prefix, locators)?;
+                    let returned = rows.len() as u64;
+                    for row in rows {
+                        visitor(row)?;
+                    }
+                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
+                        seen,
+                        dropped,
+                        returned,
+                        ExecutionStrategies::default().with(source_strategy),
+                    )));
+                }
+                drop(read);
+                let sampled_prefix = if start < prefix.operators().len() {
+                    PhysicalPlan::new(prefix.source().clone(), prefix.operators()[..start].iter().cloned())
+                        .map_err(|error| EngineError::execution(ExecutionError::evaluation(error.to_string())))?
+                } else {
+                    prefix.clone()
+                };
+                let reservoir = std::cell::RefCell::new(crate::query::Reservoir::new(capacity));
+                if let Some(prefix_stats) = self.stream_slot_batches(
+                    &sampled_prefix,
+                    &core_reads,
+                    &mut |runner, _| {
+                        let mut reservoir = reservoir.borrow_mut();
+                        for &row in runner.selection() {
+                            reservoir.push(runner.id(row as usize));
+                        }
+                        Ok(())
+                    },
+                    &mut |row| {
+                        reservoir.borrow_mut().push((row.id, row.version));
+                        Ok(())
+                    },
+                )? {
+                    let reservoir = reservoir.into_inner();
+                    let dropped = reservoir.seen().saturating_sub(capacity as u64);
+                    let mut locators = reservoir.into_items();
+                    if let Some(limit) = output_limit {
+                        locators.truncate(limit);
+                    }
+                    let rows = self.hydrate_replayed(&prefix, locators)?;
+                    let returned = rows.len() as u64;
+                    for row in rows {
+                        visitor(row)?;
+                    }
+                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
+                        prefix_stats.scanned(),
+                        prefix_stats.filtered().saturating_add(dropped),
+                        returned,
+                        ExecutionStrategies::default().with(source_strategy),
+                    )));
+                }
+            }
             let mut reservoir = crate::query::Reservoir::new(capacity);
             let prefix_stats = self
-                .stream_read_pipeline(&prefix, &mut |stored| {
+                .stream_read_pipeline(&sampling_prefix, &mut |stored| {
                     reservoir.push(ExecutionRow::from_stored(stored));
                     Ok(())
                 })?
@@ -2382,6 +4056,9 @@ impl Engine {
             let mut rows = reservoir.into_items();
             if let Some(limit) = output_limit {
                 rows.truncate(limit);
+            }
+            if late && prefix_stats.strategies().contains(ExecutionStrategy::PartialDocuments) {
+                rows = self.hydrate_replayed_rows(&prefix, rows)?;
             }
             let returned = rows.len() as u64;
             for row in rows {
@@ -2409,17 +4086,75 @@ impl Engine {
                 .ok_or_else(|| EngineError::execution(ExecutionError::evaluation("pivot runtime has no incremental accumulator")))?;
             let reservation = reserve_query_memory(&self.memory_governor, "pivot working set", working_budget)
                 .map_err(EngineError::execution)?;
-            let prefix_stats = self
-                .stream_read_pipeline(&prefix, &mut |stored| {
-                    accumulator.push(stored.document()).map_err(EngineError::execution)?;
-                    if accumulator.retained_bytes() > working_budget {
-                        return Err(EngineError::execution(ExecutionError::evaluation(
-                            "pivot cells exceed the governed query working set; reduce the row or column cardinality",
-                        )));
-                    }
-                    Ok(())
+            let over_budget = |accumulator: &dyn crate::query::IncrementalPivotAccumulator| {
+                if accumulator.retained_bytes() > working_budget {
+                    return Err(EngineError::execution(ExecutionError::evaluation(
+                        "pivot cells exceed the governed query working set; reduce the row or column cardinality",
+                    )));
+                }
+                Ok(())
+            };
+            // Rows reach the accumulator as slots when it folds them and
+            // every pivot field is top-level; documents otherwise.
+            let pivot_fields = specification
+                .rows()
+                .iter()
+                .chain(specification.columns())
+                .chain(specification.values().iter().map(|value| value.field()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let top_level = pivot_fields.iter().all(|field| field.len() == 1);
+            let slot_stats = if accumulator.folds_refs() && top_level {
+                // Batches: each pivot path is read from its output column.
+                let accumulator = std::cell::RefCell::new(&mut accumulator);
+                let groups = [specification.rows(), specification.columns()];
+                let position = |fields: &[crate::query::ExpressionFieldPath], path: &crate::query::ExpressionFieldPath| fields.iter().position(|field| field == path);
+                self.stream_slot_batches(
+                    &prefix,
+                    &pivot_fields,
+                    &mut |runner, fields| {
+                        let columns = |paths: &[crate::query::ExpressionFieldPath]| paths.iter().map(|path| position(fields, path).and_then(|index| runner.output(index))).collect::<Vec<_>>();
+                        let (rows, cols) = (columns(groups[0]), columns(groups[1]));
+                        let values = specification.values().iter().map(|value| position(fields, value.field()).and_then(|index| runner.output(index))).collect::<Vec<_>>();
+                        fn read<'c>(columns: &[Option<&'c crate::query::Column>], row: usize, out: &mut Vec<Option<ProjectedValueRef<'c>>>) {
+                            out.clear();
+                            out.extend(columns.iter().map(|column| column.and_then(|column| column.value_ref(row))));
+                        }
+                        let (mut row_refs, mut column_refs, mut value_refs) = (Vec::new(), Vec::new(), Vec::new());
+                        let mut accumulator = accumulator.borrow_mut();
+                        for &row in runner.selection() {
+                            let row = row as usize;
+                            read(&rows, row, &mut row_refs);
+                            read(&cols, row, &mut column_refs);
+                            read(&values, row, &mut value_refs);
+                            accumulator.push_refs(&row_refs, &column_refs, &value_refs).map_err(EngineError::execution)?;
+                        }
+                        over_budget(accumulator.as_ref())
+                    },
+                    &mut |row| {
+                        let mut accumulator = accumulator.borrow_mut();
+                        accumulator.push_slots(row.fields, row.values).map_err(EngineError::execution)?;
+                        over_budget(accumulator.as_ref())
+                    },
+                )?
+            } else if accumulator.folds_slots() {
+                self.stream_slot_rows(&prefix, &pivot_fields, &mut |row| {
+                    accumulator.push_slots(row.fields, row.values).map_err(EngineError::execution)?;
+                    over_budget(accumulator.as_ref())
                 })?
-                .expect("validated streaming prefix");
+            } else {
+                None
+            };
+            let prefix_stats = slot_stats.map_or_else(
+                || {
+                    self.stream_read_pipeline(&prefix, &mut |stored| {
+                        accumulator.push(stored.document()).map_err(EngineError::execution)?;
+                        over_budget(accumulator.as_ref())
+                    })
+                    .map(|statistics| statistics.expect("validated streaming prefix"))
+                },
+                Ok,
+            )?;
             let rows = accumulator.finish().map_err(EngineError::execution)?;
             drop(reservation);
             let returned = rows.len() as u64;
@@ -2440,8 +4175,8 @@ impl Engine {
             match core_operator {
                 PhysicalOperator::Union {
                     collection,
+                    alias,
                     pipeline,
-                    ..
                 } if pipeline
                     .operators()
                     .iter()
@@ -2455,11 +4190,16 @@ impl Engine {
                             Ok(())
                         })?
                         .expect("validated streaming prefix");
+                    // The branch rows meet the same consumer as the main rows. An
+                    // aliased branch may name fields through the alias: read whole rows.
+                    let branch_demand = (order_free && alias.is_none())
+                        .then(|| crate::query::source_field_demand(pipeline.operators(), consumer_demand.as_deref()))
+                        .flatten();
                     let branch_stats = self.stream_bounded_secondary_pipeline(
                         collection,
                         pipeline,
                         None,
-                        true,
+                        branch_demand.as_deref(),
                         &mut |row| {
                             visitor(row)?;
                             returned = returned.saturating_add(1);
@@ -2498,49 +4238,90 @@ impl Engine {
                     let mut inner_scanned = 0u64;
                     let mut inner_filtered = 0u64;
                     let mut returned = 0u64;
-                    let prefix_stats = self
-                        .stream_read_pipeline(&prefix, &mut |stored| {
-                            let mut outer = ExecutionRow::from_stored(stored);
-                            let mut matches = Vec::<Arc<Document>>::new();
-                            let mut retained_bytes = 0usize;
-                            let inner_stats = self.stream_bounded_secondary_pipeline(
-                                collection,
-                                pipeline,
-                                Some((outer.document(), alias.as_deref(), outer_alias.as_deref())),
-                                false,
-                                &mut |row| {
-                                    let estimated = execution_row_working_bytes(&row)
-                                        .map_err(EngineError::execution)?;
-                                    if estimated > working_budget
-                                        || retained_bytes.saturating_add(estimated) > working_budget
-                                    {
-                                        return Err(EngineError::execution(
-                                            ExecutionError::evaluation(
-                                                "one lookup result exceeds the governed query working set",
-                                            ),
-                                        ));
-                                    }
-                                    retained_bytes = retained_bytes.saturating_add(estimated);
-                                    matches.push(row.shared_document());
-                                    Ok(())
-                                },
-                            )?;
-                            inner_scanned = inner_scanned.saturating_add(inner_stats.scanned());
-                            inner_filtered = inner_filtered.saturating_add(inner_stats.filtered());
-                            let documents = LookupDocuments::new(matches);
-                            let evaluation = outer.evaluation_document();
-                            let document = self
-                                .runtime
-                                .apply_lookup(into, &evaluation, &documents)
-                                .map_err(EngineError::execution)?;
-                            outer.replace_document(document, false);
-                            visitor(outer)?;
-                            returned = returned.saturating_add(1);
+                    // An equality correlation is served by an index built once,
+                    // at the first outer row, within the working budget.
+                    let equality = LookupEquality::detect(pipeline, outer_alias.as_deref());
+                    let mut index: Option<Option<LookupIndex>> = None;
+                    let mut join_row = |stored: StoredDocument, index: &mut Option<Option<LookupIndex>>, filter: Option<&LookupKeyFilter>| -> EngineResult<()> {
+                        let mut outer = ExecutionRow::from_stored(stored);
+                        let mut matches = Vec::<Arc<Document>>::new();
+                        let mut retained_bytes = 0usize;
+                        if let (Some(equality), None) = (&equality, &index) {
+                            let built = self.build_lookup_index(collection, equality, alias.as_deref(), outer_alias.as_deref(), working_budget, filter)?;
+                            if let Some(built) = &built {
+                                inner_scanned = inner_scanned.saturating_add(built.scanned);
+                            }
+                            *index = Some(built);
+                        }
+                        let lookup_context = Some((outer.document(), alias.as_deref(), outer_alias.as_deref()));
+                        let mut collect = |row: ExecutionRow| -> EngineResult<()> {
+                            let estimated = execution_row_working_bytes(&row).map_err(EngineError::execution)?;
+                            if estimated > working_budget || retained_bytes.saturating_add(estimated) > working_budget {
+                                return Err(EngineError::execution(ExecutionError::evaluation(
+                                    "one lookup result exceeds the governed query working set",
+                                )));
+                            }
+                            retained_bytes = retained_bytes.saturating_add(estimated);
+                            matches.push(row.shared_document());
                             Ok(())
-                        })?
+                        };
+                        let inner_stats = if let (Some(equality), Some(Some(index))) = (&equality, &*index) {
+                            self.probe_lookup_index(collection, index, equality, pipeline, lookup_context, &mut collect)?
+                        } else {
+                            self.stream_bounded_secondary_pipeline(collection, pipeline, lookup_context, None, &mut collect)?
+                        };
+                        drop(collect);
+                        inner_scanned = inner_scanned.saturating_add(inner_stats.scanned());
+                        inner_filtered = inner_filtered.saturating_add(inner_stats.filtered());
+                        let documents = LookupDocuments::new(matches);
+                        let evaluation = outer.evaluation_document();
+                        let document = self
+                            .runtime
+                            .apply_lookup(into, &evaluation, &documents)
+                            .map_err(EngineError::execution)?;
+                        outer.replace_document(document, false);
+                        visitor(outer)?;
+                        returned = returned.saturating_add(1);
+                        Ok(())
+                    };
+                    // Semi-join: a bounded outer side is read first, and the
+                    // index keeps only joined rows that can match its keys.
+                    let semi_join = equality.is_some() && prefix_row_bound(&prefix).is_some_and(|bound| bound <= SEMI_JOIN_MAX_OUTER_ROWS);
+                    let prefix_stats = if semi_join {
+                        let mut outer_rows = Vec::new();
+                        let prefix_stats = self
+                            .stream_read_pipeline(&prefix, &mut |stored| {
+                                outer_rows.push(stored);
+                                Ok(())
+                            })?;
+                        let equality = equality.as_ref().expect("semi-join has an equality");
+                        let mut filter = Some(LookupKeyFilter::default());
+                        let no_inner = Document::new();
+                        for stored in &outer_rows {
+                            let fields = crate::query::LookupFields { inner: &no_inner, inner_alias: alias.as_deref(), outer: stored.document(), outer_alias: outer_alias.as_deref() };
+                            match crate::query::ExpressionFieldResolver::resolve_field(&fields, &equality.outer) {
+                                crate::query::SemanticValue::Present(value) => {
+                                    if let Some(filter) = &mut filter {
+                                        filter.insert(&value);
+                                    }
+                                }
+                                // Every joined row is a candidate for a missing key.
+                                crate::query::SemanticValue::Missing => filter = None,
+                            }
+                        }
+                        for stored in outer_rows {
+                            join_row(stored, &mut index, filter.as_ref())?;
+                        }
+                        prefix_stats
+                    } else {
+                        self.stream_read_pipeline(&prefix, &mut |stored| join_row(stored, &mut index, None))?
+                    }
                         .expect("validated streaming prefix");
                     drop(reservation);
-                    let strategies = ExecutionStrategies::default().with(source_strategy);
+                    let mut strategies = ExecutionStrategies::default().with(source_strategy);
+                    if matches!(index, Some(Some(_))) {
+                        strategies = strategies.with(ExecutionStrategy::HashJoin);
+                    }
                     return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                         prefix_stats.scanned().saturating_add(inner_scanned),
                         prefix_stats.filtered().saturating_add(inner_filtered),
@@ -3056,12 +4837,23 @@ impl Engine {
                     }
                     return Ok(Some(statistics));
                 }
+                if let Some((rows, statistics)) = self.try_slot_top_n(&prefix, keys, limit)? {
+                    for row in rows {
+                        visitor(row)?;
+                    }
+                    return Ok(Some(statistics));
+                }
                 let reservation =
                     reserve_query_memory(&self.memory_governor, "streaming top-n", working_budget)
                         .map_err(EngineError::execution)?;
+                // Late materialization: when the prefix can be replayed on one
+                // row, rank rows read as partial documents holding only what the
+                // prefix and the sort keys read, then hydrate the winners.
+                let (ranking_prefix, late) =
+                    retaining_prefix(&prefix, keys.iter().map(|key| key.field().clone()).collect());
                 let mut top = BoundedTopN::new(limit);
                 let prefix_stats = self
-                    .stream_read_pipeline(&prefix, &mut |stored| {
+                    .stream_read_pipeline(&ranking_prefix, &mut |stored| {
                         let row = ExecutionRow::from_stored(stored);
                         top.push_lazy(self.runtime.as_ref(), keys, row, |candidate| {
                             execution_row_working_bytes(candidate)
@@ -3077,16 +4869,17 @@ impl Engine {
                     .expect("validated streaming prefix");
                 drop(reservation);
 
-                let top = top
+                let mut top = top
                     .into_sorted_rows(self.runtime.as_ref(), keys)
                     .map_err(EngineError::execution)?;
+                if late && prefix_stats.strategies().contains(ExecutionStrategy::PartialDocuments) {
+                    top = self.hydrate_replayed_rows(&prefix, top)?;
+                }
                 let returned = top.len() as u64;
                 for row in top {
                     visitor(row)?;
                 }
-                let strategies = ExecutionStrategies::default()
-                    .with(source_strategy)
-                    .with(ExecutionStrategy::TopN);
+                let strategies = prefix_stats.strategies().with(source_strategy).with(ExecutionStrategy::TopN);
                 return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                     prefix_stats.scanned(),
                     prefix_stats
@@ -3856,6 +5649,43 @@ impl fmt::Debug for Engine {
     }
 }
 
+/// One-line, human-readable summary of an operator's arguments for `explain`.
+fn describe_operator(operator: &PhysicalOperator) -> String {
+    let joined = |fields: &[crate::query::ExpressionFieldPath]| {
+        fields.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    };
+    match operator {
+        PhysicalOperator::Filter { predicate } => predicate.to_string(),
+        PhysicalOperator::Set { assignments } => assignments
+            .iter()
+            .map(|assignment| format!("{} = {}", assignment.field(), assignment.value()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        PhysicalOperator::Lookup { collection, alias, into, pipeline, .. } => format!(
+            "{}{} into {into} ({} nested stage(s))",
+            collection.as_str(),
+            alias.as_ref().map(|alias| format!(" as {alias}")).unwrap_or_default(),
+            pipeline.operators().len(),
+        ),
+        PhysicalOperator::Union { collection, pipeline, .. } => {
+            format!("{} ({} nested stage(s))", collection.as_str(), pipeline.operators().len())
+        }
+        PhysicalOperator::Load { target } => target.to_string(),
+        PhysicalOperator::StreamingLoad { mode, chunks } => format!("{mode}, {} chunk(s)", chunks.len()),
+        PhysicalOperator::Limit { count } | PhysicalOperator::Skip { count } => count.to_string(),
+        PhysicalOperator::Sort { keys } => keys
+            .iter()
+            .map(|key| format!("{} {}", key.field(), key.direction().as_str()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        PhysicalOperator::Select { fields } | PhysicalOperator::Distinct { fields } => joined(fields),
+        PhysicalOperator::Group { keys } => crate::query::describe_group_fields(keys),
+        PhysicalOperator::Count { alias } => alias.to_string(),
+        PhysicalOperator::Custom { arguments, .. } => arguments.to_string(),
+        PhysicalOperator::Delete | PhysicalOperator::Insert { .. } | PhysicalOperator::Pivot { .. } => String::new(),
+    }
+}
+
 /// Logical and physical representations of one planned query.
 #[derive(Clone, Debug)]
 pub struct PlannedQuery {
@@ -4016,43 +5846,13 @@ fn merge_sorted_distinct_limited_runs( runtime: &dyn ExecutionRuntime, sort_keys
     if limit == 0 {
         return Ok(0);
     }
-    let mut readers = runs
-        .iter()
-        .map(SpillRun::reader)
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(engine_spill_error)?;
-    let mut heads = readers
-        .iter_mut()
-        .map(read_spilled_row)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(EngineError::execution)?;
+    let mut merge = merge_runs(runs, SpillRun::reader, read_spilled_row)?;
     let mut seen = Vec::<Arc<[u8]>>::with_capacity(limit);
     let mut returned = 0u64;
-    loop {
-        let mut best = None;
-        for index in 0..heads.len() {
-            let Some(candidate) = heads[index].as_ref() else {
-                continue;
-            };
-            match best {
-                None => best = Some(index),
-                Some(current) => {
-                    let selected = heads[current].as_ref().expect("selected spill head");
-                    if runtime
-                        .compare_documents(sort_keys, candidate.document(), selected.document())
-                        .map_err(EngineError::execution)?
-                        == Ordering::Less
-                    {
-                        best = Some(index);
-                    }
-                }
-            }
-        }
-        let Some(index) = best else {
-            break;
-        };
-        let row = heads[index].take().expect("selected spill row");
-        heads[index] = read_spilled_row(&mut readers[index]).map_err(EngineError::execution)?;
+    while let Some(row) = merge
+        .pop_min(|left, right| row_before(runtime, sort_keys, left, right))
+        .map_err(EngineError::execution)?
+    {
         let key = runtime
             .distinct_key(distinct_fields, row.document())
             .map_err(EngineError::execution)?;
@@ -4073,46 +5873,36 @@ fn merge_sorted_distinct_limited_runs( runtime: &dyn ExecutionRuntime, sort_keys
 }
 
 fn merge_sorted_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::SortKey], runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
-    let mut readers = runs
-        .iter()
-        .map(SpillRun::reader)
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(engine_spill_error)?;
-    let mut heads = readers
-        .iter_mut()
-        .map(read_spilled_row)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(EngineError::execution)?;
+    let mut merge = merge_runs(runs, SpillRun::reader, read_spilled_row)?;
     let mut returned = 0u64;
-    loop {
-        if limit.is_some_and(|limit| returned as usize >= limit) {
+    while limit.is_none_or(|limit| (returned as usize) < limit) {
+        let Some(row) = merge
+            .pop_min(|left, right| row_before(runtime, keys, left, right))
+            .map_err(EngineError::execution)?
+        else {
             break;
-        }
-        let mut best = None;
-        for index in 0..heads.len() {
-            let Some(candidate) = heads[index].as_ref() else {
-                continue;
-            };
-            match best {
-                None => best = Some(index),
-                Some(current) => {
-                    let selected = heads[current].as_ref().expect("selected spill head");
-                    if runtime
-                        .compare_documents(keys, candidate.document(), selected.document())
-                        .map_err(EngineError::execution)?
-                        == Ordering::Less
-                    {
-                        best = Some(index);
-                    }
-                }
-            }
-        }
-        let Some(index) = best else { break };
-        visitor(heads[index].take().expect("selected spill row"))?;
+        };
+        visitor(row)?;
         returned = returned.saturating_add(1);
-        heads[index] = read_spilled_row(&mut readers[index]).map_err(EngineError::execution)?;
     }
     Ok(returned)
+}
+
+/// A merge of spill runs whose records are read with a plain function.
+type SpillMerge<R, T> = RunMerge<R, T, fn(&mut R) -> Result<Option<T>, ExecutionError>>;
+
+fn merge_runs<R, T>( runs: &[SpillRun], open: fn(&SpillRun) -> io::Result<R>, next: fn(&mut R) -> Result<Option<T>, ExecutionError>, ) -> EngineResult<SpillMerge<R, T>> {
+    let readers = runs
+        .iter()
+        .map(open)
+        .collect::<io::Result<Vec<_>>>()
+        .map_err(engine_spill_error)?;
+    RunMerge::new(readers, next).map_err(EngineError::execution)
+}
+
+/// Whether `left` sorts strictly before `right` on `keys`.
+fn row_before( runtime: &dyn ExecutionRuntime, keys: &[crate::query::SortKey], left: &ExecutionRow, right: &ExecutionRow, ) -> Result<bool, ExecutionError> {
+    Ok(runtime.compare_documents(keys, left.document(), right.document())? == Ordering::Less)
 }
 
 fn read_spilled_row(reader: &mut SpillRunReader) -> Result<Option<ExecutionRow>, ExecutionError> {
@@ -4356,29 +6146,6 @@ fn read_group_spill_record( reader: &mut GroupSpillRunReader, ) -> Result<Option
     reader.next_record()
 }
 
-fn group_merge_heads( runs: &[SpillRun], ) -> EngineResult<(Vec<GroupSpillRunReader>, Vec<Option<GroupSpillRecord>>)> {
-    let mut readers = runs
-        .iter()
-        .map(GroupSpillRunReader::new)
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(engine_spill_error)?;
-    let heads = readers
-        .iter_mut()
-        .map(read_group_spill_record)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(EngineError::execution)?;
-    Ok((readers, heads))
-}
-
-fn smallest_group_head(heads: &[Option<GroupSpillRecord>]) -> Option<usize> {
-    heads
-        .iter()
-        .enumerate()
-        .filter_map(|(index, head)| head.as_ref().map(|head| (index, &head.key)))
-        .min_by(|left, right| left.1.cmp(right.1))
-        .map(|(index, _)| index)
-}
-
 fn flush_keyed_run( spill: &SpillEngine, chunk: &mut Vec<KeyedRow>, runs: &mut Vec<SpillRun>, ) -> EngineResult<u64> {
     chunk.sort_by(|left, right| left.key.cmp(&right.key));
     let mut writer = spill.create_run().map_err(engine_spill_error)?;
@@ -4434,44 +6201,22 @@ fn read_keyed_row(reader: &mut SpillRunReader) -> Result<Option<KeyedRow>, Execu
         .transpose()
 }
 
-fn keyed_merge_heads( runs: &[SpillRun], ) -> EngineResult<(Vec<SpillRunReader>, Vec<Option<KeyedRow>>)> {
-    let mut readers = runs
-        .iter()
-        .map(SpillRun::reader)
-        .collect::<io::Result<Vec<_>>>()
-        .map_err(engine_spill_error)?;
-    let heads = readers
-        .iter_mut()
-        .map(read_keyed_row)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(EngineError::execution)?;
-    Ok((readers, heads))
-}
-
-fn smallest_keyed_head(heads: &[Option<KeyedRow>]) -> Option<usize> {
-    heads
-        .iter()
-        .enumerate()
-        .filter_map(|(index, head)| head.as_ref().map(|head| (index, &head.key)))
-        .min_by(|left, right| left.1.cmp(right.1))
-        .map(|(index, _)| index)
-}
-
 fn merge_distinct_runs( runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
-    let (mut readers, mut heads) = keyed_merge_heads(runs)?;
+    let mut merge = merge_runs(runs, SpillRun::reader, read_keyed_row)?;
     let mut previous: Option<Arc<[u8]>> = None;
     let mut returned = 0u64;
-    while let Some(index) = smallest_keyed_head(&heads) {
-        if limit.is_some_and(|limit| returned as usize >= limit) {
+    while limit.is_none_or(|limit| (returned as usize) < limit) {
+        let Some(keyed) = merge
+            .pop_min(|left, right| Ok(left.key < right.key))
+            .map_err(EngineError::execution)?
+        else {
             break;
-        }
-        let keyed = heads[index].take().expect("selected keyed head");
+        };
         if previous.as_deref() != Some(keyed.key.as_ref()) {
             previous = Some(keyed.key.clone());
             visitor(keyed.row)?;
             returned = returned.saturating_add(1);
         }
-        heads[index] = read_keyed_row(&mut readers[index]).map_err(EngineError::execution)?;
     }
     Ok(returned)
 }
@@ -4488,7 +6233,7 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
         let merge_started = Instant::now();
         let mut merged_partials = 0u64;
         let init_started = Instant::now();
-        let (mut readers, mut heads) = group_merge_heads(runs)?;
+        let mut merge = merge_runs(runs, GroupSpillRunReader::new, read_group_spill_record)?;
         EXTERNAL_GROUP_MERGE_INIT_US
             .fetch_add(elapsed_micros(init_started), AtomicOrdering::Relaxed);
         let mut current_key: Option<Arc<[u8]>> = None;
@@ -4504,7 +6249,9 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
             let sampled =
                 crate::debug::query_instrumentation_enabled() && merged_partials & 1023 == 0;
             let select_started = sampled.then(Instant::now);
-            let selected = smallest_group_head(&heads);
+            let selected = merge
+                .min_index(|left, right| Ok(left.key < right.key))
+                .map_err(EngineError::execution)?;
             if let Some(started) = select_started {
                 merge_select_ns = merge_select_ns.saturating_add(elapsed_nanos(started));
             }
@@ -4516,7 +6263,11 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
                 merge_samples = merge_samples.saturating_add(1);
             }
 
-            let keyed = heads[index].take().expect("selected keyed head");
+            let read_started = sampled.then(Instant::now);
+            let keyed = merge.take(index).map_err(EngineError::execution)?;
+            if let Some(started) = read_started {
+                merge_read_ns = merge_read_ns.saturating_add(elapsed_nanos(started));
+            }
             merged_partials = merged_partials.saturating_add(1);
             let key_changed = current_key
                 .as_deref()
@@ -4576,13 +6327,6 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
             if let Some(started) = partial_started {
                 merge_partial_ns = merge_partial_ns.saturating_add(elapsed_nanos(started));
             }
-
-            let read_started = sampled.then(Instant::now);
-            heads[index] =
-                read_group_spill_record(&mut readers[index]).map_err(EngineError::execution)?;
-            if let Some(started) = read_started {
-                merge_read_ns = merge_read_ns.saturating_add(elapsed_nanos(started));
-            }
         }
 
         if limit.is_none_or(|limit| (returned as usize) < limit) {
@@ -4607,14 +6351,16 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
 
     // Compatibility fallback for custom runtimes that only implement the
     // legacy whole-group materializer.
-    let (mut readers, mut heads) = group_merge_heads(runs)?;
+    let mut merge = merge_runs(runs, GroupSpillRunReader::new, read_group_spill_record)?;
     let mut current_key: Option<Arc<[u8]>> = None;
     let mut documents = Vec::<Arc<Document>>::new();
     let mut group_bytes = 0usize;
     let mut returned = 0u64;
 
-    while let Some(index) = smallest_group_head(&heads) {
-        let keyed = heads[index].take().expect("selected keyed head");
+    while let Some(keyed) = merge
+        .pop_min(|left, right| Ok(left.key < right.key))
+        .map_err(EngineError::execution)?
+    {
         if current_key
             .as_deref()
             .is_some_and(|key| key != keyed.key.as_ref())
@@ -4642,8 +6388,6 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
             )));
         }
         documents.push(row.shared_document());
-        heads[index] =
-            read_group_spill_record(&mut readers[index]).map_err(EngineError::execution)?;
     }
     emit_group_documents(runtime, keys, limit, &mut documents, &mut returned, visitor)?;
     Ok(returned)

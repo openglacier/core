@@ -12,7 +12,7 @@ use crate::{
 use super::{
     BinaryOperator, ExecutionError, ExecutionResult, Expression, ExpressionFieldPath,
     ExpressionFieldResolver, ExpressionView, Literal, PhysicalOperator, SemanticValue,
-    UnaryOperator, Fields, ProjectionReuse
+    UnaryOperator, Fields, ProjectionReuse, SlotExpansion
 };
 
 /// Row representation used by stages that can consume projected field values
@@ -160,7 +160,9 @@ impl ProjectedValuePipeline {
                 PhysicalOperator::Filter { predicate } => {
                     collect_expression_fields(predicate, &mut required);
                 }
-                _ => match operator.execution_properties().fields {
+                // Only the native Select is a pure visibility boundary here;
+                // `select … as` computes its outputs and has no stage below.
+                PhysicalOperator::Select { .. } => match operator.execution_properties().fields {
                     Fields::Projected(fields) => {
                         if required.iter().any(|field| !fields.contains(field)) {
                             return Ok(None);
@@ -168,6 +170,7 @@ impl ProjectedValuePipeline {
                     }
                     _ => return Ok(None),
                 },
+                _ => return Ok(None),
             }
         }
 
@@ -268,7 +271,15 @@ impl ProjectedValuePipeline {
         F: FnMut(&Expression, &dyn ExpressionFieldResolver<crate::Value>) -> ExecutionResult<bool>,
     {
         let row = ProjectedValueRow::new(&self.layout, values)?;
-        self.accepts_resolved(&row, evaluate)
+        let mut evaluate = evaluate;
+        for stage in self.stages.iter() {
+            if let ProjectedValueStage::Filter(predicate) = stage {
+                if !evaluate(predicate.expression(), &row)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     /// Applies the same projected stage prefix to borrowed storage values.
@@ -299,24 +310,6 @@ impl ProjectedValuePipeline {
                     evaluate(predicate.expression(), row)?
                 };
                 if !accepted {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
-    }
-
-    fn accepts_resolved<F>(
-        &self,
-        row: &dyn ExpressionFieldResolver<crate::Value>,
-        mut evaluate: F,
-    ) -> ExecutionResult<bool>
-    where
-        F: FnMut(&Expression, &dyn ExpressionFieldResolver<crate::Value>) -> ExecutionResult<bool>,
-    {
-        for stage in self.stages.iter() {
-            if let ProjectedValueStage::Filter(predicate) = stage {
-                if !evaluate(predicate.expression(), row)? {
                     return Ok(false);
                 }
             }
@@ -595,6 +588,232 @@ impl ExpressionFieldResolver<crate::Value> for ProjectedValueRow<'_> {
         self.get(field)
             .cloned()
             .map_or(SemanticValue::Missing, SemanticValue::Present)
+    }
+}
+
+/// One row held as values by top-level field, without a document.
+///
+/// Row-local stages that declare top-level writes run on it (see
+/// [`super::CompiledStage::apply_slots`]); an absent field is `None`.
+#[derive(Debug)]
+pub struct SlotRow<'a> {
+    fields: &'a [ExpressionFieldPath],
+    values: &'a mut [Option<Value>],
+}
+
+impl<'a> SlotRow<'a> {
+    fn new(fields: &'a [ExpressionFieldPath], values: &'a mut [Option<Value>]) -> Self {
+        debug_assert_eq!(fields.len(), values.len());
+        Self { fields, values }
+    }
+
+    fn slot(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|field| field.first() == name)
+    }
+
+    /// Value at a (possibly nested) path.
+    #[must_use]
+    pub fn get(&self, field: &ExpressionFieldPath) -> Option<&Value> {
+        let mut segments = field.iter();
+        let mut current = self.values[self.slot(segments.next()?)?].as_ref()?;
+        for segment in segments {
+            current = current.as_object()?.get(segment)?;
+        }
+        Some(current)
+    }
+
+    /// Writes (or with `None` removes) a top-level field of the program layout.
+    pub fn set(&mut self, field: &ExpressionFieldPath, value: Option<Value>) {
+        let slot = self.slot(field.first()).expect("slot program layout holds every written field");
+        self.values[slot] = value;
+    }
+
+    /// Removes a top-level field and returns its value.
+    pub fn take(&mut self, field: &ExpressionFieldPath) -> Option<Value> {
+        let slot = self.slot(field.first())?;
+        self.values[slot].take()
+    }
+
+    /// Removes every field.
+    pub fn clear(&mut self) {
+        self.values.iter_mut().for_each(|value| *value = None);
+    }
+}
+
+impl ExpressionFieldResolver<Value> for SlotRow<'_> {
+    fn resolve_field(&self, field: &ExpressionFieldPath) -> SemanticValue<Value> {
+        self.get(field).cloned().map_or(SemanticValue::Missing, SemanticValue::Present)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum SlotStage {
+    Filter(Expression),
+    Stage(Arc<super::CompiledStage>),
+}
+
+/// Row-local stages (`where` and compiled stages that run on slots) applied
+/// to a [`SlotRow`], so a row read as projected values never becomes a
+/// document until a consumer needs one.
+///
+/// Which stages qualify is decided from what they declare: the fields they
+/// read, and top-level fields they write, one row in and one row out.
+#[derive(Clone, Debug)]
+pub struct SlotProgram {
+    fields: Arc<[ExpressionFieldPath]>,
+    stages: Arc<[SlotStage]>,
+}
+
+impl SlotProgram {
+    /// Compiles `operators` over rows holding `source_fields` (top-level).
+    /// Returns `None` when a stage cannot run on slots or reads `_id`.
+    /// Every stage turns one row into at most one: see [`Self::run`].
+    #[must_use]
+    pub fn compile(operators: &[PhysicalOperator], source_fields: &[ExpressionFieldPath]) -> Option<Self> {
+        Self::compile_with(operators, source_fields, false)
+    }
+
+    /// Like [`Self::compile`], also accepting stages that turn one row into
+    /// several (`unwind`); such a program runs through [`Self::run_each`].
+    #[must_use]
+    pub fn compile_expanding(operators: &[PhysicalOperator], source_fields: &[ExpressionFieldPath]) -> Option<Self> {
+        Self::compile_with(operators, source_fields, true)
+    }
+
+    fn compile_with(operators: &[PhysicalOperator], source_fields: &[ExpressionFieldPath], expanding: bool) -> Option<Self> {
+        if source_fields.iter().any(|field| field.len() != 1 || field.first() == "_id") {
+            return None;
+        }
+        let mut fields = source_fields.to_vec();
+        let mut stages = Vec::with_capacity(operators.len());
+        for operator in operators {
+            if operator.reads_document_id() {
+                return None;
+            }
+            match operator {
+                PhysicalOperator::Filter { predicate } => stages.push(SlotStage::Filter(predicate.clone())),
+                PhysicalOperator::Custom { writes: false, compiled: Some(stage), .. } if stage.runs_on_slots() || (expanding && stage.expands_on_slots()) => {
+                    for field in stage.writes().iter() {
+                        if field.first() == "_id" {
+                            return None;
+                        }
+                        if !fields.contains(field) {
+                            fields.push(field.clone());
+                        }
+                    }
+                    stages.push(SlotStage::Stage(Arc::clone(stage)));
+                }
+                _ => return None,
+            }
+        }
+        Some(Self { fields: Arc::from(fields), stages: Arc::from(stages) })
+    }
+
+    /// Fields held by the slots of a row, in slot order.
+    #[must_use]
+    pub fn fields(&self) -> &[ExpressionFieldPath] {
+        &self.fields
+    }
+
+    /// Slot count of a row: the source fields first, then written fields.
+    #[must_use]
+    pub fn width(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// Slots holding `fields` after the stages ran, or `None` when one of
+    /// them is not a top-level field of the program.
+    #[must_use]
+    pub fn slots(&self, fields: &[ExpressionFieldPath]) -> Option<Vec<usize>> {
+        fields.iter().map(|field| self.fields.iter().position(|slot| slot == field)).collect()
+    }
+
+    /// Runs the stages on one row whose leading slots hold the source values
+    /// and the rest `None`. Returns whether the row passed every filter.
+    /// Only for a program from [`Self::compile`].
+    pub fn run<F>(&self, values: &mut [Option<Value>], mut evaluate: F) -> ExecutionResult<bool>
+    where
+        F: FnMut(&Expression, &dyn ExpressionFieldResolver<Value>) -> ExecutionResult<bool>,
+    {
+        let mut row = SlotRow::new(&self.fields, values);
+        for stage in self.stages.iter() {
+            match stage {
+                SlotStage::Filter(predicate) => {
+                    if !evaluate(predicate, &row)? {
+                        return Ok(false);
+                    }
+                }
+                SlotStage::Stage(stage) => stage.apply_slots(&mut row)?,
+            }
+        }
+        Ok(true)
+    }
+
+    /// Runs the stages on one row and calls `emit` for every output row, in
+    /// order: none when a filter drops it, several when a stage expands it.
+    /// Returns how many rows were emitted.
+    pub fn run_each<F, E>(&self, values: &mut [Option<Value>], mut evaluate: F, emit: &mut E) -> ExecutionResult<u64>
+    where
+        F: FnMut(&Expression, &dyn ExpressionFieldResolver<Value>) -> ExecutionResult<bool>,
+        E: FnMut(&[Option<Value>]) -> ExecutionResult<()>,
+    {
+        self.run_from(0, values, &mut evaluate, emit)
+    }
+
+    fn run_from<F, E>(&self, start: usize, values: &mut [Option<Value>], evaluate: &mut F, emit: &mut E) -> ExecutionResult<u64>
+    where
+        F: FnMut(&Expression, &dyn ExpressionFieldResolver<Value>) -> ExecutionResult<bool>,
+        E: FnMut(&[Option<Value>]) -> ExecutionResult<()>,
+    {
+        let mut row = SlotRow::new(&self.fields, values);
+        for (position, stage) in self.stages.iter().enumerate().skip(start) {
+            match stage {
+                SlotStage::Filter(predicate) => {
+                    if !evaluate(predicate, &row)? {
+                        return Ok(0);
+                    }
+                }
+                SlotStage::Stage(stage) if stage.expands_on_slots() => match stage.expand_slots(&row)? {
+                    SlotExpansion::Keep => {}
+                    SlotExpansion::Drop => return Ok(0),
+                    SlotExpansion::Set(writes) => {
+                        for (field, value) in writes {
+                            row.set(&field, value);
+                        }
+                    }
+                    SlotExpansion::Each { field, index, items } => {
+                        let mut emitted = 0;
+                        let mut copy = Vec::with_capacity(row.values.len());
+                        for (item_position, item) in items.iter().enumerate() {
+                            copy.clear();
+                            copy.extend_from_slice(row.values);
+                            let mut item_row = SlotRow::new(&self.fields, &mut copy);
+                            item_row.set(&field, Some(item.clone()));
+                            if let Some(index) = &index {
+                                item_row.set(index, Some(Value::unsigned(item_position as u64)));
+                            }
+                            emitted += self.run_from(position + 1, &mut copy, evaluate, emit)?;
+                        }
+                        return Ok(emitted);
+                    }
+                },
+                SlotStage::Stage(stage) => stage.apply_slots(&mut row)?,
+            }
+        }
+        emit(row.values)?;
+        Ok(1)
+    }
+
+    /// Document holding the present slots of a row.
+    #[must_use]
+    pub fn document(&self, values: &[Option<Value>]) -> crate::Document {
+        let mut document = crate::Document::new();
+        for (field, value) in self.fields.iter().zip(values) {
+            if let Some(value) = value {
+                document.insert(field.first(), value.clone());
+            }
+        }
+        document
     }
 }
 

@@ -5,7 +5,7 @@ use std::{fmt, sync::Arc};
 
 use super::{
     BinaryOperator, Expression, ExpressionFieldPath, ExpressionKind, Literal,
-    LogicalPlanFingerprint, StageName, UnaryOperator,
+    LogicalPlanFingerprint, PhysicalLoadMode, StageName, UnaryOperator,
 };
 
 use crate::query::ast::{ObjectAst, ObjectKeyAst, ValueAst};
@@ -648,6 +648,12 @@ impl PivotValue {
     pub fn alias(&self) -> Option<&str> {
         self.alias.as_deref()
     }
+
+    /// Name of the cells this value fills: its alias, else its field's last segment.
+    #[must_use]
+    pub fn output_name(&self) -> &str {
+        self.alias().unwrap_or_else(|| self.field.last())
+    }
 }
 
 /// Fully resolved pivot contract.
@@ -738,6 +744,26 @@ pub enum LogicalOperator {
     },
     Pivot {
         specification: PivotSpecification,
+    },
+    /// Writes the documents given inline in `chunks`.
+    StreamingLoad {
+        mode: PhysicalLoadMode,
+        chunks: Arc<[Arc<str>]>,
+    },
+    /// Attaches to each row, under `into`, the rows of a read-only pipeline
+    /// over another collection; `outer_alias` names the row in that pipeline.
+    Lookup {
+        collection: Arc<str>,
+        alias: Option<Arc<str>>,
+        outer_alias: Option<Arc<str>>,
+        into: Arc<str>,
+        pipeline: Arc<[LogicalOperator]>,
+    },
+    /// Appends the rows of a read-only pipeline over another collection.
+    Union {
+        collection: Arc<str>,
+        alias: Option<Arc<str>>,
+        pipeline: Arc<[LogicalOperator]>,
     },
     Custom {
         stage: StageName,
@@ -873,7 +899,7 @@ impl LogicalOperator {
     #[must_use]
     pub const fn is_mutating(&self) -> bool {
         match self {
-            Self::Set { .. } | Self::Load { .. } | Self::Delete | Self::Insert { .. } => true,
+            Self::Set { .. } | Self::Load { .. } | Self::StreamingLoad { .. } | Self::Delete | Self::Insert { .. } => true,
             Self::Custom { mutating, .. } => *mutating,
             Self::Filter { .. }
             | Self::Limit { .. }
@@ -883,7 +909,9 @@ impl LogicalOperator {
             | Self::Distinct { .. }
             | Self::Count { .. }
             | Self::Group { .. }
-            | Self::Pivot { .. } => false,
+            | Self::Pivot { .. }
+            | Self::Lookup { .. }
+            | Self::Union { .. } => false,
         }
     }
 
@@ -898,6 +926,7 @@ impl LogicalOperator {
             self,
             Self::Set { .. }
                 | Self::Load { .. }
+                | Self::StreamingLoad { .. }
                 | Self::Count { .. }
                 | Self::Delete
                 | Self::Insert { .. }
@@ -1083,6 +1112,32 @@ impl LogicalOperator {
                         write_string(output, alias);
                     }
                 });
+                output.push(')');
+            }
+            Self::StreamingLoad { mode, chunks } => {
+                output.push_str("streaming_load(");
+                output.push_str(mode.as_str());
+                for chunk in chunks.iter() {
+                    output.push(',');
+                    write_string(output, chunk);
+                }
+                output.push(')');
+            }
+            Self::Lookup { collection, alias, outer_alias, into, pipeline } => {
+                output.push_str("lookup(");
+                write_string(output, collection);
+                write_optional_string(output, alias.as_deref());
+                write_optional_string(output, outer_alias.as_deref());
+                output.push(',');
+                write_string(output, into);
+                write_pipeline(output, pipeline);
+                output.push(')');
+            }
+            Self::Union { collection, alias, pipeline } => {
+                output.push_str("union(");
+                write_string(output, collection);
+                write_optional_string(output, alias.as_deref());
+                write_pipeline(output, pipeline);
                 output.push(')');
             }
             Self::Custom {
@@ -1694,6 +1749,8 @@ pub enum LogicalOperatorKind {
     Insert,
     Group,
     Pivot,
+    Lookup,
+    Union,
     Custom,
 }
 
@@ -1713,6 +1770,8 @@ impl fmt::Display for LogicalOperatorKind {
             Self::Insert => "insert",
             Self::Group => "group",
             Self::Pivot => "pivot",
+            Self::Lookup => "lookup",
+            Self::Union => "union",
             Self::Custom => "custom",
         })
     }
@@ -1725,7 +1784,7 @@ impl LogicalOperator {
         match self {
             Self::Filter { .. } => LogicalOperatorKind::Filter,
             Self::Set { .. } => LogicalOperatorKind::Set,
-            Self::Load { .. } => LogicalOperatorKind::Load,
+            Self::Load { .. } | Self::StreamingLoad { .. } => LogicalOperatorKind::Load,
             Self::Limit { .. } => LogicalOperatorKind::Limit,
             Self::Skip { .. } => LogicalOperatorKind::Skip,
             Self::Sort { .. } => LogicalOperatorKind::Sort,
@@ -1736,6 +1795,8 @@ impl LogicalOperator {
             Self::Insert { .. } => LogicalOperatorKind::Insert,
             Self::Group { .. } => LogicalOperatorKind::Group,
             Self::Pivot { .. } => LogicalOperatorKind::Pivot,
+            Self::Lookup { .. } => LogicalOperatorKind::Lookup,
+            Self::Union { .. } => LogicalOperatorKind::Union,
             Self::Custom { .. } => LogicalOperatorKind::Custom,
         }
     }
@@ -1858,24 +1919,20 @@ fn validate_pivot_values(values: &[PivotValue]) -> LogicalPlanResult<()> {
             FieldListContext::PivotValues,
         ));
     }
+    // Each value names its cells: two values with the same name would share them.
     for (index, value) in values.iter().enumerate() {
-        if values[..index]
+        let Some(previous) = values[..index]
             .iter()
-            .any(|previous| previous.field() == value.field())
-        {
-            return Err(LogicalPlanError::duplicate_pivot_value(
-                value.field().clone(),
-            ));
-        }
-        if let Some(alias) = value.alias() {
-            if values[..index]
-                .iter()
-                .filter_map(PivotValue::alias)
-                .any(|previous| previous == alias)
-            {
-                return Err(LogicalPlanError::duplicate_pivot_alias(alias));
+            .find(|previous| previous.output_name() == value.output_name())
+        else {
+            continue;
+        };
+        return Err(match (previous.alias(), value.alias()) {
+            (None, None) if previous.field() == value.field() => {
+                LogicalPlanError::duplicate_pivot_value(value.field().clone())
             }
-        }
+            _ => LogicalPlanError::duplicate_pivot_alias(value.output_name()),
+        });
     }
     Ok(())
 }
@@ -1966,40 +2023,14 @@ fn object_key_text(key: ObjectKeyAst, source: &str) -> LogicalPlanResult<Arc<str
 }
 
 fn decode_string_literal(literal: &str) -> LogicalPlanResult<String> {
-    let bytes = literal.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
-        return Err(LogicalPlanError::invalid_string_literal(
-            "expected double-quoted string",
-        ));
-    }
-
-    let mut output = String::with_capacity(literal.len().saturating_sub(2));
-    let mut characters = literal[1..literal.len() - 1].chars();
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            output.push(character);
-            continue;
-        }
-        let escaped = characters.next().ok_or_else(|| {
-            LogicalPlanError::invalid_string_literal("unterminated escape sequence")
-        })?;
-        output.push(match escaped {
-            '"' => '"',
-            '\\' => '\\',
-            '/' => '/',
-            'b' => '\u{0008}',
-            'f' => '\u{000c}',
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            other => {
-                return Err(LogicalPlanError::invalid_string_literal(format!(
-                    "unsupported escape sequence \\\\{other}"
-                )))
-            }
-        });
-    }
-    Ok(output)
+    let inner = literal
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .filter(|_| literal.len() >= 2)
+        .ok_or_else(|| LogicalPlanError::invalid_string_literal("expected double-quoted string"))?;
+    super::syntax::unescape_string(inner).map_err(|character| {
+        LogicalPlanError::invalid_string_literal(format!("unsupported escape sequence \\{character}"))
+    })
 }
 
 fn validate_operators(operators: &[LogicalOperator]) -> LogicalPlanResult<()> {
@@ -2012,7 +2043,7 @@ fn validate_operators(operators: &[LogicalOperator]) -> LogicalPlanResult<()> {
 fn validate_next_operator( existing: &[LogicalOperator], next: &LogicalOperator, ) -> LogicalPlanResult<()> {
     let next_index = existing.len();
 
-    if matches!(next, LogicalOperator::Load { .. }) && next_index != 0 {
+    if matches!(next, LogicalOperator::Load { .. } | LogicalOperator::StreamingLoad { .. }) && next_index != 0 {
         return Err(LogicalPlanError::load_not_first(next_index));
     }
 
@@ -2117,7 +2148,7 @@ fn write_expression(output: &mut String, expression: &Expression) {
         ExpressionKind::Array(items) => write_expressions(output, "array(", items),
         ExpressionKind::Call { function, arguments } => {
             output.push_str("call(");
-            write_string(output, function);
+            write_string(output, function.as_str());
             write_expressions(output, ",", arguments);
         }
     }
@@ -2190,6 +2221,22 @@ fn write_string(output: &mut String, value: &str) {
     output.push_str(&value.len().to_string());
     output.push(':');
     output.push_str(value);
+}
+
+/// `,<string>`, or `,-` when absent.
+fn write_optional_string(output: &mut String, value: Option<&str>) {
+    output.push(',');
+    match value {
+        Some(value) => write_string(output, value),
+        None => output.push('-'),
+    }
+}
+
+/// `,[<operator>,<operator>…]`: a nested pipeline in canonical form.
+fn write_pipeline(output: &mut String, operators: &[LogicalOperator]) {
+    output.push_str(",[");
+    write_joined(output, operators, |output, operator| operator.write_canonical(output));
+    output.push(']');
 }
 
 #[cfg(test)]

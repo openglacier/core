@@ -13,6 +13,9 @@ pub type ExpressionResult<T> = std::result::Result<T, ExpressionError>;
 pub struct Expression {
     kind: ExpressionKind,
     span: Span,
+    /// Value of the node when it depends on no field and no volatile
+    /// function, computed once when the expression is parsed.
+    constant: Option<crate::Value>,
 }
 
 impl Expression {
@@ -20,7 +23,58 @@ impl Expression {
     #[must_use]
     #[inline]
     pub const fn new(kind: ExpressionKind, span: Span) -> Self {
-        Self { kind, span }
+        Self { kind, span, constant: None }
+    }
+
+    /// The resolved function of a call node.
+    #[must_use]
+    #[inline]
+    pub const fn function(&self) -> Option<super::Function> {
+        match &self.kind {
+            ExpressionKind::Call { function, .. } => Some(*function),
+            _ => None,
+        }
+    }
+
+    /// The node's precomputed value, when it is constant.
+    #[must_use]
+    #[inline]
+    pub const fn constant(&self) -> Option<&crate::Value> {
+        self.constant.as_ref()
+    }
+
+    /// Precomputes the value of every constant subtree: literals, arrays and
+    /// objects of constants, operators and deterministic functions over
+    /// constants. A subtree whose evaluation fails stays as it is, so the
+    /// error still surfaces when rows are evaluated. Returns whether this
+    /// node is constant.
+    fn fold_constants(&mut self) -> bool {
+        // Every item is folded, even after a non-constant one.
+        let fold_all = |items: &mut [Self]| {
+            let mut all = true;
+            for item in items {
+                all &= item.fold_constants();
+            }
+            all
+        };
+        let children_constant = match &mut self.kind {
+            ExpressionKind::Literal(_) => true,
+            ExpressionKind::Field(_) => false,
+            ExpressionKind::Unary { operand, .. } | ExpressionKind::Group(operand) => operand.fold_constants(),
+            ExpressionKind::Binary { left, right, .. } => {
+                let left = left.fold_constants();
+                right.fold_constants() && left
+            }
+            ExpressionKind::Array(items) => fold_all(items),
+            ExpressionKind::Call { function, arguments } => {
+                let volatile = super::eval::is_volatile(*function);
+                fold_all(arguments) && !volatile
+            }
+        };
+        if children_constant {
+            self.constant = super::eval::evaluate_constant(self);
+        }
+        self.constant.is_some()
     }
 
     /// Creates a literal expression.
@@ -212,7 +266,7 @@ impl Expression {
             ExpressionKind::Group(expression) => ExpressionView::Group(expression.as_ref()),
             ExpressionKind::Array(items) => ExpressionView::Array(items),
             ExpressionKind::Call { function, arguments } => ExpressionView::Call {
-                function,
+                function: function.as_str(),
                 arguments,
             },
         }
@@ -239,6 +293,53 @@ impl Expression {
             visit(path);
         }
         self.for_each_child(&mut |child| child.for_each_field(visit));
+    }
+}
+
+/// Renders the expression back to query syntax (used by `explain`).
+impl fmt::Display for Expression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let list = |formatter: &mut fmt::Formatter<'_>, items: &[Self]| -> fmt::Result {
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    formatter.write_str(", ")?;
+                }
+                write!(formatter, "{item}")?;
+            }
+            Ok(())
+        };
+        match &self.kind {
+            ExpressionKind::Literal(Literal::Null) => formatter.write_str("null"),
+            ExpressionKind::Literal(Literal::Bool(value)) => write!(formatter, "{value}"),
+            ExpressionKind::Literal(Literal::Number(text) | Literal::Json(text)) => formatter.write_str(text),
+            ExpressionKind::Literal(Literal::String(text)) => write!(formatter, "{}", serde_json::Value::from(text.as_ref())),
+            ExpressionKind::Field(path) => write!(formatter, "{path}"),
+            ExpressionKind::Unary { operator: UnaryOperator::Not, operand } => write!(formatter, "not {operand}"),
+            ExpressionKind::Unary { operator, operand } if operand.is_binary() => write!(formatter, "{operator}({operand})"),
+            ExpressionKind::Unary { operator, operand } => write!(formatter, "{operator}{operand}"),
+            ExpressionKind::Binary { left, operator, right } => {
+                let spelling = match operator {
+                    BinaryOperator::And => "and",
+                    BinaryOperator::Or => "or",
+                    other => other.as_str(),
+                };
+                write!(formatter, "{left} {spelling} {right}")
+            }
+            ExpressionKind::Group(inner) => write!(formatter, "({inner})"),
+            ExpressionKind::Array(items) => {
+                formatter.write_str("[")?;
+                list(formatter, items)?;
+                formatter.write_str("]")
+            }
+            ExpressionKind::Call { function: super::Function::Optional, arguments } if arguments.len() == 1 && arguments[0].is_field() => {
+                write!(formatter, "{}?", arguments[0])
+            }
+            ExpressionKind::Call { function, arguments } => {
+                write!(formatter, "{function}(")?;
+                list(formatter, arguments)?;
+                formatter.write_str(")")
+            }
+        }
     }
 }
 
@@ -276,7 +377,7 @@ pub enum ExpressionKind {
 
     /// Function call: `round(price * qty, 2)`.
     Call {
-        function: Arc<str>,
+        function: super::Function,
         arguments: Vec<Expression>,
     },
 }
@@ -476,6 +577,12 @@ impl ExpressionFieldPath {
             .as_ref()
     }
 
+    /// Returns the segments.
+    #[must_use]
+    pub fn segments(&self) -> &[Arc<str>] {
+        &self.segments
+    }
+
     /// Iterates over segments.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
         self.segments.iter().map(AsRef::as_ref)
@@ -654,20 +761,25 @@ impl fmt::Display for BinaryOperator {
 /// Returns an error when the expression is empty, malformed, or followed by an
 /// unexpected token.
 pub fn parse_expression(source: &str) -> ExpressionResult<Expression> {
+    // A whole-expression JSON array stays one literal; objects are lexed as `Object` tokens.
     let trimmed = source.trim();
-    if matches!(trimmed.as_bytes().first(), Some(b'{' | b'[')) {
+    if trimmed.starts_with('[') {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if value.is_object() || value.is_array() {
+            if value.is_array() {
                 let canonical =
                     serde_json::to_string(&value).expect("parsed JSON value must serialize");
-                return Ok(Expression::literal(
+                let mut expression = Expression::literal(
                     Literal::Json(Arc::from(canonical)),
                     Span::new(0, source.len()),
-                ));
+                );
+                expression.fold_constants();
+                return Ok(expression);
             }
         }
     }
-    ExpressionParser::new(source).parse()
+    let mut expression = ExpressionParser::new(source).parse()?;
+    expression.fold_constants();
+    Ok(expression)
 }
 
 /// Expression parser.
@@ -719,9 +831,16 @@ impl<'source> ExpressionParser<'source> {
         let mut left = self.parse_unary()?;
 
         loop {
+            // `x [not] between low and high` sits at the relational level.
+            let negated_between = self.current.kind == ExpressionTokenKind::Bang && self.next_is_word("between");
+            if (negated_between || self.current_is_word("between")) && minimum_precedence <= RELATIONAL_PRECEDENCE {
+                left = self.parse_between(left, negated_between)?;
+                continue;
+            }
+
             let operator = match binary_operator(self.current.kind) {
                 Some(operator) => operator,
-                // `not in` is the only infix use of `not`.
+                // `not in` and `not between` are the only infix uses of `not`.
                 None if self.current.kind == ExpressionTokenKind::Bang && self.next_is(ExpressionTokenKind::In) => {
                     BinaryOperator::NotIn
                 }
@@ -763,31 +882,7 @@ impl<'source> ExpressionParser<'source> {
 
             ExpressionTokenKind::Plus => Some(UnaryOperator::Positive),
 
-            ExpressionTokenKind::Identifier
-            | ExpressionTokenKind::Number
-            | ExpressionTokenKind::String
-            | ExpressionTokenKind::True
-            | ExpressionTokenKind::False
-            | ExpressionTokenKind::Null
-            | ExpressionTokenKind::LeftParen
-            | ExpressionTokenKind::RightParen
-            | ExpressionTokenKind::LeftBracket
-            | ExpressionTokenKind::RightBracket
-            | ExpressionTokenKind::Comma
-            | ExpressionTokenKind::In
-            | ExpressionTokenKind::Dot
-            | ExpressionTokenKind::Star
-            | ExpressionTokenKind::Slash
-            | ExpressionTokenKind::Percent
-            | ExpressionTokenKind::EqualEqual
-            | ExpressionTokenKind::BangEqual
-            | ExpressionTokenKind::Less
-            | ExpressionTokenKind::LessEqual
-            | ExpressionTokenKind::Greater
-            | ExpressionTokenKind::GreaterEqual
-            | ExpressionTokenKind::AndAnd
-            | ExpressionTokenKind::OrOr
-            | ExpressionTokenKind::End => None,
+            _ => None,
         };
 
         let Some(operator) = operator else {
@@ -811,7 +906,14 @@ impl<'source> ExpressionParser<'source> {
             return Ok(Expression::new(ExpressionKind::Literal(Literal::Number(Arc::from(text))), span));
         }
 
-        let operand = self.parse_unary()?;
+        // `not` binds looser than comparisons, like in SQL and Python:
+        // `not city == "Berlin"` is `not (city == "Berlin")`, while
+        // `not a and b` stays `(not a) and b`.
+        let operand = if operator == UnaryOperator::Not {
+            self.parse_precedence(BinaryOperator::Equal.precedence())?
+        } else {
+            self.parse_unary()?
+        };
         let span = Span::new(start, operand.span().end());
 
         Ok(Expression::new(
@@ -821,6 +923,30 @@ impl<'source> ExpressionParser<'source> {
             },
             span,
         ))
+    }
+
+    /// Parses `between low and high` after `value`, with the current token on
+    /// `between` (or on `not` when `negated`). Desugars to `between(value, low, high)`.
+    fn parse_between(&mut self, value: Expression, negated: bool) -> ExpressionResult<Expression> {
+        if negated {
+            self.advance()?;
+        }
+        self.advance()?;
+        let low = self.parse_precedence(RELATIONAL_PRECEDENCE + 1)?;
+        if self.current.kind != ExpressionTokenKind::AndAnd {
+            return Err(match self.current.kind {
+                ExpressionTokenKind::End => ExpressionError::unexpected_end(self.current.span, "`and` in `between … and …`"),
+                _ => ExpressionError::unexpected_token(self.current.span, self.current.text(self.source), "`and` in `between … and …`"),
+            });
+        }
+        self.advance()?;
+        let high = self.parse_precedence(RELATIONAL_PRECEDENCE + 1)?;
+        let span = Span::new(value.span().start(), high.span().end());
+        let call = Expression::new(
+            ExpressionKind::Call { function: super::Function::Between, arguments: vec![value, low, high] },
+            span,
+        );
+        Ok(if negated { Expression::unary(UnaryOperator::Not, call, span) } else { call })
     }
 
     fn parse_primary(&mut self) -> ExpressionResult<Expression> {
@@ -888,30 +1014,24 @@ impl<'source> ExpressionParser<'source> {
 
             ExpressionTokenKind::LeftBracket => self.parse_array(),
 
+            ExpressionTokenKind::Object => {
+                let span = self.current.span;
+                let text = self.current.text(self.source);
+                let canonical = serde_json::from_str::<serde_json::Value>(text)
+                    .ok()
+                    .filter(serde_json::Value::is_object)
+                    .map(|value| serde_json::to_string(&value).expect("parsed JSON value must serialize"))
+                    .ok_or_else(|| ExpressionError::unexpected_token(span, text, "a JSON object with quoted keys"))?;
+                self.advance()?;
+                Ok(Expression::literal(Literal::Json(Arc::from(canonical)), span))
+            }
+
             ExpressionTokenKind::End => Err(ExpressionError::unexpected_end(
                 self.current.span,
                 "expression",
             )),
 
-            ExpressionTokenKind::RightParen
-            | ExpressionTokenKind::RightBracket
-            | ExpressionTokenKind::Comma
-            | ExpressionTokenKind::In
-            | ExpressionTokenKind::Dot
-            | ExpressionTokenKind::Plus
-            | ExpressionTokenKind::Minus
-            | ExpressionTokenKind::Star
-            | ExpressionTokenKind::Slash
-            | ExpressionTokenKind::Percent
-            | ExpressionTokenKind::Bang
-            | ExpressionTokenKind::EqualEqual
-            | ExpressionTokenKind::BangEqual
-            | ExpressionTokenKind::Less
-            | ExpressionTokenKind::LessEqual
-            | ExpressionTokenKind::Greater
-            | ExpressionTokenKind::GreaterEqual
-            | ExpressionTokenKind::AndAnd
-            | ExpressionTokenKind::OrOr => Err(ExpressionError::unexpected_token(
+            _ => Err(ExpressionError::unexpected_token(
                 self.current.span,
                 self.current.text(self.source),
                 "expression",
@@ -932,7 +1052,20 @@ impl<'source> ExpressionParser<'source> {
             return self.parse_call(Arc::clone(&segments[0]), start);
         }
 
-        while self.current.kind == ExpressionTokenKind::Dot {
+        // A `?` after any segment (`nick?`, `profile?.country`) makes the whole
+        // path optional: a missing field reads as `null` instead of failing.
+        let mut optional = false;
+        loop {
+            if self.current.kind == ExpressionTokenKind::Question {
+                optional = true;
+                end = self.current.span.end();
+                self.advance()?;
+            }
+
+            if self.current.kind != ExpressionTokenKind::Dot {
+                break;
+            }
+
             self.advance()?;
 
             if self.current.kind != ExpressionTokenKind::Identifier {
@@ -953,11 +1086,14 @@ impl<'source> ExpressionParser<'source> {
         let path = ExpressionFieldPath {
             segments: Arc::from(segments),
         };
+        let span = Span::new(start, end);
+        let field = Expression::new(ExpressionKind::Field(path), span);
 
-        Ok(Expression::new(
-            ExpressionKind::Field(path),
-            Span::new(start, end),
-        ))
+        Ok(if optional {
+            Expression::new(ExpressionKind::Call { function: super::Function::Optional, arguments: vec![field] }, span)
+        } else {
+            field
+        })
     }
 
     fn parse_group(&mut self) -> ExpressionResult<Expression> {
@@ -996,7 +1132,7 @@ impl<'source> ExpressionParser<'source> {
     fn parse_call(&mut self, function: Arc<str>, start: usize) -> ExpressionResult<Expression> {
         self.advance()?;
         let (arguments, end) = self.parse_list(ExpressionTokenKind::RightParen, "',' or ')'")?;
-        super::eval::check_call(&function, arguments.len())
+        let function = super::eval::check_call(&function, arguments.len())
             .map_err(|message| ExpressionError::new(ExpressionErrorKind::InvalidCall { message: Arc::from(message) }, Span::new(start, end)))?;
         Ok(Expression::new(ExpressionKind::Call { function, arguments }, Span::new(start, end)))
     }
@@ -1036,11 +1172,24 @@ impl<'source> ExpressionParser<'source> {
         self.lexer.clone().next_token().is_ok_and(|token| token.kind == kind)
     }
 
+    fn current_is_word(&self, word: &str) -> bool {
+        self.current.kind == ExpressionTokenKind::Identifier && self.current.text(self.source) == word
+    }
+
+    fn next_is_word(&self, word: &str) -> bool {
+        self.lexer.clone().next_token().is_ok_and(|token| {
+            token.kind == ExpressionTokenKind::Identifier && token.text(self.source) == word
+        })
+    }
+
     fn advance(&mut self) -> ExpressionResult<()> {
         self.current = self.lexer.next_token()?;
         Ok(())
     }
 }
+
+/// Precedence of the relational level (`<`, `in`, `between`, …).
+const RELATIONAL_PRECEDENCE: u8 = 4;
 
 const fn binary_operator(kind: ExpressionTokenKind) -> Option<BinaryOperator> {
     match kind {
@@ -1072,20 +1221,7 @@ const fn binary_operator(kind: ExpressionTokenKind) -> Option<BinaryOperator> {
 
         ExpressionTokenKind::In => Some(BinaryOperator::In),
 
-        ExpressionTokenKind::Identifier
-        | ExpressionTokenKind::Number
-        | ExpressionTokenKind::String
-        | ExpressionTokenKind::True
-        | ExpressionTokenKind::False
-        | ExpressionTokenKind::Null
-        | ExpressionTokenKind::LeftParen
-        | ExpressionTokenKind::RightParen
-        | ExpressionTokenKind::LeftBracket
-        | ExpressionTokenKind::RightBracket
-        | ExpressionTokenKind::Comma
-        | ExpressionTokenKind::Dot
-        | ExpressionTokenKind::Bang
-        | ExpressionTokenKind::End => None,
+        _ => None,
     }
 }
 
@@ -1125,6 +1261,12 @@ enum ExpressionTokenKind {
 
     AndAnd,
     OrOr,
+
+    /// Postfix `?` marking an optional field path.
+    Question,
+
+    /// Complete JSON object literal `{…}`, lexed as one token.
+    Object,
 
     End,
 }
@@ -1184,6 +1326,8 @@ impl<'source> ExpressionLexer<'source> {
         match character {
             '"' => self.lex_string(),
 
+            '{' => self.lex_object(),
+
             '(' => {
                 self.advance();
 
@@ -1206,6 +1350,14 @@ impl<'source> ExpressionLexer<'source> {
                 self.advance();
                 Ok(ExpressionToken::new(
                     ExpressionTokenKind::Dot,
+                    Span::new(start, self.offset),
+                ))
+            }
+
+            '?' => {
+                self.advance();
+                Ok(ExpressionToken::new(
+                    ExpressionTokenKind::Question,
                     Span::new(start, self.offset),
                 ))
             }
@@ -1436,6 +1588,30 @@ impl<'source> ExpressionLexer<'source> {
         ))
     }
 
+    /// Lexes a balanced `{…}` as one token; strings may contain braces.
+    fn lex_object(&mut self) -> ExpressionResult<ExpressionToken> {
+        let start = self.offset;
+        let mut depth = 0_usize;
+        let mut in_string = false;
+        while let Some(character) = self.advance() {
+            match character {
+                '\\' if in_string => {
+                    self.advance();
+                }
+                '"' => in_string = !in_string,
+                '{' if !in_string => depth += 1,
+                '}' if !in_string => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(ExpressionToken::new(ExpressionTokenKind::Object, Span::new(start, self.offset)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Err(ExpressionError::unexpected_end(Span::new(start, self.offset), "'}'"))
+    }
+
     fn lex_string(&mut self) -> ExpressionResult<ExpressionToken> {
         let start = self.offset;
 
@@ -1512,43 +1688,11 @@ impl<'source> ExpressionLexer<'source> {
 }
 
 fn decode_string_literal(source: &str, span: Span) -> ExpressionResult<String> {
-    let Some(inner) = source
+    let inner = source
         .strip_prefix('"')
         .and_then(|value| value.strip_suffix('"'))
-    else {
-        return Err(ExpressionError::unterminated_string(span));
-    };
-
-    let mut decoded = String::with_capacity(inner.len());
-    let mut characters = inner.chars();
-
-    while let Some(character) = characters.next() {
-        if character != '\\' {
-            decoded.push(character);
-            continue;
-        }
-
-        let Some(escaped) = characters.next() else {
-            return Err(ExpressionError::invalid_escape('\\', span));
-        };
-
-        match escaped {
-            '"' => decoded.push('"'),
-            '\\' => decoded.push('\\'),
-            '/' => decoded.push('/'),
-            'n' => decoded.push('\n'),
-            'r' => decoded.push('\r'),
-            't' => decoded.push('\t'),
-            'b' => decoded.push('\u{0008}'),
-            'f' => decoded.push('\u{000c}'),
-
-            other => {
-                return Err(ExpressionError::invalid_escape(other, span));
-            }
-        }
-    }
-
-    Ok(decoded)
+        .ok_or_else(|| ExpressionError::unterminated_string(span))?;
+    super::syntax::unescape_string(inner).map_err(|character| ExpressionError::invalid_escape(character, span))
 }
 
 fn is_identifier_start(character: char) -> bool {
@@ -1823,6 +1967,7 @@ mod tests {
 
     #[test] fn rejects_unterminated_string() { let error = parse_expression(r#""hello"#).unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::UnterminatedString,); }
 
+    #[test] fn decodes_unicode_escapes() { assert_eq!(parse_expression(r#""a\u0001b\ud83d\ude00""#).unwrap().as_literal().unwrap().as_string(), Some("a\u{1}b😀")); assert!(parse_expression(r#""\u12""#).is_err()); }
     #[test] fn rejects_invalid_string_escape() { let error = parse_expression(r#""\q""#).unwrap_err(); assert_eq!( error.kind(), &ExpressionErrorKind::InvalidStringEscape { character: 'q' }, ); }
 
     #[test] fn rejects_incomplete_exponent() { let error = parse_expression("1e+").unwrap_err(); assert_eq!(error.kind(), &ExpressionErrorKind::InvalidNumber,); }
@@ -1894,5 +2039,10 @@ mod tests {
     }
 
     #[test] fn symbolic_and_word_boolean_operators_build_equivalent_trees() { let words = parse_expression("a == 1 and (b == 2 or not disabled)").unwrap(); let symbols = parse_expression("a == 1 && (b == 2 || !disabled)").unwrap(); assert_same_expression_structure(&words, &symbols); }
+    #[test] fn not_binds_looser_than_comparisons() { let expression = parse_expression("not city == \"Berlin\" and active").unwrap(); let ExpressionView::Binary { left, operator: BinaryOperator::And, .. } = expression.view() else { panic!("expected conjunction"); }; assert!(matches!(left.view(), ExpressionView::Unary { operator: UnaryOperator::Not, operand } if operand.is_binary())); assert!(matches!(parse_expression("!x in tags").unwrap().view(), ExpressionView::Unary { operand, .. } if operand.is_binary())); }
+    #[test] fn between_desugars_to_a_call() { let expression = parse_expression("age between 18 and 30 + 1 and active").unwrap(); let ExpressionView::Binary { left, operator: BinaryOperator::And, .. } = expression.view() else { panic!("expected conjunction"); }; assert!(matches!(left.view(), ExpressionView::Call { function: "between", arguments } if arguments.len() == 3 && arguments[2].is_binary())); assert!(matches!(parse_expression("age not between 1 and 2").unwrap().view(), ExpressionView::Unary { operator: UnaryOperator::Not, .. })); assert!(parse_expression("age between 1").is_err()); assert!(parse_expression("between == 1").unwrap().is_binary()); }
+    #[test] fn question_mark_makes_a_path_optional() { for source in ["nick?", "profile?.country", "profile.country?"] { let expression = parse_expression(source).unwrap(); assert!(matches!(expression.view(), ExpressionView::Call { function: "optional", arguments } if arguments[0].is_field()), "{source}"); } assert_eq!(parse_expression("profile?.country").unwrap().to_string(), "profile.country?"); assert!(parse_expression("f(x)?").is_err()); }
+    #[test] fn constant_subtrees_are_computed_once() { let expression = parse_expression("price * (2 + 3) > len([1, 2]) and now() > 0").unwrap(); assert!(expression.constant().is_none()); let ExpressionView::Binary { left, right, .. } = expression.view() else { panic!("expected and") }; let ExpressionView::Binary { left: product, right: length, .. } = left.view() else { panic!("expected comparison") }; assert_eq!(length.constant(), Some(&crate::Value::unsigned(2))); let ExpressionView::Binary { right: sum, .. } = product.view() else { panic!("expected product") }; assert_eq!(sum.constant(), Some(&crate::Value::signed(5))); assert!(right.constant().is_none(), "now() is volatile"); assert!(parse_expression("1 / 0").unwrap().constant().is_none(), "failing constants stay lazy"); assert_eq!(parse_expression("{\"a\": [1]}").unwrap().constant().and_then(crate::Value::as_object).map(crate::Document::len), Some(1)); }
+    #[test] fn display_round_trips_through_the_parser() { for source in ["a.b >= -2 and not (c or d)", "round(price * qty, 2) not in [1, \"x\"]", "not x == 1", "-(a + b)", "nick? == \"Z\""] { let expression = parse_expression(source).unwrap(); let reparsed = parse_expression(&expression.to_string()).unwrap(); assert_eq!(reparsed.to_string(), expression.to_string(), "{source}"); } }
     #[test] fn parses_calls_arrays_and_membership() { let expression = parse_expression("round(price * qty, 2) not in [1, a.b]").unwrap(); let ExpressionKind::Binary { left, operator, right } = expression.kind() else { panic!("expected membership"); }; assert_eq!(*operator, BinaryOperator::NotIn); assert!(matches!(left.view(), ExpressionView::Call { function: "round", arguments } if arguments.len() == 2)); assert!(matches!(right.view(), ExpressionView::Array(items) if items.len() == 2)); let mut fields = Vec::new(); expression.for_each_field(&mut |field| fields.push(field.to_string())); assert_eq!(fields, ["price", "qty", "a.b"]); assert!(matches!(parse_expression("x in tags").unwrap().kind(), ExpressionKind::Binary { operator: BinaryOperator::In, .. })); assert!(parse_expression("f(").is_err()); assert!(parse_expression("[1, ").is_err()); }
 }

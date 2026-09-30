@@ -8,9 +8,7 @@ use std::{
 };
 
 use crate::{
-    compare,
     helpers::json_to_value,
-    model::CoercionPolicy,
     model::Document,
     model::Number,
     model::Value,
@@ -18,14 +16,14 @@ use crate::{
         CollectionId, DocumentId, ProjectedValueRef, StorageRead, UuidV7Generator,
         VersionPrecondition,
     },
-    ValueCapabilities,
 };
 
 use super::{
-    parse_expression, CustomOperatorResult, ExecutionError, ExecutionResult,
-    Expression, ExpressionFieldPath, IncrementalGroupAccumulator, IncrementalPivotAccumulator,
-    InsertDocumentMaterializer, LookupDocuments, PhysicalLoadMode, PivotAggregate,
-    PivotSpecification, PivotValue, QueryRuntime, SortDirection, SortKey, StreamingLoadMutation,
+    apply_assignments, evaluate_predicate, executor::{compare_owned_projected_rows, compare_sort_values, PreparedInsertDocument}, logical_plan::InsertDocument,
+    parse_expression, projected_values::SlotRow, CustomOperatorResult, DocumentFields, ExecutionError, ExecutionResult,
+    ExecutionRuntime, Expression, ExpressionFieldPath, ExpressionFieldResolver, IncrementalGroupAccumulator, IncrementalPivotAccumulator,
+    InsertDocumentMaterializer, LookupDocuments, LookupFields, PhysicalLoadMode, PivotAggregate,
+    PivotSpecification, SetAssignment, SortKey, StageName, StreamingLoadMutation,
     SyntheticDocument,
 };
 
@@ -140,82 +138,128 @@ impl NearSpec {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuntimeMaterializer;
 
-/// Shared composition of the default physical document operators.
-///
-/// This trait keeps daemon and embedding code independent from the concrete
-/// materializer types. Predicate evaluation and `set` remain supplied by the
-/// expression runtime; this extension installs only the document-level
-/// operations shared by the standard in-memory engine.
-pub trait QueryRuntimeMaterializationExt {
-    /// Installs the standard lookup, load, pivot, insert and custom handlers.
-    ///
-    /// Generated insert identifiers use `insert_id_prefix`.
-    #[must_use]
-    fn with_default_materialization(self, insert_id_prefix: impl Into<Arc<str>>) -> QueryRuntime;
+/// The standard runtime: `where` and `set` evaluate expressions over the
+/// row's fields, and every other stage materializes documents.
+#[derive(Clone, Debug, Default)]
+pub struct QueryRuntime {
+    materializer: RuntimeMaterializer,
+    insert: InsertDocumentMaterializer,
+    streaming_load: StreamingLoadMaterializer,
 }
 
-impl QueryRuntimeMaterializationExt for QueryRuntime {
-    fn with_default_materialization(self, insert_id_prefix: impl Into<Arc<str>>) -> QueryRuntime {
-        let materializer = RuntimeMaterializer::new();
-        let lookup_materializer = materializer;
-        let pivot_materializer = materializer;
-        let group_materializer = materializer;
-        let prefix = insert_id_prefix.into();
-        let insert_materializer = InsertDocumentMaterializer::new(Arc::clone(&prefix));
-        let streaming_materializer = StreamingLoadMaterializer::new(prefix);
-
-        self.with_streaming_load(move |collection, storage, mode, chunks| {
-            streaming_materializer.materialize(collection, storage, mode, chunks)
-        })
-        .with_load(|_expression, document| Ok(Arc::new(document.clone())))
-        .with_compare(move |keys, left, right| {
-            materializer.materialize_sort_comparison(keys, left, right)
-        })
-        .with_projected_compare(move |keys, left, right| {
-            materializer.materialize_projected_sort_comparison(keys, left, right)
-        })
-        .with_select(move |fields, document| materializer.materialize_select(fields, document))
-        .with_distinct(move |fields, document| {
-            materializer.materialize_distinct_key(fields, document)
-        })
-        .with_buffered_distinct(move |fields, document, key| {
-            materializer.write_distinct_key(fields, document, key)
-        })
-        .with_projected_distinct(move |fields, values, indexes, key| {
-            materializer.write_projected_ref_distinct_key(fields, values, indexes, key)
-        })
-        .with_count(move |alias, count| materializer.materialize_count(alias, count))
-        .with_group(move |keys, documents| group_materializer.materialize_group(keys, documents))
-        .with_incremental_group(move |keys| group_materializer.incremental_group(keys))
-        .with_lookup(move |into, outer, matches| {
-            lookup_materializer.materialize_lookup(into, outer, matches)
-        })
-        .with_incremental_pivot(move |specification| {
-            Ok(Box::new(pivot_materializer.incremental_pivot(specification)))
-        })
-        .with_pivot(move |specification, documents| {
-            pivot_materializer.materialize_pivot(specification, documents)
-        })
-        .with_insert(move |document| insert_materializer.materialize(document))
-        .with_custom(move |name, arguments, _writes, document| {
-            materializer.materialize_custom(name.as_str(), arguments, document)
-        })
+impl QueryRuntime {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
-#[derive(Clone, Debug)]
+impl ExecutionRuntime for QueryRuntime {
+    fn evaluate_predicate( &self, expression: &Expression, document: &Document, ) -> ExecutionResult<bool> {
+        evaluate_predicate(expression, &DocumentFields(document))
+    }
+
+    fn evaluate_resolved_predicate( &self, expression: &Expression, resolver: &dyn ExpressionFieldResolver<Value>, ) -> ExecutionResult<bool> {
+        evaluate_predicate(expression, resolver)
+    }
+
+    // The lookup scope is an ordinary field resolver: correlated predicates
+    // need no dedicated evaluation.
+    fn evaluate_lookup_predicate( &self, expression: &Expression, scope: &LookupFields<'_>, ) -> ExecutionResult<bool> {
+        evaluate_predicate(expression, scope)
+    }
+
+    fn apply_set( &self, assignments: &[SetAssignment], document: &Document, ) -> ExecutionResult<Arc<Document>> {
+        apply_assignments(assignments, document)
+    }
+
+    fn apply_lookup( &self, into: &str, outer: &Document, matches: &LookupDocuments, ) -> ExecutionResult<Arc<Document>> {
+        self.materializer.materialize_lookup(into, outer, matches)
+    }
+
+    fn prepare_streaming_load( &self, collection: &CollectionId, storage: &dyn StorageRead, mode: PhysicalLoadMode, chunks: &[Arc<str>], ) -> ExecutionResult<Vec<StreamingLoadMutation>> {
+        self.streaming_load.materialize(collection, storage, mode, chunks)
+    }
+
+    fn apply_load(&self, _target: &str, document: &Document) -> ExecutionResult<Arc<Document>> {
+        Ok(Arc::new(document.clone()))
+    }
+
+    fn compare_documents( &self, keys: &[SortKey], left: &Document, right: &Document, ) -> ExecutionResult<Ordering> {
+        self.materializer.materialize_sort_comparison(keys, left, right)
+    }
+
+    fn supports_projected_sort(&self) -> bool {
+        true
+    }
+
+    fn compare_projected_values( &self, keys: &[SortKey], left: &[Option<Value>], right: &[Option<Value>], ) -> ExecutionResult<Option<Ordering>> {
+        self.materializer.materialize_projected_sort_comparison(keys, left, right).map(Some)
+    }
+
+    fn apply_select( &self, fields: &[ExpressionFieldPath], document: &Document, ) -> ExecutionResult<Arc<Document>> {
+        self.materializer.materialize_select(fields, document)
+    }
+
+    fn distinct_key( &self, fields: &[ExpressionFieldPath], document: &Document, ) -> ExecutionResult<Arc<[u8]>> {
+        self.materializer.materialize_distinct_key(fields, document)
+    }
+
+    fn supports_buffered_distinct(&self) -> bool {
+        true
+    }
+
+    fn write_distinct_key( &self, fields: &[ExpressionFieldPath], document: &Document, key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
+        self.materializer.write_distinct_key(fields, document, key).map(|()| true)
+    }
+
+    fn supports_projected_distinct(&self) -> bool {
+        true
+    }
+
+    fn write_projected_distinct_key( &self, fields: &[ExpressionFieldPath], values: &[Option<ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
+        self.materializer.write_projected_ref_distinct_key(fields, values, indexes, key).map(|()| true)
+    }
+
+    fn write_projected_document_distinct_key( &self, fields: &[ExpressionFieldPath], values: &[Option<ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
+        self.materializer.write_projected_ref_document_key(fields, values, indexes, key).map(|()| true)
+    }
+
+    fn count_document(&self, alias: &str, count: u64) -> ExecutionResult<Arc<Document>> {
+        self.materializer.materialize_count(alias, count)
+    }
+
+    fn incremental_group_accumulator( &self, keys: &[ExpressionFieldPath], ) -> ExecutionResult<Option<Box<dyn IncrementalGroupAccumulator>>> {
+        self.materializer.incremental_group(keys).map(Some)
+    }
+
+    fn group_documents( &self, keys: &[ExpressionFieldPath], documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
+        self.materializer.materialize_group(keys, documents)
+    }
+
+    fn prepare_insert( &self, document: &InsertDocument, ) -> ExecutionResult<PreparedInsertDocument> {
+        self.insert.materialize(document)
+    }
+
+    fn incremental_pivot_accumulator( &self, specification: &PivotSpecification, ) -> ExecutionResult<Option<Box<dyn IncrementalPivotAccumulator>>> {
+        Ok(Some(Box::new(self.materializer.incremental_pivot(specification))))
+    }
+
+    fn pivot_documents( &self, specification: &PivotSpecification, documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
+        self.materializer.materialize_pivot(specification, documents)
+    }
+
+    fn apply_custom( &self, stage: &StageName, arguments: &str, _writes: bool, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
+        self.materializer.materialize_custom(stage.as_str(), arguments, document)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct StreamingLoadMaterializer {
     id_generator: UuidV7Generator,
 }
 
 impl StreamingLoadMaterializer {
-    fn new(generated_id_prefix: Arc<str>) -> Self {
-        let _ = generated_id_prefix;
-        Self {
-            id_generator: UuidV7Generator::new(),
-        }
-    }
-
     fn materialize( &self, collection: &CollectionId, storage: &dyn StorageRead, mode: PhysicalLoadMode, chunks: &[Arc<str>], ) -> ExecutionResult<Vec<StreamingLoadMutation>> {
         let mut mutations = Vec::new();
         let mut seen = BTreeSet::new();
@@ -350,102 +394,14 @@ impl RuntimeMaterializer {
     }
 
     /// Applies the standard read-only document transformation stages.
+    ///
+    /// The stage is compiled from its text for this one call; plans hold a
+    /// [`CompiledStage`] instead, so rows never re-parse their stage.
     pub fn materialize_custom( &self, name: &str, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        match name {
-            "select" => self.materialize_select_aliases(arguments, document),
-            "rename" => self.materialize_rename(arguments, document),
-            "drop" => self.materialize_drop(arguments, document),
-            "derive" => self.materialize_derive(arguments, document),
-            "near" => self.materialize_near(arguments, document),
-            "root" => self.materialize_root(arguments, document),
-            "first" | "single" => self.materialize_scalar_projection(arguments, document),
-            "unwind" => self.materialize_unwind(arguments, document),
-            _ => Ok(CustomOperatorResult::Keep),
+        match CompiledStage::compile(name, arguments)? {
+            Some(stage) => stage.apply(document),
+            None => Ok(CustomOperatorResult::Keep),
         }
-    }
-
-    fn materialize_near( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let spec = NearSpec::parse(arguments)?;
-        let Some(value) = path_value(document, spec.field()) else {
-            return Ok(CustomOperatorResult::Discard);
-        };
-        let distance = spec.distance_value(value)?;
-        let mut result = document.clone();
-        result.insert(
-            "_distance",
-            Value::float(distance).map_err(|error| {
-                ExecutionError::evaluation(format!("invalid near distance: {error}"))
-            })?,
-        );
-        Ok(CustomOperatorResult::Replace(Arc::new(result)))
-    }
-
-    fn materialize_root( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let path = ExpressionFieldPath::new(arguments.trim().split('.'))
-            .map_err(|error| ExecutionError::evaluation(error.to_string()))?;
-        let value = path_value(document, &path).ok_or_else(|| {
-            ExecutionError::evaluation(format!("root field {arguments:?} is missing"))
-        })?;
-        let Value::Object(root) = value else {
-            return Err(ExecutionError::evaluation(format!(
-                "root field {arguments:?} must be an object"
-            )));
-        };
-        Ok(CustomOperatorResult::Replace(Arc::clone(root)))
-    }
-
-    fn materialize_scalar_projection( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let field = arguments.trim();
-        if field.is_empty() {
-            return Ok(CustomOperatorResult::Keep);
-        }
-        let path = ExpressionFieldPath::new(field.split('.'))
-            .map_err(|error| ExecutionError::evaluation(error.to_string()))?;
-        Ok(CustomOperatorResult::Replace(
-            self.materialize_select(&[path], document)?,
-        ))
-    }
-
-    fn materialize_unwind( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let path = ExpressionFieldPath::new(arguments.trim().split('.'))
-            .map_err(|error| ExecutionError::evaluation(error.to_string()))?;
-        let Some(value) = cloned_path_value(document, &path) else {
-            return Ok(CustomOperatorResult::Keep);
-        };
-        let Value::Array(values) = value else {
-            return Ok(CustomOperatorResult::Keep);
-        };
-        let segments = path.iter().collect::<Vec<_>>();
-        let documents = values
-            .iter()
-            .cloned()
-            .map(|value| {
-                let mut result = document.clone();
-                insert_path(&mut result, &segments, value);
-                Arc::new(result)
-            })
-            .collect();
-        Ok(CustomOperatorResult::Expand(documents))
-    }
-
-    /// Derives one or more fields without mutating stored documents.
-    pub fn materialize_derive( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let assignments = split_derive_assignments(arguments)?;
-        let mut result = document.clone();
-
-        for (field, expression_source) in assignments {
-            let expression = parse_expression(expression_source).map_err(|error| {
-                ExecutionError::evaluation(format!(
-                    "invalid derive expression {expression_source:?}: {error}"
-                ))
-            })?;
-            // Assignments apply in order, so later ones can use earlier results.
-            let value = evaluate_derive_expression(&expression, &result)?;
-            let path = field.split('.').collect::<Vec<_>>();
-            insert_path(&mut result, &path, value);
-        }
-
-        Ok(CustomOperatorResult::Replace(Arc::new(result)))
     }
 
     /// Compares two documents according to the ordered sort keys.
@@ -456,31 +412,11 @@ impl RuntimeMaterializer {
     /// execution error.
     pub fn materialize_sort_comparison( &self, keys: &[SortKey], left: &Document, right: &Document, ) -> ExecutionResult<Ordering> {
         for key in keys {
-            let left_value = path_value(left, key.field());
-            let right_value = path_value(right, key.field());
-
-            let ordering = match (left_value, right_value) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Less,
-                (Some(_), None) => Ordering::Greater,
-                (Some(left), Some(right)) => compare(left, right, CoercionPolicy::Numeric)
-                    .map_err(|error| {
-                        ExecutionError::evaluation(format!(
-                            "cannot sort field {}: {error}",
-                            key.field()
-                        ))
-                    })?
-                    .into_ordering(),
-            };
-
+            let ordering = compare_sort_values(path_value(left, key.field()), path_value(right, key.field()), key)?;
             if ordering != Ordering::Equal {
-                return Ok(match key.direction() {
-                    SortDirection::Ascending => ordering,
-                    SortDirection::Descending => ordering.reverse(),
-                });
+                return Ok(ordering);
             }
         }
-
         Ok(Ordering::Equal)
     }
 
@@ -494,31 +430,7 @@ impl RuntimeMaterializer {
                 "projected sort values do not match the sort-key layout",
             ));
         }
-
-        for (index, key) in keys.iter().enumerate() {
-            let ordering = match (left[index].as_ref(), right[index].as_ref()) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Less,
-                (Some(_), None) => Ordering::Greater,
-                (Some(left), Some(right)) => compare(left, right, CoercionPolicy::Numeric)
-                    .map_err(|error| {
-                        ExecutionError::evaluation(format!(
-                            "cannot sort field {}: {error}",
-                            key.field()
-                        ))
-                    })?
-                    .into_ordering(),
-            };
-
-            if ordering != Ordering::Equal {
-                return Ok(match key.direction() {
-                    SortDirection::Ascending => ordering,
-                    SortDirection::Descending => ordering.reverse(),
-                });
-            }
-        }
-
-        Ok(Ordering::Equal)
+        compare_owned_projected_rows(keys, left, right)
     }
 
     /// Projects a document to the requested field paths.
@@ -584,6 +496,28 @@ impl RuntimeMaterializer {
         Ok(())
     }
 
+    /// Encodes the full-document equality key of the document holding the
+    /// present values, byte-for-byte as [`Self::write_distinct_key`] does for
+    /// it. `fields` are every top-level field in name order (the document's
+    /// own order) and `indexes` maps them into `values`.
+    pub fn write_projected_ref_document_key( &self, fields: &[ExpressionFieldPath], values: &[Option<crate::storage::ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<()> {
+        if fields.len() != indexes.len() || indexes.iter().any(|index| *index >= values.len()) {
+            return Err(ExecutionError::evaluation(
+                "projected document distinct slots do not match the source layout",
+            ));
+        }
+        key.clear();
+        key.push(0);
+        encode_len(key, indexes.iter().filter(|index| values[**index].is_some()).count());
+        for (field, index) in fields.iter().zip(indexes) {
+            if let Some(value) = &values[*index] {
+                encode_bytes(key, field.first().as_bytes());
+                encode_projected_ref(key, value);
+            }
+        }
+        Ok(())
+    }
+
     /// Encodes the explicit-field equality key directly into a reusable
     /// caller-owned buffer. This avoids one key allocation per source row.
     pub(crate) fn write_projected_distinct_key_indexes( &self, values: &[Option<Value>], indexes: &[usize], key: &mut Vec<u8>, ) {
@@ -625,68 +559,26 @@ impl RuntimeMaterializer {
         Ok(Arc::new(result))
     }
 
-    /// Creates the bounded, capability-driven aggregate state used by the
-    /// external group executor. `Summable` values are folded immediately; no
-    /// source document is retained.
+    /// Creates the bounded aggregate state used by the external group
+    /// executor. Measures are folded immediately; no source document is retained.
     pub fn incremental_group( &self, fields: &[ExpressionFieldPath], ) -> ExecutionResult<Box<dyn IncrementalGroupAccumulator>> {
         Ok(Box::new(DefaultIncrementalGroupAccumulator::new(fields)?))
     }
 
-    /// Groups documents by key paths and optional encoded sum measures.
+    /// Groups documents by key paths and optional encoded measures.
     ///
     /// Plain paths are grouping keys. Internal marker paths generated by the
-    /// planner represent sum candidates. A candidate is aggregated only when
-    /// its runtime value exposes the `Summable` capability. If no candidate is
-    /// summable for a group, the result falls back to the row `count`.
+    /// planner are measures (`sum`, `avg`, `min`, `max`, `first`, `last`,
+    /// `count`). A row whose measures produce no value carries `count` instead.
     pub fn materialize_group( &self, fields: &[ExpressionFieldPath], documents: &[Arc<Document>], ) -> ExecutionResult<Vec<SyntheticDocument>> {
-        #[derive(Debug)]
-        struct GroupKey {
-            source: ExpressionFieldPath,
-            output: ExpressionFieldPath,
-        }
-
-        #[derive(Debug)]
-        struct GroupMeasure {
-            source: ExpressionFieldPath,
-            alias: String,
-        }
-
-        #[derive(Debug)]
-        struct GroupBucket {
-            values: Vec<Option<Value>>,
-            count: u64,
-            sums: Vec<f64>,
-            seen_summable: Vec<bool>,
-        }
-
-        let mut keys = Vec::new();
-        let mut measures = Vec::new();
-
-        for field in fields {
-            if let Some((source, alias)) = decode_group_sum_marker(field)? {
-                measures.push(GroupMeasure { source, alias });
-            } else if let Some((source, output)) = decode_group_key_marker(field)? {
-                keys.push(GroupKey { source, output });
-            } else {
-                keys.push(GroupKey {
-                    source: field.clone(),
-                    output: field.clone(),
-                });
-            }
-        }
-
-        let mut groups: BTreeMap<Vec<u8>, GroupBucket> = BTreeMap::new();
+        let template = DefaultIncrementalGroupAccumulator::new(fields)?;
+        let mut groups: BTreeMap<Vec<u8>, DefaultIncrementalGroupAccumulator> = BTreeMap::new();
 
         for document in documents {
-            let values = keys
-                .iter()
-                .map(|key| cloned_path_value(document, &key.source))
-                .collect::<Vec<_>>();
-
             let mut encoded = Vec::new();
-            encode_len(&mut encoded, values.len());
-            for value in &values {
-                match value {
+            encode_len(&mut encoded, template.keys.len());
+            for key in template.keys.iter() {
+                match path_value(document, &key.source) {
                     Some(value) => {
                         encoded.push(1);
                         encode_value(&mut encoded, value);
@@ -694,140 +586,17 @@ impl RuntimeMaterializer {
                     None => encoded.push(0),
                 }
             }
-
-            let bucket = groups.entry(encoded).or_insert_with(|| GroupBucket {
-                values,
-                count: 0,
-                sums: vec![0.0; measures.len()],
-                seen_summable: vec![false; measures.len()],
-            });
-
-            bucket.count = bucket.count.checked_add(1).ok_or_else(|| {
-                ExecutionError::evaluation("group count exceeds the supported u64 range")
-            })?;
-
-            for (index, measure) in measures.iter().enumerate() {
-                let Some(value) = cloned_path_value(document, &measure.source) else {
-                    continue;
-                };
-
-                if value.is_summable() {
-                    bucket.sums[index] += numeric_value(&value)?;
-                    bucket.seen_summable[index] = true;
-                }
-            }
+            groups
+                .entry(encoded)
+                .or_insert_with(|| template.clone())
+                .push(document)?;
         }
 
         groups
             .into_values()
             .enumerate()
-            .map(|(index, bucket)| {
-                let mut document = Document::new();
-
-                for (key, value) in keys.iter().zip(bucket.values) {
-                    let path = key.output.iter().collect::<Vec<_>>();
-                    insert_path(&mut document, &path, value.unwrap_or_else(Value::null));
-                }
-
-                let mut emitted_sum = false;
-                for (measure_index, measure) in measures.iter().enumerate() {
-                    if bucket.seen_summable[measure_index] {
-                        let value = Value::float(bucket.sums[measure_index]).map_err(|error| {
-                            ExecutionError::evaluation(format!(
-                                "group sum cannot be represented as a finite number: {error}"
-                            ))
-                        })?;
-                        document.insert(measure.alias.as_str(), value);
-                        emitted_sum = true;
-                    }
-                }
-
-                if !emitted_sum {
-                    document.insert("count", Value::unsigned(bucket.count));
-                }
-
-                let id = DocumentId::synthetic(GROUP_NAMESPACE, index as u64 + 1);
-
-                Ok(SyntheticDocument::new(id, Arc::new(document)))
-            })
+            .map(|(index, group)| Box::new(group).finish(index as u64 + 1))
             .collect()
-    }
-
-    fn materialize_select_aliases( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let mut result = Document::new();
-        let mut scope = document.clone();
-
-        for (item_index, item) in split_projection_items(arguments)?.into_iter().enumerate() {
-            let item = item.trim();
-            if item.is_empty() {
-                return Err(ExecutionError::evaluation(format!(
-                    "invalid select projection at index {item_index}: projection is empty"
-                )));
-            }
-
-            let (source_text, target_text, expression_projection) = match item.rsplit_once(" as ") {
-                Some((source, target)) => (source.trim(), target.trim(), true),
-                None => (item, item, false),
-            };
-
-            let target = parse_runtime_path(target_text, "select target")?;
-            let value = if expression_projection {
-                let expression = parse_expression(source_text).map_err(|error| {
-                    ExecutionError::evaluation(format!(
-                        "invalid select expression {source_text:?}: {error}"
-                    ))
-                })?;
-                Some(evaluate_derive_expression(&expression, &scope)?)
-            } else {
-                let source = parse_runtime_path(source_text, "select source")?;
-                cloned_runtime_path_value(&scope, &source)
-            };
-
-            if let Some(value) = value {
-                insert_path(&mut result, &target, value.clone());
-                // Later projections may refer to aliases introduced earlier in
-                // the same select list.
-                insert_path(&mut scope, &target, value);
-            }
-        }
-
-        Ok(CustomOperatorResult::Replace(Arc::new(result)))
-    }
-
-    fn materialize_rename( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let (source, target) = arguments.split_once(" as ").ok_or_else(|| {
-            ExecutionError::evaluation(
-                "invalid rename runtime payload: expected `<source> as <target>`",
-            )
-        })?;
-
-        let source = parse_runtime_path(source, "rename source")?;
-        let target = parse_runtime_path(target, "rename target")?;
-
-        let mut result = document.clone();
-        let Some(value) = remove_path(&mut result, &source) else {
-            return Ok(CustomOperatorResult::Keep);
-        };
-
-        insert_path(&mut result, &target, value);
-        Ok(CustomOperatorResult::Replace(Arc::new(result)))
-    }
-
-    fn materialize_drop( &self, arguments: &str, document: &Document, ) -> ExecutionResult<CustomOperatorResult> {
-        let mut paths = Vec::new();
-        for field in arguments.split(',') {
-            paths.push(parse_runtime_path(field, "drop field")?);
-        }
-        let mut result = document.clone();
-        let mut changed = false;
-        for path in paths {
-            changed |= remove_path(&mut result, &path).is_some();
-        }
-        if changed {
-            Ok(CustomOperatorResult::Replace(Arc::new(result)))
-        } else {
-            Ok(CustomOperatorResult::Keep)
-        }
     }
 
     /// Implements lookup's left-join result contract.
@@ -861,56 +630,99 @@ impl RuntimeMaterializer {
     pub fn incremental_pivot(&self, specification: &PivotSpecification) -> DefaultIncrementalPivotAccumulator {
         DefaultIncrementalPivotAccumulator {
             specification: specification.clone(),
-            groups: BTreeMap::new(),
+            groups: Vec::new(),
+            by_key: std::collections::HashMap::new(),
+            by_values: std::collections::HashMap::new(),
+            values_key: Vec::new(),
+            column: String::new(),
+            column_key: Vec::new(),
+            by_column: std::collections::HashMap::new(),
+            by_label: std::collections::HashMap::new(),
+            labels: Vec::new(),
+            last_group: None,
+            last_column: None,
             bytes: 0,
         }
     }
 }
 
 /// Pivot state: one aggregate cell per (row key, column) pair.
+///
+/// Rows are ordered by their stable key, computed once per new row values;
+/// every row finds its group by the binary encoding of those values, and its
+/// column by the encoding of its column values. A column's label (and so
+/// its cell names) is written once, when the column is first seen; columns
+/// sharing a label share their cells. Cells are indexed by column and
+/// measure and named only when the result is built.
 #[derive(Debug)]
 pub struct DefaultIncrementalPivotAccumulator {
     specification: PivotSpecification,
-    groups: BTreeMap<String, PivotGroup>,
+    groups: Vec<(String, PivotGroup)>,
+    by_key: std::collections::HashMap<String, usize>,
+    by_values: std::collections::HashMap<Box<[u8]>, usize>,
+    values_key: Vec<u8>,
+    column: String,
+    column_key: Vec<u8>,
+    by_column: std::collections::HashMap<Box<[u8]>, usize>,
+    by_label: std::collections::HashMap<String, usize>,
+    labels: Vec<String>,
+    /// Encoded values and index of the previous row's group and column.
+    last_group: Option<(Vec<u8>, usize)>,
+    last_column: Option<(Vec<u8>, usize)>,
     bytes: usize,
 }
 
 impl IncrementalPivotAccumulator for DefaultIncrementalPivotAccumulator {
     fn push(&mut self, document: &Document) -> ExecutionResult<()> {
-        let specification = &self.specification;
-        let row_values = specification
-            .rows()
-            .iter()
-            .map(|path| cloned_path_value(document, path))
-            .collect::<Vec<_>>();
-        let row_key = stable_values_key(&row_values);
-        let column_values = specification
-            .columns()
-            .iter()
-            .map(|path| cloned_path_value(document, path))
-            .collect::<Vec<_>>();
-        let column_name = column_label(&column_values);
-        if !self.groups.contains_key(&row_key) {
-            self.bytes = self.bytes.saturating_add(
-                PIVOT_ENTRY_BYTES + row_key.len() * 2 + row_values.iter().map(optional_value_bytes).sum::<usize>(),
-            );
-        }
-        let group = self.groups.entry(row_key).or_insert_with(|| PivotGroup {
-            row_values,
-            cells: BTreeMap::new(),
-        });
-        for value in specification.values() {
-            let cell_name = pivot_cell_name(&column_name, value, specification.values().len());
-            let input = cloned_path_value(document, value.field());
-            if !group.cells.contains_key(&cell_name) {
-                self.bytes = self.bytes.saturating_add(PIVOT_ENTRY_BYTES + cell_name.len() * 2);
+        self.push_with(|path| path_value(document, path))
+    }
+
+    fn folds_slots(&self) -> bool {
+        true
+    }
+
+    fn push_slots(&mut self, fields: &[ExpressionFieldPath], values: &[Option<Value>]) -> ExecutionResult<()> {
+        self.push_with(|path| {
+            let mut segments = path.iter();
+            let first = segments.next()?;
+            let slot = fields.iter().position(|field| field.len() == 1 && field.first() == first)?;
+            let mut value = values[slot].as_ref()?;
+            for segment in segments {
+                value = value.as_object()?.get(segment)?;
             }
-            let cell = group
-                .cells
-                .entry(cell_name)
-                .or_insert_with(|| AggregateState::new(value.aggregate()));
+            Some(value)
+        })
+    }
+
+    fn folds_refs(&self) -> bool {
+        true
+    }
+
+    fn push_refs( &mut self, rows: &[Option<ProjectedValueRef<'_>>], columns: &[Option<ProjectedValueRef<'_>>], values: &[Option<ProjectedValueRef<'_>>], ) -> ExecutionResult<()> {
+        let group = self.group_of(rows);
+        let column = self.column_of(columns);
+        let measures = self.specification.values().len();
+        let label = self.labels[column].len();
+        let cells = &mut self.groups[group].1.cells;
+        if cells.len() < (column + 1) * measures {
+            cells.resize_with((column + 1) * measures, || None);
+        }
+        for (index, (measure, value)) in self.specification.values().iter().zip(values).enumerate() {
+            let cell = match &mut cells[column * measures + index] {
+                Some(cell) => cell,
+                slot => {
+                    let name = if measures == 1 { label } else { label + 1 + measure.output_name().len() };
+                    self.bytes = self.bytes.saturating_add(PIVOT_ENTRY_BYTES + name * 2);
+                    slot.insert(MeasureState::new(measure.aggregate()))
+                }
+            };
             let before = cell.retained_bytes();
-            cell.push(input)?;
+            // Pivot cells skip missing values, except `count`, which counts rows.
+            if measure.aggregate() == PivotAggregate::Count {
+                cell.push(Some(&Value::Bool(true)))?;
+            } else if value.is_some() {
+                cell.push_ref(value.as_ref())?;
+            }
             self.bytes = self.bytes.saturating_add(cell.retained_bytes()).saturating_sub(before);
         }
         Ok(())
@@ -921,12 +733,121 @@ impl IncrementalPivotAccumulator for DefaultIncrementalPivotAccumulator {
     }
 
     fn finish(self: Box<Self>) -> ExecutionResult<Vec<SyntheticDocument>> {
-        let Self { specification, groups, .. } = *self;
+        let Self { specification, mut groups, labels, .. } = *self;
+        groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let measures = specification.values().len();
         groups
-            .into_values()
+            .into_iter()
             .enumerate()
-            .map(|(index, group)| build_pivot_document(index, &specification, group))
+            .map(|(index, (_, group))| {
+                let mut cells = BTreeMap::new();
+                for (position, cell) in group.cells.into_iter().enumerate() {
+                    let Some(cell) = cell else { continue };
+                    let (column, measure) = (position / measures, position % measures);
+                    let mut name = labels[column].clone();
+                    if measures != 1 {
+                        name.push('.');
+                        name.push_str(specification.values()[measure].output_name());
+                    }
+                    cells.insert(name, cell);
+                }
+                build_pivot_document(index, &specification, group.row_values, cells)
+            })
             .collect()
+    }
+}
+
+impl DefaultIncrementalPivotAccumulator {
+    /// Folds one row whose fields `get` resolves.
+    fn push_with<'a>(&mut self, get: impl Fn(&ExpressionFieldPath) -> Option<&'a Value>) -> ExecutionResult<()> {
+        let refs = |paths: &[ExpressionFieldPath]| paths.iter().map(|path| get(path).map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
+        let (rows, columns) = (refs(self.specification.rows()), refs(self.specification.columns()));
+        let values = self.specification.values().iter().map(|value| get(value.field()).map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
+        self.push_refs(&rows, &columns, &values)
+    }
+
+    /// Index of the group holding row values `rows`, created when new.
+    fn group_of(&mut self, rows: &[Option<ProjectedValueRef<'_>>]) -> usize {
+        encode_optional_refs(&mut self.values_key, rows);
+        if let Some((key, index)) = &self.last_group {
+            if *key == self.values_key {
+                return *index;
+            }
+        }
+        let index = match self.by_values.get(self.values_key.as_slice()) {
+            Some(index) => *index,
+            None => {
+                let row_values = rows.iter().map(|value| value.as_ref().map(ProjectedValueRef::to_value)).collect::<Vec<_>>();
+                let row_key = stable_values_key(&row_values);
+                let index = match self.by_key.get(&row_key) {
+                    Some(index) => *index,
+                    None => {
+                        self.bytes = self.bytes.saturating_add(
+                            PIVOT_ENTRY_BYTES + row_key.len() * 2 + row_values.iter().map(optional_value_bytes).sum::<usize>(),
+                        );
+                        self.by_key.insert(row_key.clone(), self.groups.len());
+                        self.groups.push((row_key, PivotGroup { row_values, cells: Vec::new() }));
+                        self.groups.len() - 1
+                    }
+                };
+                self.bytes = self.bytes.saturating_add(PIVOT_ENTRY_BYTES + self.values_key.len());
+                self.by_values.insert(Box::from(self.values_key.as_slice()), index);
+                index
+            }
+        };
+        let last = self.last_group.get_or_insert_with(|| (Vec::new(), index));
+        last.0.clear();
+        last.0.extend_from_slice(&self.values_key);
+        last.1 = index;
+        index
+    }
+
+    /// Index of the column of values `columns`: columns sharing a label
+    /// share an index.
+    fn column_of(&mut self, columns: &[Option<ProjectedValueRef<'_>>]) -> usize {
+        encode_optional_refs(&mut self.column_key, columns);
+        if let Some((key, index)) = &self.last_column {
+            if *key == self.column_key {
+                return *index;
+            }
+        }
+        let index = match self.by_column.get(self.column_key.as_slice()) {
+            Some(index) => *index,
+            None => {
+                let values = columns.iter().map(|value| value.as_ref().map(ProjectedValueRef::to_value)).collect::<Vec<_>>();
+                self.column.clear();
+                write_column_label(&mut self.column, values.iter().map(Option::as_ref));
+                let index = match self.by_label.get(&self.column) {
+                    Some(index) => *index,
+                    None => {
+                        self.labels.push(self.column.clone());
+                        self.by_label.insert(self.column.clone(), self.labels.len() - 1);
+                        self.labels.len() - 1
+                    }
+                };
+                self.by_column.insert(Box::from(self.column_key.as_slice()), index);
+                index
+            }
+        };
+        let last = self.last_column.get_or_insert_with(|| (Vec::new(), index));
+        last.0.clear();
+        last.0.extend_from_slice(&self.column_key);
+        last.1 = index;
+        index
+    }
+}
+
+/// Encoding of optional values, as the pivot and group keys use it.
+fn encode_optional_refs(output: &mut Vec<u8>, values: &[Option<ProjectedValueRef<'_>>]) {
+    output.clear();
+    for value in values {
+        match value {
+            Some(value) => {
+                output.push(1);
+                encode_projected_ref(output, value);
+            }
+            None => output.push(0),
+        }
     }
 }
 
@@ -944,162 +865,51 @@ fn optional_value_bytes(value: &Option<Value>) -> usize {
 #[derive(Debug)]
 struct PivotGroup {
     row_values: Vec<Option<Value>>,
-    cells: BTreeMap<String, AggregateState>,
-}
-
-#[derive(Debug)]
-enum AggregateState {
-    Sum { total: f64, count: u64 },
-    Average { total: f64, count: u64 },
-    First(Option<Value>),
-    Last(Option<Value>),
-    Minimum(Option<Value>),
-    Maximum(Option<Value>),
-    Count(u64),
-}
-
-impl AggregateState {
-    #[inline]
-    const fn new(aggregate: PivotAggregate) -> Self {
-        match aggregate {
-            PivotAggregate::Sum => Self::Sum {
-                total: 0.0,
-                count: 0,
-            },
-            PivotAggregate::Average => Self::Average {
-                total: 0.0,
-                count: 0,
-            },
-            PivotAggregate::First => Self::First(None),
-            PivotAggregate::Last => Self::Last(None),
-            PivotAggregate::Minimum => Self::Minimum(None),
-            PivotAggregate::Maximum => Self::Maximum(None),
-            PivotAggregate::Count => Self::Count(0),
-        }
-    }
-
-    /// Bytes retained by a cell beyond its fixed overhead.
-    fn retained_bytes(&self) -> usize {
-        match self {
-            Self::First(value) | Self::Last(value) | Self::Minimum(value) | Self::Maximum(value) => {
-                optional_value_bytes(value)
-            }
-            Self::Sum { .. } | Self::Average { .. } | Self::Count(_) => 0,
-        }
-    }
-
-    fn push(&mut self, value: Option<Value>) -> ExecutionResult<()> {
-        match self {
-            Self::Sum { total, count } | Self::Average { total, count } => {
-                if let Some(value) = value {
-                    *total += numeric_value(&value)?;
-                    *count = count.checked_add(1).ok_or_else(|| {
-                        ExecutionError::evaluation("pivot aggregate count overflow")
-                    })?;
-                }
-            }
-            Self::First(current) => {
-                if current.is_none() {
-                    *current = value;
-                }
-            }
-            Self::Last(current) => {
-                if value.is_some() {
-                    *current = value;
-                }
-            }
-            Self::Minimum(current) => update_extreme(current, value, true)?,
-            Self::Maximum(current) => update_extreme(current, value, false)?,
-            Self::Count(count) => {
-                *count = count
-                    .checked_add(1)
-                    .ok_or_else(|| ExecutionError::evaluation("pivot count overflow"))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> ExecutionResult<Value> {
-        match self {
-            Self::Sum { total, .. } => float_value(total),
-            Self::Average { total, count } => {
-                if count == 0 {
-                    Ok(Value::null())
-                } else {
-                    float_value(total / count as f64)
-                }
-            }
-            Self::First(value)
-            | Self::Last(value)
-            | Self::Minimum(value)
-            | Self::Maximum(value) => Ok(value.unwrap_or_else(Value::null)),
-            Self::Count(count) => Ok(Value::unsigned(count)),
-        }
-    }
+    /// Cell of each (column, measure), `None` until a row reaches it.
+    cells: Vec<Option<MeasureState>>,
 }
 
 fn update_extreme( current: &mut Option<Value>, candidate: Option<Value>, minimum: bool, ) -> ExecutionResult<()> {
     let Some(candidate) = candidate else {
         return Ok(());
     };
-
-    let Some(existing) = current.as_ref() else {
-        *current = Some(candidate);
-        return Ok(());
+    let replace = match current.as_ref() {
+        None => true,
+        Some(existing) => {
+            let ordering = compare_extreme_values(&candidate, existing)?;
+            if minimum { ordering.is_lt() } else { ordering.is_gt() }
+        }
     };
-
-    let ordering = compare_pivot_values(&candidate, existing)?;
-    let replace = if minimum {
-        ordering.is_lt()
-    } else {
-        ordering.is_gt()
-    };
-
     if replace {
         *current = Some(candidate);
     }
-
     Ok(())
 }
 
-fn compare_pivot_values(left: &Value, right: &Value) -> ExecutionResult<std::cmp::Ordering> {
+fn compare_extreme_values(left: &Value, right: &Value) -> ExecutionResult<std::cmp::Ordering> {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => numeric_order(*left, *right),
+        (Value::Number(left), Value::Number(right)) => number_as_f64(*left)
+            .partial_cmp(&number_as_f64(*right))
+            .ok_or_else(|| ExecutionError::evaluation("min/max cannot compare non-finite numbers")),
         (Value::String(left), Value::String(right)) => Ok(left.cmp(right)),
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
         _ => Err(ExecutionError::evaluation(format!(
-            "pivot min/max requires comparable values of the same scalar type, found {left:?} and {right:?}"
+            "min/max requires comparable values of the same scalar type, found {left:?} and {right:?}"
         ))),
     }
 }
 
-fn numeric_order(left: Number, right: Number) -> ExecutionResult<std::cmp::Ordering> {
-    let left = match left {
-        Number::Signed(value) => value as f64,
-        Number::Unsigned(value) => value as f64,
-        Number::Float(value) => value,
-    };
-    let right = match right {
-        Number::Signed(value) => value as f64,
-        Number::Unsigned(value) => value as f64,
-        Number::Float(value) => value,
-    };
-
-    left.partial_cmp(&right).ok_or_else(|| {
-        ExecutionError::evaluation("pivot min/max cannot compare non-finite numbers")
-    })
-}
-
-fn build_pivot_document( index: usize, specification: &PivotSpecification, group: PivotGroup, ) -> ExecutionResult<SyntheticDocument> {
+fn build_pivot_document( index: usize, specification: &PivotSpecification, row_values: Vec<Option<Value>>, cells: BTreeMap<String, MeasureState>, ) -> ExecutionResult<SyntheticDocument> {
     let mut document = Document::new();
 
-    for (path, value) in specification.rows().iter().zip(group.row_values) {
+    for (path, value) in specification.rows().iter().zip(row_values) {
         let field = path.last();
         document.insert(field, value.unwrap_or_else(Value::null));
     }
 
-    for (name, state) in group.cells {
-        document.insert(name, state.finish()?);
+    for (name, state) in cells {
+        // A sum cell that never saw a number is 0 in a pivot table.
+        document.insert(name, state.finish()?.unwrap_or_else(|| Value::signed(0)));
     }
 
     let id = DocumentId::synthetic(0x0070_6976_6f74, index as u64 + 1);
@@ -1107,28 +917,275 @@ fn build_pivot_document( index: usize, specification: &PivotSpecification, group
     Ok(SyntheticDocument::new(id, Arc::new(document)))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct IncrementalGroupKey {
     source: ExpressionFieldPath,
     output: ExpressionFieldPath,
 }
 
-#[derive(Debug)]
-struct IncrementalGroupMeasure {
-    source: ExpressionFieldPath,
+/// Every aggregate, in marker-decoding order.
+const AGGREGATES: [PivotAggregate; 7] = [
+    PivotAggregate::Sum, PivotAggregate::Average, PivotAggregate::Minimum, PivotAggregate::Maximum,
+    PivotAggregate::First, PivotAggregate::Last, PivotAggregate::Count,
+];
+
+#[derive(Clone, Debug)]
+struct GroupMeasure {
+    aggregate: PivotAggregate,
+    /// Measured field; `None` for `count` without a field, which counts rows.
+    source: Option<ExpressionFieldPath>,
     alias: String,
 }
 
-#[derive(Debug)]
+/// Running state of one `group` measure or `pivot` cell.
+#[derive(Clone, Debug)]
+enum MeasureState {
+    /// `integer` stays exact while every term is an integer and the total fits in i64.
+    Sum { seen: bool, integer: Option<i64>, total: f64 },
+    Avg { count: u64, total: f64 },
+    /// Smallest (`minimum`) or largest non-null value.
+    Extreme { minimum: bool, value: Option<Value> },
+    /// Value of the first row, or of the latest row when `last`.
+    Pick { last: bool, value: Option<Value> },
+    Count(u64),
+}
+
+impl MeasureState {
+    const fn new(aggregate: PivotAggregate) -> Self {
+        match aggregate {
+            PivotAggregate::Sum => Self::Sum { seen: false, integer: Some(0), total: 0.0 },
+            PivotAggregate::Average => Self::Avg { count: 0, total: 0.0 },
+            PivotAggregate::Minimum => Self::Extreme { minimum: true, value: None },
+            PivotAggregate::Maximum => Self::Extreme { minimum: false, value: None },
+            PivotAggregate::First => Self::Pick { last: false, value: None },
+            PivotAggregate::Last => Self::Pick { last: true, value: None },
+            PivotAggregate::Count => Self::Count(0),
+        }
+    }
+
+    /// Bytes retained beyond the fixed overhead of the state.
+    fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Extreme { value, .. } | Self::Pick { value, .. } => optional_value_bytes(value),
+            Self::Sum { .. } | Self::Avg { .. } | Self::Count(_) => 0,
+        }
+    }
+
+    /// Folds one row's value; `None` means the field is missing on that row.
+    /// Sums and averages ignore non-numeric values.
+    fn push(&mut self, value: Option<&Value>) -> ExecutionResult<()> {
+        let number = value.and_then(Value::as_number).copied();
+        match self {
+            Self::Sum { .. } | Self::Avg { .. } => {
+                if let Some(number) = number {
+                    self.push_number(number)?;
+                }
+            }
+            Self::Extreme { minimum, value: current } => {
+                update_extreme(current, value.filter(|value| !value.is_null()).cloned(), *minimum)?;
+            }
+            Self::Pick { last, value: current } => {
+                if *last || current.is_none() {
+                    *current = Some(value.cloned().unwrap_or_else(Value::null));
+                }
+            }
+            Self::Count(count) => {
+                if value.is_some_and(|value| !value.is_null()) {
+                    *count = count.checked_add(1).ok_or_else(|| ExecutionError::evaluation("group count exceeds the supported u64 range"))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrowed twin of [`Self::push`]: sums, averages and counts read the
+    /// storage value in place, so the per-row hot path never builds a [`Value`].
+    fn push_ref(&mut self, value: Option<&ProjectedValueRef<'_>>) -> ExecutionResult<()> {
+        let number = match value {
+            Some(ProjectedValueRef::Owned(value)) => return self.push(Some(value)),
+            Some(ProjectedValueRef::Signed(value)) => Some(Number::Signed(*value)),
+            Some(ProjectedValueRef::Unsigned(value)) => Some(Number::Unsigned(*value)),
+            Some(ProjectedValueRef::Float(value)) => Some(Number::Float(*value)),
+            _ => None,
+        };
+        match self {
+            Self::Sum { .. } | Self::Avg { .. } => {
+                if let Some(number) = number {
+                    self.push_number(number)?;
+                }
+            }
+            Self::Count(count) => {
+                if value.is_some_and(|value| !matches!(value, ProjectedValueRef::Null)) {
+                    *count = count.checked_add(1).ok_or_else(|| ExecutionError::evaluation("group count exceeds the supported u64 range"))?;
+                }
+            }
+            // The first value is kept: later rows change nothing.
+            Self::Pick { last: false, value: Some(_) } => {}
+            Self::Extreme { minimum, value: current } => {
+                // Compared borrowed; a value is built only when it replaces
+                // the current one. Other pairs take the common path.
+                let ordering = match (value, current.as_ref()) {
+                    (None | Some(ProjectedValueRef::Null), _) => return Ok(()),
+                    (Some(ProjectedValueRef::String(text)), Some(Value::String(existing))) => Some((*text).cmp(existing.as_ref())),
+                    (Some(_), Some(Value::Number(existing))) => match number {
+                        Some(number) => Some(number_as_f64(number).partial_cmp(&number_as_f64(*existing)).ok_or_else(|| {
+                            ExecutionError::evaluation("min/max cannot compare non-finite numbers")
+                        })?),
+                        None => None,
+                    },
+                    _ => None,
+                };
+                match ordering {
+                    Some(ordering) => {
+                        if (*minimum && ordering.is_lt()) || (!*minimum && ordering.is_gt()) {
+                            *current = value.map(ProjectedValueRef::to_value);
+                        }
+                    }
+                    None => self.push(value.map(ProjectedValueRef::to_value).as_ref())?,
+                }
+            }
+            Self::Pick { .. } => {
+                self.push(value.map(ProjectedValueRef::to_value).as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds one numeric term to a sum or average.
+    fn push_number(&mut self, number: Number) -> ExecutionResult<()> {
+        match self {
+            Self::Sum { seen, integer, total } => {
+                *integer = integer.zip(exact_integer(number)).and_then(|(sum, term)| sum.checked_add(term));
+                *total += number_as_f64(number);
+                *seen = true;
+            }
+            Self::Avg { count, total } => {
+                *total += number_as_f64(number);
+                *count = count.checked_add(1).ok_or_else(|| {
+                    ExecutionError::evaluation("group count exceeds the supported u64 range")
+                })?;
+            }
+            _ => return Err(ExecutionError::evaluation("group measure is not numeric")),
+        }
+        Ok(())
+    }
+
+    /// Folds a partial state computed over later rows of the same group.
+    fn merge(&mut self, other: Self) -> ExecutionResult<()> {
+        let overflow = || ExecutionError::evaluation("group count exceeds the supported u64 range");
+        match (self, other) {
+            (Self::Sum { seen, integer, total }, Self::Sum { seen: other_seen, integer: other_integer, total: other_total }) => {
+                *integer = integer.zip(other_integer).and_then(|(left, right)| left.checked_add(right));
+                *total += other_total;
+                *seen |= other_seen;
+            }
+            (Self::Avg { count, total }, Self::Avg { count: other_count, total: other_total }) => {
+                *total += other_total;
+                *count = count.checked_add(other_count).ok_or_else(overflow)?;
+            }
+            (Self::Extreme { minimum, value }, Self::Extreme { value: other, .. }) => update_extreme(value, other, *minimum)?,
+            (Self::Pick { last, value }, Self::Pick { value: other, .. }) => {
+                if value.is_none() || (*last && other.is_some()) {
+                    *value = other;
+                }
+            }
+            (Self::Count(count), Self::Count(other)) => *count = count.checked_add(other).ok_or_else(overflow)?,
+            _ => return Err(ExecutionError::evaluation("group partial state does not match its measure")),
+        }
+        Ok(())
+    }
+
+    fn encode(&self, output: &mut Vec<u8>) {
+        match self {
+            Self::Sum { seen: false, .. } => output.push(0),
+            Self::Sum { integer: Some(integer), .. } => {
+                output.push(2);
+                output.extend_from_slice(&(*integer as u64).to_be_bytes());
+            }
+            Self::Sum { total, .. } => {
+                output.push(1);
+                output.extend_from_slice(&total.to_bits().to_be_bytes());
+            }
+            Self::Avg { count, total } => {
+                encode_var_u64(output, *count);
+                output.extend_from_slice(&total.to_bits().to_be_bytes());
+            }
+            Self::Extreme { value, .. } | Self::Pick { value, .. } => match value {
+                Some(value) => {
+                    output.push(1);
+                    encode_value(output, value);
+                }
+                None => output.push(0),
+            },
+            Self::Count(count) => encode_var_u64(output, *count),
+        }
+    }
+
+    fn decode(aggregate: PivotAggregate, input: &mut CompactGroupDecoder<'_>) -> ExecutionResult<Self> {
+        let mut state = Self::new(aggregate);
+        match &mut state {
+            Self::Sum { seen, integer, total } => match input.byte()? {
+                0 => {}
+                1 => (*seen, *integer, *total) = (true, None, f64::from_bits(input.u64()?)),
+                2 => {
+                    let value = input.u64()? as i64;
+                    (*seen, *integer, *total) = (true, Some(value), value as f64);
+                }
+                _ => return Err(ExecutionError::evaluation("invalid compact group sum")),
+            },
+            Self::Avg { count, total } => (*count, *total) = (input.var_u64()?, f64::from_bits(input.u64()?)),
+            Self::Extreme { value, .. } | Self::Pick { value, .. } => {
+                *value = match input.byte()? {
+                    0 => None,
+                    1 => Some(input.value()?),
+                    _ => return Err(ExecutionError::evaluation("invalid compact group measure")),
+                };
+            }
+            Self::Count(count) => *count = input.var_u64()?,
+        }
+        Ok(state)
+    }
+
+    /// Final value, or `None` for a sum that never saw a number.
+    fn finish(self) -> ExecutionResult<Option<Value>> {
+        Ok(match self {
+            Self::Sum { seen: false, .. } => None,
+            Self::Sum { integer: Some(integer), .. } => Some(Value::signed(integer)),
+            Self::Sum { total, .. } => Some(float_value(total)?),
+            Self::Avg { count: 0, .. } => Some(Value::null()),
+            Self::Avg { count, total } => Some(float_value(total / count as f64)?),
+            Self::Extreme { value, .. } | Self::Pick { value, .. } => Some(value.unwrap_or_else(Value::null)),
+            Self::Count(count) => Some(Value::unsigned(count)),
+        })
+    }
+}
+
+fn exact_integer(number: Number) -> Option<i64> {
+    match number {
+        Number::Signed(value) => Some(value),
+        Number::Unsigned(value) => i64::try_from(value).ok(),
+        Number::Float(_) => None,
+    }
+}
+
+fn number_as_f64(number: Number) -> f64 {
+    match number {
+        Number::Signed(value) => value as f64,
+        Number::Unsigned(value) => value as f64,
+        Number::Float(value) => value,
+    }
+}
+
+#[derive(Clone, Debug)]
 struct DefaultIncrementalGroupAccumulator {
-    keys: Vec<IncrementalGroupKey>,
-    measures: Vec<IncrementalGroupMeasure>,
+    keys: Arc<[IncrementalGroupKey]>,
+    measures: Arc<[GroupMeasure]>,
     key_values: Option<Vec<Option<Value>>>,
     count: u64,
-    sums: Vec<f64>,
-    seen_summable: Vec<bool>,
-    projected_key_indexes: Vec<usize>,
-    projected_measure_indexes: Vec<usize>,
+    states: Vec<MeasureState>,
+    /// Position of each key and measure source in the required input fields.
+    projected_key_indexes: Arc<[usize]>,
+    projected_measure_indexes: Arc<[Option<usize>]>,
 }
 
 impl DefaultIncrementalGroupAccumulator {
@@ -1136,150 +1193,101 @@ impl DefaultIncrementalGroupAccumulator {
         let mut keys = Vec::new();
         let mut measures = Vec::new();
         for field in fields {
-            if let Some((source, alias)) = decode_group_sum_marker(field)? {
-                measures.push(IncrementalGroupMeasure { source, alias });
+            if let Some(measure) = decode_group_measure_marker(field)? {
+                measures.push(measure);
             } else if let Some((source, output)) = decode_group_key_marker(field)? {
                 keys.push(IncrementalGroupKey { source, output });
             } else {
-                keys.push(IncrementalGroupKey {
-                    source: field.clone(),
-                    output: field.clone(),
-                });
+                keys.push(IncrementalGroupKey { source: field.clone(), output: field.clone() });
             }
         }
-        let measure_count = measures.len();
         let (_, required) = group_field_layout(fields)?;
-        let projected_key_indexes = keys
-            .iter()
-            .map(|key| {
-                required
-                    .iter()
-                    .position(|field| field == &key.source)
-                    .expect("group key is required")
-            })
-            .collect();
-        let projected_measure_indexes = measures
-            .iter()
-            .map(|measure| {
-                required
-                    .iter()
-                    .position(|field| field == &measure.source)
-                    .expect("group measure is required")
-            })
-            .collect();
+        let position = |source: &ExpressionFieldPath| {
+            required.iter().position(|field| field == source).expect("group input field is required")
+        };
+        let projected_key_indexes = keys.iter().map(|key| position(&key.source)).collect();
+        let projected_measure_indexes = measures.iter().map(|measure| measure.source.as_ref().map(position)).collect();
         Ok(Self {
-            keys,
-            measures,
+            states: measures.iter().map(|measure| MeasureState::new(measure.aggregate)).collect(),
+            keys: Arc::from(keys),
+            measures: Arc::from(measures),
             key_values: None,
             count: 0,
-            sums: vec![0.0; measure_count],
-            seen_summable: vec![false; measure_count],
             projected_key_indexes,
             projected_measure_indexes,
         })
+    }
+
+    /// Captures the grouping-key values from the group's first row.
+    fn init_keys(&mut self, values: impl FnOnce(&Self) -> Vec<Option<Value>>) {
+        if self.key_values.is_none() {
+            self.key_values = Some(values(self));
+        }
+    }
+
+    fn count_row(&mut self) -> ExecutionResult<()> {
+        self.count = self.count.checked_add(1).ok_or_else(|| {
+            ExecutionError::evaluation("group count exceeds the supported u64 range")
+        })?;
+        Ok(())
+    }
+
+    /// Counts one row and folds it; `value(index)` returns measure `index`'s source value.
+    fn push_row<'v>(&mut self, mut value: impl FnMut(usize) -> Option<&'v Value>) -> ExecutionResult<()> {
+        self.count_row()?;
+        let row = Value::bool(true);
+        for (index, state) in self.states.iter_mut().enumerate() {
+            let measured = if self.measures[index].source.is_some() { value(index) } else { Some(&row) };
+            state.push(measured)?;
+        }
+        Ok(())
     }
 }
 
 impl IncrementalGroupAccumulator for DefaultIncrementalGroupAccumulator {
     fn push(&mut self, document: &Document) -> ExecutionResult<()> {
-        if self.key_values.is_none() {
-            self.key_values = Some(
-                self.keys
-                    .iter()
-                    .map(|key| path_value(document, &key.source).cloned())
-                    .collect(),
-            );
-        }
-
-        self.count = self.count.checked_add(1).ok_or_else(|| {
-            ExecutionError::evaluation("group count exceeds the supported u64 range")
-        })?;
-
-        for (index, measure) in self.measures.iter().enumerate() {
-            let Some(value) = path_value(document, &measure.source) else {
-                continue;
-            };
-            if value.has_capability(crate::Capability::Summable) {
-                self.sums[index] += numeric_value(value)?;
-                self.seen_summable[index] = true;
-            }
-        }
-        Ok(())
+        self.init_keys(|this| this.keys.iter().map(|key| path_value(document, &key.source).cloned()).collect());
+        let measures = Arc::clone(&self.measures);
+        self.push_row(|index| measures[index].source.as_ref().and_then(|source| path_value(document, source)))
     }
 
     fn push_projected_values(&mut self, values: &[Option<Value>]) -> ExecutionResult<bool> {
-        if self.key_values.is_none() {
-            self.key_values = Some(
-                self.projected_key_indexes
-                    .iter()
-                    .map(|index| values.get(*index).cloned().flatten())
-                    .collect(),
-            );
-        }
-
-        self.count = self.count.checked_add(1).ok_or_else(|| {
-            ExecutionError::evaluation("group count exceeds the supported u64 range")
-        })?;
-
-        for (measure_index, value_index) in self.projected_measure_indexes.iter().enumerate() {
-            let Some(Some(value)) = values.get(*value_index) else {
-                continue;
-            };
-            if value.has_capability(crate::Capability::Summable) {
-                self.sums[measure_index] += numeric_value(value)?;
-                self.seen_summable[measure_index] = true;
-            }
-        }
+        self.init_keys(|this| this.projected_key_indexes.iter().map(|index| values.get(*index).cloned().flatten()).collect());
+        let indexes = Arc::clone(&self.projected_measure_indexes);
+        self.push_row(|index| indexes[index].and_then(|slot| values.get(slot)).and_then(Option::as_ref))?;
         Ok(true)
     }
 
     fn push_projected_value_refs( &mut self, values: &[Option<crate::storage::ProjectedValueRef<'_>>], source_slots: &[usize], ) -> ExecutionResult<bool> {
-        if self.key_values.is_none() {
-            self.key_values = Some(
-                self.projected_key_indexes
-                    .iter()
-                    .map(|index| {
-                        values
-                            .get(source_slots.get(*index).copied().unwrap_or(usize::MAX))
-                            .and_then(Option::as_ref)
-                            .map(crate::storage::ProjectedValueRef::to_value)
-                    })
-                    .collect(),
-            );
-        }
-
-        self.count = self.count.checked_add(1).ok_or_else(|| {
-            ExecutionError::evaluation("group count exceeds the supported u64 range")
-        })?;
-
-        for (measure_index, value_index) in self.projected_measure_indexes.iter().enumerate() {
-            let Some(Some(value)) = values.get(
-                source_slots
-                    .get(*value_index)
-                    .copied()
-                    .unwrap_or(usize::MAX),
-            ) else {
-                continue;
-            };
-            if let Some(number) = value.as_f64() {
-                self.sums[measure_index] += number;
-                self.seen_summable[measure_index] = true;
+        let resolve = |index: usize| {
+            values
+                .get(source_slots.get(index).copied().unwrap_or(usize::MAX))
+                .and_then(Option::as_ref)
+        };
+        self.init_keys(|this| this.projected_key_indexes.iter().map(|index| resolve(*index).map(ProjectedValueRef::to_value)).collect());
+        self.count_row()?;
+        let row = Value::bool(true);
+        for (state, slot) in self.states.iter_mut().zip(self.projected_measure_indexes.iter()) {
+            match slot {
+                Some(slot) => state.push_ref(resolve(*slot))?,
+                None => state.push(Some(&row))?,
             }
         }
         Ok(true)
     }
 
+    fn into_dense(self: Box<Self>) -> Option<DenseGroups> {
+        Some(DenseGroups { template: *self, keys: Vec::new(), counts: Vec::new(), states: Vec::new() })
+    }
+
     fn compact_partial(&self) -> ExecutionResult<Option<Vec<u8>>> {
-        // v2 deliberately omits grouping-key values. The engine already writes the
+        // Grouping-key values are omitted: the engine already writes the
         // canonical key once per spill record and seeds it again during merge.
-        let mut out = Vec::with_capacity(9 + self.measures.len() * 9);
-        out.push(2);
+        let mut out = Vec::with_capacity(9 + self.states.len() * 9);
+        out.push(3);
         encode_var_u64(&mut out, self.count);
-        for index in 0..self.measures.len() {
-            out.push(u8::from(self.seen_summable[index]));
-            if self.seen_summable[index] {
-                out.extend_from_slice(&self.sums[index].to_bits().to_be_bytes());
-            }
+        for state in &self.states {
+            state.encode(&mut out);
         }
         Ok(Some(out))
     }
@@ -1299,90 +1307,19 @@ impl IncrementalGroupAccumulator for DefaultIncrementalGroupAccumulator {
     }
 
     fn merge_compact_partial(&mut self, payload: &[u8]) -> ExecutionResult<bool> {
+        // Spill runs live only for one query, so only the current format (3) exists.
         let mut input = CompactGroupDecoder::new(payload);
-        match input.byte()? {
-            1 => {
-                // Backward-compatible reader for v1 runs written by older engines.
-                let key_count = input.len()?;
-                if key_count != self.keys.len() {
-                    return Ok(false);
-                }
-                let mut decoded_keys = Vec::with_capacity(key_count);
-                for _ in 0..key_count {
-                    decoded_keys.push(match input.byte()? {
-                        0 => None,
-                        1 => Some(input.value()?),
-                        _ => return Ok(false),
-                    });
-                }
-                if self.key_values.is_none() {
-                    self.key_values = Some(decoded_keys);
-                }
-                self.count = self.count.checked_add(input.u64()?).ok_or_else(|| {
-                    ExecutionError::evaluation("group count exceeds the supported u64 range")
-                })?;
-                let measure_count = input.len()?;
-                if measure_count != self.measures.len() {
-                    return Ok(false);
-                }
-                for index in 0..measure_count {
-                    match input.byte()? {
-                        0 => {}
-                        1 => {
-                            self.sums[index] += f64::from_bits(input.u64()?);
-                            self.seen_summable[index] = true;
-                        }
-                        _ => return Ok(false),
-                    }
-                }
-            }
-            2 => {
-                self.count = self.count.checked_add(input.var_u64()?).ok_or_else(|| {
-                    ExecutionError::evaluation("group count exceeds the supported u64 range")
-                })?;
-                for index in 0..self.measures.len() {
-                    match input.byte()? {
-                        0 => {}
-                        1 => {
-                            self.sums[index] += f64::from_bits(input.u64()?);
-                            self.seen_summable[index] = true;
-                        }
-                        _ => return Ok(false),
-                    }
-                }
-            }
-            _ => return Ok(false),
+        if input.byte()? != 3 {
+            return Ok(false);
         }
-        input.finish()?;
-        Ok(true)
-    }
-
-    fn merge_partial(&mut self, document: &Document) -> ExecutionResult<bool> {
-        if self.key_values.is_none() {
-            self.key_values = Some(
-                self.keys
-                    .iter()
-                    .map(|key| path_value(document, &key.source).cloned())
-                    .collect(),
-            );
-        }
-        let partial_count = match document.get("__og_internal_group_partial_count") {
-            Some(Value::Number(Number::Unsigned(value))) => *value,
-            Some(Value::Number(Number::Signed(value))) if *value >= 0 => *value as u64,
-            _ => return Ok(false),
-        };
-        self.count = self.count.checked_add(partial_count).ok_or_else(|| {
+        self.count = self.count.checked_add(input.var_u64()?).ok_or_else(|| {
             ExecutionError::evaluation("group count exceeds the supported u64 range")
         })?;
-        for (index, measure) in self.measures.iter().enumerate() {
-            let Some(value) = document.get(measure.alias.as_str()) else {
-                continue;
-            };
-            if value.has_capability(crate::Capability::Summable) {
-                self.sums[index] += numeric_value(value)?;
-                self.seen_summable[index] = true;
-            }
+        for index in 0..self.measures.len() {
+            let partial = MeasureState::decode(self.measures[index].aggregate, &mut input)?;
+            self.states[index].merge(partial)?;
         }
+        input.finish()?;
         Ok(true)
     }
 
@@ -1394,19 +1331,14 @@ impl IncrementalGroupAccumulator for DefaultIncrementalGroupAccumulator {
             insert_path(&mut document, &path, value.unwrap_or_else(Value::null));
         }
 
-        let mut emitted_sum = false;
-        for (index, measure) in self.measures.iter().enumerate() {
-            if self.seen_summable[index] {
-                let value = Value::float(self.sums[index]).map_err(|error| {
-                    ExecutionError::evaluation(format!(
-                        "group sum cannot be represented as a finite number: {error}"
-                    ))
-                })?;
+        let mut emitted = false;
+        for (measure, state) in self.measures.iter().zip(self.states) {
+            if let Some(value) = state.finish()? {
                 document.insert(measure.alias.as_str(), value);
-                emitted_sum = true;
+                emitted = true;
             }
         }
-        if !emitted_sum {
+        if !emitted {
             document.insert("count", Value::unsigned(self.count));
         }
 
@@ -1416,23 +1348,93 @@ impl IncrementalGroupAccumulator for DefaultIncrementalGroupAccumulator {
         ))
     }
 }
+/// Every group of one `group` stage, with the measure states of all groups
+/// in one contiguous vector: the per-row fold touches one small slice
+/// instead of a boxed accumulator per group. A group finishes through the
+/// same accumulator as [`IncrementalGroupAccumulator::finish`].
+#[derive(Debug)]
+pub struct DenseGroups {
+    template: DefaultIncrementalGroupAccumulator,
+    keys: Vec<Option<Vec<Option<Value>>>>,
+    counts: Vec<u64>,
+    states: Vec<MeasureState>,
+}
+
+impl DenseGroups {
+    /// Groups created so far (evicted ones included).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Creates a group whose key values are read from `values` (the group
+    /// input fields of its first row).
+    pub fn add(&mut self, values: &[Option<ProjectedValueRef<'_>>]) -> u32 {
+        let group = self.keys.len() as u32;
+        self.keys.push(Some(self.template.projected_key_indexes.iter().map(|index| values.get(*index).and_then(Option::as_ref).map(ProjectedValueRef::to_value)).collect()));
+        self.counts.push(0);
+        self.states.extend_from_slice(&self.template.states);
+        group
+    }
+
+    /// Folds one row of `group`, as `push_projected_value_refs` does.
+    #[inline]
+    pub fn push(&mut self, group: u32, values: &[Option<ProjectedValueRef<'_>>]) -> ExecutionResult<()> {
+        let group = group as usize;
+        let count = &mut self.counts[group];
+        *count = count.checked_add(1).ok_or_else(|| ExecutionError::evaluation("group count exceeds the supported u64 range"))?;
+        let measures = self.template.states.len();
+        let states = &mut self.states[group * measures..(group + 1) * measures];
+        for (state, slot) in states.iter_mut().zip(self.template.projected_measure_indexes.iter()) {
+            match slot {
+                Some(slot) => state.push_ref(values.get(*slot).and_then(Option::as_ref))?,
+                None => state.push(Some(&Value::Bool(true)))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops a group: it is never finished.
+    pub fn evict(&mut self, group: u32) {
+        self.keys[group as usize] = None;
+    }
+
+    /// Result row of `group`, numbered `ordinal`.
+    pub fn finish(&mut self, group: u32, ordinal: u64) -> ExecutionResult<SyntheticDocument> {
+        let group = group as usize;
+        let measures = self.template.states.len();
+        let mut accumulator = self.template.clone();
+        accumulator.key_values = self.keys[group].take();
+        accumulator.count = self.counts[group];
+        accumulator.states = self.states[group * measures..(group + 1) * measures].to_vec();
+        Box::new(accumulator).finish(ordinal)
+    }
+}
+
 const GROUP_NAMESPACE: u64 = 0x0067_726f_7570;
-const GROUP_SUM_MARKER_PREFIX: &str = "__og_group_sum_";
+const GROUP_MARKER_PREFIX: &str = "__og_group_";
 const GROUP_KEY_MARKER_PREFIX: &str = "__og_group_key_";
 
 /// Resolves the physical group layout.
 ///
 /// Returns `(grouping_keys, required_input_fields)`: grouping keys exclude the
-/// planner's internal sum markers, while required input fields replace each
+/// planner's internal measure markers, while required input fields replace each
 /// marker with its source path. This is the shape storage projection must use.
 pub fn group_field_layout( fields: &[ExpressionFieldPath], ) -> ExecutionResult<(Vec<ExpressionFieldPath>, Vec<ExpressionFieldPath>)> {
     let mut grouping_keys = Vec::new();
     let mut required = Vec::new();
 
     for field in fields {
-        if let Some((source, _alias)) = decode_group_sum_marker(field)? {
-            if !required.contains(&source) {
-                required.push(source);
+        if let Some(measure) = decode_group_measure_marker(field)? {
+            if let Some(source) = measure.source {
+                if !required.contains(&source) {
+                    required.push(source);
+                }
             }
         } else if let Some((source, _output)) = decode_group_key_marker(field)? {
             grouping_keys.push(source.clone());
@@ -1450,10 +1452,31 @@ pub fn group_field_layout( fields: &[ExpressionFieldPath], ) -> ExecutionResult<
     Ok((grouping_keys, required))
 }
 
+/// Renders group fields as written by the user (`region as zone, avg(qty) as mean`).
+pub(crate) fn describe_group_fields(fields: &[ExpressionFieldPath]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            if let Ok(Some(measure)) = decode_group_measure_marker(field) {
+                let source = measure.source.map(|source| source.to_string()).unwrap_or_default();
+                format!("{}({source}) as {}", measure.aggregate.as_str(), measure.alias)
+            } else if let Ok(Some((source, output))) = decode_group_key_marker(field) {
+                format!("{source} as {output}")
+            } else {
+                field.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn decode_group_key_marker( field: &ExpressionFieldPath, ) -> ExecutionResult<Option<(ExpressionFieldPath, ExpressionFieldPath)>> {
     let Some((source, output)) = decode_group_path_marker(field, GROUP_KEY_MARKER_PREFIX, "key")?
     else {
         return Ok(None);
+    };
+    let Some(source) = source else {
+        return Err(ExecutionError::evaluation("group key marker has no source field"));
     };
     let output = ExpressionFieldPath::new(output.split('.')).map_err(|error| {
         ExecutionError::evaluation(format!("invalid encoded group output path: {error}"))
@@ -1461,7 +1484,9 @@ pub fn decode_group_key_marker( field: &ExpressionFieldPath, ) -> ExecutionResul
     Ok(Some((source, output)))
 }
 
-fn decode_group_path_marker( field: &ExpressionFieldPath, prefix: &str, marker_kind: &str, ) -> ExecutionResult<Option<(ExpressionFieldPath, String)>> {
+/// Decodes `__og_group_<prefix-rest>` into `(source, output)`. An empty source
+/// (a row `count` measure) decodes as `None`.
+fn decode_group_path_marker( field: &ExpressionFieldPath, prefix: &str, marker_kind: &str, ) -> ExecutionResult<Option<(Option<ExpressionFieldPath>, String)>> {
     let segments = field.iter().collect::<Vec<_>>();
     if segments.len() != 1 {
         return Ok(None);
@@ -1476,16 +1501,37 @@ fn decode_group_path_marker( field: &ExpressionFieldPath, prefix: &str, marker_k
         )));
     };
 
-    let source = decode_group_marker_text(source_hex)?;
     let output = decode_group_marker_text(output_hex)?;
+    if source_hex.is_empty() {
+        return Ok(Some((None, output)));
+    }
+    let source = decode_group_marker_text(source_hex)?;
     let source = ExpressionFieldPath::new(source.split('.')).map_err(|error| {
         ExecutionError::evaluation(format!("invalid encoded group source path: {error}"))
     })?;
-    Ok(Some((source, output)))
+    Ok(Some((Some(source), output)))
 }
 
-pub fn decode_group_sum_marker( field: &ExpressionFieldPath, ) -> ExecutionResult<Option<(ExpressionFieldPath, String)>> {
-    decode_group_path_marker(field, GROUP_SUM_MARKER_PREFIX, "sum")
+/// Decodes a measure marker `__og_group_<aggregate>_<source hex>_<alias hex>`.
+fn decode_group_measure_marker( field: &ExpressionFieldPath, ) -> ExecutionResult<Option<GroupMeasure>> {
+    let Some(rest) = field.first().strip_prefix(GROUP_MARKER_PREFIX) else {
+        return Ok(None);
+    };
+    for aggregate in AGGREGATES {
+        let name = aggregate.as_str();
+        if !rest.strip_prefix(name).is_some_and(|rest| rest.starts_with('_')) {
+            continue;
+        }
+        let prefix = format!("{GROUP_MARKER_PREFIX}{name}_");
+        let Some((source, alias)) = decode_group_path_marker(field, &prefix, name)? else {
+            return Ok(None);
+        };
+        if source.is_none() && aggregate != PivotAggregate::Count {
+            return Err(ExecutionError::evaluation(format!("group {name} measure requires a field")));
+        }
+        return Ok(Some(GroupMeasure { aggregate, source, alias }));
+    }
+    Ok(None)
 }
 
 fn decode_group_marker_text(text: &str) -> ExecutionResult<String> {
@@ -1504,6 +1550,493 @@ fn decode_group_marker_text(text: &str) -> ExecutionResult<String> {
 
     String::from_utf8(bytes)
         .map_err(|_| ExecutionError::evaluation("group marker is not valid UTF-8"))
+}
+
+/// How a compiled stage relates its output fields to its input fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageOutput {
+    /// Every input field passes through, except the written ones.
+    Rewritten,
+    /// Only the written fields are output.
+    Projected,
+    /// The row is replaced by a value of unknown shape (`root`).
+    Replaced,
+}
+
+/// What an expanding stage makes of one slot row.
+#[derive(Debug)]
+pub enum SlotExpansion {
+    /// The row passes through unchanged.
+    Keep,
+    /// The row is removed.
+    Drop,
+    /// The row passes through with these slots written.
+    Set(Vec<(ExpressionFieldPath, Option<Value>)>),
+    /// One row per item: `field` holds the item and `index` its position.
+    Each { field: ExpressionFieldPath, index: Option<ExpressionFieldPath>, items: Arc<[Value]> },
+}
+
+/// A native row-local stage (`derive`, `select … as`, `rename`, `drop`,
+/// `root`, `near`, `unwind`, `first`/`single`) compiled once per plan:
+/// expressions are parsed and paths resolved before the first row.
+///
+/// It also declares the input fields it reads and the fields it writes, so
+/// planning can reason about field usage without knowing the stage.
+#[derive(Debug)]
+pub struct CompiledStage {
+    operation: CompiledOperation,
+    reads: Arc<[ExpressionFieldPath]>,
+    writes: Arc<[ExpressionFieldPath]>,
+    output: StageOutput,
+}
+
+#[derive(Debug)]
+enum CompiledOperation {
+    Derive(Vec<(ExpressionFieldPath, Expression)>),
+    Select(Vec<(ExpressionFieldPath, SelectSource)>),
+    Rename { source: ExpressionFieldPath, target: ExpressionFieldPath },
+    Drop(Vec<ExpressionFieldPath>),
+    Near(NearSpec),
+    Root(ExpressionFieldPath),
+    Project(Option<ExpressionFieldPath>),
+    Unwind { field: ExpressionFieldPath, index: Option<ExpressionFieldPath>, keep_empty: bool },
+    /// A stage executed elsewhere (`sample`): compiled only for its properties.
+    Passthrough,
+}
+
+#[derive(Debug)]
+enum SelectSource {
+    Field(ExpressionFieldPath),
+    Expression(Expression),
+}
+
+/// What a stage that runs on slots does, for executors that compile it
+/// their own way (see [`CompiledStage::slot_operation`]).
+pub(crate) enum SlotOperation<'a> {
+    /// Assignments in order; later ones read earlier results.
+    Derive(&'a [(ExpressionFieldPath, Expression)]),
+    /// `select`: each target reads a field (`Ok`) or an expression (`Err`).
+    Select(Vec<(&'a ExpressionFieldPath, Result<&'a ExpressionFieldPath, &'a Expression>)>),
+    Rename { source: &'a ExpressionFieldPath, target: &'a ExpressionFieldPath },
+    Drop(&'a [ExpressionFieldPath]),
+}
+
+impl CompiledStage {
+    /// Compiles a native stage from its planned arguments; `None` for a stage
+    /// this runtime does not implement.
+    pub fn compile(name: &str, arguments: &str) -> ExecutionResult<Option<Self>> {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut output = StageOutput::Rewritten;
+        let operation = match name {
+            "derive" => {
+                let mut assignments = Vec::new();
+                for (field, source) in split_derive_assignments(arguments)? {
+                    let expression = parse_expression(source).map_err(|error| {
+                        ExecutionError::evaluation(format!("invalid derive expression {source:?}: {error}"))
+                    })?;
+                    read_expression_fields(&expression, &writes, &mut reads);
+                    let target = runtime_path(field, "derive field")?;
+                    writes.push(target.clone());
+                    assignments.push((target, expression));
+                }
+                CompiledOperation::Derive(assignments)
+            }
+            "select" => {
+                output = StageOutput::Projected;
+                let mut items = Vec::new();
+                for (item_index, item) in split_projection_items(arguments)?.into_iter().enumerate() {
+                    let item = item.trim();
+                    if item.is_empty() {
+                        return Err(ExecutionError::evaluation(format!(
+                            "invalid select projection at index {item_index}: projection is empty"
+                        )));
+                    }
+                    let source = match item.rsplit_once(" as ") {
+                        Some((source, _)) => {
+                            let source = source.trim();
+                            let expression = parse_expression(source).map_err(|error| {
+                                ExecutionError::evaluation(format!("invalid select expression {source:?}: {error}"))
+                            })?;
+                            read_expression_fields(&expression, &writes, &mut reads);
+                            SelectSource::Expression(expression)
+                        }
+                        None => {
+                            let field = runtime_path(item, "select source")?;
+                            push_unique(&mut reads, &field);
+                            SelectSource::Field(field)
+                        }
+                    };
+                    let target = runtime_path(item.rsplit_once(" as ").map_or(item, |(_, target)| target), "select target")?;
+                    writes.push(target.clone());
+                    items.push((target, source));
+                }
+                CompiledOperation::Select(items)
+            }
+            "rename" => {
+                let (source, target) = arguments.split_once(" as ").ok_or_else(|| {
+                    ExecutionError::evaluation("invalid rename runtime payload: expected `<source> as <target>`")
+                })?;
+                let source = runtime_path(source, "rename source")?;
+                let target = runtime_path(target, "rename target")?;
+                reads.push(source.clone());
+                writes.extend([source.clone(), target.clone()]);
+                CompiledOperation::Rename { source, target }
+            }
+            "drop" => {
+                writes = arguments.split(',').map(|field| runtime_path(field, "drop field")).collect::<ExecutionResult<_>>()?;
+                CompiledOperation::Drop(writes.clone())
+            }
+            "near" => {
+                let spec = NearSpec::parse(arguments)?;
+                reads.push(spec.field().clone());
+                writes.push(runtime_path("_distance", "near output")?);
+                CompiledOperation::Near(spec)
+            }
+            "root" => {
+                output = StageOutput::Replaced;
+                let path = runtime_path(arguments, "root field")?;
+                reads.push(path.clone());
+                CompiledOperation::Root(path)
+            }
+            "first" | "single" => {
+                let field = arguments.trim();
+                if field.is_empty() {
+                    CompiledOperation::Project(None)
+                } else {
+                    output = StageOutput::Projected;
+                    let path = runtime_path(field, "projection field")?;
+                    reads.push(path.clone());
+                    writes.push(path.clone());
+                    CompiledOperation::Project(Some(path))
+                }
+            }
+            "unwind" => {
+                let spec = super::syntax::UnwindSpec::parse(arguments).map_err(ExecutionError::evaluation)?;
+                let field = runtime_path(spec.field, "unwind field")?;
+                let index = spec.index.map(|index| runtime_path(index, "unwind index")).transpose()?;
+                reads.push(field.clone());
+                writes.push(field.clone());
+                writes.extend(index.clone());
+                CompiledOperation::Unwind { field, index, keep_empty: spec.keep_empty }
+            }
+            // The reservoir runs in the executors; rows keep every field.
+            "sample" => CompiledOperation::Passthrough,
+            _ => return Ok(None),
+        };
+        Ok(Some(Self { operation, reads: Arc::from(reads), writes: Arc::from(writes), output }))
+    }
+
+    /// Input fields the stage reads.
+    #[must_use]
+    pub fn reads(&self) -> &Arc<[ExpressionFieldPath]> {
+        &self.reads
+    }
+
+    /// Output fields relative to input fields, as an execution property.
+    #[must_use]
+    pub fn output_fields(&self) -> super::Fields<'_> {
+        match self.output {
+            StageOutput::Rewritten if self.writes.is_empty() => super::Fields::Preserved,
+            StageOutput::Rewritten => super::Fields::Rewritten(&self.writes),
+            StageOutput::Projected => super::Fields::Projected(&self.writes),
+            StageOutput::Replaced => super::Fields::Computed,
+        }
+    }
+
+    /// Whether the stage can run on a [`SlotRow`]: it turns one row into one
+    /// row and every field it writes is top-level, so each write lands in a
+    /// slot of its own. Reads may be nested; they walk the top-level slot.
+    #[must_use]
+    pub fn runs_on_slots(&self) -> bool {
+        matches!(
+            self.operation,
+            CompiledOperation::Derive(_) | CompiledOperation::Select(_) | CompiledOperation::Rename { .. } | CompiledOperation::Drop(_)
+        ) && self.writes.iter().all(|field| field.len() == 1)
+    }
+
+    /// The operation of a stage that runs on slots
+    /// ([`Self::runs_on_slots`]); `None` otherwise.
+    pub(crate) fn slot_operation(&self) -> Option<SlotOperation<'_>> {
+        if !self.runs_on_slots() {
+            return None;
+        }
+        Some(match &self.operation {
+            CompiledOperation::Derive(assignments) => SlotOperation::Derive(assignments),
+            CompiledOperation::Select(items) => SlotOperation::Select(items.iter().map(|(target, source)| (target, match source {
+                SelectSource::Field(field) => Ok(field),
+                SelectSource::Expression(expression) => Err(expression),
+            })).collect()),
+            CompiledOperation::Rename { source, target } => SlotOperation::Rename { source, target },
+            CompiledOperation::Drop(paths) => SlotOperation::Drop(paths),
+            _ => return None,
+        })
+    }
+
+    /// Field, index field and `keep empty` of an `unwind` that runs on
+    /// slots ([`Self::expands_on_slots`]); `None` otherwise.
+    pub(crate) fn unwind_operation(&self) -> Option<(&ExpressionFieldPath, Option<&ExpressionFieldPath>, bool)> {
+        match &self.operation {
+            CompiledOperation::Unwind { field, index, keep_empty } if self.expands_on_slots() => Some((field, index.as_ref(), *keep_empty)),
+            _ => None,
+        }
+    }
+
+    /// Whether the stage can run on a [`SlotRow`] by turning it into any
+    /// number of rows (`unwind`), each landing its writes in top-level slots.
+    #[must_use]
+    pub fn expands_on_slots(&self) -> bool {
+        matches!(self.operation, CompiledOperation::Unwind { .. }) && self.writes.iter().all(|field| field.len() == 1)
+    }
+
+    /// What an expanding stage does to one slot row, with the same semantics
+    /// as [`Self::apply`] on the document holding the row's present slots.
+    /// Only valid when [`Self::expands_on_slots`] holds.
+    pub fn expand_slots(&self, row: &SlotRow<'_>) -> ExecutionResult<SlotExpansion> {
+        let CompiledOperation::Unwind { field, index, keep_empty } = &self.operation else {
+            return Err(ExecutionError::unsupported_operator("stage", "does not expand slot rows"));
+        };
+        let null_index = || index.iter().map(|index| (index.clone(), Some(Value::null()))).collect::<Vec<_>>();
+        Ok(match row.get(field) {
+            Some(Value::Array(items)) if !items.is_empty() => SlotExpansion::Each {
+                field: field.clone(),
+                index: index.clone(),
+                items: Arc::clone(items),
+            },
+            // An empty (or null) array drops the row unless `keep empty`
+            // asks to keep it with the field set to null.
+            Some(Value::Array(_) | Value::Null) if *keep_empty => {
+                let mut writes = vec![(field.clone(), Some(Value::null()))];
+                writes.extend(null_index());
+                SlotExpansion::Set(writes)
+            }
+            Some(Value::Array(_)) => SlotExpansion::Drop,
+            // A missing field or a scalar passes through unchanged (with a null index).
+            Some(_) | None if index.is_some() => SlotExpansion::Set(null_index()),
+            _ => SlotExpansion::Keep,
+        })
+    }
+
+    /// When the stage cannot fail on any row whose fields have the kinds
+    /// `field` gives (see [`super::total_kinds`]), the kinds it leaves in the
+    /// fields it writes: `None` for a field it removes. `None` when the stage
+    /// may fail, or is not a row-local rewrite of top-level fields.
+    #[must_use]
+    pub fn total_effects(&self, field: &dyn Fn(&ExpressionFieldPath) -> Option<super::Kinds>) -> Option<Vec<(ExpressionFieldPath, Option<super::Kinds>)>> {
+        if !self.writes.iter().all(|path| path.len() == 1) {
+            return None;
+        }
+        let mut effects: Vec<(ExpressionFieldPath, Option<super::Kinds>)> = Vec::new();
+        let lookup = |effects: &[(ExpressionFieldPath, Option<super::Kinds>)], path: &ExpressionFieldPath| {
+            match effects.iter().rev().find(|(written, _)| written.first() == path.first()) {
+                Some((_, kinds)) if path.len() == 1 => *kinds,
+                Some(_) => None,
+                None => field(path),
+            }
+        };
+        match &self.operation {
+            CompiledOperation::Derive(assignments) => {
+                for (target, expression) in assignments {
+                    let kinds = super::total_kinds(expression, &|path| lookup(&effects, path))?;
+                    effects.push((target.clone(), Some(kinds)));
+                }
+            }
+            CompiledOperation::Rename { source, target } => {
+                // A missing source leaves the row unchanged: the target keeps
+                // what it held, so only a source every row holds is followed.
+                let kinds = lookup(&effects, source)?;
+                effects.push((source.clone(), None));
+                effects.push((target.clone(), Some(kinds)));
+            }
+            CompiledOperation::Drop(paths) => effects.extend(paths.iter().map(|path| (path.clone(), None))),
+            _ => return None,
+        }
+        Some(effects)
+    }
+
+    /// Fields the stage writes (or removes), in declaration order.
+    #[must_use]
+    pub fn writes(&self) -> &Arc<[ExpressionFieldPath]> {
+        &self.writes
+    }
+
+    /// Applies the stage to one slot row, with the same semantics as
+    /// [`Self::apply`] on the document holding the row's present slots.
+    /// Only valid when [`Self::runs_on_slots`] holds.
+    pub fn apply_slots(&self, row: &mut SlotRow<'_>) -> ExecutionResult<()> {
+        match &self.operation {
+            CompiledOperation::Derive(assignments) => {
+                for (target, expression) in assignments {
+                    let value = super::eval::evaluate(expression, &*row)?;
+                    row.set(target, Some(value));
+                }
+            }
+            CompiledOperation::Select(items) => {
+                // Later items see the aliases written by earlier ones, as the
+                // document path's scope does; only the targets are output.
+                let mut produced = Vec::with_capacity(items.len());
+                for (target, source) in items {
+                    let value = match source {
+                        SelectSource::Field(field) => row.get(field).cloned(),
+                        SelectSource::Expression(expression) => Some(super::eval::evaluate(expression, &*row)?),
+                    };
+                    if let Some(value) = value {
+                        if items.len() > 1 {
+                            row.set(target, Some(value.clone()));
+                        }
+                        produced.push((target, value));
+                    }
+                }
+                row.clear();
+                for (target, value) in produced {
+                    row.set(target, Some(value));
+                }
+            }
+            CompiledOperation::Rename { source, target } => {
+                if let Some(value) = row.take(source) {
+                    row.set(target, Some(value));
+                }
+            }
+            CompiledOperation::Drop(paths) => {
+                for path in paths {
+                    row.set(path, None);
+                }
+            }
+            _ => return Err(ExecutionError::unsupported_operator("stage", "not runnable on slot rows")),
+        }
+        Ok(())
+    }
+
+    /// Applies the stage to one document.
+    pub fn apply(&self, document: &Document) -> ExecutionResult<CustomOperatorResult> {
+        let replace = |document: Document| Ok(CustomOperatorResult::Replace(Arc::new(document)));
+        match &self.operation {
+            CompiledOperation::Derive(assignments) => {
+                let mut result = document.clone();
+                for (target, expression) in assignments {
+                    // Assignments apply in order, so later ones can use earlier results.
+                    let value = super::eval::evaluate_document(expression, &result)?;
+                    insert_path(&mut result, target.segments(), value);
+                }
+                replace(result)
+            }
+            CompiledOperation::Select(items) => {
+                let mut result = Document::new();
+                // Later items may use aliases introduced earlier; copy the row only then.
+                let mut scope: Option<Document> = None;
+                for (target, source) in items {
+                    let value = match source {
+                        SelectSource::Field(field) => path_value(scope.as_ref().unwrap_or(document), field).cloned(),
+                        SelectSource::Expression(expression) => {
+                            Some(super::eval::evaluate_document(expression, scope.as_ref().unwrap_or(document))?)
+                        }
+                    };
+                    if let Some(value) = value {
+                        if items.len() > 1 {
+                            insert_path(scope.get_or_insert_with(|| document.clone()), target.segments(), value.clone());
+                        }
+                        insert_path(&mut result, target.segments(), value);
+                    }
+                }
+                replace(result)
+            }
+            CompiledOperation::Rename { source, target } => {
+                let mut result = document.clone();
+                let Some(value) = remove_path(&mut result, source.segments()) else {
+                    return Ok(CustomOperatorResult::Keep);
+                };
+                insert_path(&mut result, target.segments(), value);
+                replace(result)
+            }
+            CompiledOperation::Drop(paths) => {
+                let mut result = document.clone();
+                let mut changed = false;
+                for path in paths {
+                    changed |= remove_path(&mut result, path.segments()).is_some();
+                }
+                if changed { replace(result) } else { Ok(CustomOperatorResult::Keep) }
+            }
+            CompiledOperation::Near(spec) => {
+                let Some(value) = path_value(document, spec.field()) else {
+                    return Ok(CustomOperatorResult::Discard);
+                };
+                let distance = spec.distance_value(value)?;
+                let mut result = document.clone();
+                result.insert("_distance", Value::float(distance).map_err(|error| {
+                    ExecutionError::evaluation(format!("invalid near distance: {error}"))
+                })?);
+                replace(result)
+            }
+            CompiledOperation::Root(path) => {
+                let value = path_value(document, path)
+                    .ok_or_else(|| ExecutionError::evaluation(format!("root field {:?} is missing", path.to_string())))?;
+                let Value::Object(root) = value else {
+                    return Err(ExecutionError::evaluation(format!("root field {:?} must be an object", path.to_string())));
+                };
+                Ok(CustomOperatorResult::Replace(Arc::clone(root)))
+            }
+            CompiledOperation::Project(None) | CompiledOperation::Passthrough => Ok(CustomOperatorResult::Keep),
+            CompiledOperation::Project(Some(path)) => {
+                let mut result = Document::new();
+                if let Some(value) = path_value(document, path) {
+                    insert_path(&mut result, path.segments(), value.clone());
+                }
+                replace(result)
+            }
+            CompiledOperation::Unwind { field, index, keep_empty } => {
+                let with_item = |value: Value, position: Option<usize>| {
+                    let mut result = document.clone();
+                    insert_path(&mut result, field.segments(), value);
+                    if let Some(index) = index {
+                        let position = position.map_or_else(Value::null, |position| Value::unsigned(position as u64));
+                        insert_path(&mut result, index.segments(), position);
+                    }
+                    Arc::new(result)
+                };
+                match path_value(document, field) {
+                    Some(Value::Array(values)) if !values.is_empty() => Ok(CustomOperatorResult::Expand(
+                        values.iter().cloned().enumerate().map(|(position, value)| with_item(value, Some(position))).collect(),
+                    )),
+                    // An empty (or null) array drops the row unless `keep empty`
+                    // asks to keep it with the field set to null.
+                    Some(Value::Array(_) | Value::Null) if *keep_empty => Ok(CustomOperatorResult::Replace(with_item(Value::null(), None))),
+                    Some(Value::Array(_)) => Ok(CustomOperatorResult::Expand(Vec::new())),
+                    // A missing field or a scalar passes through unchanged (with a null index).
+                    Some(value) if index.is_some() => Ok(CustomOperatorResult::Replace(with_item(value.clone(), None))),
+                    None => match index {
+                        Some(index) => {
+                            let mut result = document.clone();
+                            insert_path(&mut result, index.segments(), Value::null());
+                            replace(result)
+                        }
+                        None => Ok(CustomOperatorResult::Keep),
+                    },
+                    Some(_) => Ok(CustomOperatorResult::Keep),
+                }
+            }
+        }
+    }
+}
+
+/// Parses a stage field path (`a.b.c`), rejecting empty segments.
+fn runtime_path(text: &str, context: &str) -> ExecutionResult<ExpressionFieldPath> {
+    let segments = parse_runtime_path(text, context)?;
+    ExpressionFieldPath::new(segments).map_err(|error| ExecutionError::evaluation(error.to_string()))
+}
+
+/// Adds the fields an expression reads, except those the stage wrote earlier.
+fn read_expression_fields(expression: &Expression, written: &[ExpressionFieldPath], reads: &mut Vec<ExpressionFieldPath>) {
+    expression.for_each_field(&mut |field| {
+        if !written.contains(field) {
+            push_unique(reads, field);
+        }
+    });
+}
+
+fn push_unique(fields: &mut Vec<ExpressionFieldPath>, field: &ExpressionFieldPath) {
+    if !fields.contains(field) {
+        fields.push(field.clone());
+    }
 }
 
 fn parse_runtime_path<'a>(text: &'a str, context: &str) -> ExecutionResult<Vec<&'a str>> {
@@ -1526,8 +2059,9 @@ fn parse_runtime_path<'a>(text: &'a str, context: &str) -> ExecutionResult<Vec<&
     Ok(segments)
 }
 
-fn remove_path(document: &mut Document, path: &[&str]) -> Option<Value> {
+fn remove_path<S: AsRef<str>>(document: &mut Document, path: &[S]) -> Option<Value> {
     let (first, rest) = path.split_first()?;
+    let first = first.as_ref();
 
     if rest.is_empty() {
         return document.remove(first);
@@ -1535,7 +2069,7 @@ fn remove_path(document: &mut Document, path: &[&str]) -> Option<Value> {
 
     let original = document.remove(first)?;
     let Some(parent) = original.as_object() else {
-        document.insert(*first, original);
+        document.insert(first, original);
         return None;
     };
 
@@ -1544,22 +2078,23 @@ fn remove_path(document: &mut Document, path: &[&str]) -> Option<Value> {
 
     if let Some(value) = removed {
         if !nested.is_empty() {
-            document.insert(*first, Value::object(nested));
+            document.insert(first, Value::object(nested));
         }
         Some(value)
     } else {
-        document.insert(*first, original);
+        document.insert(first, original);
         None
     }
 }
 
-fn insert_path(document: &mut Document, path: &[&str], value: Value) {
+fn insert_path<S: AsRef<str>>(document: &mut Document, path: &[S], value: Value) {
     let Some((first, rest)) = path.split_first() else {
         return;
     };
+    let first = first.as_ref();
 
     if rest.is_empty() {
-        document.insert(*first, value);
+        document.insert(first, value);
         return;
     }
 
@@ -1570,16 +2105,7 @@ fn insert_path(document: &mut Document, path: &[&str], value: Value) {
         .unwrap_or_default();
 
     insert_path(&mut nested, rest, value);
-    document.insert(*first, Value::object(nested));
-}
-
-fn cloned_runtime_path_value(document: &Document, path: &[&str]) -> Option<Value> {
-    let (first, rest) = path.split_first()?;
-    let mut value = document.get(first)?;
-    for segment in rest {
-        value = value.as_object()?.get(segment)?;
-    }
-    Some(value.clone())
+    document.insert(first, Value::object(nested));
 }
 
 fn path_value<'a>(document: &'a Document, path: &ExpressionFieldPath) -> Option<&'a Value> {
@@ -1819,44 +2345,26 @@ fn stable_values_key(values: &[Option<Value>]) -> String {
         .join("\u{1f}")
 }
 
-fn column_label(values: &[Option<Value>]) -> String {
-    if values.is_empty() {
-        return "value".to_owned();
+/// Writes the label of a pivot column: its values joined by `.`, or
+/// `value` when the pivot has no column field.
+fn write_column_label<'a>(output: &mut String, values: impl ExactSizeIterator<Item = Option<&'a Value>>) {
+    use std::fmt::Write as _;
+    if values.len() == 0 {
+        output.push_str("value");
+        return;
     }
-
-    values
-        .iter()
-        .map(|value| match value {
-            Some(Value::String(value)) => value.to_string(),
-            Some(Value::Bool(value)) => value.to_string(),
-            Some(Value::Number(value)) => format_number(*value),
-            Some(Value::Null) | None => "null".to_owned(),
-            Some(other) => format!("{other:?}"),
-        })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn pivot_cell_name(column: &str, value: &PivotValue, value_count: usize) -> String {
-    let measure = value.alias().unwrap_or_else(|| value.field().last());
-
-    if value_count == 1 {
-        column.to_owned()
-    } else {
-        format!("{column}.{measure}")
+    for (index, value) in values.enumerate() {
+        if index > 0 {
+            output.push('.');
+        }
+        let _ = match value {
+            Some(Value::String(value)) => { output.push_str(value); Ok(()) }
+            Some(Value::Bool(value)) => write!(output, "{value}"),
+            Some(Value::Number(value)) => { output.push_str(&format_number(*value)); Ok(()) }
+            Some(Value::Null) | None => { output.push_str("null"); Ok(()) }
+            Some(other) => write!(output, "{other:?}"),
+        };
     }
-}
-
-fn numeric_value(value: &Value) -> ExecutionResult<f64> {
-    let number = value.as_number().ok_or_else(|| {
-        ExecutionError::evaluation(format!("pivot sum/avg requires a number, found {value:?}"))
-    })?;
-
-    Ok(match *number {
-        Number::Signed(value) => value as f64,
-        Number::Unsigned(value) => value as f64,
-        Number::Float(value) => value,
-    })
 }
 
 fn float_value(value: f64) -> ExecutionResult<Value> {
@@ -1907,10 +2415,6 @@ fn split_derive_assignments(source: &str) -> ExecutionResult<Vec<(&str, &str)>> 
 }
 
 /// `derive` and `select … as` evaluate through the common expression evaluator.
-fn evaluate_derive_expression( expression: &Expression, document: &Document, ) -> ExecutionResult<Value> {
-    super::eval::evaluate_document(expression, document)
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1950,10 +2454,11 @@ mod tests {
         }
     }
 
-    #[test] fn derive_subtracts_fields_and_preserves_the_source_document() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(120)); document.insert("COGS", Value::unsigned(45)); let result = RuntimeMaterializer::new() .materialize_derive("Marge=CAFacture-COGS", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("Marge"), Some(&Value::signed(75))); assert_eq!(document.get("Marge"), None); assert_eq!(document.get("CAFacture"), Some(&Value::unsigned(120))); }
-    #[test] fn derive_supports_unary_positive_without_colliding_with_pivot_numeric_conversion() { let mut document = Document::new(); document.insert("amount", Value::signed(-12)); let result = RuntimeMaterializer::new() .materialize_derive("copy=+amount", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("copy"), Some(&Value::signed(-12))); }
-    #[test] fn derive_applies_multiple_assignments_to_nested_targets() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("cost", Value::unsigned(50)); let result = RuntimeMaterializer::new() .materialize_derive( "metrics.margin=revenue-cost, metrics.ratio=(revenue-cost)/revenue", &document, ) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; let metrics = result .get("metrics") .and_then(Value::as_object) .expect("derive should create the nested object"); assert_eq!(metrics.get("margin"), Some(&Value::signed(150))); assert_eq!(metrics.get("ratio"), Some(&Value::float(0.75).unwrap())); }
-    #[test] fn derive_rejects_division_by_zero() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("zero", Value::unsigned(0)); let error = RuntimeMaterializer::new() .materialize_derive("ratio=revenue/zero", &document) .unwrap_err(); assert!(error.to_string().contains("division by zero")); }
+    #[test] fn derive_subtracts_fields_and_preserves_the_source_document() { let mut document = Document::new(); document.insert("CAFacture", Value::unsigned(120)); document.insert("COGS", Value::unsigned(45)); let result = RuntimeMaterializer::new() .materialize_custom("derive", "Marge=CAFacture-COGS", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("Marge"), Some(&Value::signed(75))); assert_eq!(document.get("Marge"), None); assert_eq!(document.get("CAFacture"), Some(&Value::unsigned(120))); }
+    #[test] fn pivot_columns_sharing_a_label_share_their_cells() { use crate::query::logical_plan::{PivotAggregate, PivotSpecification, PivotValue}; let field = |name: &str| ExpressionFieldPath::new([name]).unwrap(); let specification = PivotSpecification::new([field("region")], [field("month")], [PivotValue::new(field("revenue"), PivotAggregate::Sum, None::<&str>).unwrap(), PivotValue::new(field("revenue"), PivotAggregate::Count, Some("n")).unwrap()]).unwrap(); let row = |region: &str, month: Value, revenue: Value| Arc::new(Document::from_fields([("region", Value::string(region)), ("month", month), ("revenue", revenue)])); let documents = [row("north", Value::signed(1), Value::signed(2)), row("north", Value::string("1"), Value::float(0.5).unwrap()), row("south", Value::Null, Value::signed(7)), row("north", Value::signed(2), Value::string("x"))]; let result = RuntimeMaterializer::new().materialize_pivot(&specification, &documents).unwrap(); assert_eq!(result.len(), 2); let north = result[0].document(); assert_eq!(north.get("region"), Some(&Value::string("north"))); assert_eq!(north.get("1.revenue"), Some(&Value::float(2.5).unwrap())); assert_eq!(north.get("1.n"), Some(&Value::unsigned(2))); assert_eq!(north.get("2.revenue"), Some(&Value::signed(0))); assert_eq!(north.get("2.n"), Some(&Value::unsigned(1))); let south = result[1].document(); assert_eq!(south.get("null.revenue"), Some(&Value::signed(7))); assert_eq!(south.len(), 3); }
+    #[test] fn derive_supports_unary_positive_without_colliding_with_pivot_numeric_conversion() { let mut document = Document::new(); document.insert("amount", Value::signed(-12)); let result = RuntimeMaterializer::new() .materialize_custom("derive", "copy=+amount", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; assert_eq!(result.get("copy"), Some(&Value::signed(-12))); }
+    #[test] fn derive_applies_multiple_assignments_to_nested_targets() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("cost", Value::unsigned(50)); let result = RuntimeMaterializer::new() .materialize_custom("derive",  "metrics.margin=revenue-cost, metrics.ratio=(revenue-cost)/revenue", &document, ) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("derive should replace the result document"); }; let metrics = result .get("metrics") .and_then(Value::as_object) .expect("derive should create the nested object"); assert_eq!(metrics.get("margin"), Some(&Value::signed(150))); assert_eq!(metrics.get("ratio"), Some(&Value::float(0.75).unwrap())); }
+    #[test] fn derive_rejects_division_by_zero() { let mut document = Document::new(); document.insert("revenue", Value::unsigned(200)); document.insert("zero", Value::unsigned(0)); let error = RuntimeMaterializer::new() .materialize_custom("derive", "ratio=revenue/zero", &document) .unwrap_err(); assert!(error.to_string().contains("division by zero")); }
     #[test] fn root_replaces_with_nested_object() { let mut nested = Document::new(); nested.insert("answer", Value::unsigned(42)); let mut wrapper = Document::new(); wrapper.insert("nested", Value::object(nested)); let mut document = Document::new(); document.insert("payload", Value::object(wrapper)); let result = RuntimeMaterializer::new() .materialize_custom("root", "payload.nested", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("root should replace the result document"); }; assert_eq!(result.get("answer"), Some(&Value::unsigned(42))); }
     #[test] fn root_rejects_missing_or_non_object_fields() { let materializer = RuntimeMaterializer::new(); let missing = materializer .materialize_custom("root", "payload", &Document::new()) .unwrap_err(); assert!(missing.to_string().contains("is missing")); let mut document = Document::new(); document.insert("payload", "not an object"); let scalar = materializer .materialize_custom("root", "payload", &document) .unwrap_err(); assert!(scalar.to_string().contains("must be an object")); }
     #[test] fn near_adds_cosine_distance_without_mutating_the_source_document() { let mut document = Document::new(); document.insert( "embedding", Value::array([Value::float(1.0).unwrap(), Value::float(0.0).unwrap()]), ); let result = RuntimeMaterializer::new() .materialize_custom("near", "embedding, [1.0, 0.0]", &document) .unwrap(); let CustomOperatorResult::Replace(result) = result else { panic!("near should replace the result document"); }; assert_eq!(result.get("_distance"), Some(&Value::float(0.0).unwrap())); assert_eq!(document.get("_distance"), None); }
@@ -1976,24 +2481,32 @@ mod tests {
     #[test] fn projected_sort_matches_document_sort_semantics() { let field = ExpressionFieldPath::new(["a"]).unwrap(); let keys = [SortKey::ascending(field)]; let mut one = Document::new(); one.insert("a", Value::unsigned(1)); let mut two = Document::new(); two.insert("a", Value::unsigned(2)); let materializer = RuntimeMaterializer::new(); assert_eq!( materializer .materialize_projected_sort_comparison( &keys, &[Some(Value::unsigned(1))], &[Some(Value::unsigned(2))], ) .unwrap(), materializer .materialize_sort_comparison(&keys, &one, &two) .unwrap(), ); }
     #[test] fn sort_compares_ascending_and_descending_values() { let mut one = Document::new(); one.insert("a", Value::unsigned(1)); let mut two = Document::new(); two.insert("a", Value::unsigned(2)); let field = ExpressionFieldPath::new(["a"]).unwrap(); let materializer = RuntimeMaterializer::new(); assert_eq!( materializer .materialize_sort_comparison(&[SortKey::ascending(field.clone())], &one, &two) .unwrap(), Ordering::Less ); assert_eq!( materializer .materialize_sort_comparison(&[SortKey::descending(field)], &one, &two) .unwrap(), Ordering::Greater ); }
     #[test] fn sort_uses_later_keys_when_values_are_equal() { let mut left = Document::new(); left.insert("a", Value::unsigned(1)); left.insert("b", Value::unsigned(2)); let mut right = Document::new(); right.insert("a", Value::unsigned(1)); right.insert("b", Value::unsigned(3)); let keys = [ SortKey::ascending(ExpressionFieldPath::new(["a"]).unwrap()), SortKey::ascending(ExpressionFieldPath::new(["b"]).unwrap()), ]; assert_eq!( RuntimeMaterializer::new() .materialize_sort_comparison(&keys, &left, &right) .unwrap(), Ordering::Less ); }
+    #[test] fn sort_orders_null_values_like_missing_values() { let mut null = Document::new(); null.insert("a", Value::Null); let mut present = Document::new(); present.insert("a", Value::unsigned(1)); let field = ExpressionFieldPath::new(["a"]).unwrap(); assert_eq!( RuntimeMaterializer::new() .materialize_sort_comparison( &[SortKey::ascending(field.clone())], &null, &present, ) .unwrap(), Ordering::Less ); assert_eq!( RuntimeMaterializer::new() .materialize_projected_sort_comparison(&[SortKey::descending(field)], &[Some(Value::Null)], &[Some(Value::unsigned(1))],) .unwrap(), Ordering::Greater ); }
     #[test] fn sort_orders_missing_values_deterministically() { let missing = Document::new(); let mut present = Document::new(); present.insert("a", Value::unsigned(1)); let field = ExpressionFieldPath::new(["a"]).unwrap(); assert_eq!( RuntimeMaterializer::new() .materialize_sort_comparison( &[SortKey::ascending(field.clone())], &missing, &present, ) .unwrap(), Ordering::Less ); assert_eq!( RuntimeMaterializer::new() .materialize_sort_comparison(&[SortKey::descending(field)], &missing, &present,) .unwrap(), Ordering::Greater ); }
     #[test] fn borrowed_path_value_reads_nested_fields_without_materializing_a_clone() { let mut nested = Document::new(); nested.insert("value", Value::unsigned(42)); let mut document = Document::new(); document.insert("nested", Value::object(nested)); let path = ExpressionFieldPath::new(["nested", "value"]).unwrap(); let value = path_value(&document, &path).expect("path exists"); assert_eq!(value, &Value::unsigned(42)); }
     #[test] fn group_field_layout_resolves_aliased_keys_to_source_fields() { let fields = [ ExpressionFieldPath::new(["__og_group_key_61727469636c65_436c69656e74"]).unwrap(), ExpressionFieldPath::new(["__og_group_sum_6361_546f74616c"]).unwrap(), ]; let (grouping, required) = group_field_layout(&fields).unwrap(); assert_eq!( grouping, vec![ExpressionFieldPath::new(["article"]).unwrap()] ); assert_eq!( required, vec![ ExpressionFieldPath::new(["article"]).unwrap(), ExpressionFieldPath::new(["ca"]).unwrap(), ] ); }
     #[test] fn group_materializes_aliased_key_without_changing_group_identity() { let mut first = Document::new(); first.insert("article", Value::string("A")); let mut second = Document::new(); second.insert("article", Value::string("A")); let fields = [ExpressionFieldPath::new(["__og_group_key_61727469636c65_436c69656e74"]).unwrap()]; let documents = vec![Arc::new(first), Arc::new(second)]; let groups = RuntimeMaterializer::new() .materialize_group(&fields, &documents) .unwrap(); assert_eq!(groups.len(), 1); assert_eq!( groups[0].document().get("Client"), Some(&Value::string("A")) ); assert!(groups[0].document().get("article").is_none()); assert_eq!(groups[0].document().get("count"), Some(&Value::unsigned(2))); }
     #[test] fn incremental_group_materializes_aliased_key() { let fields = [ExpressionFieldPath::new(["__og_group_key_61727469636c65_436c69656e74"]).unwrap()]; let mut accumulator = RuntimeMaterializer::new() .incremental_group(&fields) .unwrap(); let mut document = Document::new(); document.insert("article", Value::string("A")); accumulator.push(&document).unwrap(); let grouped = accumulator.finish(1).unwrap(); assert_eq!(grouped.document().get("Client"), Some(&Value::string("A"))); assert!(grouped.document().get("article").is_none()); }
     #[test] fn group_field_layout_resolves_sum_markers_to_source_fields() { let fields = [ ExpressionFieldPath::new(["tPeriode"]).unwrap(), ExpressionFieldPath::new(["__og_group_sum_434146616374757265_434146616374757265"]) .unwrap(), ]; let (grouping, required) = group_field_layout(&fields).unwrap(); assert_eq!( grouping, vec![ExpressionFieldPath::new(["tPeriode"]).unwrap()] ); assert_eq!( required, vec![ ExpressionFieldPath::new(["tPeriode"]).unwrap(), ExpressionFieldPath::new(["CAFacture"]).unwrap(), ] ); }
-    #[test] fn incremental_group_folds_summable_values_without_retaining_rows() { let fields = [ ExpressionFieldPath::new(["period"]).unwrap(), ExpressionFieldPath::new(["__og_group_sum_6361_6361"]).unwrap(), ]; let mut accumulator = RuntimeMaterializer::new() .incremental_group(&fields) .unwrap(); for _ in 0..100_000 { let mut document = Document::new(); document.insert("period", Value::string("2026-01")); document.insert("ca", Value::unsigned(2)); accumulator.push(&document).unwrap(); } let grouped = accumulator.finish(1).unwrap(); assert_eq!( grouped.document().get("period"), Some(&Value::string("2026-01")) ); assert_eq!( grouped.document().get("ca"), Some(&Value::float(200_000.0).unwrap()) ); assert!(grouped.document().get("count").is_none()); }
+    #[test] fn incremental_group_folds_summable_values_without_retaining_rows() { let fields = [ ExpressionFieldPath::new(["period"]).unwrap(), ExpressionFieldPath::new(["__og_group_sum_6361_6361"]).unwrap(), ]; let mut accumulator = RuntimeMaterializer::new() .incremental_group(&fields) .unwrap(); for _ in 0..100_000 { let mut document = Document::new(); document.insert("period", Value::string("2026-01")); document.insert("ca", Value::unsigned(2)); accumulator.push(&document).unwrap(); } let grouped = accumulator.finish(1).unwrap(); assert_eq!( grouped.document().get("period"), Some(&Value::string("2026-01")) ); assert_eq!( grouped.document().get("ca"), Some(&Value::signed(200_000)) ); assert!(grouped.document().get("count").is_none()); }
     #[test] fn group_counts_documents_by_one_key() { let mut first = Document::new(); first.insert("article", Value::string("A")); let mut second = Document::new(); second.insert("article", Value::string("A")); let mut third = Document::new(); third.insert("article", Value::string("B")); let documents = vec![Arc::new(first), Arc::new(second), Arc::new(third)]; let keys = [ExpressionFieldPath::new(["article"]).unwrap()]; let groups = RuntimeMaterializer::new() .materialize_group(&keys, &documents) .unwrap(); assert_eq!(groups.len(), 2); assert_eq!( groups[0].document().get("article"), Some(&Value::string("A")) ); assert_eq!(groups[0].document().get("count"), Some(&Value::unsigned(2))); assert_eq!( groups[1].document().get("article"), Some(&Value::string("B")) ); assert_eq!(groups[1].document().get("count"), Some(&Value::unsigned(1))); }
     #[test] fn group_preserves_nested_key_paths() { let mut address = Document::new(); address.insert("country", Value::string("FR")); let mut document = Document::new(); document.insert("address", Value::object(address)); let documents = vec![Arc::new(document)]; let keys = [ExpressionFieldPath::new(["address", "country"]).unwrap()]; let groups = RuntimeMaterializer::new() .materialize_group(&keys, &documents) .unwrap(); let address = groups[0] .document() .get("address") .and_then(Value::as_object) .expect("nested group key should be materialized as an object"); assert_eq!(address.get("country"), Some(&Value::string("FR"))); assert_eq!(groups[0].document().get("count"), Some(&Value::unsigned(1))); }
     #[test] fn group_keeps_missing_distinct_from_physical_null() { let missing = Document::new(); let mut null = Document::new(); null.insert("article", Value::null()); let documents = vec![Arc::new(missing), Arc::new(null)]; let keys = [ExpressionFieldPath::new(["article"]).unwrap()]; let groups = RuntimeMaterializer::new() .materialize_group(&keys, &documents) .unwrap(); assert_eq!(groups.len(), 2); assert!(groups.iter().all(|group| { group.document().get("article") == Some(&Value::null()) && group.document().get("count") == Some(&Value::unsigned(1)) })); }
-    #[test] fn group_sums_runtime_summable_values() { let mut first = Document::new(); first.insert("article", Value::string("A")); first.insert("ca", Value::unsigned(10)); let mut second = Document::new(); second.insert("article", Value::string("A")); second.insert("ca", Value::signed(5)); let marker = ExpressionFieldPath::new(["__og_group_sum_6361_546f74616c5f4341"]).unwrap(); let fields = [ExpressionFieldPath::new(["article"]).unwrap(), marker]; let documents = vec![Arc::new(first), Arc::new(second)]; let groups = RuntimeMaterializer::new() .materialize_group(&fields, &documents) .unwrap(); assert_eq!(groups.len(), 1); assert_eq!( groups[0].document().get("article"), Some(&Value::string("A")) ); assert_eq!( groups[0].document().get("Total_CA"), Some(&Value::float(15.0).unwrap()) ); assert!(groups[0].document().get("count").is_none()); }
+    #[test] fn group_sums_runtime_summable_values() { let mut first = Document::new(); first.insert("article", Value::string("A")); first.insert("ca", Value::unsigned(10)); let mut second = Document::new(); second.insert("article", Value::string("A")); second.insert("ca", Value::signed(5)); let marker = ExpressionFieldPath::new(["__og_group_sum_6361_546f74616c5f4341"]).unwrap(); let fields = [ExpressionFieldPath::new(["article"]).unwrap(), marker]; let documents = vec![Arc::new(first), Arc::new(second)]; let groups = RuntimeMaterializer::new() .materialize_group(&fields, &documents) .unwrap(); assert_eq!(groups.len(), 1); assert_eq!( groups[0].document().get("article"), Some(&Value::string("A")) ); assert_eq!( groups[0].document().get("Total_CA"), Some(&Value::signed(15)) ); assert!(groups[0].document().get("count").is_none()); }
+    fn measure_marker(aggregate: &str, source: &str, alias: &str) -> ExpressionFieldPath { let hex = |text: &str| text.bytes().map(|byte| format!("{byte:02x}")).collect::<String>(); ExpressionFieldPath::new([format!("__og_group_{aggregate}_{}_{}", hex(source), hex(alias))]).unwrap() }
+    fn measured_rows() -> Vec<Arc<Document>> { [(Value::signed(4), "b"), (Value::float(1.5).unwrap(), "a"), (Value::null(), "c")].into_iter().map(|(qty, label)| { let mut document = Document::new(); document.insert("k", Value::string("K")); document.insert("qty", qty); document.insert("label", Value::string(label)); Arc::new(document) }).collect() }
+    fn measure_fields() -> Vec<ExpressionFieldPath> { vec![ ExpressionFieldPath::new(["k"]).unwrap(), measure_marker("sum", "qty", "total"), measure_marker("avg", "qty", "mean"), measure_marker("min", "label", "low"), measure_marker("max", "qty", "high"), measure_marker("first", "label", "head"), measure_marker("last", "qty", "tail"), measure_marker("count", "qty", "known"), measure_marker("count", "", "rows") ] }
+    #[test] fn projected_refs_fold_like_documents() { use crate::storage::ProjectedValueRef as R; let extra = [Value::signed(2), Value::unsigned(3)].map(|qty| { let mut document = Document::new(); document.insert("k", Value::string("K")); document.insert("qty", qty); document.insert("label", Value::string("d")); Arc::new(document) }); let documents = measured_rows().into_iter().chain(extra).collect::<Vec<_>>(); let refs = [(R::Signed(4), "b"), (R::Float(1.5), "a"), (R::Null, "c"), (R::Owned(Value::signed(2)), "d"), (R::Unsigned(3), "d")]; let fields = measure_fields(); let materializer = RuntimeMaterializer::new(); let mut borrowed = materializer.incremental_group(&fields).unwrap(); for (qty, label) in refs { assert!(borrowed.push_projected_value_refs(&[Some(R::String("K")), Some(qty), Some(R::String(label))], &[0, 1, 2]).unwrap()); } let mut owned = materializer.incremental_group(&fields).unwrap(); for document in &documents { owned.push(document).unwrap(); } assert_eq!(borrowed.finish(1).unwrap().document(), owned.finish(1).unwrap().document()); }
+    #[test] fn group_computes_every_measure_kind() { let groups = RuntimeMaterializer::new().materialize_group(&measure_fields(), &measured_rows()).unwrap(); let row = groups[0].document(); assert_eq!(row.get("total"), Some(&Value::float(5.5).unwrap())); assert_eq!(row.get("mean"), Some(&Value::float(2.75).unwrap())); assert_eq!(row.get("low"), Some(&Value::string("a"))); assert_eq!(row.get("high"), Some(&Value::signed(4))); assert_eq!(row.get("head"), Some(&Value::string("b"))); assert_eq!(row.get("tail"), Some(&Value::null())); assert_eq!(row.get("known"), Some(&Value::unsigned(2))); assert_eq!(row.get("rows"), Some(&Value::unsigned(3))); assert!(row.get("count").is_none()); let (_, required) = group_field_layout(&measure_fields()).unwrap(); assert_eq!(required.len(), 3); }
+    #[test] fn compact_partials_merge_every_measure_kind() { let rows = measured_rows(); let fields = measure_fields(); let materializer = RuntimeMaterializer::new(); let mut early = materializer.incremental_group(&fields).unwrap(); early.push(&rows[0]).unwrap(); let mut late = materializer.incremental_group(&fields).unwrap(); late.push(&rows[1]).unwrap(); late.push(&rows[2]).unwrap(); let mut merged = materializer.incremental_group(&fields).unwrap(); for partial in [early.compact_partial().unwrap().unwrap(), late.compact_partial().unwrap().unwrap()] { assert!(merged.merge_compact_partial(&partial).unwrap()); } merged.push(&rows[0]).unwrap(); let expected = materializer.materialize_group(&fields, &[Arc::clone(&rows[0]), Arc::clone(&rows[1]), Arc::clone(&rows[2]), Arc::clone(&rows[0])]).unwrap(); let mut actual = merged.finish(1).unwrap().document().clone(); actual.remove("k"); let mut wanted = expected[0].document().clone(); wanted.remove("k"); assert_eq!(actual, wanted); assert_eq!(wanted.get("tail"), Some(&Value::signed(4))); }
+    #[test] fn integer_sums_fall_back_to_float_on_overflow() { let rows = [i64::MAX, 1].map(|value| { let mut document = Document::new(); document.insert("v", Value::signed(value)); Arc::new(document) }); let groups = RuntimeMaterializer::new().materialize_group(&[measure_marker("sum", "v", "v")], &rows).unwrap(); assert!(matches!(groups[0].document().get("v"), Some(Value::Number(Number::Float(_))))); }
     #[test] fn group_falls_back_to_count_when_measure_is_not_summable() { let mut first = Document::new(); first.insert("article", Value::string("A")); first.insert("label", Value::string("x")); let mut second = Document::new(); second.insert("article", Value::string("A")); second.insert("label", Value::string("y")); let marker = ExpressionFieldPath::new(["__og_group_sum_6c6162656c_4c6162656c"]).unwrap(); let fields = [ExpressionFieldPath::new(["article"]).unwrap(), marker]; let documents = vec![Arc::new(first), Arc::new(second)]; let groups = RuntimeMaterializer::new() .materialize_group(&fields, &documents) .unwrap(); assert_eq!(groups.len(), 1); assert_eq!(groups[0].document().get("count"), Some(&Value::unsigned(2))); assert!(groups[0].document().get("Label").is_none()); }
     #[test] fn group_can_sum_fields_created_by_previous_stages() { let mut first = Document::new(); first.insert("article", Value::string("A")); first.insert("calculated", Value::float(2.5).unwrap()); let mut second = Document::new(); second.insert("article", Value::string("A")); second.insert("calculated", Value::float(1.5).unwrap()); let marker = ExpressionFieldPath::new(["__og_group_sum_63616c63756c61746564_546f74616c"]).unwrap(); let fields = [ExpressionFieldPath::new(["article"]).unwrap(), marker]; let documents = vec![Arc::new(first), Arc::new(second)]; let groups = RuntimeMaterializer::new() .materialize_group(&fields, &documents) .unwrap(); assert_eq!( groups[0].document().get("Total"), Some(&Value::float(4.0).unwrap()) ); }
     #[test] fn group_without_keys_counts_the_complete_input() { let documents = vec![Arc::new(Document::new()), Arc::new(Document::new())]; let groups = RuntimeMaterializer::new() .materialize_group(&[], &documents) .unwrap(); assert_eq!(groups.len(), 1); assert_eq!(groups[0].document().get("count"), Some(&Value::unsigned(2))); }
-    #[test] fn unwind_expands_array_values() { let mut document = Document::new(); document.insert("items", Value::array([Value::signed(1), Value::signed(2)])); let result = RuntimeMaterializer::new() .materialize_unwind("items", &document) .unwrap(); assert!(matches!(result, CustomOperatorResult::Expand(values) if values.len() == 2)); }
-    #[test] fn first_projection_selects_requested_field() { let mut document = Document::new(); document.insert("Article_Code", Value::string("A")); document.insert("other", Value::signed(1)); let result = RuntimeMaterializer::new() .materialize_scalar_projection("Article_Code", &document) .unwrap(); assert!( matches!(result, CustomOperatorResult::Replace(value) if value.get("Article_Code").is_some() && value.get("other").is_none()) ); }
-    #[test] fn streaming_load_generated_ids_skip_existing_document_lookups() { let storage = crate::storage::MemoryStorage::new(); let read = CountingRead { inner: storage.read().unwrap(), gets: Cell::new(0), }; let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::new(Arc::from("ogd")); let chunks = [Arc::<str>::from(r#"[{"name":"Ada"},{"name":"Grace"}]"#)]; let mutations = materializer .materialize(&collection, &read, PhysicalLoadMode::Merge, &chunks) .unwrap(); assert_eq!(mutations.len(), 2); assert_eq!(read.gets.get(), 0); }
-    #[test] fn streaming_load_mixed_explicit_and_generated_ids_preserves_reserved_ids() { let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::new(Arc::from("ogd")); let chunks = [Arc::<str>::from( r#"[{"_id":"019fb7ae-9588-7057-830a-01bdb143b7ce","name":"Ada"},{"name":"Grace"}]"#, )]; let mutations = materializer .materialize(&collection, read.as_ref(), PhysicalLoadMode::Merge, &chunks) .unwrap(); assert_eq!(mutations.len(), 2); assert!(matches!(mutations[0], StreamingLoadMutation::Insert { .. })); assert!(matches!(mutations[1], StreamingLoadMutation::Insert { .. })); }
-    #[test] fn streaming_load_merge_inserts_new_documents() { let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::new(Arc::from("ogd")); let chunks = [Arc::<str>::from(r#"[{"name":"Ada","age":36}]"#)]; let mutations = materializer .materialize(&collection, read.as_ref(), PhysicalLoadMode::Merge, &chunks) .unwrap(); assert_eq!(mutations.len(), 1); assert!( matches!(&mutations[0], StreamingLoadMutation::Insert { document, .. } if document.get("name").and_then(Value::as_str) == Some("Ada")) ); }
-    #[test] fn streaming_load_rejects_non_array_chunks() { let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::new(Arc::from("ogd")); let chunks = [Arc::<str>::from(r#"{"name":"Ada"}"#)]; let error = materializer .materialize(&collection, read.as_ref(), PhysicalLoadMode::Merge, &chunks) .unwrap_err(); assert!(error.to_string().contains("must be a JSON array")); }
+    #[test] fn unwind_expands_array_values() { let mut document = Document::new(); document.insert("items", Value::array([Value::signed(1), Value::signed(2)])); let result = RuntimeMaterializer::new() .materialize_custom("unwind", "items", &document) .unwrap(); assert!(matches!(result, CustomOperatorResult::Expand(values) if values.len() == 2)); }
+    #[test] fn first_projection_selects_requested_field() { let mut document = Document::new(); document.insert("Article_Code", Value::string("A")); document.insert("other", Value::signed(1)); let result = RuntimeMaterializer::new() .materialize_custom("first", "Article_Code", &document) .unwrap(); assert!( matches!(result, CustomOperatorResult::Replace(value) if value.get("Article_Code").is_some() && value.get("other").is_none()) ); }
+    #[test] fn streaming_load_generated_ids_skip_existing_document_lookups() { let storage = crate::storage::MemoryStorage::new(); let read = CountingRead { inner: storage.read().unwrap(), gets: Cell::new(0), }; let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::default(); let chunks = [Arc::<str>::from(r#"[{"name":"Ada"},{"name":"Grace"}]"#)]; let mutations = materializer .materialize(&collection, &read, PhysicalLoadMode::Merge, &chunks) .unwrap(); assert_eq!(mutations.len(), 2); assert_eq!(read.gets.get(), 0); }
+    #[test] fn streaming_load_mixed_explicit_and_generated_ids_preserves_reserved_ids() { let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::default(); let chunks = [Arc::<str>::from( r#"[{"_id":"019fb7ae-9588-7057-830a-01bdb143b7ce","name":"Ada"},{"name":"Grace"}]"#, )]; let mutations = materializer .materialize(&collection, read.as_ref(), PhysicalLoadMode::Merge, &chunks) .unwrap(); assert_eq!(mutations.len(), 2); assert!(matches!(mutations[0], StreamingLoadMutation::Insert { .. })); assert!(matches!(mutations[1], StreamingLoadMutation::Insert { .. })); }
+    #[test] fn streaming_load_merge_inserts_new_documents() { let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::default(); let chunks = [Arc::<str>::from(r#"[{"name":"Ada","age":36}]"#)]; let mutations = materializer .materialize(&collection, read.as_ref(), PhysicalLoadMode::Merge, &chunks) .unwrap(); assert_eq!(mutations.len(), 1); assert!( matches!(&mutations[0], StreamingLoadMutation::Insert { document, .. } if document.get("name").and_then(Value::as_str) == Some("Ada")) ); }
+    #[test] fn streaming_load_rejects_non_array_chunks() { let storage = crate::storage::MemoryStorage::new(); let read = storage.read().unwrap(); let collection = CollectionId::parse("data").unwrap(); let materializer = StreamingLoadMaterializer::default(); let chunks = [Arc::<str>::from(r#"{"name":"Ada"}"#)]; let error = materializer .materialize(&collection, read.as_ref(), PhysicalLoadMode::Merge, &chunks) .unwrap_err(); assert!(error.to_string().contains("must be a JSON array")); }
 }

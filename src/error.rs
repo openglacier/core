@@ -226,11 +226,6 @@ pub struct MemoryReservationError { pub class: crate::memory::MemoryClass, pub r
 impl fmt::Display for MemoryReservationError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self.limit_bytes { Some(limit) => write!(f, "memory reservation rejected for {}: requested {} bytes with {} bytes already reserved; limit is {} bytes", self.class, self.requested_bytes, self.current_bytes, limit), None => write!(f, "memory reservation rejected for {}: byte accounting overflow", self.class), } } }
 impl error::Error for MemoryReservationError {}
 
-/// Invalid query runtime builder configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QueryRuntimeBuildError { MissingPredicateHandler, MissingSetHandler }
-impl fmt::Display for QueryRuntimeBuildError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { match self { Self::MissingPredicateHandler => f.write_str("query runtime requires a predicate handler"), Self::MissingSetHandler => f.write_str("query runtime requires a set handler"), } } }
-impl error::Error for QueryRuntimeBuildError {}
 
 #[cfg(test)]
 mod tests {

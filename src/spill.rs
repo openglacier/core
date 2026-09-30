@@ -194,6 +194,61 @@ impl Drop for SpillRun {
     }
 }
 
+/// Merges sorted runs: the smallest of the runs' next records comes first.
+pub struct RunMerge<R, T, F> {
+    readers: Vec<R>,
+    heads: Vec<Option<T>>,
+    next: F,
+}
+
+impl<R, T, F> std::fmt::Debug for RunMerge<R, T, F> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RunMerge").field("runs", &self.readers.len()).finish_non_exhaustive()
+    }
+}
+
+impl<R, T, E, F> RunMerge<R, T, F>
+where
+    F: FnMut(&mut R) -> Result<Option<T>, E>,
+{
+    /// Starts the merge by reading the first record of every run with `next`.
+    pub fn new(mut readers: Vec<R>, mut next: F) -> Result<Self, E> {
+        let heads = readers.iter_mut().map(&mut next).collect::<Result<_, _>>()?;
+        Ok(Self { readers, heads, next })
+    }
+
+    /// The run whose next record is the smallest by `less`; the first such run on ties.
+    pub fn min_index(&self, mut less: impl FnMut(&T, &T) -> Result<bool, E>) -> Result<Option<usize>, E> {
+        let mut best: Option<usize> = None;
+        for (index, head) in self.heads.iter().enumerate() {
+            let Some(candidate) = head else { continue };
+            let better = match best {
+                None => true,
+                Some(best) => less(candidate, self.heads[best].as_ref().expect("selected run has a record"))?,
+            };
+            if better {
+                best = Some(index);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Takes the next record of run `index`, reading the one after it.
+    pub fn take(&mut self, index: usize) -> Result<T, E> {
+        let record = self.heads[index].take().expect("selected run has a record");
+        self.heads[index] = (self.next)(&mut self.readers[index])?;
+        Ok(record)
+    }
+
+    /// Takes the smallest next record by `less`, if any run has one left.
+    pub fn pop_min(&mut self, less: impl FnMut(&T, &T) -> Result<bool, E>) -> Result<Option<T>, E> {
+        match self.min_index(less)? {
+            Some(index) => self.take(index).map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SpillRunReader { reader: BufReader<File>, }
 impl SpillRunReader {

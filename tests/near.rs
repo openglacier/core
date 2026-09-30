@@ -8,10 +8,7 @@ use std::{
 
 use og_core::{
     engine::Engine,
-    query::{
-        value_expression_runtime, PlannerPipeline, PlannerStage, QueryRuntimeMaterializationExt,
-        ScanPlanLowerer, Span, StageName,
-    },
+    query::{PlannerPipeline, PlannerStage, QueryRuntime, ScanPlanLowerer, Span, StageName},
     storage::{glacier::GlacierStorage, CollectionId, DocumentId, MemoryStorage, StorageEngine},
     Document, Value,
 };
@@ -57,11 +54,7 @@ fn near_composes_with_existing_sort_and_limit() {
     }
     transaction.commit().unwrap();
 
-    let runtime = Arc::new(
-        value_expression_runtime()
-            .unwrap()
-            .with_default_materialization("test"),
-    );
+    let runtime = Arc::new(QueryRuntime::new());
     let engine = Engine::new(storage, runtime, Arc::new(ScanPlanLowerer::new()));
     let query = PlannerPipeline::new(
         "memories",
@@ -122,11 +115,7 @@ fn glacier_near_top_n_projects_embeddings_and_hydrates_only_winners() {
     }
     transaction.commit().unwrap();
 
-    let runtime = Arc::new(
-        value_expression_runtime()
-            .unwrap()
-            .with_default_materialization("test"),
-    );
+    let runtime = Arc::new(QueryRuntime::new());
     let engine = Engine::new(storage.clone(), runtime, Arc::new(ScanPlanLowerer::new()));
     let query = PlannerPipeline::new(
         "memories",
@@ -216,11 +205,7 @@ fn glacier_near_defers_embedding_decode_until_where_accepts_row() {
     }
     transaction.commit().unwrap();
 
-    let runtime = Arc::new(
-        value_expression_runtime()
-            .unwrap()
-            .with_default_materialization("test"),
-    );
+    let runtime = Arc::new(QueryRuntime::new());
     let engine = Engine::new(storage.clone(), runtime, Arc::new(ScanPlanLowerer::new()));
     let query = PlannerPipeline::new(
         "memories",

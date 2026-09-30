@@ -4,9 +4,10 @@
 use std::{error::Error as StdError, fmt, sync::Arc};
 
 use crate::storage::{CollectionId, DocumentId, ScanDirection, ScanOptions};
+use crate::Document;
 
 use super::execution_properties::{
-    Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Materialization, Order,
+    Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Materialization, Order, Reads,
     ProjectedAccess, ProjectionReuse, Shape,
 };
 use super::{AccessVector, Expression, ExpressionFieldPath, SetAssignment, SortKey, StageName};
@@ -21,6 +22,10 @@ pub type PhysicalPlanResult<T> = std::result::Result<T, PhysicalPlanError>;
 pub struct PhysicalPlan {
     source: PhysicalSource,
     operators: Arc<[PhysicalOperator]>,
+    /// Whether the consumer of this plan's rows ignores their source order.
+    order_free: bool,
+    /// Fields that consumer reads from the rows; `None` means whole rows.
+    field_demand: Option<Arc<[ExpressionFieldPath]>>,
     mode: ExecutionMode,
     memory_mode: MemoryExecutionMode,
     changes_cardinality: bool,
@@ -54,6 +59,8 @@ impl PhysicalPlan {
         let (mode, memory_mode, changes_cardinality) = summarize_execution(&operators);
         Ok(Self {
             source,
+            order_free: false,
+            field_demand: None,
             mode,
             memory_mode,
             changes_cardinality,
@@ -62,6 +69,28 @@ impl PhysicalPlan {
             projected_prefix_len,
             source_projection_reuse,
         })
+    }
+
+    /// Declares that the consumer of this plan's rows ignores their source
+    /// order and reads `fields` from them (`None`: whole rows). Executors may
+    /// then read only the fields the plan needs, from an unordered cursor.
+    #[must_use]
+    pub fn with_order_free_consumer(mut self, fields: Option<Vec<ExpressionFieldPath>>) -> Self {
+        self.order_free = true;
+        self.field_demand = fields.map(Arc::from);
+        self
+    }
+
+    /// Whether the consumer of this plan's rows ignores their source order.
+    #[must_use]
+    pub const fn order_free(&self) -> bool {
+        self.order_free
+    }
+
+    /// Fields the consumer of this plan's rows reads, when declared.
+    #[must_use]
+    pub fn field_demand(&self) -> Option<&[ExpressionFieldPath]> {
+        self.field_demand.as_deref()
     }
 
     /// Returns the physical source access.
@@ -489,6 +518,11 @@ pub enum PhysicalOperator {
         /// Declared: the stage turns one row into zero or more rows, in
         /// order, without buffering (`unwind`).
         expands_rows: bool,
+        /// Declared: the stage may drop rows, one at a time, without buffering (`near`).
+        filters_rows: bool,
+        /// The stage compiled once for the whole plan, when the runtime
+        /// knows it; rows then never re-parse the stage arguments.
+        compiled: Option<Arc<super::CompiledStage>>,
     },
 }
 
@@ -707,6 +741,13 @@ impl PhysicalOperator {
                 },
             ));
         }
+        // A stage that fails to compile keeps its text: running it reports the
+        // same error as before, at the first row.
+        let compiled = if writes {
+            None
+        } else {
+            super::CompiledStage::compile(name.as_str(), arguments).ok().flatten().map(Arc::new)
+        };
         Ok(Self::Custom {
             name,
             arguments: Arc::from(arguments),
@@ -716,7 +757,73 @@ impl PhysicalOperator {
             preserves_fields: false,
             exact_rows: false,
             expands_rows: false,
+            filters_rows: false,
+            compiled,
         })
+    }
+
+    /// Every input field the stage reads, or `None` when it may read any
+    /// (for example a `lookup`, whose correlation reads the outer row).
+    ///
+    /// Complements the borrowed [`ExecutionProperties::reads`] for native
+    /// stages whose read set is derived from their arguments (predicates,
+    /// sort keys, group layout, pivot specification).
+    #[must_use]
+    pub fn field_reads(&self) -> Option<Vec<ExpressionFieldPath>> {
+        let mut fields = Vec::new();
+        let mut add = |field: &ExpressionFieldPath| {
+            if !fields.contains(field) {
+                fields.push(field.clone());
+            }
+        };
+        match self {
+            Self::Filter { predicate } => predicate.for_each_field(&mut add),
+            Self::Sort { keys } => keys.iter().for_each(|key| add(key.field())),
+            Self::Distinct { fields: keys } if !keys.is_empty() => keys.iter().for_each(&mut add),
+            Self::Group { keys } => super::group_field_layout(keys).ok()?.1.iter().for_each(&mut add),
+            Self::Pivot { specification } => specification
+                .rows()
+                .iter()
+                .chain(specification.columns())
+                .chain(specification.values().iter().map(super::PivotValue::field))
+                .for_each(&mut add),
+            _ => match self.execution_properties().reads {
+                Reads::Nothing => {}
+                Reads::Fields(read) => read.iter().for_each(&mut add),
+                Reads::Unknown => return None,
+            },
+        }
+        Some(fields)
+    }
+
+    /// Whether the stage may read the virtual `_id` field. Executors only
+    /// build the document copy carrying `_id` for such stages; the others
+    /// read the stored document in place.
+    #[must_use]
+    pub fn reads_document_id(&self) -> bool {
+        let is_id = |path: &ExpressionFieldPath| path.first() == "_id";
+        match self {
+            Self::Filter { predicate } => {
+                let mut found = false;
+                predicate.for_each_field(&mut |field| found |= is_id(field));
+                found
+            }
+            _ => match self.execution_properties().reads {
+                Reads::Nothing => false,
+                Reads::Fields(fields) => fields.iter().any(is_id),
+                Reads::Unknown => true,
+            },
+        }
+    }
+
+    /// Runs a row-local extension operator on one document: through its
+    /// compiled stage when the plan holds one, through the runtime otherwise.
+    pub fn apply_custom( &self, runtime: &dyn super::ExecutionRuntime, document: &Document, ) -> super::ExecutionResult<super::CustomOperatorResult> {
+        match self {
+            Self::Custom { compiled: Some(stage), .. } => stage.apply(document),
+            Self::Custom { name, arguments, writes, .. } => runtime.apply_custom(name, arguments, *writes, document),
+            other => Err(super::ExecutionError::unsupported_operator(other.name(), "not an extension operator")),
+        }
     }
 
     /// Declares that a read-only, row-local extension operator lets at most
@@ -772,6 +879,17 @@ impl PhysicalOperator {
         self
     }
 
+    /// Declares that a read-only, row-local extension operator may drop rows
+    /// (one row in, zero or one row out), so bounds after it are not pushed
+    /// past it.
+    #[must_use]
+    pub fn with_row_filter(mut self) -> Self {
+        if let Self::Custom { writes: false, changes_cardinality: false, row_bound: None, filters_rows, .. } = &mut self {
+            *filters_rows = true;
+        }
+        self
+    }
+
     /// Returns the resolved execution properties for this operator instance.
     #[must_use]
     pub fn execution_properties(&self) -> ExecutionProperties<'_> {
@@ -779,7 +897,7 @@ impl PhysicalOperator {
         use Bound::{AtMost, Exact, Unknown as U};
         use CardinalityEffect::{Expand, Preserve, Reduce, Unknown};
         use Effect::{ReadOnly as R, Write as W};
-        use Fields::{Preserved as SameFields, Projected, Unknown as UnknownFields};
+        use Fields::{Computed, Preserved as SameFields, Projected, Unknown as UnknownFields};
         use Flow::{GovernedBlocking as B, Specialized as X, Streaming as S};
         use Materialization::{Deferred as Defer, Required as Materialize};
         use Order::{Ordered, Preserved, Unknown as NoOrder};
@@ -847,7 +965,7 @@ impl PhysicalOperator {
                 Expand,
                 U,
                 NoOrder,
-                UnknownFields,
+                SameFields,
                 L,
                 Set,
                 R,
@@ -876,7 +994,7 @@ impl PhysicalOperator {
                 Reduce,
                 U,
                 NoOrder,
-                UnknownFields,
+                SameFields,
                 L,
                 Set,
                 R,
@@ -889,7 +1007,7 @@ impl PhysicalOperator {
                 Reduce,
                 U,
                 NoOrder,
-                UnknownFields,
+                SameFields,
                 L,
                 Set,
                 R,
@@ -902,7 +1020,7 @@ impl PhysicalOperator {
                 Reduce,
                 U,
                 NoOrder,
-                UnknownFields,
+                Computed,
                 L,
                 Set,
                 R,
@@ -941,7 +1059,7 @@ impl PhysicalOperator {
                 Unknown,
                 Exact(1),
                 NoOrder,
-                UnknownFields,
+                Computed,
                 C,
                 Set,
                 R,
@@ -980,7 +1098,7 @@ impl PhysicalOperator {
                 Unknown,
                 U,
                 NoOrder,
-                UnknownFields,
+                Computed,
                 M,
                 Set,
                 R,
@@ -1009,13 +1127,14 @@ impl PhysicalOperator {
             Self::Custom {
                 writes: false,
                 expands_rows: true,
+                compiled,
                 ..
             } => (
                 S,
                 Expand,
                 U,
                 Preserved,
-                UnknownFields,
+                compiled_fields(compiled),
                 L,
                 Set,
                 R,
@@ -1025,16 +1144,25 @@ impl PhysicalOperator {
             ),
             Self::Custom {
                 writes: false,
+                filters_rows: true,
+                compiled,
+                ..
+            } => (
+                S, Reduce, U, Preserved, compiled_fields(compiled), L, Row, R, NoPv, Materialize, NoReuse,
+            ),
+            Self::Custom {
+                writes: false,
                 row_bound: Some(bound),
                 preserves_fields,
                 exact_rows,
+                compiled,
                 ..
             } => (
                 S,
                 Reduce,
                 if *exact_rows { Exact(*bound) } else { AtMost(*bound) },
                 Preserved,
-                if *preserves_fields { SameFields } else { UnknownFields },
+                if *preserves_fields { SameFields } else { compiled_fields(compiled) },
                 L,
                 Set,
                 R,
@@ -1045,6 +1173,7 @@ impl PhysicalOperator {
             Self::Custom {
                 writes,
                 changes_cardinality,
+                compiled,
                 ..
             } => (
                 if *writes {
@@ -1061,7 +1190,7 @@ impl PhysicalOperator {
                 },
                 U,
                 NoOrder,
-                UnknownFields,
+                compiled_fields(compiled),
                 L,
                 if *changes_cardinality { Set } else { Row },
                 if *writes { W } else { R },
@@ -1070,12 +1199,20 @@ impl PhysicalOperator {
                 NoReuse,
             ),
         };
+        let reads = match self {
+            Self::Select { fields } => Reads::Fields(fields),
+            // A union passes its input rows through untouched.
+            Self::Limit { .. } | Self::Skip { .. } | Self::Count { .. } | Self::Union { .. } => Reads::Nothing,
+            Self::Custom { compiled: Some(stage), .. } => Reads::Fields(stage.reads()),
+            _ => Reads::Unknown,
+        };
         ExecutionProperties {
             flow,
             cardinality,
             bound,
             order,
             fields,
+            reads,
             shape,
             scope,
             effect,
@@ -1985,6 +2122,11 @@ fn negotiate_source_projection_reuse(operators: &[PhysicalOperator]) -> Projecti
     }
 }
 
+/// Output fields declared by a compiled stage; unknown without one.
+fn compiled_fields(compiled: &Option<Arc<super::CompiledStage>>) -> Fields<'_> {
+    compiled.as_deref().map_or(Fields::Unknown, super::CompiledStage::output_fields)
+}
+
 fn summarize_execution( operators: &[PhysicalOperator], ) -> (ExecutionMode, MemoryExecutionMode, bool) {
     let (writes, blocking, changes) = operators.iter().fold((false, false, false), |state, op| {
         let p = op.execution_properties();
@@ -2009,6 +2151,41 @@ fn summarize_execution( operators: &[PhysicalOperator], ) -> (ExecutionMode, Mem
         },
         changes,
     )
+}
+
+/// Source fields a chain of operators needs so that its consumer, which
+/// reads `demand` from the chain's output (`None`: whole rows), sees the same
+/// values as with complete documents. `None` when any field may be needed.
+///
+/// The walk runs backwards and only uses declared properties: what each stage
+/// reads ([`PhysicalOperator::field_reads`]) and how its output fields relate
+/// to its input ([`Fields`]).
+#[must_use]
+pub fn source_field_demand( operators: &[PhysicalOperator], demand: Option<&[ExpressionFieldPath]>, ) -> Option<Vec<ExpressionFieldPath>> {
+    // `None` means every field. A stage that may read any field needs every
+    // field of its input, yet a projection further upstream can still narrow
+    // what the source must provide, so the walk goes on.
+    let mut needed = demand.map(<[ExpressionFieldPath]>::to_vec);
+    for operator in operators.iter().rev() {
+        let reads = operator.field_reads();
+        let merge = |mut fields: Vec<ExpressionFieldPath>, reads: Vec<ExpressionFieldPath>| {
+            for field in reads {
+                if !fields.contains(&field) {
+                    fields.push(field);
+                }
+            }
+            fields
+        };
+        needed = match operator.execution_properties().fields {
+            Fields::Preserved => needed.zip(reads).map(|(fields, reads)| merge(fields, reads)),
+            Fields::Rewritten(written) => needed.zip(reads).map(|(fields, reads)| {
+                merge(fields.into_iter().filter(|field| !written.contains(field)).collect(), reads)
+            }),
+            Fields::Projected(_) | Fields::Computed => reads,
+            Fields::Unknown => return None,
+        };
+    }
+    needed
 }
 
 #[cfg(test)]
@@ -2078,6 +2255,8 @@ mod tests {
     #[test] fn pivot_rejects_following_operators() { let mut builder = PhysicalPlan::builder(source()); builder.pivot(pivot_specification()).unwrap(); assert!(matches!( builder.limit(1).unwrap_err().kind(), PhysicalPlanErrorKind::OperatorAfterTerminal { .. } )); }
     #[test] fn distinct_without_fields_means_complete_documents() { let operator = PhysicalOperator::distinct([]).unwrap(); assert_eq!(operator.distinct_fields(), Some(&[][..])); }
     #[test] fn duplicate_unique_operator_is_rejected() { let mut builder = PhysicalPlan::builder(source()); builder.limit(10).unwrap(); assert!(matches!( builder.limit(20).unwrap_err().kind(), PhysicalPlanErrorKind::DuplicateOperator { operator: PhysicalOperatorKind::Limit, .. } )); }
+    #[test] fn compiled_stages_declare_the_fields_they_read_and_write() { let custom = |name: &str, arguments: &str| PhysicalOperator::custom(StageName::parse(name).unwrap(), arguments, false, false).unwrap(); let names = |fields: &Arc<[ExpressionFieldPath]>| fields.iter().map(ToString::to_string).collect::<Vec<_>>(); let derive = custom("derive", "total = price * qty, big = total > 100, meta.flag = round(total)"); let properties = derive.execution_properties(); assert!(matches!(properties.reads, Reads::Fields(fields) if names(fields) == ["price", "qty"])); assert!(matches!(properties.fields, Fields::Rewritten(fields) if names(fields) == ["total", "big", "meta.flag"])); let select = custom("select", "name, price * 2 as double"); assert!(matches!(select.execution_properties().fields, Fields::Projected(fields) if names(fields) == ["name", "double"])); assert!(matches!(select.execution_properties().reads, Reads::Fields(fields) if names(fields) == ["name", "price"])); assert!(matches!(custom("drop", "a, b.c").execution_properties().fields, Fields::Rewritten(fields) if names(fields) == ["a", "b.c"])); assert!(matches!(custom("rename", "a as b").execution_properties().reads, Reads::Fields(fields) if names(fields) == ["a"])); assert!(matches!(custom("root", "profile").execution_properties().fields, Fields::Computed)); for opaque in [custom("frobnicate", "x"), custom("derive", "total = price *")] { assert!(matches!(opaque.execution_properties().reads, Reads::Unknown), "{opaque:?}"); assert!(matches!(opaque.execution_properties().fields, Fields::Unknown), "{opaque:?}"); } assert!(matches!(PhysicalOperator::limit(3).execution_properties().reads, Reads::Nothing)); }
+    #[test] fn field_demand_follows_declared_reads_and_writes() { let custom = |name: &str, arguments: &str| PhysicalOperator::custom(StageName::parse(name).unwrap(), arguments, false, false).unwrap(); let path = |text: &str| ExpressionFieldPath::new(text.split('.')).unwrap(); let names = |fields: Option<Vec<ExpressionFieldPath>>| fields.map(|fields| fields.iter().map(ToString::to_string).collect::<Vec<_>>()); let count = PhysicalOperator::count("n").unwrap(); let derive = custom("derive", "total = price * qty"); let filter = PhysicalOperator::filter(crate::query::parse_expression("total > 20 and region == \"EU\"").unwrap()); assert_eq!(names(source_field_demand(&[derive.clone(), filter.clone(), count.clone()], None)), Some(vec!["region".to_owned(), "price".to_owned(), "qty".to_owned()])); assert_eq!(names(source_field_demand(&[derive.clone(), filter], None)), None); let select = PhysicalOperator::select([path("region")]).unwrap(); assert_eq!(names(source_field_demand(&[select, PhysicalOperator::distinct([]).unwrap()], None)), Some(vec!["region".to_owned()])); assert_eq!(names(source_field_demand(&[derive, count], Some(&[path("other")]))), Some(vec!["price".to_owned(), "qty".to_owned()])); assert_eq!(names(source_field_demand(&[custom("frobnicate", "x")], Some(&[]))), None); }
     #[test] fn validates_native_operator_arguments() { assert!(matches!( PhysicalOperator::sort([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptySortKeys )); assert!(matches!( PhysicalOperator::select([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptyFieldList { context: PhysicalFieldContext::Select } )); assert!(matches!( PhysicalOperator::group([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptyFieldList { context: PhysicalFieldContext::Group } )); }
     #[test] fn supports_lookup_and_union_subpipelines() { let nested = PhysicalSubPipeline::new([PhysicalOperator::filter( parse_expression("active == true").unwrap(), )]) .unwrap(); let lookup = PhysicalOperator::lookup( CollectionId::parse("workspace").unwrap(), Some("w"), "public", nested.clone(), ) .unwrap(); assert_eq!(lookup.kind(), PhysicalOperatorKind::Lookup); assert_eq!(lookup.lookup_alias(), Some("w")); assert_eq!(lookup.lookup_target(), Some("public")); assert!(!lookup.execution_properties().writes()); assert!(!!matches!( lookup.execution_properties().cardinality, CardinalityEffect::Preserve )); let union = PhysicalOperator::union( CollectionId::parse("archived_users").unwrap(), None::<&str>, nested, ) .unwrap(); assert_eq!(union.kind(), PhysicalOperatorKind::Union); assert!(!matches!( union.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(!union.execution_properties().writes()); }
     #[test] fn nested_pipeline_rejects_mutations_and_terminal_operators() { assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::delete()]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::pivot(pivot_specification())]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); }

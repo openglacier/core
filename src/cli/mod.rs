@@ -22,7 +22,7 @@ use crate::{
     },
 };
 use rustyline::{error::ReadlineError, DefaultEditor, ExternalPrinter};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 #[cfg(feature = "cli-tui")]
 mod tui;
@@ -190,7 +190,7 @@ fn execute_background_line( config: &Config, line: &str, mut emit: impl FnMut(St
             Ok(ExitCode::SUCCESS)
         }
     } else {
-        client.query_stream_emit(line, config.output, &mut emit)
+        client.query_stream_emit(line, &config.params, config.output, &mut emit)
     }
 }
 
@@ -225,7 +225,7 @@ fn handle_line( config: &Config, client: &mut Client, line: &str, interactive: b
                 Ok(ExitCode::SUCCESS)
             }
         } else {
-            client.query(line, config.output)
+            client.query(line, &config.params, config.output)
         }
     })?;
     if result != ExitCode::SUCCESS {
@@ -392,11 +392,11 @@ impl Client {
         }
     }
 
-    fn query_stream_emit( &mut self, query: &str, output: Output, emit: &mut impl FnMut(String) -> Result<()>, ) -> Result<ExitCode> {
+    fn query_stream_emit( &mut self, query: &str, params: &Map<String, Value>, output: Output, emit: &mut impl FnMut(String) -> Result<()>, ) -> Result<ExitCode> {
         if query.trim().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "query cannot be empty").into());
         }
-        let expected = self.send(QUERY_EXECUTE, json!({"query": query}))?;
+        let expected = self.send(QUERY_EXECUTE, query_payload(query, params))?;
         let mut message = Vec::with_capacity(4096);
         loop {
             self.receive(&mut message)?;
@@ -437,11 +437,11 @@ impl Client {
         }
     }
 
-    fn query(&mut self, query: &str, output: Output) -> Result<ExitCode> {
+    fn query(&mut self, query: &str, params: &Map<String, Value>, output: Output) -> Result<ExitCode> {
         if query.trim().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "query cannot be empty").into());
         }
-        let expected = self.send(QUERY_EXECUTE, json!({"query": query}))?;
+        let expected = self.send(QUERY_EXECUTE, query_payload(query, params))?;
         let mut documents = Vec::new();
         let mut message = Vec::with_capacity(4096);
         loop {
@@ -553,6 +553,8 @@ struct Config {
     identity: Option<PathBuf>,
     password_file: Option<PathBuf>,
     password: Option<String>,
+    /// `$name` query parameters given with `--param name=value`.
+    params: Map<String, Value>,
     #[cfg(feature = "cli-tui")]
     tui: bool,
 }
@@ -572,6 +574,7 @@ impl Config {
             identity,
             password_file: env::var("OGCLI_IDENTITY_PASSWORD_FILE").ok().map(PathBuf::from),
             password: env::var("OGCLI_IDENTITY_PASSWORD").ok(),
+            params: Map::new(),
             #[cfg(feature = "cli-tui")]
             tui: false,
         })
@@ -649,6 +652,15 @@ impl Args {
                     )
                     .into())
                 }
+                "--param" => {
+                    let assignment = value!();
+                    let (name, raw) = assignment.split_once('=').ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, format!("--param expects NAME=VALUE, found {assignment}"))
+                    })?;
+                    // JSON values (`18`, `true`, `["a"]`, `"x"`) keep their type; anything else is a string.
+                    let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()));
+                    config.params.insert(name.to_owned(), value);
+                }
                 "--compact" => config.output = Output::Compact,
                 "-q" | "--quiet" => config.output = Output::Quiet,
                 "--" => {
@@ -665,6 +677,15 @@ impl Args {
             config.address = address(&host.unwrap_or_else(|| "127.0.0.1".into()), port.unwrap_or(7878));
         }
         Ok((config, Action::Run((!query.is_empty()).then(|| query.join(" ")))))
+    }
+}
+
+/// `query.execute` payload, with `params` only when some are bound.
+fn query_payload(query: &str, params: &Map<String, Value>) -> Value {
+    if params.is_empty() {
+        json!({"query": query})
+    } else {
+        json!({"query": query, "params": params})
     }
 }
 
@@ -710,6 +731,7 @@ OPTIONS:\n\
     --read-timeout-ms MS      0 waits indefinitely [default: 0]\n\
     --write-timeout-ms MS     [default: 30000]\n\
     --tui                     Interactive tabs/tiles UI (requires cli-tui)\n\
+    --param NAME=VALUE        Binds $NAME in queries; VALUE is JSON or a plain string\n\
     --compact                 Compact JSON\n\
     --quiet, -q               Documents only\n\
     --help, -h\n\

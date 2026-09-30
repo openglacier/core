@@ -28,6 +28,8 @@
 //! rollback at arbitrary failure positions.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
+mod support;
+
 use std::{
     collections::BTreeSet,
     sync::{
@@ -39,8 +41,8 @@ use std::{
 use og_core::{
     engine::{Engine, EngineErrorKind},
     query::{
-        CustomOperatorResult, ExecutionError, PlannerPipeline, PlannerStage, QueryRuntime,
-        QueryRuntimeBuilder, ScanPlanLowerer, Span, StageName,
+        ExecutionError, ExecutionRuntime, PlannerPipeline, PlannerStage,
+        ScanPlanLowerer, Span, StageName,
     },
     storage::{CollectionId, DocumentId, MemoryStorage, StorageEngine},
     Document,
@@ -119,19 +121,11 @@ fn seed_ids(storage: &MemoryStorage, collection_name: &str, ids: impl IntoIterat
     transaction.commit().expect("commit seed transaction");
 }
 
-fn default_runtime() -> Arc<QueryRuntime> {
-    Arc::new(
-        QueryRuntimeBuilder::new()
-            .predicate(|_, _| Ok(true))
-            .set(|_, document| Ok(Arc::new(document.clone())))
-            .load(|_, document| Ok(Arc::new(document.clone())))
-            .custom(|_, _, _, _| Ok(CustomOperatorResult::Keep))
-            .build()
-            .expect("valid default runtime"),
-    )
+fn default_runtime() -> Arc<dyn ExecutionRuntime> {
+    support::passthrough_runtime()
 }
 
-fn engine(storage: Arc<MemoryStorage>, runtime: Arc<QueryRuntime>) -> Engine {
+fn engine(storage: Arc<MemoryStorage>, runtime: Arc<dyn ExecutionRuntime>) -> Engine {
     Engine::new(storage, runtime, Arc::new(ScanPlanLowerer::new()))
 }
 
@@ -258,17 +252,11 @@ proptest! {
         let predicate_selection = Arc::clone(&selection);
         let predicate_counter = Arc::clone(&predicate_index);
 
-        let runtime = Arc::new(
-            QueryRuntimeBuilder::new()
-                .predicate(move |_, _| {
+        let runtime = support::runtime(move |_, _| {
                     let index = predicate_counter
                         .fetch_add(1, Ordering::SeqCst);
                     Ok(predicate_selection[index])
-                })
-                .set(|_, document| Ok(Arc::new(document.clone())))
-                .build()
-                .expect("valid runtime"),
-        );
+                }, |_, document| Ok(Arc::new(document.clone())));
 
         let engine = engine(storage, runtime);
         let result = engine
@@ -323,20 +311,14 @@ proptest! {
         let predicate_counter = Arc::clone(&predicate_index);
         let set_counter = Arc::clone(&set_calls);
 
-        let runtime = Arc::new(
-            QueryRuntimeBuilder::new()
-                .predicate(move |_, _| {
+        let runtime = support::runtime(move |_, _| {
                     let index = predicate_counter
                         .fetch_add(1, Ordering::SeqCst);
                     Ok(predicate_selection[index])
-                })
-                .set(move |_, document| {
+                }, move |_, document| {
                     set_counter.fetch_add(1, Ordering::SeqCst);
                     Ok(Arc::new(document.clone()))
-                })
-                .build()
-                .expect("valid runtime"),
-        );
+                });
 
         let engine = engine(Arc::clone(&storage), runtime);
         let result = engine
@@ -390,10 +372,7 @@ proptest! {
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
 
-        let runtime = Arc::new(
-            QueryRuntimeBuilder::new()
-                .predicate(|_, _| Ok(true))
-                .set(move |_, document| {
+        let runtime = support::runtime(|_, _| Ok(true), move |_, document| {
                     let index =
                         counter.fetch_add(1, Ordering::SeqCst);
 
@@ -404,10 +383,7 @@ proptest! {
                     }
 
                     Ok(Arc::new(document.clone()))
-                })
-                .build()
-                .expect("valid failing runtime"),
-        );
+                });
 
         let engine = engine(Arc::clone(&storage), runtime);
         let error = engine

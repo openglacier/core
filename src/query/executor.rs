@@ -4,11 +4,10 @@
 use std::{cmp::Ordering, error::Error as StdError, fmt, io, mem::size_of, sync::Arc};
 
 use crate::{
-    compare,
     helpers::{document_scope_matches, enforce_document_scope, fnv1a64, unix_time_nanos, PLACE_SCOPE_FIELD},
     memory::{MemoryClass, MemoryGovernor, MemoryReservation, MemoryReservationError},
-    model::{CoercionPolicy, Document, Number, Value},
-    spill::{SpillEngine, SpillRun, SpillRunReader},
+    model::{compare_for_sort, CoercionPolicy, Document, Number, Value},
+    spill::{RunMerge, SpillEngine, SpillRun, SpillRunReader},
     storage::{
         CollectionId, CommitResult, DocumentId, DocumentVersion, ProjectedValueRef, ScanOptions, StorageEngine,
         StorageError, StorageMutation, StorageRead, StorageTransaction, StoredDocument,
@@ -231,6 +230,37 @@ pub trait IncrementalPivotAccumulator: Send {
     /// Folds one document into the pivot.
     fn push(&mut self, document: &Document) -> ExecutionResult<()>;
 
+    /// Whether [`Self::push_slots`] is implemented.
+    fn folds_slots(&self) -> bool {
+        false
+    }
+
+    /// Folds one row held as values of top-level `fields`, as [`Self::push`]
+    /// does for the document holding the present values. Only called when
+    /// [`Self::folds_slots`] holds.
+    fn push_slots(&mut self, fields: &[ExpressionFieldPath], values: &[Option<Value>]) -> ExecutionResult<()> {
+        let _ = (fields, values);
+        Err(ExecutionError::unsupported_operator("pivot", "accumulator folds documents only"))
+    }
+
+    /// Whether [`Self::push_refs`] is implemented.
+    fn folds_refs(&self) -> bool {
+        false
+    }
+
+    /// Folds one row given by the values of the specification's row,
+    /// column and value paths, in that order, as [`Self::push`] does for a
+    /// document holding them. Only called when [`Self::folds_refs`] holds.
+    fn push_refs(
+        &mut self,
+        rows: &[Option<crate::storage::ProjectedValueRef<'_>>],
+        columns: &[Option<crate::storage::ProjectedValueRef<'_>>],
+        values: &[Option<crate::storage::ProjectedValueRef<'_>>],
+    ) -> ExecutionResult<()> {
+        let _ = (rows, columns, values);
+        Err(ExecutionError::unsupported_operator("pivot", "accumulator folds documents only"))
+    }
+
     /// Estimated bytes currently retained by the aggregate state.
     fn retained_bytes(&self) -> usize;
 
@@ -261,6 +291,12 @@ pub trait IncrementalGroupAccumulator: Send {
         _source_slots: &[usize],
     ) -> ExecutionResult<bool> {
         Ok(false)
+    }
+
+    /// The same group semantics as a [`super::DenseGroups`] holding every
+    /// group of the stage, when the runtime provides one.
+    fn into_dense(self: Box<Self>) -> Option<super::DenseGroups> {
+        None
     }
 
     /// Materializes a compact mergeable partial state for external spill.
@@ -429,6 +465,14 @@ pub trait ExecutionRuntime: Send + Sync {
     /// caller-owned `key` buffer and return `true`; returning `false` selects the
     /// established full-document fallback.
     fn write_projected_distinct_key( &self, fields: &[ExpressionFieldPath], values: &[Option<ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
+        let _ = (fields, values, indexes, key);
+        Ok(false)
+    }
+
+    /// Encodes the full-document distinct key of the document holding the
+    /// present values, `fields` being every top-level field of the collection
+    /// in name order. Returning `false` selects the full-document fallback.
+    fn write_projected_document_distinct_key( &self, fields: &[ExpressionFieldPath], values: &[Option<ProjectedValueRef<'_>>], indexes: &[usize], key: &mut Vec<u8>, ) -> ExecutionResult<bool> {
         let _ = (fields, values, indexes, key);
         Ok(false)
     }
@@ -1091,10 +1135,25 @@ impl ExecutionRow {
         document
     }
 
+    /// The document a stage reads: the stored document itself, or a copy
+    /// carrying the virtual `_id` field when the stage reads it.
+    pub(crate) fn stage_input(&self, needs_id: bool) -> std::borrow::Cow<'_, Document> {
+        if needs_id {
+            std::borrow::Cow::Owned(self.evaluation_document())
+        } else {
+            std::borrow::Cow::Borrowed(self.document.as_ref())
+        }
+    }
+
     pub(crate) fn replace_document(&mut self, document: Arc<Document>, mark_changed: bool) {
-        let mut document = document.as_ref().clone();
-        document.remove("_id");
-        self.document = Arc::new(document);
+        // Only a document carrying the virtual `_id` needs a copy without it.
+        self.document = if document.contains_key("_id") {
+            let mut document = document.as_ref().clone();
+            document.remove("_id");
+            Arc::new(document)
+        } else {
+            document
+        };
         self.changed |= mark_changed;
     }
 }
@@ -1270,6 +1329,10 @@ pub enum ExecutionStrategy {
     InMemoryGroup,
     ExternalGroup,
     InMemoryPivot,
+    /// Rows were read as partial documents holding only the fields the query reads.
+    PartialDocuments,
+    /// A lookup matched rows through an equality index built once.
+    HashJoin,
 }
 
 impl ExecutionStrategy {
@@ -1288,6 +1351,8 @@ impl ExecutionStrategy {
             Self::InMemoryGroup => "in_memory_group",
             Self::ExternalGroup => "external_group",
             Self::InMemoryPivot => "in_memory_pivot",
+            Self::PartialDocuments => "partial_documents",
+            Self::HashJoin => "hash_join",
         }
     }
 
@@ -1305,6 +1370,8 @@ impl ExecutionStrategy {
             Self::InMemoryGroup => 1 << 9,
             Self::ExternalGroup => 1 << 10,
             Self::InMemoryPivot => 1 << 11,
+            Self::PartialDocuments => 1 << 12,
+            Self::HashJoin => 1 << 13,
         }
     }
 }
@@ -1325,7 +1392,7 @@ impl ExecutionStrategies {
     }
 
     pub fn iter(self) -> impl Iterator<Item = ExecutionStrategy> {
-        const ALL: [ExecutionStrategy; 12] = [
+        const ALL: [ExecutionStrategy; 14] = [
             ExecutionStrategy::CollectionScan,
             ExecutionStrategy::PrimaryKeyLookup,
             ExecutionStrategy::DirectCount,
@@ -1338,6 +1405,8 @@ impl ExecutionStrategies {
             ExecutionStrategy::InMemoryGroup,
             ExecutionStrategy::ExternalGroup,
             ExecutionStrategy::InMemoryPivot,
+            ExecutionStrategy::PartialDocuments,
+            ExecutionStrategy::HashJoin,
         ];
         ALL.into_iter()
             .filter(move |strategy| self.contains(*strategy))
@@ -1720,14 +1789,19 @@ fn is_set_level_operator(operator: &PhysicalOperator) -> bool {
 fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntime, operators: &[PhysicalOperator], state: &mut PipelineState, lookup_context: Option<LookupContext<'_>>, memory_governor: &MemoryGovernor, scope: Option<&DocumentScope>, ) -> ExecutionResult<()> {
     let mut retained = Vec::with_capacity(state.rows.len());
     let mut removed = 0usize;
+    // Lookup aliases can name `_id` indirectly: keep it there.
+    let needs_id = operators
+        .iter()
+        .map(|operator| lookup_context.is_some() || operator.reads_document_id())
+        .collect::<Vec<_>>();
 
     for mut row in state.rows.drain(..) {
         let mut keep = true;
 
-        for operator in operators {
+        for (operator, needs_id) in operators.iter().zip(&needs_id) {
             match operator {
                 PhysicalOperator::Filter { predicate } => {
-                    let evaluation_document = row.evaluation_document();
+                    let evaluation_document = row.stage_input(*needs_id);
                     let accepted = match lookup_context {
                         Some(context) => runtime.evaluate_lookup_predicate(
                             predicate,
@@ -1786,21 +1860,16 @@ fn execute_row_segment( storage: &dyn StorageRead, runtime: &dyn ExecutionRuntim
                 PhysicalOperator::StreamingLoad { .. } => {}
 
                 PhysicalOperator::Select { fields } => {
-                    let evaluation_document = row.evaluation_document();
+                    let evaluation_document = row.stage_input(*needs_id);
                     let document = runtime.apply_select(fields, &evaluation_document)?;
                     row.replace_document(document, false);
                 }
 
                 PhysicalOperator::Delete | PhysicalOperator::Insert { .. } => {}
 
-                PhysicalOperator::Custom {
-                    name,
-                    arguments,
-                    writes,
-                    ..
-                } => {
-                    let evaluation_document = row.evaluation_document();
-                    match runtime.apply_custom(name, arguments, *writes, &evaluation_document)? {
+                PhysicalOperator::Custom { writes, .. } => {
+                    let evaluation_document = row.stage_input(*needs_id);
+                    match operator.apply_custom(runtime, &evaluation_document)? {
                         CustomOperatorResult::Keep => {}
                         CustomOperatorResult::Discard => {
                             keep = false;
@@ -2019,12 +2088,7 @@ fn execute_set_level_operator( storage: &dyn StorageRead, runtime: &dyn Executio
             }
         }
 
-        PhysicalOperator::Custom {
-            name,
-            arguments,
-            writes,
-            ..
-        } if matches!(name.as_str(), "unwind" | "first" | "single") => {
+        PhysicalOperator::Custom { name, writes, .. } if matches!(name.as_str(), "unwind" | "first" | "single") => {
             if name.as_str() == "first" {
                 if state.rows.len() > 1 {
                     let removed = state.rows.len() - 1;
@@ -2040,7 +2104,7 @@ fn execute_set_level_operator( storage: &dyn StorageRead, runtime: &dyn Executio
 
             let mut expanded = Vec::new();
             for mut row in state.rows.drain(..) {
-                match runtime.apply_custom(name, arguments, *writes, row.document())? {
+                match operator.apply_custom(runtime, row.document())? {
                     CustomOperatorResult::Keep => expanded.push(row),
                     CustomOperatorResult::Discard => {}
                     CustomOperatorResult::Replace(document) => {
@@ -2085,34 +2149,67 @@ fn sample_rows(rows: &mut Vec<ExecutionRow>, count: usize) -> usize {
 }
 
 /// Uniform random sample of at most `capacity` items from a stream of unknown
-/// length (reservoir sampling, algorithm R). Memory stays bounded by
-/// `capacity` whatever the input size.
+/// length (reservoir sampling, algorithm L: once full, the number of items to
+/// skip before the next replacement is drawn, so most items cost a counter
+/// decrement). Memory stays bounded by `capacity` whatever the input size.
 #[derive(Debug)]
 pub struct Reservoir<T> {
     capacity: usize,
     seen: u64,
     state: u64,
+    /// `W` of algorithm L.
+    weight: f64,
+    skip: u64,
     items: Vec<T>,
 }
 
 impl<T> Reservoir<T> {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        Self { capacity, seen: 0, state: sample_seed(), items: Vec::with_capacity(capacity.min(4096)) }
+        Self { capacity, seen: 0, state: sample_seed(), weight: 1.0, skip: 0, items: Vec::with_capacity(capacity.min(4096)) }
     }
 
+    #[inline]
     pub fn push(&mut self, item: T) {
         self.seen += 1;
-        if self.items.len() < self.capacity {
-            self.items.push(item);
+        if self.skip > 0 {
+            self.skip -= 1;
             return;
         }
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15).rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
-        if let Ok(slot) = usize::try_from(self.state % self.seen) {
-            if slot < self.capacity {
-                self.items[slot] = item;
+        if self.items.len() < self.capacity {
+            self.items.push(item);
+            if self.items.len() == self.capacity {
+                self.weight = self.draw_weight();
+                self.skip = self.draw_skip();
             }
+            return;
         }
+        if self.capacity == 0 {
+            return;
+        }
+        let slot = (self.next() % self.capacity as u64) as usize;
+        self.items[slot] = item;
+        self.weight *= self.draw_weight();
+        self.skip = self.draw_skip();
+    }
+
+    fn next(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15).rotate_left(27).wrapping_mul(0x94d0_49bb_1331_11eb);
+        self.state ^ (self.state >> 31)
+    }
+
+    /// Uniform in (0, 1].
+    fn uniform(&mut self) -> f64 {
+        ((self.next() >> 11) + 1) as f64 * (1.0 / (1_u64 << 53) as f64)
+    }
+
+    fn draw_weight(&mut self) -> f64 {
+        (self.uniform().ln() / self.capacity as f64).exp()
+    }
+
+    fn draw_skip(&mut self) -> u64 {
+        let skip = (self.uniform().ln() / (1.0 - self.weight).ln()).floor();
+        if skip.is_finite() && skip >= 0.0 { skip.min(u64::MAX as f64) as u64 } else { 0 }
     }
 
     /// Number of items offered so far.
@@ -2184,25 +2281,83 @@ fn reserve_import_memory( governor: &MemoryGovernor, bytes: usize, ) -> Executio
         .map_err(|error| ExecutionError::memory_limit("streaming import", error))
 }
 
-#[derive(Debug)]
-struct TopNEntry {
-    sequence: u64,
-    estimated_bytes: usize,
-    row: ExecutionRow,
-}
-
-/// Shared bounded Top-N selector used by both materialized and streaming executors.
+/// The first `limit` rows of a stream in sort order, in bounded memory.
 ///
-/// The selector keeps the current worst candidate cached. Once full, the common
-/// path needs one comparison per incoming row; only a candidate that beats the
-/// current worst triggers an O(N) rescan. This avoids the previous O(N) insertion
-/// walk on every source row while keeping memory strictly bounded by `limit`.
+/// The worst kept entry is cached: once full, a row costs one comparison and
+/// only a row that beats the worst triggers an O(N) rescan. Rows that compare
+/// equal keep their arrival order.
 #[derive(Debug)]
-pub struct BoundedTopN {
+struct TopSelection<T> {
     limit: usize,
-    entries: Vec<TopNEntry>,
+    entries: Vec<(u64, T)>,
     worst_index: Option<usize>,
     next_sequence: u64,
+}
+
+impl<T> TopSelection<T> {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            entries: Vec::with_capacity(limit.min(4096)),
+            worst_index: None,
+            next_sequence: 0,
+        }
+    }
+
+    /// Offers the next row. Once full, `beats_worst` decides whether it sorts
+    /// before the worst kept entry; `keep` builds the entry of a kept row.
+    /// Returns the entry the row evicted.
+    fn offer<C>( &mut self, row: C, beats_worst: impl FnOnce(&C, &T) -> ExecutionResult<bool>, keep: impl FnOnce(C) -> ExecutionResult<T>, mut compare: impl FnMut(&T, &T) -> ExecutionResult<Ordering>, ) -> ExecutionResult<Option<T>> {
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.limit == 0 {
+            return Ok(None);
+        }
+        if self.entries.len() < self.limit {
+            let index = self.entries.len();
+            self.entries.push((sequence, keep(row)?));
+            let worse = match self.worst_index {
+                None => true,
+                Some(worst) => self.sorts_after(index, worst, &mut compare)?,
+            };
+            if worse {
+                self.worst_index = Some(index);
+            }
+            return Ok(None);
+        }
+        let worst = self.worst_index.expect("full Top-N has a worst candidate");
+        // Equal candidates arrive later and therefore cannot improve a stable Top-N.
+        if !beats_worst(&row, &self.entries[worst].1)? {
+            return Ok(None);
+        }
+        let (_, evicted) = std::mem::replace(&mut self.entries[worst], (sequence, keep(row)?));
+        let mut worst = 0usize;
+        for index in 1..self.entries.len() {
+            if self.sorts_after(index, worst, &mut compare)? {
+                worst = index;
+            }
+        }
+        self.worst_index = Some(worst);
+        Ok(Some(evicted))
+    }
+
+    /// Whether entry `index` sorts after entry `other`, arrival order breaking ties.
+    fn sorts_after( &self, index: usize, other: usize, compare: &mut impl FnMut(&T, &T) -> ExecutionResult<Ordering>, ) -> ExecutionResult<bool> {
+        let ordering = compare(&self.entries[other].1, &self.entries[index].1)?;
+        Ok(ordering == Ordering::Less || (ordering == Ordering::Equal && self.entries[index].0 > self.entries[other].0))
+    }
+
+    /// The kept entries in arrival order: a stable sort then orders equal rows as they came.
+    fn into_arrival_order(mut self) -> Vec<T> {
+        self.entries.sort_unstable_by_key(|(sequence, _)| *sequence);
+        self.entries.into_iter().map(|(_, entry)| entry).collect()
+    }
+}
+
+/// Bounded Top-N selector over rows, shared by the materialized and streaming executors.
+#[derive(Debug)]
+pub struct BoundedTopN {
+    selection: TopSelection<(usize, ExecutionRow)>,
     live_bytes: usize,
 }
 
@@ -2210,10 +2365,7 @@ impl BoundedTopN {
     #[must_use]
     pub(crate) fn new(limit: usize) -> Self {
         Self {
-            limit,
-            entries: Vec::with_capacity(limit.min(4096)),
-            worst_index: None,
-            next_sequence: 0,
+            selection: TopSelection::new(limit),
             live_bytes: 0,
         }
     }
@@ -2246,85 +2398,23 @@ impl BoundedTopN {
     where
         F: FnOnce(&ExecutionRow) -> ExecutionResult<usize>,
     {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.limit == 0 {
-            return Ok(());
-        }
-
-        if self.entries.len() < self.limit {
-            let estimated_bytes = estimate(&row)?;
-            let index = self.entries.len();
-            self.live_bytes = self.live_bytes.saturating_add(estimated_bytes);
-            self.entries.push(TopNEntry {
-                sequence,
-                estimated_bytes,
-                row,
-            });
-            match self.worst_index {
-                None => self.worst_index = Some(index),
-                Some(worst) => {
-                    let ordering = runtime.compare_documents(
-                        keys,
-                        self.entries[worst].row.document(),
-                        self.entries[index].row.document(),
-                    )?;
-                    if ordering == Ordering::Less
-                        || (ordering == Ordering::Equal
-                            && self.entries[index].sequence > self.entries[worst].sequence)
-                    {
-                        self.worst_index = Some(index);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        let worst = self.worst_index.expect("full Top-N has a worst candidate");
-        let ordering =
-            runtime.compare_documents(keys, row.document(), self.entries[worst].row.document())?;
-        // Equal candidates arrive later and therefore cannot improve a stable Top-N.
-        if ordering != Ordering::Less {
-            return Ok(());
-        }
-
-        let estimated_bytes = estimate(&row)?;
-        self.live_bytes = self
-            .live_bytes
-            .saturating_sub(self.entries[worst].estimated_bytes)
-            .saturating_add(estimated_bytes);
-        self.entries[worst] = TopNEntry {
-            sequence,
-            estimated_bytes,
+        let mut kept_bytes = 0;
+        let evicted = self.selection.offer(
             row,
-        };
-        self.recompute_worst(runtime, keys)
-    }
-
-    fn recompute_worst( &mut self, runtime: &dyn ExecutionRuntime, keys: &[SortKey], ) -> ExecutionResult<()> {
-        let mut worst = 0usize;
-        for index in 1..self.entries.len() {
-            let ordering = runtime.compare_documents(
-                keys,
-                self.entries[worst].row.document(),
-                self.entries[index].row.document(),
-            )?;
-            if ordering == Ordering::Less
-                || (ordering == Ordering::Equal
-                    && self.entries[index].sequence > self.entries[worst].sequence)
-            {
-                worst = index;
-            }
-        }
-        self.worst_index = Some(worst);
+            |row, (_, worst)| Ok(runtime.compare_documents(keys, row.document(), worst.document())? == Ordering::Less),
+            |row| {
+                kept_bytes = estimate(&row)?;
+                Ok((kept_bytes, row))
+            },
+            |(_, left), (_, right)| runtime.compare_documents(keys, left.document(), right.document()),
+        )?;
+        let evicted_bytes = evicted.map_or(0, |(bytes, _)| bytes);
+        self.live_bytes = self.live_bytes.saturating_sub(evicted_bytes).saturating_add(kept_bytes);
         Ok(())
     }
 
-    pub(crate) fn into_sorted_rows( mut self, runtime: &dyn ExecutionRuntime, keys: &[SortKey], ) -> ExecutionResult<Vec<ExecutionRow>> {
-        // Restore source order first so the stable sort preserves the original
-        // order among equal keys even though replacements happen in-place.
-        self.entries.sort_unstable_by_key(|entry| entry.sequence);
-        let mut rows: Vec<_> = self.entries.into_iter().map(|entry| entry.row).collect();
+    pub(crate) fn into_sorted_rows( self, runtime: &dyn ExecutionRuntime, keys: &[SortKey], ) -> ExecutionResult<Vec<ExecutionRow>> {
+        let mut rows = self.selection.into_arrival_order().into_iter().map(|(_, row)| row).collect::<Vec<_>>();
         stable_sort(runtime, keys, &mut rows)?;
         Ok(rows)
     }
@@ -2355,12 +2445,6 @@ impl ProjectedTopNWinner {
     }
 }
 
-#[derive(Debug)]
-struct ProjectedTopNEntry {
-    sequence: u64,
-    winner: ProjectedTopNWinner,
-}
-
 /// Bounded ordering selector over a projected-value vector.
 ///
 /// Unlike [`BoundedTopN`], this selector never constructs a temporary `Document`
@@ -2370,127 +2454,49 @@ struct ProjectedTopNEntry {
 /// special case tied to one physical stage.
 #[derive(Debug)]
 pub struct BoundedProjectedTopN {
-    limit: usize,
-    entries: Vec<ProjectedTopNEntry>,
-    worst_index: Option<usize>,
-    next_sequence: u64,
+    selection: TopSelection<ProjectedTopNWinner>,
 }
 
 impl BoundedProjectedTopN {
     #[must_use]
     pub(crate) fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            entries: Vec::with_capacity(limit.min(4096)),
-            worst_index: None,
-            next_sequence: 0,
-        }
+        Self { selection: TopSelection::new(limit) }
     }
 
     pub(crate) fn push_refs( &mut self, keys: &[SortKey], slots: &[usize], id: DocumentId, version: DocumentVersion, values: &[Option<ProjectedValueRef<'_>>], ) -> ExecutionResult<()> {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        if self.limit == 0 {
-            return Ok(());
-        }
-        if slots.len() != keys.len() || slots.iter().any(|slot| *slot >= values.len()) {
+        if self.selection.limit > 0 && (slots.len() != keys.len() || slots.iter().any(|slot| *slot >= values.len())) {
             return Err(ExecutionError::evaluation(
                 "projected Top-N slots do not match its sort-key layout",
             ));
         }
-
-        if self.entries.len() < self.limit {
-            let index = self.entries.len();
-            self.entries.push(ProjectedTopNEntry {
-                sequence,
-                winner: ProjectedTopNWinner {
-                    id,
-                    version,
-                    values: materialize_projected_slots(values, slots),
-                },
-            });
-            match self.worst_index {
-                None => self.worst_index = Some(index),
-                Some(worst) => {
-                    let ordering = compare_owned_projected_rows(
-                        keys,
-                        &self.entries[worst].winner.values,
-                        &self.entries[index].winner.values,
-                    )?;
-                    if ordering == Ordering::Less
-                        || (ordering == Ordering::Equal
-                            && self.entries[index].sequence > self.entries[worst].sequence)
-                    {
-                        self.worst_index = Some(index);
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        let worst = self
-            .worst_index
-            .expect("full projected Top-N has a worst candidate");
-        let ordering = compare_projected_refs_to_owned(
-            keys,
-            slots,
+        self.selection.offer(
             values,
-            &self.entries[worst].winner.values,
+            |values, worst| Ok(compare_projected_refs_to_owned(keys, slots, values, &worst.values)? == Ordering::Less),
+            |values| Ok(ProjectedTopNWinner { id, version, values: materialize_projected_slots(values, slots) }),
+            |left, right| compare_owned_projected_rows(keys, &left.values, &right.values),
         )?;
-        if ordering != Ordering::Less {
-            return Ok(());
-        }
-
-        self.entries[worst] = ProjectedTopNEntry {
-            sequence,
-            winner: ProjectedTopNWinner {
-                id,
-                version,
-                values: materialize_projected_slots(values, slots),
-            },
-        };
-        self.recompute_worst(keys)
-    }
-
-    fn recompute_worst(&mut self, keys: &[SortKey]) -> ExecutionResult<()> {
-        let mut worst = 0usize;
-        for index in 1..self.entries.len() {
-            let ordering = compare_owned_projected_rows(
-                keys,
-                &self.entries[worst].winner.values,
-                &self.entries[index].winner.values,
-            )?;
-            if ordering == Ordering::Less
-                || (ordering == Ordering::Equal
-                    && self.entries[index].sequence > self.entries[worst].sequence)
-            {
-                worst = index;
-            }
-        }
-        self.worst_index = Some(worst);
         Ok(())
     }
 
-    pub(crate) fn into_sorted_winners( mut self, keys: &[SortKey], ) -> ExecutionResult<Vec<ProjectedTopNWinner>> {
-        // Restore source order first; the fallible insertion sort below is stable
-        // on equal keys and N is deliberately bounded/small.
-        self.entries.sort_unstable_by_key(|entry| entry.sequence);
-        for index in 1..self.entries.len() {
+    pub(crate) fn into_sorted_winners( self, keys: &[SortKey], ) -> ExecutionResult<Vec<ProjectedTopNWinner>> {
+        // The fallible insertion sort is stable on equal keys and N is deliberately bounded/small.
+        let mut winners = self.selection.into_arrival_order();
+        for index in 1..winners.len() {
             let mut cursor = index;
             while cursor > 0 {
                 let ordering = compare_owned_projected_rows(
                     keys,
-                    &self.entries[cursor - 1].winner.values,
-                    &self.entries[cursor].winner.values,
+                    &winners[cursor - 1].values,
+                    &winners[cursor].values,
                 )?;
                 if ordering != Ordering::Greater {
                     break;
                 }
-                self.entries.swap(cursor - 1, cursor);
+                winners.swap(cursor - 1, cursor);
                 cursor -= 1;
             }
         }
-        Ok(self.entries.into_iter().map(|entry| entry.winner).collect())
+        Ok(winners)
     }
 }
 
@@ -2523,9 +2529,9 @@ fn compare_projected_refs_to_owned( keys: &[SortKey], slots: &[usize], left: &[O
     Ok(Ordering::Equal)
 }
 
-fn compare_owned_projected_rows( keys: &[SortKey], left: &[Option<Value>], right: &[Option<Value>], ) -> ExecutionResult<Ordering> {
+pub(crate) fn compare_owned_projected_rows( keys: &[SortKey], left: &[Option<Value>], right: &[Option<Value>], ) -> ExecutionResult<Ordering> {
     for (index, key) in keys.iter().enumerate() {
-        let ordering = compare_optional_values(
+        let ordering = compare_sort_values(
             left.get(index).and_then(Option::as_ref),
             right.get(index).and_then(Option::as_ref),
             key,
@@ -2561,51 +2567,37 @@ fn compare_projected_ref_value( left: Option<&ProjectedValueRef<'_>>, right: Opt
                 ))
             })?
         }
-        (Some(ProjectedValueRef::Owned(left)), Some(right)) => {
-            compare(left, right, CoercionPolicy::Numeric)
-                .map_err(|error| {
-                    ExecutionError::evaluation(format!(
-                        "cannot sort field {}: {error}",
-                        key.field()
-                    ))
-                })?
-                .into_ordering()
-        }
-        (Some(left), Some(right)) => {
-            // Mixed physical kinds are uncommon on the fast path. Materialize
-            // only this comparison so normal numeric/string rows stay borrowed.
-            let left = left.to_value();
-            compare(&left, right, CoercionPolicy::Numeric)
-                .map_err(|error| {
-                    ExecutionError::evaluation(format!(
-                        "cannot sort field {}: {error}",
-                        key.field()
-                    ))
-                })?
-                .into_ordering()
-        }
+        (Some(ProjectedValueRef::Owned(left)), Some(right)) => sort_order(left, right, key)?,
+        // Mixed physical kinds are uncommon on the fast path. Materialize
+        // only this comparison so normal numeric/string rows stay borrowed.
+        (Some(left), Some(right)) => sort_order(&left.to_value(), right, key)?,
     };
-    Ok(match key.direction() {
-        super::SortDirection::Ascending => ordering,
-        super::SortDirection::Descending => ordering.reverse(),
-    })
+    Ok(directed(ordering, key))
 }
 
-fn compare_optional_values( left: Option<&Value>, right: Option<&Value>, key: &SortKey, ) -> ExecutionResult<Ordering> {
+/// Orders two values of a sort key: a missing value first, then OG's
+/// numeric sort order, reversed for a descending key.
+pub(crate) fn compare_sort_values( left: Option<&Value>, right: Option<&Value>, key: &SortKey, ) -> ExecutionResult<Ordering> {
     let ordering = match (left, right) {
         (None, None) => Ordering::Equal,
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
-        (Some(left), Some(right)) => compare(left, right, CoercionPolicy::Numeric)
-            .map_err(|error| {
-                ExecutionError::evaluation(format!("cannot sort field {}: {error}", key.field()))
-            })?
-            .into_ordering(),
+        (Some(left), Some(right)) => sort_order(left, right, key)?,
     };
-    Ok(match key.direction() {
+    Ok(directed(ordering, key))
+}
+
+fn sort_order(left: &Value, right: &Value, key: &SortKey) -> ExecutionResult<Ordering> {
+    compare_for_sort(left, right, CoercionPolicy::Numeric)
+        .map(|comparison| comparison.into_ordering())
+        .map_err(|error| ExecutionError::evaluation(format!("cannot sort field {}: {error}", key.field())))
+}
+
+const fn directed(ordering: Ordering, key: &SortKey) -> Ordering {
+    match key.direction() {
         super::SortDirection::Ascending => ordering,
         super::SortDirection::Descending => ordering.reverse(),
-    })
+    }
 }
 
 fn execute_top_n( runtime: &dyn ExecutionRuntime, keys: &[SortKey], limit: usize, state: &mut PipelineState, ) -> ExecutionResult<()> {
@@ -2701,40 +2693,17 @@ fn external_sort( runtime: &dyn ExecutionRuntime, keys: &[SortKey], state: &mut 
         runs.push(writer.finish().map_err(spill_execution_error)?);
     }
 
-    let mut readers = runs
+    let readers = runs
         .iter()
         .map(SpillRun::reader)
         .collect::<io::Result<Vec<_>>>()
         .map_err(spill_execution_error)?;
-    let mut heads = readers
-        .iter_mut()
-        .map(read_next_spilled_row)
-        .collect::<ExecutionResult<Vec<_>>>()?;
+    let mut merge = RunMerge::new(readers, read_next_spilled_row)?;
     let mut merged = Vec::new();
-    loop {
-        let mut best: Option<usize> = None;
-        for index in 0..heads.len() {
-            let Some(candidate) = heads[index].as_ref() else {
-                continue;
-            };
-            match best {
-                None => best = Some(index),
-                Some(current) => {
-                    let current_row = heads[current].as_ref().expect("selected spill head");
-                    if runtime.compare_documents(
-                        keys,
-                        candidate.document(),
-                        current_row.document(),
-                    )? == Ordering::Less
-                    {
-                        best = Some(index);
-                    }
-                }
-            }
-        }
-        let Some(index) = best else { break };
-        merged.push(heads[index].take().expect("selected spill row"));
-        heads[index] = read_next_spilled_row(&mut readers[index])?;
+    while let Some(row) = merge.pop_min(|left, right| {
+        Ok(runtime.compare_documents(keys, left.document(), right.document())? == Ordering::Less)
+    })? {
+        merged.push(row);
     }
     state.rows = merged;
     Ok(())
@@ -3074,5 +3043,6 @@ mod tests {
     #[test] fn place_document_scope_matches_all_instances_in_the_place() { let scope = DocumentScope::for_place("place-a"); let app_one = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-1")), ]); let app_two = Document::from_fields([ ("_place", Value::from("place-a")), ("_app_instance", Value::from("app-2")), ]); let place_only = Document::from_fields([("_place", Value::from("place-a"))]); let other_place = Document::from_fields([ ("_place", Value::from("place-b")), ("_app_instance", Value::from("app-1")), ]); assert!(scope.matches(&app_one)); assert!(scope.matches(&app_two)); assert!(scope.matches(&place_only)); assert!(!scope.matches(&other_place)); }
     #[test] fn place_document_scope_forces_place_without_overwriting_app_instance() { let scope = DocumentScope::for_place("place-a"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-2")), ("name", Value::from("item")), ]); let scoped = scope.enforce(&document); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-2"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
     #[test] fn execution_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Executor>(); assert_send_and_sync::<DocumentScope>(); assert_send_and_sync::<ExecutionOutput>(); assert_send_and_sync::<ExecutionRow>(); assert_send_and_sync::<ExecutionRowOrigin>(); assert_send_and_sync::<ExecutionError>(); assert_send_and_sync::<ExecutionStatistics>(); assert_send_and_sync::<PreparedInsertDocument>(); assert_send_and_sync::<SyntheticDocument>(); assert_send_and_sync::<LookupDocuments>(); assert_send_and_sync::<StreamingLoadMutation>(); }
+    #[test] fn reservoir_samples_every_position_uniformly() { let (capacity, length, rounds) = (4_usize, 40_usize, 20_000_usize); let mut hits = vec![0_u32; length]; for _ in 0..rounds { let mut reservoir = Reservoir::new(capacity); for value in 0..length { reservoir.push(value); } assert_eq!(reservoir.seen(), length as u64); for value in reservoir.into_items() { hits[value] += 1; } } let expected = (rounds * capacity / length) as f64; for (position, hit) in hits.iter().enumerate() { assert!((f64::from(*hit) - expected).abs() < expected * 0.1, "position {position}: {hit} hits, expected ~{expected}"); } }
     #[test] fn reservoir_keeps_a_bounded_sample_of_distinct_inputs() { let mut reservoir = Reservoir::new(5); for value in 0..1000 { reservoir.push(value); } assert_eq!(reservoir.seen(), 1000); let mut items = reservoir.into_items(); assert_eq!(items.len(), 5); items.sort_unstable(); items.dedup(); assert_eq!(items.len(), 5); let mut small = Reservoir::new(5); small.push(1); assert_eq!(small.into_items(), [1]); assert!(Reservoir::<u8>::new(0).into_items().is_empty()); }
 }

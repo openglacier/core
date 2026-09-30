@@ -389,6 +389,11 @@ pub struct QueryExecuteInput {
     /// `read_only` remains accepted for compatibility with older direct clients.
     #[serde(default, rename = "readOnly", alias = "read_only")]
     pub read_only: bool,
+    /// Values for the `$name` parameters of `query`. They are bound as escaped
+    /// literals during validation (with the query's `let` variables), before
+    /// authorization and planning see the query.
+    #[serde(default)]
+    pub params: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -1089,6 +1094,11 @@ impl OperationPayload for QueryExecuteInput {
         if self.query.trim().is_empty() {
             return Err(invalid_payload(operation, "query must not be empty"));
         }
+        // Evaluate `let` variables and bind `$name` values before authorization
+        // and planning ever see the query.
+        let parameters = self.params.take().unwrap_or_default();
+        self.query = crate::query::prepare_query(&self.query, &parameters)
+            .map_err(|message| invalid_payload(operation, message))?;
         if let Some(context) = self.context.as_ref() {
             non_empty(operation, "context.placeId", &context.place_id)?;
             if let Some(app_instance_id) = context.app_instance_id.as_ref() {

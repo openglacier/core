@@ -388,7 +388,7 @@ fn coerce_signed_unsigned(signed: i64, unsigned: u64) -> CoercionResult<CoercedN
     clippy::cast_sign_loss,
     reason = "the non-negative round-trip cast intentionally verifies exact representability"
 )]
-const fn signed_to_exact_float(value: i64) -> CoercionResult<f64> {
+pub(crate) const fn signed_to_exact_float(value: i64) -> CoercionResult<f64> {
     let converted = value as f64;
 
     if converted as i64 == value {
@@ -398,7 +398,7 @@ const fn signed_to_exact_float(value: i64) -> CoercionResult<f64> {
     }
 }
 
-const fn unsigned_to_exact_float(value: u64) -> CoercionResult<f64> {
+pub(crate) const fn unsigned_to_exact_float(value: u64) -> CoercionResult<f64> {
     let converted = value as f64;
 
     if converted as u64 == value {

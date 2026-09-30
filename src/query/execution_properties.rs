@@ -83,11 +83,34 @@ pub enum ProjectionReuse {
     Reusable,
 }
 
+/// Output fields of a stage relative to its input fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fields<'a> {
     Unknown,
+    /// Every input field passes through unchanged.
     Preserved,
+    /// Only these fields are output.
     Projected(&'a Arc<[ExpressionFieldPath]>),
+    /// Every input field passes through, except these, which the stage
+    /// writes (`derive`, `near`, `unwind`) or removes (`drop`, `rename`).
+    Rewritten(&'a Arc<[ExpressionFieldPath]>),
+    /// Output rows are computed from the read fields only; no input field
+    /// passes through as such (`count`, `group`, `pivot`, `root`).
+    Computed,
+}
+
+/// Input fields a stage reads to produce its output.
+///
+/// Together with [`Fields`], this lets planning compute which source fields a
+/// pipeline really needs without knowing any stage by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reads<'a> {
+    /// The stage may read any field (conservative default).
+    Unknown,
+    /// The stage reads no field (`limit`, `skip`, `count`).
+    Nothing,
+    /// The stage reads exactly these fields.
+    Fields(&'a Arc<[ExpressionFieldPath]>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -97,6 +120,7 @@ pub struct ExecutionProperties<'a> {
     pub bound: Bound,
     pub order: Order<'a>,
     pub fields: Fields<'a>,
+    pub reads: Reads<'a>,
     pub shape: Shape,
     pub scope: Scope,
     pub effect: Effect,
