@@ -1798,6 +1798,11 @@ impl DenseGroups {
         Ok(())
     }
 
+    /// Sets the key values of a group created without them.
+    pub fn set_keys(&mut self, group: u32, keys: Vec<Option<Value>>) {
+        self.keys[group as usize] = Some(keys);
+    }
+
     /// Drops a group: it is never finished.
     pub fn evict(&mut self, group: u32) {
         self.keys[group as usize] = None;
@@ -1805,20 +1810,17 @@ impl DenseGroups {
 
     /// Result row of `group`, numbered `ordinal`.
     pub fn finish(&mut self, group: u32, ordinal: u64) -> ExecutionResult<SyntheticDocument> {
-        let key_values = self.keys[group as usize].take();
-        let document = self.document(group, key_values, |_| true)?;
+        let (group, measures) = (group as usize, self.template.states.len());
+        let states = self.states[group * measures..(group + 1) * measures].iter_mut().map(|state| std::mem::replace(state, MeasureState::Count(0)));
+        let document = group_document(&self.template.keys, &self.template.measures, self.keys[group].take(), self.counts[group], states, |_| true)?;
         Ok(SyntheticDocument::new(DocumentId::synthetic(GROUP_NAMESPACE, ordinal), Arc::new(document)))
     }
 
     /// [`Self::finish`]'s row with only the top-level fields `names`; the
     /// group stays to finish.
     pub fn fields(&self, group: u32, names: &[&str]) -> ExecutionResult<Document> {
-        self.document(group, self.keys[group as usize].clone(), |name| names.contains(&name))
-    }
-
-    fn document(&self, group: u32, key_values: Option<Vec<Option<Value>>>, wanted: impl Fn(&str) -> bool) -> ExecutionResult<Document> {
         let (group, measures) = (group as usize, self.template.states.len());
-        group_document(&self.template.keys, &self.template.measures, key_values, self.counts[group], self.states[group * measures..(group + 1) * measures].iter().cloned(), wanted)
+        group_document(&self.template.keys, &self.template.measures, self.keys[group].clone(), self.counts[group], self.states[group * measures..(group + 1) * measures].iter().cloned(), |name| names.contains(&name))
     }
 }
 

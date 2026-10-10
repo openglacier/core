@@ -628,7 +628,7 @@ impl Planner {
                 continue;
             }
             let alias = match alias {
-                Some(alias) => parse_single_identifier(alias).map_err(&invalid)?.to_owned(),
+                Some(alias) => parse_single_identifier(alias).map_err(invalid)?.to_owned(),
                 None => parse_group_measure_directive(aggregate, value).map_err(|_| invalid(format!("an expression measure needs `as <alias>`: `{aggregate} <expression> as <alias>`")))?.1,
             };
             let value = if value.is_empty() { "1" } else { value };
@@ -692,12 +692,12 @@ impl Planner {
             self.require_simple(child_location, child)?;
             let name = child.name().as_str();
             let invalid = |message: String| self.invalid_syntax(child_location, child, message);
-            let field = |text: &str| parse_field_path(text).map(|_| text.to_owned()).map_err(&invalid);
+            let field = |text: &str| parse_field_path(text).map(|_| text.to_owned()).map_err(invalid);
             let arguments = child.arguments().trim();
             match name {
                 "partition" => {
                     let fields = arguments.strip_prefix("by").map(str::trim).unwrap_or_default();
-                    for item in split_top_level(fields, ',').map_err(&invalid)? {
+                    for item in split_top_level(fields, ',').map_err(invalid)? {
                         partition.push(field(item.trim())?);
                     }
                 }

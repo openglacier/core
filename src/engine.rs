@@ -673,8 +673,8 @@ impl<'a> BatchGroups<'a> {
     fn group_of(&mut self, key: u32) -> Result<u32, StorageError> {
         // Unbounded, every key gets its group when first seen, in key order:
         // a key is its group.
-        if self.limit.is_none() && (key as usize) < self.group_keys.len() {
-            return Ok(key);
+        if self.limit.is_none() {
+            return if (key as usize) < self.group_keys.len() { Ok(key) } else { self.create(key) };
         }
         if let Some(&group) = self.key_groups.get(key as usize) {
             if group != UNSEEN_KEY {
@@ -704,7 +704,8 @@ impl<'a> BatchGroups<'a> {
     /// group) or the working set is exceeded.
     fn create(&mut self, key: u32) -> Result<u32, StorageError> {
         debug_assert!(self.limit.is_some() || key as usize == self.group_keys.len(), "unbounded keys are their groups");
-        let state_estimate = group_state_estimate(self.key_buffer.len(), self.keys.len());
+        // An unbounded group's key values stay in `table`, which counts them.
+        let state_estimate = group_state_estimate(if self.limit.is_some() { self.key_buffer.len() } else { 0 }, self.keys.len());
         if let Some(limit) = self.limit {
             if self.ordered.len() >= limit {
                 let (largest, evicted) = self.ordered.last_key_value().expect("bounded group frontier exists");
@@ -725,7 +726,7 @@ impl<'a> BatchGroups<'a> {
             return Ok(crate::query::DenseGroups::SKIP);
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(state_estimate);
-        let group = self.dense.add_keys((0..self.key_indexes.len()).map(|field| self.table.value(key, field).cloned()).collect());
+        let group = self.dense.add_keys(if self.limit.is_some() { (0..self.key_indexes.len()).map(|field| self.table.value(key, field).cloned()).collect() } else { Vec::new() });
         // An unbounded group orders its keys at the end, by rank
         // ([`crate::query::keys::KeyTable::sort_by_key`]).
         if self.limit.is_some() {
@@ -772,7 +773,7 @@ impl<'a> BatchGroups<'a> {
         if self.exceeded {
             return Ok(None);
         }
-        let dense = self.dense;
+        let mut dense = self.dense;
         let groups = if self.limit.is_some() {
             let mut groups = self.groups.into_iter().enumerate().filter_map(|(group, key)| Some((key?, group as u32))).collect::<Vec<_>>();
             groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
@@ -785,13 +786,15 @@ impl<'a> BatchGroups<'a> {
         };
         let names = top.map(|(keys, _)| keys.iter().map(|key| key.field().first()).collect::<Vec<_>>()).filter(|names| !names.contains(&"_id"));
         let (Some((keys, limit)), Some(names), None) = (top, names, self.limit) else {
-            return Ok(Some(GroupRows { dense, groups: groups.into_iter().enumerate().collect::<Vec<_>>().into_iter(), sorted: false }));
+            let keys = self.limit.is_none().then_some((self.table, self.group_keys));
+            return Ok(Some(GroupRows { dense, keys, groups: groups.into_iter().enumerate().collect::<Vec<_>>().into_iter(), sorted: false }));
         };
         type Keyed = (usize, Vec<Option<Value>>);
         let compare = |left: &Keyed, right: &Keyed| crate::query::compare_owned_projected_rows(keys, &left.1, &right.1);
         let mut selection = limit.map(crate::query::TopSelection::new);
         let mut keyed = Vec::new();
         for (index, group) in groups.iter().enumerate() {
+            dense.set_keys(*group, (0..self.key_indexes.len()).map(|field| self.table.value(self.group_keys[*group as usize], field).cloned()).collect());
             let fields = dense.fields(*group, &names).map_err(EngineError::execution)?;
             let entry = (index, keys.iter().map(|key| crate::query::path_value(&fields, key.field()).cloned()).collect());
             match &mut selection {
@@ -804,7 +807,7 @@ impl<'a> BatchGroups<'a> {
         keyed.sort_by(|left, right| compare(left, right).unwrap_or_else(|error| { failed.get_or_insert(error); std::cmp::Ordering::Equal }));
         match failed {
             Some(error) => Err(EngineError::execution(error)),
-            None => Ok(Some(GroupRows { dense, groups: keyed.into_iter().map(|(index, _)| (index, groups[index])).collect::<Vec<_>>().into_iter(), sorted: true })),
+            None => Ok(Some(GroupRows { dense, keys: None, groups: keyed.into_iter().map(|(index, _)| (index, groups[index])).collect::<Vec<_>>().into_iter(), sorted: true })),
         }
     }
 }
@@ -813,6 +816,9 @@ impl<'a> BatchGroups<'a> {
 /// all groups never coexist.
 struct GroupRows {
     dense: crate::query::DenseGroups,
+    /// An unbounded group's keys and the key of each group, whose values
+    /// the rows take as they are built.
+    keys: Option<(crate::query::keys::KeyTable, Vec<u32>)>,
     groups: std::vec::IntoIter<(usize, u32)>,
     /// Already in the order of the sort after the group.
     sorted: bool,
@@ -824,6 +830,9 @@ impl Iterator for GroupRows {
     fn next(&mut self) -> Option<Self::Item> {
         let (index, group) = self.groups.next()?;
         let ordinal = usize_to_u64_saturating(index).saturating_add(1);
+        if let Some((table, keys)) = &self.keys {
+            self.dense.set_keys(group, (0..table.width()).map(|field| table.value(keys[group as usize], field).cloned()).collect());
+        }
         Some(self.dense.finish(group, ordinal).map(ExecutionRow::synthetic).map_err(EngineError::execution))
     }
 }
@@ -3319,16 +3328,17 @@ impl Engine {
             return Ok(None);
         }
         let table = table.into_inner();
-        let mut order = Vec::with_capacity(table.len());
-        let mut buffer = Vec::with_capacity(64);
-        for key in 0..table.len() as u32 {
-            match &names {
-                Some(names) => table.write_document_key(key, names, &mut buffer),
-                None => table.write_key(key, &mut buffer),
+        let mut order = (0..table.len() as u32).collect::<Vec<_>>();
+        match &names {
+            // Keys of selected fields are documents: their present fields, by name.
+            Some(names) => {
+                let mut buffer = Vec::with_capacity(64);
+                let mut encoded = order.iter().map(|key| { table.write_document_key(*key, names, &mut buffer); (Box::<[u8]>::from(buffer.as_slice()), *key) }).collect::<Vec<_>>();
+                encoded.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+                order = encoded.into_iter().map(|(_, key)| key).collect();
             }
-            order.push((Box::<[u8]>::from(buffer.as_slice()), key));
+            None => table.sort_by_key(&mut order, |key| *key),
         }
-        order.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         order.truncate(output_limit.unwrap_or(usize::MAX));
         let mut returned = 0u64;
         if rows_unused {
@@ -3339,7 +3349,7 @@ impl Engine {
             }
         } else {
             let locators = locators.into_inner();
-            for row in self.hydrate_replayed(prefix, order.iter().map(|(_, key)| locators[*key as usize]))? {
+            for row in self.hydrate_replayed(prefix, order.iter().map(|key| locators[*key as usize]))? {
                 visitor(row)?;
                 returned += 1;
             }

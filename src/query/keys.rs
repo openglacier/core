@@ -397,6 +397,14 @@ pub(crate) struct KeyTable {
     /// Tuples by their word: two fields packed in one, else their hash.
     by_tuple: WordIndex,
     keys: usize,
+    /// Per value of the first field, the word and key of its latest tuple
+    /// (`u32::MAX`: none): rows of one value often repeat its tuple, found
+    /// here without a lookup in `by_tuple`.
+    recent: Vec<(u64, u32)>,
+    /// Whether `batch` uses `recent`: decided on one batch in 64, from how
+    /// often it held the row's tuple, and the batches counted.
+    recent_on: bool,
+    batches: u32,
     /// Per field, the value identifiers of the current batch's rows.
     batch: Vec<Vec<u32>>,
     tuple: Vec<u32>,
@@ -406,7 +414,7 @@ impl KeyTable {
     #[must_use]
     pub(crate) fn new(width: usize) -> Self {
         assert!(width > 0, "a key has at least one field");
-        Self { fields: (0..width).map(|_| ValueIds::default()).collect(), tuples: Vec::new(), by_tuple: WordIndex::default(), keys: 0, batch: vec![Vec::new(); width], tuple: Vec::with_capacity(width) }
+        Self { fields: (0..width).map(|_| ValueIds::default()).collect(), tuples: Vec::new(), by_tuple: WordIndex::default(), keys: 0, recent: Vec::new(), recent_on: true, batches: 0, batch: vec![Vec::new(); width], tuple: Vec::with_capacity(width) }
     }
 
     /// Keys of every row of a block's key column, for a one-field key, into
@@ -436,6 +444,12 @@ impl KeyTable {
         }
     }
 
+    /// Fields of a key.
+    #[must_use]
+    pub(crate) fn width(&self) -> usize {
+        self.fields.len()
+    }
+
     /// Keys seen so far.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
@@ -450,6 +464,16 @@ impl KeyTable {
             return self.fields[0].of_rows(*column, selection, keys);
         }
         self.batch_fields(columns, selection);
+        // One batch in 64 decides whether `recent` serves the next ones.
+        let sampled = self.batches % 64 == 0;
+        self.batches = self.batches.wrapping_add(1);
+        if self.recent_on || sampled {
+            let hits = self.batch_recent(selection.len(), keys);
+            if sampled {
+                self.recent_on = hits * 4 >= selection.len();
+            }
+            return;
+        }
         let batch = &self.batch;
         self.by_tuple.touch((0..selection.len()).map(|position| Self::word(batch.iter().map(|ids| ids[position]))));
         let mut tuple = std::mem::take(&mut self.tuple);
@@ -460,6 +484,34 @@ impl KeyTable {
             keys.push(key);
         }
         self.tuple = tuple;
+    }
+
+    /// [`Self::batch`]'s keys of the `rows` rows of the last
+    /// [`Self::batch_fields`], through `recent`: returns the rows found
+    /// there. Out of [`Self::batch`]: its loop keeps its code.
+    #[inline(never)]
+    fn batch_recent(&mut self, rows: usize, keys: &mut Vec<u32>) -> usize {
+        let (batch, recent) = (&self.batch, &self.recent);
+        let word = |position: usize| Self::word(batch.iter().map(|ids| ids[position]));
+        let latest = |position: usize| recent.get(batch[0][position] as usize).and_then(|&(word, key)| (key != u32::MAX).then_some((word, key)));
+        self.by_tuple.touch((0..rows).filter(|position| latest(*position).is_none_or(|(latest, _)| latest != word(*position))).map(word));
+        let (width, mut hits) = (self.batch.len(), 0);
+        let mut tuple = std::mem::take(&mut self.tuple);
+        for position in 0..rows {
+            tuple.clear();
+            tuple.extend(self.batch.iter().map(|ids| ids[position]));
+            let (word, first) = (Self::word(tuple.iter().copied()), tuple[0] as usize);
+            let found = self.recent.get(first).filter(|(latest, key)| *latest == word && *key != u32::MAX && (width == 2 || self.tuples[*key as usize * width..][..width] == *tuple)).map(|(_, key)| *key);
+            hits += usize::from(found.is_some());
+            let key = found.unwrap_or_else(|| self.of_tuple(&tuple));
+            if first >= self.recent.len() {
+                self.recent.resize(first + 1, (0, u32::MAX));
+            }
+            self.recent[first] = (word, key);
+            keys.push(key);
+        }
+        self.tuple = tuple;
+        hits
     }
 
     /// Finds the value identifiers of every key field of the rows of
@@ -611,22 +663,22 @@ impl KeyTable {
     /// each field's values are ranked once by their encoded component, then
     /// items by their keys' ranks (components are prefix-free, so the first
     /// field whose components differ decides, as it does for the bytes).
-    pub(crate) fn sort_by_key<T>(&self, items: &mut [T], key_of: impl Fn(&T) -> u32) {
-        let ranks = (0..self.fields.len()).map(|field| self.field_ranks(field)).collect::<Vec<_>>();
-        match ranks.as_slice() {
-            [ranks] => items.sort_unstable_by_key(|item| ranks[key_of(item) as usize]),
-            [first, second] => items.sort_unstable_by_key(|item| {
-                let tuple = &self.tuples[key_of(item) as usize * 2..][..2];
-                u64::from(first[tuple[0] as usize]) << 32 | u64::from(second[tuple[1] as usize])
-            }),
-            _ => {
-                let width = self.fields.len();
-                items.sort_unstable_by(|left, right| {
-                    let (left, right) = (&self.tuples[key_of(left) as usize * width..][..width], &self.tuples[key_of(right) as usize * width..][..width]);
-                    left.iter().zip(right).zip(&ranks).map(|((left, right), ranks)| ranks[*left as usize].cmp(&ranks[*right as usize])).find(|ordering| ordering.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
-                });
-            }
+    /// Each item's ranks are read once, packed into one word when they fit.
+    pub(crate) fn sort_by_key<T: Copy>(&self, items: &mut [T], key_of: impl Fn(&T) -> u32) {
+        let width = self.fields.len();
+        let ranks = (0..width).map(|field| self.field_ranks(field)).collect::<Vec<_>>();
+        let id = |key: u32, field: usize| if width == 1 { key } else { self.tuples[key as usize * width + field] };
+        let bits = ranks.iter().map(|ranks| usize::BITS - ranks.len().leading_zeros()).collect::<Vec<_>>();
+        if bits.iter().sum::<u32>() <= 64 {
+            let mut keyed = items.iter().map(|item| (ranks.iter().zip(&bits).enumerate().fold(0u64, |word, (field, (ranks, bits))| word << bits | u64::from(ranks[id(key_of(item), field) as usize])), *item)).collect::<Vec<_>>();
+            keyed.sort_unstable_by_key(|(word, _)| *word);
+            items.iter_mut().zip(keyed).for_each(|(item, (_, sorted))| *item = sorted);
+            return;
         }
+        items.sort_unstable_by(|left, right| {
+            let (left, right) = (key_of(left), key_of(right));
+            (0..width).map(|field| ranks[field][id(left, field) as usize].cmp(&ranks[field][id(right, field) as usize])).find(|ordering| ordering.is_ne()).unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     /// Rank of each value of field `field` in the order of its encoded
@@ -651,7 +703,7 @@ impl KeyTable {
     /// Bytes retained, estimated.
     #[must_use]
     pub(crate) fn bytes(&self) -> usize {
-        self.fields.iter().map(ValueIds::bytes).sum::<usize>() + self.keys * (self.fields.len() * 8 + ENTRY_BYTES)
+        self.fields.iter().map(ValueIds::bytes).sum::<usize>() + self.keys * (self.fields.len() * 8 + ENTRY_BYTES) + self.recent.len() * 16
     }
 }
 
