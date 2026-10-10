@@ -464,6 +464,8 @@ jobs:
           - name: windows-aarch64
             target: aarch64-pc-windows-msvc
             os: windows-11-arm
+            # LLVM cannot encode SEH unwind info for aligned loops on this target.
+            no_align: true
 
           - name: windows-i686
             target: i686-pc-windows-msvc
@@ -487,6 +489,8 @@ jobs:
 
       - name: Build
         shell: pwsh
+        env:
+          RUSTFLAGS: ${{ !matrix.no_align && '-C llvm-args=-align-loops=64' || '' }}
         run: |
           $ErrorActionPreference = "Stop"
 

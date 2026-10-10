@@ -1191,6 +1191,7 @@ fn process_memory_snapshot(governed_bytes: usize) -> Option<ProcessMemorySnapsho
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 const fn process_memory_snapshot_from_parts( rss_bytes: usize, anonymous_bytes: usize, governed_bytes: usize, ) -> ProcessMemorySnapshot {
     ProcessMemorySnapshot {
         rss_bytes,
