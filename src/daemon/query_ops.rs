@@ -6,7 +6,7 @@ use super::serve::{place_role_denied, authorization_denied, diverged, reply, Con
 
 #[cfg(feature = "database")]
 pub(super) fn handle_query_operation(connection: &mut Connection, settings: &ConnectionSettings, engine: &Engine, event_engine: &EventEngine, delegation: Option<&GatewayDelegation>, operation: RoutedOperation, compact: &mut bool) -> Handled {
-    let RoutedOperation::QueryExecute(Routed { id, input: QueryExecuteInput { query, context, read_only, .. } }) = operation else {
+    let RoutedOperation::QueryExecute(Routed { id, input: QueryExecuteInput { query, context, read_only, params, .. } }) = operation else {
         return diverged(operation.id());
     };
     let writer = &mut connection.writer;
@@ -46,6 +46,40 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
         None => None,
     };
 
+    // A query reading its Place (views, `let` queries) is prepared once the
+    // Place is known.
+    let query = match params {
+        Some(parameters) => match crate::view::prepare(engine, execution_context.as_ref().map(|context| context.place_id.as_str()), execution_context.as_ref().and_then(|context| context.app_instance_id.as_deref()), &query, &parameters) {
+            Ok(prepared) => prepared,
+            Err(message) => reject!(id, "query.invalid", message),
+        },
+        None => query,
+    };
+    let query = match crate::view::literals(engine, &query) {
+        Ok(query) => query,
+        Err(message) => reject!(id, "query.invalid", message),
+    };
+
+    // `define view` / `undefine view` write `_views` for the Place Owner, or a
+    // standard view for a principal allowed to write `_views`.
+    if let Some(statement) = crate::view::Statement::parse(&query) {
+        let allowed = match execution_context.as_ref() {
+            Some(context) => context.access.role() == Some(PlaceRole::Owner),
+            None => !settings.authorization_mode.is_enforced() || authorize_connection(engine, principal, AuthorizationAction::QueryWrite, crate::view::VIEWS_COLLECTION),
+        };
+        if read_only && !explain {
+            reject!(id, "query.read_only_violation", "readOnly query attempted to define a view");
+        }
+        if !allowed {
+            reject!(id, "view.forbidden", "views are defined by the Owner of the Place");
+        }
+        let author = principal_actor(execution_context.as_ref().map_or(principal, |context| &context.principal));
+        return match statement.and_then(|statement| statement.run(engine, execution_context.as_ref().map(|context| context.place_id.as_str()), &author, explain)) {
+            Ok(view) => Err(QueryResponse::success(id, vec![view], None).into()),
+            Err(message) => reject!(id, "view.invalid", message),
+        };
+    }
+
     if read_only {
         let readonly_plan = parse_pipeline(&query)
             .and_then(|pipeline| {
@@ -54,13 +88,17 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
                     .map_err(|error| QueryTextError::Planning(error.to_string()))
             });
         match readonly_plan {
-            Ok(plan) if plan.is_read_only() => {}
+            Ok(plan) if !plan.is_write() => {}
             Ok(_) => reject!(id, "query.read_only_violation", "readOnly query attempted to mutate storage"),
             Err(error) => reject!(id, "query.invalid", error.to_string()),
         }
     }
 
     let analyzed_access = QueryAccess::analyze(&query).ok();
+    // Only og-core writes the cache of materialized views.
+    if analyzed_access.as_ref().is_some_and(|access| access.action == AuthorizationAction::QueryWrite && access.collection.starts_with(crate::view::CACHE_COLLECTION)) {
+        reject!(id, "query.invalid", "the cache of materialized views is written by og-core only");
+    }
     let scoped_write_collection = analyzed_access.as_ref()
         .filter(|access| access.action == AuthorizationAction::QueryWrite)
         .map(|access| access.collection.clone());
@@ -108,9 +146,13 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
         let checks = std::iter::once((access.action, access.collection.as_str()))
             .chain(access.source_read.as_deref().map(|source| (AuthorizationAction::QueryRead, source)));
         for (action, resource) in checks {
+            // A Place reads its own views (`_views`, restricted below to its
+            // rows) and its cached rows of materialized views; anyone reads
+            // the constant rows of `values […]`.
+            let reading = action == AuthorizationAction::QueryRead;
             let scoped_app_collection = execution_context.is_some()
-                && !resource.starts_with('_');
-            if !scoped_app_collection
+                && (!resource.starts_with('_') || (reading && (resource == crate::view::VIEWS_COLLECTION || resource.starts_with(crate::view::CACHE_PREFIX))));
+            if !scoped_app_collection && !(reading && resource.starts_with(crate::view::VALUES_PREFIX))
                 && !authorize_connection(engine, principal, action, resource)
             {
                 write_response(writer, &authorization_denied(id, principal, action, resource))?;
@@ -147,14 +189,11 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
             })),
         }),
     );
-    // Scoped queries use the blocking executor so the trusted document
-    // scope is applied below query syntax. The legacy streaming path remains
-    // unchanged for unscoped queries.
-    let streaming = if execution_context.is_none() {
-        try_write_streaming_request(engine, writer, &request)
-    } else {
-        Ok(false)
-    };
+    // A scoped read streams like any read: the trusted document scope is a
+    // filter written into its plan, in front of every source it reads,
+    // below query syntax. Scoped writes return a whole response.
+    let scope = execution_context.as_ref().map(|context| (context.place_id.as_str(), context.app_instance_id.as_deref()));
+    let streaming = try_write_streaming_request(engine, writer, &request, scope);
     match streaming {
         Ok(true) => {
             event_engine.publish_global(
@@ -163,11 +202,14 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
             );
         }
         Ok(false) => {
-            let response = execute_request_scoped(
+            // Commits made by this query are recorded with its author
+            // (`_by` / `_by_device` in `history`), when history is kept.
+            let author = commit_author(execution_context.as_ref().map_or_else(|| delegation.map_or(principal, |value| &value.principal), |context| &context.principal));
+            let response = crate::storage::history::with_commit_author(author, || execute_request_scoped(
                 engine,
                 request,
                 execution_context.as_ref(),
-            );
+            ));
             let ok = response.is_ok();
             write_response(writer, &response)?;
             let event_type = if ok { "query.finished" } else { "query.failed" };
@@ -220,4 +262,15 @@ pub(super) fn handle_subscription_operation(connection: &mut Connection, setting
         serde_json::json!({ "subscriptionId": subscription_id }),
     );
     Ok(())
+}
+
+/// The commit author of a principal (`None` when anonymous).
+fn commit_author(principal: &Principal) -> Option<crate::storage::history::CommitAuthor> {
+    match principal {
+        Principal::Anonymous => None,
+        Principal::Identity { identity_id, device_id } => Some(crate::storage::history::CommitAuthor {
+            identity: std::sync::Arc::from(identity_id.as_str()),
+            device: (!device_id.is_empty()).then(|| std::sync::Arc::from(device_id.as_str())),
+        }),
+    }
 }

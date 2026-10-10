@@ -1,17 +1,18 @@
-//! Pipeline-to-logical-plan translation.
+//! Pipeline-to-plan translation.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{fmt, sync::Arc};
 
-use super::logical_plan::{
-    CollectionName, InsertDocument, LogicalObject, LogicalOperator, LogicalPlan, LogicalPlanError,
-    LogicalSource, LogicalValue, PivotAggregate, PivotSpecification, PivotValue, SetAssignment,
-    SortKey,
+use super::plan_values::{
+    CollectionName, InsertDocument, PivotAggregate, PivotSpecification,
+    PivotValue, SetAssignment, SortKey,
 };
+use super::{BinaryOperator, Expression, Literal, PhysicalAccess, PhysicalOperator, PhysicalPlan, PhysicalPlanner, PhysicalSubPipeline};
+use crate::storage::{CollectionId, DocumentId};
 use super::syntax::{
     parse_sort_item, split_assignment, split_sort_direction, split_top_level,
     split_top_level_word, validate_balanced_text, UnwindSpec,
 };
-use super::{parse_expression, ExpressionFieldPath, PhysicalLoadMode, PipelineAst, Span, StageAst, StageName};
+use super::{parse_expression, Arguments, ExpressionFieldPath, PhysicalLoadMode, PipelineAst, Span, Stage, StageAst, StageName};
 
 use crate::query::ast::Spanned;
 
@@ -23,6 +24,7 @@ pub type PlanningResult<T> = std::result::Result<T, PlannerError>;
 pub struct PlannerSource {
     collection: Arc<str>,
     alias: Option<Arc<str>>,
+    temporal: Option<crate::storage::Temporal>,
 }
 
 impl PlannerSource {
@@ -33,6 +35,7 @@ impl PlannerSource {
         Self {
             collection: Arc::from(collection.as_ref()),
             alias: None,
+            temporal: None,
         }
     }
 
@@ -42,7 +45,21 @@ impl PlannerSource {
         Self {
             collection: Arc::from(collection.as_ref()),
             alias: Some(Arc::from(alias.as_ref())),
+            temporal: None,
         }
+    }
+
+    /// Reads the source at a past state or as its history.
+    #[must_use]
+    pub fn with_temporal(mut self, temporal: crate::storage::Temporal) -> Self {
+        self.temporal = Some(temporal);
+        self
+    }
+
+    /// The temporal read of the source (`as of`, `history`), if any.
+    #[must_use]
+    pub const fn temporal(&self) -> Option<&crate::storage::Temporal> {
+        self.temporal.as_ref()
     }
 
     #[must_use]
@@ -102,10 +119,13 @@ impl PlannerPipeline {
                 )
             })?;
 
-        let source = match pipeline.source().alias_name(source_text) {
+        let mut source = match pipeline.source().alias_name(source_text) {
             Some(alias) => PlannerSource::with_alias(collection, alias),
             None => PlannerSource::new(collection),
         };
+        if let Some(temporal) = pipeline.source().temporal() {
+            source = source.with_temporal(source_temporal(source_text, collection, temporal)?);
+        }
 
         let mut stages = Vec::with_capacity(pipeline.stage_count());
 
@@ -402,32 +422,24 @@ impl Planner {
         &self.options
     }
 
-    /// Converts a parsed pipeline AST directly into a logical plan.
-    pub fn plan_ast(
-        &self,
-        source_text: &str,
-        pipeline: &PipelineAst,
-    ) -> PlanningResult<LogicalPlan> {
+    /// Converts a parsed pipeline AST directly into a plan.
+    pub fn plan_ast( &self, source_text: &str, pipeline: &PipelineAst, ) -> PlanningResult<PhysicalPlan> {
         let normalized = PlannerPipeline::from_ast(source_text, pipeline)?;
         self.plan(&normalized)
     }
 
-    /// Converts a normalized pipeline into a logical plan.
-    pub fn plan(&self, pipeline: &PlannerPipeline) -> PlanningResult<LogicalPlan> {
+    /// Converts a normalized pipeline into an executable plan.
+    pub fn plan(&self, pipeline: &PlannerPipeline) -> PlanningResult<PhysicalPlan> {
         self.validate_source_alias(pipeline.source_descriptor())?;
 
-        let collection = CollectionName::parse(pipeline.source()).map_err(|error| {
-            PlannerError::new(
-                PlannerErrorKind::InvalidSource {
-                    source: Arc::from(pipeline.source()),
-                    message: Arc::from(error.to_string()),
-                },
-                None,
-            )
-        })?;
-
-        let source = LogicalSource::new(collection);
-        let mut builder = LogicalPlan::builder(source);
+        let invalid_source = |message: String| PlannerError::new(
+            PlannerErrorKind::InvalidSource { source: Arc::from(pipeline.source()), message: Arc::from(message) },
+            None,
+        );
+        let collection = CollectionName::parse(pipeline.source()).map_err(|error| invalid_source(error.to_string()))?;
+        let collection = CollectionId::parse(collection.to_string()).map_err(|error| invalid_source(error.to_string()))?;
+        let mut builder = PhysicalPlanner::new().plan_collection(collection);
+        builder.set_source_temporal(pipeline.source_descriptor().temporal().cloned());
 
         for (index, stage) in pipeline.stages().iter().enumerate() {
             let location = StageLocation::root(index);
@@ -443,13 +455,27 @@ impl Planner {
                 let scope_alias = scope_alias.as_deref().or(pipeline.source_alias());
                 let operator = self.compile_stage(location, &stage, scope_alias)?;
 
-                builder.push(operator).map_err(|error| self.logical_plan_error(location, &stage, error))?;
+                builder.push(operator).map_err(|error| self.plan_error(location, &stage, error))?;
             }
         }
-
+        if let Some(depth) = builder.operators().iter().map(nesting_depth).max().filter(|depth| *depth > MAX_COMPOUND_DEPTH) {
+            return Err(PlannerError::new(
+                PlannerErrorKind::Plan {
+                    location: None,
+                    message: Arc::from(format!("compound-stage nesting of {depth} exceeds the supported limit of {MAX_COMPOUND_DEPTH}")),
+                },
+                None,
+            ));
+        }
+        builder.push_filters();
+        // `_id` is the master index of every collection: a leading UUIDv7
+        // equality becomes a direct lookup, the filter staying as a check.
+        if let Some(id) = builder.operators().first().and_then(PhysicalOperator::predicate).and_then(primary_key_equality) {
+            builder.set_source_access(PhysicalAccess::PrimaryKeyLookup { id });
+        }
         builder.finish().map_err(|error| {
             PlannerError::new(
-                PlannerErrorKind::LogicalPlan {
+                PlannerErrorKind::Plan {
                     location: None,
                     message: Arc::from(error.to_string()),
                 },
@@ -458,21 +484,34 @@ impl Planner {
         })
     }
 
+    fn collection_id( &self, location: StageLocation, stage: &PlannerStage, collection: &str, ) -> PlanningResult<CollectionId> {
+        CollectionId::parse(collection).map_err(|error| self.plan_error(location, stage, format!("invalid collection {collection:?}: {error}")))
+    }
+
     /// Rewrites a root stage written in a shorthand form into the stages it
     /// stands for. Each stage comes with an optional scope alias override
     /// (used when the shorthand needs to name the outer document).
     fn desugar_stage( &self, location: StageLocation, stage: &PlannerStage, source_alias: Option<&str>, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
         let unchanged = || Ok(vec![(stage.clone(), None)]);
+        let native = Stage::parse(stage.name().as_str());
         if stage.is_compound() {
-            return match stage.name().as_str() {
-                "pivot" => self.desugar_pivot(location, stage),
+            return match native {
+                Some(Stage::Pivot) => self.desugar_pivot(location, stage),
+                Some(Stage::Group) => self.desugar_group(location, stage),
+                Some(Stage::Window) => self.desugar_window(location, stage),
                 _ => unchanged(),
             };
         }
-        match stage.name().as_str() {
-            "sort" => self.desugar_sort(location, stage),
-            "bucket" => self.desugar_bucket(location, stage),
-            "lookup" | "join" if split_top_level_word(stage.arguments(), "into").is_some() => {
+        match native {
+            Some(Stage::Sort) => self.check_form(location, stage, Stage::Sort).and_then(|()| self.desugar_sort(location, stage)),
+            Some(Stage::Bucket) => self.check_form(location, stage, Stage::Bucket).and_then(|()| self.desugar_bucket(location, stage)),
+            Some(Stage::Fill) => {
+                self.check_form(location, stage, Stage::Fill)?;
+                let spec = super::FillSpec::parse(stage.arguments()).map_err(|message| self.invalid_syntax(location, stage, message))?;
+                let keys = spec.sort_fields().iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+                Ok(vec![(synthetic_stage("sort", &keys, stage), None), (stage.clone(), None)])
+            }
+            Some(Stage::Lookup) if split_top_level_word(stage.arguments(), "into").is_some() => {
                 self.desugar_lookup(location, stage, source_alias)
             }
             _ => unchanged(),
@@ -482,7 +521,7 @@ impl Planner {
     /// `sort <expression> [asc|desc], …`: every key that is not a plain field
     /// is computed by a `derive` into a hidden field, sorted on, then dropped.
     fn desugar_sort( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
-        let arguments = self.required_arguments(location, stage)?;
+        let arguments = stage.arguments().trim();
         let items = split_top_level(arguments, ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
         let mut keys = Vec::with_capacity(items.len());
         let mut derived = Vec::new();
@@ -553,23 +592,151 @@ impl Planner {
             }
             children.push(synthetic_stage("values", &values.join(", "), child));
         }
-        if derived.is_empty() {
+        Ok(with_derived(stage, &derived, children))
+    }
+
+    /// `group | … | <aggregate> <value> [by <order>] [where <predicate>] [as <alias>] | … | end`:
+    /// an expression, or the value where a predicate fails (`null`), is a
+    /// hidden field computed by a `derive`. `first`/`last … by` measure two
+    /// fields, the value and the order (`null` where the predicate fails).
+    fn desugar_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
+        let Some(body) = stage.subpipeline() else {
             return Ok(vec![(stage.clone(), None)]);
+        };
+        let mut derived = Vec::new();
+        let mut children = Vec::with_capacity(body.stages().len());
+        for (index, child) in body.stages().iter().enumerate() {
+            let aggregate = child.name().as_str();
+            if child.is_compound() || !matches!(aggregate, "sum" | "avg" | "min" | "max" | "first" | "last" | "count" | "list") {
+                children.push(child.clone());
+                continue;
+            }
+            let invalid = |message: String| self.invalid_syntax(location.child(index), child, message);
+            let (rest, alias) = split_top_level_word(child.arguments(), "as").map_or((child.arguments().trim(), None), |(rest, alias)| (rest, Some(alias)));
+            let (rest, predicate) = split_top_level_word(rest, "where").map_or((rest, None), |(rest, predicate)| (rest, Some(predicate)));
+            let (value, order) = split_top_level_word(rest, "by").map_or((rest, None), |(value, order)| (value, Some(order)));
+            let picks = matches!(aggregate, "first" | "last");
+            if order.is_some() && !picks {
+                return Err(invalid(format!("`{aggregate}` takes no `by <order>`: only `first` and `last` do")));
+            }
+            if picks && predicate.is_some() && order.is_none() {
+                return Err(invalid(format!("`{aggregate} … where` needs `by <order>`")));
+            }
+            let field = |text: &str| parse_field_path(text).is_ok();
+            if predicate.is_none() && order.is_none() && (value.is_empty() || field(value)) {
+                children.push(child.clone());
+                continue;
+            }
+            let alias = match alias {
+                Some(alias) => parse_single_identifier(alias).map_err(&invalid)?.to_owned(),
+                None => parse_group_measure_directive(aggregate, value).map_err(|_| invalid(format!("an expression measure needs `as <alias>`: `{aggregate} <expression> as <alias>`")))?.1,
+            };
+            let value = if value.is_empty() { "1" } else { value };
+            for text in [Some(value), order, predicate].into_iter().flatten() {
+                parse_expression(text).map_err(|error| invalid(format!("invalid expression {text:?}: {error}")))?;
+            }
+            let mut hide = |text: &str, kept: bool| {
+                let expression = match predicate.filter(|_| kept) {
+                    Some(predicate) => format!("if({predicate}, {text}, null)"),
+                    None if field(text) => return text.to_owned(),
+                    None => text.to_owned(),
+                };
+                derived.push(format!("{HIDDEN_GROUP_FIELD_PREFIX}{} = {expression}", derived.len()));
+                format!("{HIDDEN_GROUP_FIELD_PREFIX}{}", derived.len() - 1)
+            };
+            children.push(match order {
+                Some(order) => {
+                    let value = hide(value, false);
+                    synthetic_stage(&format!("{aggregate}by"), &format!("{value} {} as {alias}", hide(order, true)), child)
+                }
+                None => synthetic_stage(aggregate, &format!("{} as {alias}", hide(value, true)), child),
+            });
         }
-        let pivot = PlannerStage::with_subpipeline(
-            stage.name().clone(),
-            stage.arguments(),
-            PlannerSubPipeline::new(children, body.span()),
-            stage.span(),
-        );
-        Ok(vec![(synthetic_stage("derive", &derived.join(", "), stage), None), (pivot, None)])
+        Ok(with_derived(stage, &derived, children))
+    }
+
+    /// `window | partition by <fields> | order by <keys> | <functions> | end`:
+    /// a `sort` by the partition then the order, and the window without its
+    /// `order by`, which runs on the sorted rows.
+    fn desugar_window( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
+        let body = self.required_subpipeline(location, stage)?;
+        let mut keys = Vec::new();
+        let mut order = None;
+        for (index, child) in body.stages().iter().enumerate() {
+            let child_location = location.child(index);
+            let by = || child.arguments().trim().strip_prefix("by").filter(|rest| rest.starts_with(char::is_whitespace)).map(str::trim).ok_or_else(|| self.invalid_syntax(child_location, child, format!("expected `{} by <fields>`", child.name().as_str())));
+            match child.name().as_str() {
+                "partition" => keys.extend(split_top_level(by()?, ',').map_err(|message| self.invalid_syntax(child_location, child, message))?.into_iter().map(str::to_owned)),
+                "order" if order.is_some() => return Err(self.duplicate_directive(child_location, stage, child)),
+                "order" => order = Some(by()?.to_owned()),
+                _ => {}
+            }
+        }
+        let order = order.ok_or_else(|| self.missing_directive(location, stage, "order"))?;
+        keys.push(order);
+        let children = body.stages().iter().filter(|child| child.name().as_str() != "order").cloned().collect();
+        let mut stages = vec![(synthetic_stage("sort", &keys.join(", "), stage), None)];
+        stages.extend(with_derived(stage, &[], children));
+        Ok(stages)
+    }
+
+    /// `window` after [`Self::desugar_window`]: `partition by <fields>` and
+    /// `lag|lead <field> [<n>]`, `cumsum|first|last <field>`, `row_number`,
+    /// each `[as <alias>]`, written as the runtime reads them
+    /// ([`super::WindowSpec`]).
+    fn compile_window( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let body = self.required_subpipeline(location, stage)?;
+        let (mut partition, mut functions) = (Vec::new(), Vec::new());
+        for (index, child) in body.stages().iter().enumerate() {
+            let child_location = location.child(index);
+            self.require_simple(child_location, child)?;
+            let name = child.name().as_str();
+            let invalid = |message: String| self.invalid_syntax(child_location, child, message);
+            let field = |text: &str| parse_field_path(text).map(|_| text.to_owned()).map_err(&invalid);
+            let arguments = child.arguments().trim();
+            match name {
+                "partition" => {
+                    let fields = arguments.strip_prefix("by").map(str::trim).unwrap_or_default();
+                    for item in split_top_level(fields, ',').map_err(&invalid)? {
+                        partition.push(field(item.trim())?);
+                    }
+                }
+                "order" => return Err(invalid("`window` sorts its rows only at the top level of a pipeline".to_owned())),
+                "lag" | "lead" | "cumsum" | "first" | "last" | "row_number" => {
+                    let (rest, alias) = split_top_level_word(arguments, "as").map_or((arguments, None), |(rest, alias)| (rest, Some(alias)));
+                    let words = rest.split_whitespace().collect::<Vec<_>>();
+                    let expected = || invalid(match name {
+                        "lag" | "lead" => format!("expected `{name} <field> [<rows>] [as <alias>]`"),
+                        "row_number" => "expected `row_number [as <alias>]`".to_owned(),
+                        _ => format!("expected `{name} <field> [as <alias>]`"),
+                    });
+                    let (source, offset) = match (name, words.as_slice()) {
+                        ("row_number", []) => (None, None),
+                        ("lag" | "lead", [source, rows]) => (Some(field(source)?), Some(rows.parse::<usize>().ok().filter(|rows| *rows > 0).ok_or_else(expected)?)),
+                        (_, [source]) if name != "row_number" => (Some(field(source)?), None),
+                        _ => return Err(expected()),
+                    };
+                    let alias = match (alias, &source) {
+                        (Some(alias), _) => field(alias)?,
+                        (None, Some(source)) => format!("{name}_{}", source.rsplit('.').next().unwrap_or(source)),
+                        (None, None) => name.to_owned(),
+                    };
+                    functions.push([Some(name.to_owned()), source, offset.map(|rows| rows.to_string()), Some(format!("as {alias}"))].into_iter().flatten().collect::<Vec<_>>().join(" "));
+                }
+                _ => return Err(self.invalid_child_stage(child_location, stage, child, "window accepts `partition by <fields>`, `order by <keys>` and `lag|lead <field> [<rows>]`, `cumsum|first|last <field>`, `row_number`, each `[as <alias>]`")),
+            }
+        }
+        if functions.is_empty() {
+            return Err(self.invalid_syntax(location, stage, "`window` needs at least one function: `lag`, `lead`, `cumsum`, `first`, `last` or `row_number`".to_owned()));
+        }
+        native_stage(Stage::Window, format!("{} | {}", partition.join(", "), functions.join(", ")))
     }
 
     /// `bucket <expression> by [b0, b1, …] [default <value>] [as <alias>]`:
     /// counts rows per range `[b(i), b(i+1))`, like `derive` + `group`.
     fn desugar_bucket( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
         let syntax = "expected `bucket <expression> by [<boundaries>] [default <value>] [as <alias>]`";
-        let arguments = self.required_arguments(location, stage)?;
+        let arguments = stage.arguments().trim();
         let (expression, rest) = split_top_level_word(arguments, "by")
             .ok_or_else(|| self.invalid_syntax(location, stage, syntax))?;
         let (rest, alias) = split_top_level_word(rest, "as").unwrap_or((rest, "bucket"));
@@ -635,104 +802,94 @@ impl Planner {
     /// `scope_alias` names the document the stage runs on (the source alias at
     /// the top level, the enclosing lookup/union alias inside sub-pipelines);
     /// nested lookups use it to resolve correlated fields.
-    fn compile_stage( &self, location: StageLocation, stage: &PlannerStage, scope_alias: Option<&str>, ) -> PlanningResult<LogicalOperator> {
-        match stage.name().as_str() {
-            "where" => self.compile_where(location, stage),
-            "near" => self.compile_near(location, stage),
-            "root" => self.compile_root(location, stage),
-            "sample" => self.compile_sample(location, stage),
-            "set" => self.compile_set(location, stage),
-            "derive" => self.compile_derive(location, stage),
-            "lookup" | "join" => self.compile_lookup(location, stage, scope_alias),
-            "union" => self.compile_union(location, stage),
-            "load" => self.compile_load(location, stage),
-            "limit" => self.compile_limit(location, stage),
-            "skip" | "offset" => self.compile_skip(location, stage),
-            "first" => self.compile_first(location, stage),
-            "single" => self.compile_single(location, stage),
-            "unwind" => self.compile_unwind(location, stage),
-            "sort" => self.compile_sort(location, stage),
-            "select" => self.compile_select(location, stage),
-            "rename" => self.compile_rename(location, stage),
-            "drop" => self.compile_drop(location, stage),
-            "distinct" => self.compile_distinct(location, stage),
-            "count" => self.compile_count(location, stage),
-            "delete" => self.compile_delete(location, stage),
-            "insert" => self.compile_insert(location, stage),
-            "into" | "out" => self.compile_into(location, stage),
-            "group" => self.compile_group(location, stage),
-            "pivot" => self.compile_pivot(location, stage),
-
-            _ if stage.is_compound() => Err(PlannerError::new(
-                PlannerErrorKind::CompoundCustomStage {
-                    location,
-                    name: Arc::from(stage.name().as_str()),
-                },
-                Some(stage.span()),
-            )),
-
-            _ if self.options.allow_custom_stages => Ok(LogicalOperator::custom(
-                stage.name().clone(),
-                stage.arguments(),
-                false,
-            )),
-
-            _ => Err(PlannerError::new(
-                PlannerErrorKind::UnknownStage {
-                    location,
-                    name: Arc::from(stage.name().as_str()),
-                },
-                Some(stage.span()),
-            )),
+    fn compile_stage( &self, location: StageLocation, stage: &PlannerStage, scope_alias: Option<&str>, ) -> PlanningResult<PhysicalOperator> {
+        // `bucket` exists only as a root shorthand (`desugar_stage`).
+        let Some(native) = Stage::parse(stage.name().as_str()).filter(|native| *native != Stage::Bucket) else {
+            return if stage.is_compound() {
+                Err(PlannerError::new(PlannerErrorKind::CompoundCustomStage { location, name: Arc::from(stage.name().as_str()) }, Some(stage.span())))
+            } else if self.options.allow_custom_stages {
+                custom_stage(stage.name().clone(), stage.arguments())
+            } else {
+                Err(PlannerError::new(PlannerErrorKind::UnknownStage { location, name: Arc::from(stage.name().as_str()) }, Some(stage.span())))
+            };
+        };
+        self.check_form(location, stage, native)?;
+        match native {
+            Stage::Where => self.compile_where(location, stage),
+            Stage::Near | Stage::Derive => native_stage(native, stage.arguments().trim()),
+            Stage::Root => self.compile_root(location, stage),
+            Stage::Sample => self.compile_sample(location, stage),
+            Stage::Window => self.compile_window(location, stage),
+            Stage::Fill if location.depth() > 1 => Err(self.invalid_syntax(location, stage, "`fill` sorts its rows only at the top level of a pipeline".to_owned())),
+            Stage::Fill => native_stage(Stage::Fill, stage.arguments().trim()),
+            Stage::Set => self.compile_set(location, stage),
+            Stage::Lookup => self.compile_lookup(location, stage, scope_alias),
+            Stage::Union => self.compile_union(location, stage),
+            Stage::Load => self.compile_load(location, stage),
+            Stage::Limit => self.compile_limit(location, stage),
+            Stage::Skip => self.compile_skip(location, stage),
+            Stage::First | Stage::Single => self.compile_first(location, stage, native),
+            Stage::Unwind => self.compile_unwind(location, stage),
+            Stage::Sort => self.compile_sort(location, stage),
+            Stage::Select => self.compile_select(location, stage),
+            Stage::Rename => self.compile_rename(location, stage),
+            Stage::Drop => self.compile_drop(location, stage),
+            Stage::Distinct => self.compile_distinct(location, stage),
+            Stage::Count => self.compile_count(location, stage),
+            Stage::Delete => Ok(PhysicalOperator::delete()),
+            Stage::Insert => self.compile_insert(location, stage),
+            Stage::Into => self.compile_into(location, stage),
+            Stage::Group => self.compile_group(location, stage),
+            Stage::Pivot => self.compile_pivot(location, stage),
+            Stage::Bucket => unreachable!("filtered above"),
         }
     }
 
-    fn compile_where( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    /// Checks the stage form (simple or compound) and its arguments against
+    /// the catalogue entry of `native`.
+    fn check_form( &self, location: StageLocation, stage: &PlannerStage, native: Stage ) -> PlanningResult<()> {
+        let entry = native.entry();
+        let arguments = match (stage.is_compound(), entry.simple, entry.compound) {
+            (false, Some(arguments), _) | (true, _, Some(arguments)) => arguments,
+            (true, Some(_), None) => return self.require_simple(location, stage),
+            (false, None, Some(arguments)) => {
+                self.check_arguments(location, stage, arguments)?;
+                return self.required_subpipeline(location, stage).map(drop);
+            }
+            (_, None, None) => unreachable!("every catalogue stage has a form"),
+        };
+        self.check_arguments(location, stage, arguments)
+    }
+
+    fn check_arguments( &self, location: StageLocation, stage: &PlannerStage, arguments: Arguments ) -> PlanningResult<()> {
+        match arguments {
+            Arguments::Required => self.required_arguments(location, stage).map(drop),
+            Arguments::Forbidden => self.require_no_arguments(location, stage),
+            Arguments::Optional => Ok(()),
+        }
+    }
+
+    fn compile_where( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         let predicate = self.parse_stage_expression(location, stage, arguments)?;
-        Ok(LogicalOperator::filter(predicate))
+        Ok(PhysicalOperator::filter(predicate))
     }
 
-    fn compile_near( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
-        let name = StageName::parse("near").expect("native stage name 'near' must always be valid");
-        Ok(LogicalOperator::custom(name, arguments, false))
-    }
 
-    fn compile_root( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_root( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         parse_field_path(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
-        Ok(LogicalOperator::custom(
-            StageName::parse("root").unwrap(),
-            arguments,
-            false,
-        ))
+        native_stage(Stage::Root, arguments)
     }
 
-    fn compile_sample( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_sample( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let count = self.parse_non_negative_integer(location, stage)?;
-        Ok(LogicalOperator::custom(
-            StageName::parse("sample").unwrap(),
-            count.to_string(),
-            false,
-        ))
+        native_stage(Stage::Sample, count.to_string())
     }
 
-    fn compile_derive( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
-        let name =
-            StageName::parse("derive").expect("native stage name 'derive' must always be valid");
-        Ok(LogicalOperator::custom(name, arguments, false))
-    }
 
-    fn compile_set( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_set( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         let assignments = split_top_level(arguments, ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
         let mut compiled = Vec::with_capacity(assignments.len());
         for (assignment_index, assignment) in assignments.into_iter().enumerate() {
@@ -764,109 +921,77 @@ impl Planner {
             compiled.push(SetAssignment::new(field, value));
         }
 
-        LogicalOperator::set(compiled).map_err(|error| self.logical_plan_error(location, stage, error))
+        PhysicalOperator::set(compiled).map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_lookup( &self, location: StageLocation, stage: &PlannerStage, outer_alias: Option<&str>, ) -> PlanningResult<LogicalOperator> {
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_lookup( &self, location: StageLocation, stage: &PlannerStage, outer_alias: Option<&str>, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         let subpipeline = self.required_subpipeline(location, stage)?;
 
         let header = parse_lookup_header(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
 
         let compiled = self.compile_lookup_body(location, stage, subpipeline, header.alias)?;
 
-        Ok(LogicalOperator::Lookup {
-            collection: Arc::from(header.collection),
-            alias: header.alias.map(Arc::from),
-            outer_alias: outer_alias.map(Arc::from),
-            into: Arc::from(compiled.into),
-            pipeline: Arc::from(compiled.stages),
-        })
+        let pipeline = PhysicalSubPipeline::new(compiled.stages).map_err(|error| self.plan_error(location, stage, error))?;
+        PhysicalOperator::lookup(self.collection_id(location, stage, header.collection)?, header.alias, compiled.into, pipeline)
+            .map(|operator| operator.with_outer_alias(outer_alias))
+            .map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_union( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_no_arguments(location, stage)?;
+    fn compile_union( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let subpipeline = self.required_subpipeline(location, stage)?;
 
         let compiled = self.compile_union_body(location, stage, subpipeline)?;
 
-        Ok(LogicalOperator::Union {
-            collection: Arc::from(compiled.source),
-            alias: compiled.alias.map(Arc::from),
-            pipeline: Arc::from(compiled.stages),
-        })
+        let pipeline = PhysicalSubPipeline::new(compiled.stages).map_err(|error| self.plan_error(location, stage, error))?;
+        PhysicalOperator::union(self.collection_id(location, stage, compiled.source)?, compiled.alias, pipeline)
+            .map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_load( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
+    fn compile_load( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         match stage.subpipeline() {
             None => {
-                let arguments = self.required_arguments(location, stage)?;
+                let arguments = stage.arguments().trim();
 
-                LogicalOperator::load(arguments).map_err(|error| self.logical_plan_error(location, stage, error))
+                PhysicalOperator::load(arguments).map_err(|error| self.plan_error(location, stage, error))
             }
 
             Some(subpipeline) => {
-                self.require_no_arguments(location, stage)?;
-                self.compile_streaming_load_body(location, stage, subpipeline)
+                        self.compile_streaming_load_body(location, stage, subpipeline)
             }
         }
     }
 
-    fn compile_limit( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_limit( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let count = self.parse_non_negative_integer(location, stage)?;
-        Ok(LogicalOperator::limit(count))
+        Ok(PhysicalOperator::limit(count))
     }
 
-    fn compile_skip( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_skip( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let count = self.parse_non_negative_integer(location, stage)?;
-        Ok(LogicalOperator::skip(count))
+        Ok(PhysicalOperator::skip(count))
     }
 
-    fn compile_first( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_first( &self, location: StageLocation, stage: &PlannerStage, native: Stage ) -> PlanningResult<PhysicalOperator> {
         let arguments = stage.arguments().trim();
         if !arguments.is_empty() {
             parse_field_path(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
         }
-        Ok(LogicalOperator::custom(
-            StageName::parse("first").unwrap(),
-            arguments,
-            false,
-        ))
+        native_stage(native, arguments)
     }
 
-    fn compile_single( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+
+    fn compile_unwind( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let arguments = stage.arguments().trim();
-        if !arguments.is_empty() {
-            parse_field_path(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
-        }
-        Ok(LogicalOperator::custom(
-            StageName::parse("single").unwrap(),
-            arguments,
-            false,
-        ))
-    }
-
-    fn compile_unwind( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
         let spec = UnwindSpec::parse(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
         for path in std::iter::once(spec.field).chain(spec.index) {
             parse_field_path(path).map_err(|message| self.invalid_syntax(location, stage, message))?;
         }
-        Ok(LogicalOperator::custom(
-            StageName::parse("unwind").unwrap(),
-            arguments,
-            false,
-        ))
+        native_stage(Stage::Unwind, arguments)
     }
 
-    fn compile_sort( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_sort( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         let items = split_top_level(arguments, ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
         let mut keys = Vec::with_capacity(items.len());
         for (item_index, item) in items.into_iter().enumerate() {
@@ -878,12 +1003,11 @@ impl Planner {
 
             keys.push(SortKey::new(field, direction));
         }
-        LogicalOperator::sort(keys).map_err(|error| self.logical_plan_error(location, stage, error))
+        PhysicalOperator::sort(keys).map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_select( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_select( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         let items = split_top_level(arguments, ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
 
         let mut normalized = Vec::with_capacity(items.len());
@@ -935,19 +1059,14 @@ impl Planner {
         }
 
         if requires_custom_projection {
-            return Ok(LogicalOperator::custom(
-                StageName::parse("select").expect("native stage name is valid"),
-                normalized.join(", "),
-                false,
-            ));
+            return native_stage(Stage::Select, normalized.join(", "));
         }
 
-        LogicalOperator::select(plain_fields).map_err(|error| self.logical_plan_error(location, stage, error))
+        PhysicalOperator::select(plain_fields).map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_rename( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_rename( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         let (source, target) = parse_rename_arguments(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
         let source = parse_field_path(source).map_err(|message| self.invalid_syntax(location, stage, message))?;
         let target = parse_field_path(target).map_err(|message| self.invalid_syntax(location, stage, message))?;
@@ -956,15 +1075,10 @@ impl Planner {
             return Err(self.invalid_syntax(location, stage, "rename source and target must be different".to_owned()));
         }
 
-        Ok(LogicalOperator::custom(
-            StageName::parse("rename").expect("native stage name is valid"),
-            format!("{source} as {target}"),
-            false,
-        ))
+        native_stage(Stage::Rename, format!("{source} as {target}"))
     }
 
-    fn compile_drop( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_drop( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let fields = self.parse_required_field_list(location, stage)?;
         let arguments = fields
             .iter()
@@ -972,73 +1086,60 @@ impl Planner {
             .collect::<Vec<_>>()
             .join(", ");
 
-        Ok(LogicalOperator::custom(
-            StageName::parse("drop").expect("native stage name is valid"),
-            arguments,
-            false,
-        ))
+        native_stage(Stage::Drop, arguments)
     }
 
-    fn compile_distinct( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_distinct( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let arguments = stage.arguments().trim();
         let fields = if arguments.is_empty() {
             Vec::new()
         } else {
             self.parse_field_list(location, stage, arguments)?
         };
-        LogicalOperator::distinct(fields).map_err(|error| self.logical_plan_error(location, stage, error))
+        PhysicalOperator::distinct(fields).map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_count( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
+    fn compile_count( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let arguments = stage.arguments().trim();
         let alias = if arguments.is_empty() {
             "count"
         } else {
             parse_count_alias(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?
         };
-        LogicalOperator::count(alias).map_err(|error| self.logical_plan_error(location, stage, error))
+        PhysicalOperator::count(alias).map_err(|error| self.plan_error(location, stage, error))
     }
 
-    fn compile_delete( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        self.require_no_arguments(location, stage)?;
-        Ok(LogicalOperator::delete())
-    }
 
-    fn compile_insert( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
+    fn compile_insert( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
         // `insert [{…}, {…}]` inserts a batch: one atomic streaming load in merge mode.
         if arguments.starts_with('[') {
             let chunk = insert_batch_json(arguments).map_err(|message| self.invalid_syntax(location, stage, message))?;
-            return Ok(LogicalOperator::StreamingLoad { mode: PhysicalLoadMode::Merge, chunks: Arc::from([Arc::from(chunk)]) });
+            return PhysicalOperator::streaming_load(PhysicalLoadMode::Merge, [chunk]).map_err(|error| self.plan_error(location, stage, error));
         }
-        let document = InsertDocument::parse(arguments).map_err(|error| self.logical_plan_error(location, stage, error))?;
-        LogicalOperator::from_insert_document(document).map_err(|error| self.logical_plan_error(location, stage, error))
+        let document = InsertDocument::parse(arguments).map_err(|error| self.plan_error(location, stage, error))?;
+        Ok(PhysicalOperator::insert(document))
     }
 
     /// `into <collection>` (alias `out`): terminal stage that inserts the pipeline result
-    /// into another collection. Lowered as a mutating extension operator and
-    /// executed by the executor as a read phase followed by one atomic write.
-    fn compile_into( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_simple(location, stage)?;
-        let arguments = self.required_arguments(location, stage)?;
-        let collection = CollectionName::parse(arguments).map_err(|error| self.logical_plan_error(location, stage, error))?
+    /// into another collection. Lowered as a mutating extension operator: its
+    /// rows are streamed into one transaction (see `engine::execute`).
+    fn compile_into( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
+        let arguments = stage.arguments().trim();
+        let collection = CollectionName::parse(arguments).map_err(|error| self.plan_error(location, stage, error))?
             .to_string();
-        if collection.starts_with('_') {
+        // Materialized views refresh their cache collections with `into`.
+        if collection.starts_with('_') && !collection.starts_with(crate::view::CACHE_PREFIX) {
             return Err(self.invalid_syntax(location, stage, "into cannot target a system collection"));
         }
-        let name = StageName::parse("into").map_err(|error| self.invalid_syntax(location, stage, error.to_string()))?;
-        Ok(LogicalOperator::custom(name, collection, true))
+        native_stage(Stage::Into, collection)
     }
 
-    fn compile_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
+    fn compile_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let mut fields = Vec::new();
         match stage.subpipeline() {
             None => {
-                let arguments = self.required_arguments(location, stage)?;
+                let arguments = stage.arguments().trim();
                 let items = split_top_level(arguments, ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
 
                 // Compact group syntax follows the relational shape people read from
@@ -1062,8 +1163,7 @@ impl Planner {
             }
 
             Some(subpipeline) => {
-                self.require_no_arguments(location, stage)?;
-                let mut by_seen = false;
+                        let mut by_seen = false;
 
                 for (index, child) in subpipeline.stages().iter().enumerate() {
                     let child_location = location.child(index);
@@ -1079,7 +1179,15 @@ impl Planner {
                                 .map_err(|message| self.invalid_syntax(child_location, child, message))?;
                             self.push_group_keys(child_location, child, &items, &mut fields)?;
                         }
-                        aggregate @ ("sum" | "avg" | "min" | "max" | "first" | "last" | "count") => {
+                        aggregate @ ("firstby" | "lastby") => {
+                            let invalid = || self.invalid_syntax(child_location, child, format!("expected `{aggregate} <field> <order> as <alias>`"));
+                            let [value, order, "as", alias] = child.arguments().split_whitespace().collect::<Vec<_>>()[..] else { return Err(invalid()) };
+                            for text in [value, order, alias] {
+                                parse_field_path(text).map_err(|_| invalid())?;
+                            }
+                            fields.push(group_measure_marker(aggregate, &format!("{value} {order}"), alias).map_err(|message| self.invalid_syntax(child_location, child, message))?);
+                        }
+                        aggregate @ ("sum" | "avg" | "min" | "max" | "first" | "last" | "count" | "list") => {
                             let invalid = |message: String| self.invalid_syntax(child_location, child, message);
                             let (source, alias) = parse_group_measure_directive(aggregate, child.arguments()).map_err(invalid)?;
                             fields.push(group_measure_marker(aggregate, source, &alias).map_err(invalid)?);
@@ -1089,7 +1197,7 @@ impl Planner {
                                 child_location,
                                 stage,
                                 child,
-                                "group accepts one `by <fields>` directive and measures `sum|avg|min|max|first|last <field> [as <alias>]` or `count [<field>] [as <alias>]`",
+                                "group accepts one `by <fields>` directive and measures `sum|avg|min|max|first|last|list <value> [by <order>] [where <predicate>] [as <alias>]` or `count [<value>] [where <predicate>] [as <alias>]`",
                             ));
                         }
                     }
@@ -1101,7 +1209,7 @@ impl Planner {
             }
         }
 
-        LogicalOperator::group(fields).map_err(|error| self.logical_plan_error(location, stage, error))
+        PhysicalOperator::group(fields).map_err(|error| self.plan_error(location, stage, error))
     }
 
     /// Appends grouping keys (`field` or `field as alias`) to `fields`.
@@ -1118,12 +1226,11 @@ impl Planner {
         Ok(())
     }
 
-    fn compile_pivot( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<LogicalOperator> {
-        self.require_no_arguments(location, stage)?;
+    fn compile_pivot( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let subpipeline = self.required_subpipeline(location, stage)?;
         let specification = self.compile_pivot_body(location, stage, subpipeline)?;
 
-        LogicalOperator::pivot(specification).map_err(|error| self.logical_plan_error(location, stage, error))
+        Ok(PhysicalOperator::pivot(specification))
     }
 
     fn compile_pivot_body( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &PlannerSubPipeline, ) -> PlanningResult<PivotSpecification> {
@@ -1190,17 +1297,17 @@ impl Planner {
             .into_iter()
             .map(|(field, alias)| {
                 PivotValue::new(field, aggregate, alias)
-                    .map_err(|error| self.logical_plan_error(parent_location, parent_stage, error))
+                    .map_err(|error| self.plan_error(parent_location, parent_stage, error))
             })
             .collect::<PlanningResult<Vec<_>>>()?;
 
-        PivotSpecification::new(rows, columns, values).map_err(|error| self.logical_plan_error(parent_location, parent_stage, error))
+        PivotSpecification::new(rows, columns, values).map_err(|error| self.plan_error(parent_location, parent_stage, error))
     }
 
     /// `values <field> [as <alias>], …`; expressions were already computed
     /// into hidden fields by [`Self::desugar_pivot`].
     fn parse_pivot_values( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(ExpressionFieldPath, Option<String>)>> {
-        let arguments = self.required_arguments(location, stage)?;
+        let arguments = stage.arguments().trim();
         let items = split_top_level(arguments, ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
         items
             .into_iter()
@@ -1340,7 +1447,7 @@ impl Planner {
         })
     }
 
-    fn compile_streaming_load_body( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &PlannerSubPipeline, ) -> PlanningResult<LogicalOperator> {
+    fn compile_streaming_load_body( &self, parent_location: StageLocation, parent_stage: &PlannerStage, subpipeline: &PlannerSubPipeline, ) -> PlanningResult<PhysicalOperator> {
         let mut mode = None;
         let mut chunks = Vec::new();
 
@@ -1408,12 +1515,12 @@ impl Planner {
             ));
         }
 
-        Ok(LogicalOperator::StreamingLoad { mode, chunks: Arc::from(chunks) })
+        PhysicalOperator::streaming_load(mode, chunks.iter().map(|chunk: &Arc<str>| chunk.as_ref())).map_err(|error| self.plan_error(parent_location, parent_stage, error))
     }
 
-    fn compile_nested_read_stage( &self, location: StageLocation, parent_stage: &PlannerStage, stage: &PlannerStage, scope_alias: Option<&str>, ) -> PlanningResult<LogicalOperator> {
+    fn compile_nested_read_stage( &self, location: StageLocation, parent_stage: &PlannerStage, stage: &PlannerStage, scope_alias: Option<&str>, ) -> PlanningResult<PhysicalOperator> {
         let operator = self.compile_stage(location, stage, scope_alias)?;
-        if operator.is_mutating() || operator.is_terminal() {
+        if operator.execution_properties().writes() || operator.count_alias().is_some() {
             return Err(PlannerError::new(
                 PlannerErrorKind::InvalidCompoundChild {
                     location,
@@ -1507,7 +1614,7 @@ impl Planner {
     }
 
     fn parse_non_negative_integer( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<usize> {
-        let arguments = self.required_arguments(location, stage)?;
+        let arguments = stage.arguments().trim();
         if arguments.split_whitespace().count() != 1 {
             return Err(self.invalid_syntax(location, stage, "expected exactly one non-negative integer"));
         }
@@ -1518,7 +1625,7 @@ impl Planner {
     }
 
     fn parse_required_field_list( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<ExpressionFieldPath>> {
-        let arguments = self.required_arguments(location, stage)?;
+        let arguments = stage.arguments().trim();
         self.parse_field_list(location, stage, arguments)
     }
 
@@ -1606,9 +1713,9 @@ impl Planner {
         )
     }
 
-    fn logical_plan_error( &self, location: StageLocation, stage: &PlannerStage, error: LogicalPlanError, ) -> PlannerError {
+    fn plan_error( &self, location: StageLocation, stage: &PlannerStage, error: impl fmt::Display, ) -> PlannerError {
         PlannerError::new(
-            PlannerErrorKind::LogicalPlan {
+            PlannerErrorKind::Plan {
                 location: Some(location),
                 message: Arc::from(error.to_string()),
             },
@@ -1620,7 +1727,7 @@ impl Planner {
 /// Planner behavior options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlannerOptions {
-    /// Preserve unknown simple stages as read-only custom logical operators.
+    /// Preserve unknown simple stages as read-only custom operators.
     pub allow_custom_stages: bool,
 }
 
@@ -1633,11 +1740,6 @@ impl PlannerOptions {
         }
     }
 
-    #[must_use]
-    pub const fn with_custom_stages(mut self, allow: bool) -> Self {
-        self.allow_custom_stages = allow;
-        self
-    }
 }
 
 impl Default for PlannerOptions {
@@ -1885,12 +1987,12 @@ impl fmt::Display for PlannerError {
                 "streaming load at pipeline location {location} requires at least one `chunk` stage",
             ),
 
-            PlannerErrorKind::LogicalPlan { location, message } => match location {
+            PlannerErrorKind::Plan { location, message } => match location {
                 Some(location) => write!(
                     formatter,
-                    "logical-plan validation failed at pipeline location {location}: {message}",
+                    "plan validation failed at pipeline location {location}: {message}",
                 ),
-                None => write!(formatter, "logical-plan validation failed: {message}"),
+                None => write!(formatter, "plan validation failed: {message}"),
             },
         }
     }
@@ -1999,7 +2101,7 @@ pub enum PlannerErrorKind {
     MissingLoadChunk {
         location: StageLocation,
     },
-    LogicalPlan {
+    Plan {
         location: Option<StageLocation>,
         message: Arc<str>,
     },
@@ -2017,13 +2119,13 @@ struct SourceDirective<'a> {
 
 struct CompiledLookup<'a> {
     into: &'a str,
-    stages: Vec<LogicalOperator>,
+    stages: Vec<PhysicalOperator>,
 }
 
 struct CompiledUnion<'a> {
     source: &'a str,
     alias: Option<&'a str>,
-    stages: Vec<LogicalOperator>,
+    stages: Vec<PhysicalOperator>,
 }
 
 fn set_once<T, E>(
@@ -2139,8 +2241,9 @@ fn parse_pivot_aggregate(text: &str) -> Result<PivotAggregate, String> {
         ["max" | "maximum"] => Ok(PivotAggregate::Maximum),
         ["first"] => Ok(PivotAggregate::First),
         ["last"] => Ok(PivotAggregate::Last),
+        ["list"] => Ok(PivotAggregate::List),
         _ => Err(
-            "expected one pivot aggregate: `sum`, `count`, `avg`, `average`, `min`, `minimum`, `max`, `maximum`, `first`, or `last`"
+            "expected one pivot aggregate: `sum`, `count`, `avg`, `average`, `min`, `minimum`, `max`, `maximum`, `first`, `last`, or `list`"
                 .to_owned(),
         ),
     }
@@ -2273,9 +2376,21 @@ fn parse_count_alias(text: &str) -> Result<&str, String> {
 const HIDDEN_SORT_FIELD_PREFIX: &str = "__og_sort_";
 /// Prefix of the hidden fields computed for expression pivot values.
 const HIDDEN_PIVOT_FIELD_PREFIX: &str = "__og_pivot_";
+/// Prefix of the hidden fields computed for `group` measures.
+const HIDDEN_GROUP_FIELD_PREFIX: &str = "__og_measure_";
 /// Aliases used by the one-line `lookup` when the query does not name them.
 const LOOKUP_INNER_ALIAS: &str = "__og_joined";
 const LOOKUP_OUTER_ALIAS: &str = "__og_outer";
+
+/// `stage` with `children` as its body, after a `derive` of `derived` if any.
+fn with_derived(stage: &PlannerStage, derived: &[String], children: Vec<PlannerStage>) -> Vec<(PlannerStage, Option<Arc<str>>)> {
+    let Some(body) = stage.subpipeline() else {
+        return vec![(stage.clone(), None)];
+    };
+    let rebuilt = PlannerStage::with_subpipeline(stage.name().clone(), stage.arguments(), PlannerSubPipeline::new(children, body.span()), stage.span());
+    let derive = (!derived.is_empty()).then(|| (synthetic_stage("derive", &derived.join(", "), stage), None));
+    derive.into_iter().chain([(rebuilt, None)]).collect()
+}
 
 /// A stage generated by a shorthand, reported at the shorthand's span.
 fn synthetic_stage(name: &str, arguments: &str, origin: &PlannerStage) -> PlannerStage {
@@ -2285,48 +2400,112 @@ fn synthetic_stage(name: &str, arguments: &str, origin: &PlannerStage) -> Planne
 
 /// Converts `insert [{…}, …]` (keys may be unquoted) into a canonical JSON array.
 fn insert_batch_json(text: &str) -> Result<String, String> {
-    let LogicalValue::Array(items) = LogicalValue::from_source(text).map_err(|error| error.to_string())? else {
+    let crate::Value::Array(items) = super::plan_values::value_from_source(text).map_err(|error| error.to_string())? else {
         return Err("a batch insert expects an array of objects".to_owned());
     };
     if items.is_empty() {
         return Err("a batch insert needs at least one document".to_owned());
     }
-    let documents = items
-        .iter()
-        .map(|item| match item {
-            LogicalValue::Object(object) => logical_object_to_json(object),
-            _ => Err("a batch insert expects an array of objects".to_owned()),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(serde_json::Value::Array(documents).to_string())
+    if !items.iter().all(|item| matches!(item, crate::Value::Object(_))) {
+        return Err("a batch insert expects an array of objects".to_owned());
+    }
+    Ok(crate::helpers::value_to_json(&crate::Value::Array(items)).to_string())
 }
 
-fn logical_object_to_json(object: &LogicalObject) -> Result<serde_json::Value, String> {
-    object
-        .fields()
-        .map(|field| Ok((field.name().to_owned(), logical_value_to_json(field.value())?)))
-        .collect::<Result<serde_json::Map<_, _>, String>>()
-        .map(serde_json::Value::Object)
-}
-
-fn logical_value_to_json(value: &LogicalValue) -> Result<serde_json::Value, String> {
-    Ok(match value {
-        LogicalValue::String(text) | LogicalValue::Identifier(text) => serde_json::Value::from(text.as_ref()),
-        LogicalValue::Boolean(flag) => serde_json::Value::Bool(*flag),
-        LogicalValue::Null => serde_json::Value::Null,
-        LogicalValue::Number(text) => {
-            let number = crate::model::parse_number_value(text).map_err(|error| format!("invalid number {text:?}: {error}"))?;
-            crate::helpers::value_to_json(&crate::Value::Number(number))
+/// Converts `as of <value>` / `history` into the storage temporal read.
+fn source_temporal(source_text: &str, collection: &str, temporal: crate::query::ast::SourceTemporalAst) -> PlanningResult<crate::storage::Temporal> {
+    use crate::query::ast::SourceTemporalAst;
+    use crate::storage::{AsOf, CollectionId, Temporal};
+    match temporal {
+        SourceTemporalAst::History { span } => CollectionId::parse(collection)
+            .map(|collection| Temporal::History { collection })
+            .map_err(|error| PlannerError::invalid_ast(error.to_string(), Some(span))),
+        SourceTemporalAst::AsOf { value, number, span } => {
+            let text = value.slice(source_text).ok_or_else(|| PlannerError::invalid_ast("`as of` value span does not belong to the source text", Some(span)))?;
+            if number {
+                return text
+                    .parse::<u64>()
+                    .map(|generation| Temporal::AsOf(AsOf::Generation(generation)))
+                    .map_err(|_| PlannerError::invalid_ast(format!("`as of` generation must be a non-negative integer, got {text}"), Some(value)));
+            }
+            let inner = text.get(1..text.len().saturating_sub(1)).unwrap_or("");
+            let decoded = crate::query::syntax::unescape_string(inner).map_err(|escape| PlannerError::invalid_ast(format!("invalid escape \\{escape} in `as of` date"), Some(value)))?;
+            crate::query::dates::parse_iso(&decoded)
+                .map(|millis| Temporal::AsOf(AsOf::Time(millis)))
+                .map_err(|message| PlannerError::invalid_ast(format!("`as of` {message}"), Some(value)))
         }
-        LogicalValue::Array(items) => serde_json::Value::Array(items.iter().map(logical_value_to_json).collect::<Result<_, _>>()?),
-        LogicalValue::Object(object) => logical_object_to_json(object)?,
-    })
+    }
+}
+
+/// Deepest lookup/union nesting below `operator` (1 for a flat stage).
+fn nesting_depth(operator: &PhysicalOperator) -> usize {
+    1 + operator.nested_pipeline().map_or(0, |pipeline| pipeline.operators().iter().map(nesting_depth).max().unwrap_or(0))
+}
+
+/// Maximum nesting of compound stages (lookup and union inside each other).
+const MAX_COMPOUND_DEPTH: usize = 8;
+
+/// The document identifier a predicate `_id == "<uuid>"` selects.
+fn primary_key_equality(expression: &Expression) -> Option<DocumentId> {
+    let (left, operator, right) = expression.ungrouped().as_binary()?;
+    if operator != BinaryOperator::Equal {
+        return None;
+    }
+    let pair = |field: &Expression, literal: &Expression| {
+        let path = field.as_field()?;
+        if path.len() != 1 || path.first() != "_id" {
+            return None;
+        }
+        let Literal::String(value) = literal.as_literal()? else { return None };
+        DocumentId::parse(value.as_ref()).ok()
+    };
+    pair(left.ungrouped(), right.ungrouped()).or_else(|| pair(right.ungrouped(), left.ungrouped()))
+}
+
+/// An extension stage with its execution properties: the one place where a
+/// custom stage name maps to physical properties, for top-level and nested
+/// pipelines alike.
+fn custom_stage( name: StageName, arguments: impl AsRef<str> ) -> PlanningResult<PhysicalOperator> {
+    PhysicalOperator::custom(name, arguments)
+        .map_err(|error| PlannerError::new(PlannerErrorKind::Plan { location: None, message: Arc::from(error.to_string()) }, None))
+}
+
+/// The operator of a built-in stage run through its compiled form.
+fn native_stage( stage: Stage, arguments: impl AsRef<str> ) -> PlanningResult<PhysicalOperator> {
+    custom_stage(StageName::parse(stage.name()).expect("catalogue stage names are valid"), arguments)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::{parse, parse_expression, Literal};
+    use crate::query::{parse, parse_expression, PhysicalOperatorKind};
+
+    /// The plan questions the tests ask, by operator kind.
+    trait PlanView {
+        fn operator(&self, index: usize) -> Option<&PhysicalOperator>;
+        fn has(&self, kind: PhysicalOperatorKind) -> bool;
+        fn has_filter(&self) -> bool { self.has(PhysicalOperatorKind::Filter) }
+        fn has_set(&self) -> bool { self.has(PhysicalOperatorKind::Set) }
+        fn has_load(&self) -> bool { self.has(PhysicalOperatorKind::Load) || self.has(PhysicalOperatorKind::StreamingLoad) }
+        fn has_limit(&self) -> bool { self.has(PhysicalOperatorKind::Limit) }
+        fn has_skip(&self) -> bool { self.has(PhysicalOperatorKind::Skip) }
+        fn has_sort(&self) -> bool { self.has(PhysicalOperatorKind::Sort) }
+        fn has_select(&self) -> bool { self.has(PhysicalOperatorKind::Select) }
+        fn has_distinct(&self) -> bool { self.has(PhysicalOperatorKind::Distinct) }
+        fn has_count(&self) -> bool { self.has(PhysicalOperatorKind::Count) }
+        fn has_delete(&self) -> bool { self.has(PhysicalOperatorKind::Delete) }
+        fn has_insert(&self) -> bool { self.has(PhysicalOperatorKind::Insert) }
+        fn has_group(&self) -> bool { self.has(PhysicalOperatorKind::Group) }
+        fn has_pivot(&self) -> bool { self.has(PhysicalOperatorKind::Pivot) }
+        fn is_mutating(&self) -> bool;
+        fn is_read_only(&self) -> bool { !self.is_mutating() }
+    }
+
+    impl PlanView for PhysicalPlan {
+        fn operator(&self, index: usize) -> Option<&PhysicalOperator> { self.operators().get(index) }
+        fn has(&self, kind: PhysicalOperatorKind) -> bool { self.operators().iter().any(|operator| operator.kind() == kind) }
+        fn is_mutating(&self) -> bool { self.is_write() }
+    }
 
     const GROUP_SUM_MARKER_PREFIX: &str = "__og_group_sum_";
 
@@ -2348,51 +2527,51 @@ mod tests {
         )
     }
 
-    fn plan_one(name: &str, arguments: &str) -> LogicalPlan {
+    fn plan_one(name: &str, arguments: &str) -> PhysicalPlan {
         Planner::new()
             .plan(&PlannerPipeline::new("users", [stage(name, arguments)]))
             .unwrap()
     }
 
-    #[test] fn plans_all_simple_native_stages() { assert!(plan_one("where", "age >= 18").has_filter()); let near = plan_one("near", "embedding, [1.0, 0.0]"); assert!(matches!( near.operator(0), Some(LogicalOperator::Custom { stage, arguments, mutating: false, }) if stage.as_str() == "near" && arguments.as_ref() == "embedding, [1.0, 0.0]" )); let root = plan_one("root", "payload"); assert!(matches!( root.operator(0), Some(LogicalOperator::Custom { stage, arguments, mutating: false, }) if stage.as_str() == "root" && arguments.as_ref() == "payload" )); let sample = plan_one("sample", "5"); assert!(matches!( sample.operator(0), Some(LogicalOperator::Custom { stage, arguments, mutating: false, }) if stage.as_str() == "sample" && arguments.as_ref() == "5" )); assert!(plan_one("set", "enabled=true").has_set()); assert!(plan_one("load", "profile").has_load()); assert!(plan_one("limit", "10").has_limit()); assert!(plan_one("skip", "20").has_skip()); assert!(plan_one("sort", "age desc, name asc").has_sort()); assert!(plan_one("select", "name, profile.country").has_select()); let rename = plan_one("rename", "name as display_name"); let rename = rename .operator(0) .expect("rename should produce one logical operator"); assert!(matches!( rename, LogicalOperator::Custom { stage, arguments, mutating: false, } if stage.as_str() == "rename" && arguments.as_ref() == "name as display_name" )); let drop = plan_one("drop", "age, profile.secret"); let drop = drop .operator(0) .expect("drop should produce one logical operator"); assert!(matches!( drop, LogicalOperator::Custom { stage, arguments, mutating: false, } if stage.as_str() == "drop" && arguments.as_ref() == "age, profile.secret" )); assert!(plan_one("distinct", "email").has_distinct()); assert!(plan_one("distinct", "").has_distinct()); assert!(plan_one("count", "as total").has_count()); assert!(plan_one("delete", "").has_delete()); assert!(plan_one("insert", "{ name: \"Alice\" }").has_insert()); assert!(plan_one("group", "country, city").has_group()); }
-    #[test] fn plans_set_with_structured_json_literals() { let plan = plan_one( "set", r#"definition = {"views":{"tile":[{"type":"metric","value":42}]}}, permissions = ["read","write"]"#, ); let assignments = plan .operator(0) .and_then(LogicalOperator::assignments) .expect("set should expose assignments"); assert_eq!(assignments.len(), 2); assert!(matches!( assignments[0].value().as_literal(), Some(Literal::Json(value)) if value.starts_with('{') )); assert!(matches!( assignments[1].value().as_literal(), Some(Literal::Json(value)) if value.starts_with('[') )); }
+    #[test] fn plans_all_simple_native_stages() { assert!(plan_one("where", "age >= 18").has_filter()); let near = plan_one("near", "embedding, [1.0, 0.0]"); assert!(matches!( near.operator(0), Some(PhysicalOperator::Custom { name: stage, arguments, writes: false, .. }) if stage.as_str() == "near" && arguments.as_ref() == "embedding, [1.0, 0.0]" )); let root = plan_one("root", "payload"); assert!(matches!( root.operator(0), Some(PhysicalOperator::Custom { name: stage, arguments, writes: false, .. }) if stage.as_str() == "root" && arguments.as_ref() == "payload" )); let sample = plan_one("sample", "5"); assert!(matches!( sample.operator(0), Some(PhysicalOperator::Custom { name: stage, arguments, writes: false, .. }) if stage.as_str() == "sample" && arguments.as_ref() == "5" )); assert!(plan_one("set", "enabled=true").has_set()); assert!(plan_one("load", "profile").has_load()); assert!(plan_one("limit", "10").has_limit()); assert!(plan_one("skip", "20").has_skip()); assert!(plan_one("sort", "age desc, name asc").has_sort()); assert!(plan_one("select", "name, profile.country").has_select()); let rename = plan_one("rename", "name as display_name"); let rename = rename .operator(0) .expect("rename should produce one logical operator"); assert!(matches!( rename, PhysicalOperator::Custom { name: stage, arguments, writes: false, .. } if stage.as_str() == "rename" && arguments.as_ref() == "name as display_name" )); let drop = plan_one("drop", "age, profile.secret"); let drop = drop .operator(0) .expect("drop should produce one logical operator"); assert!(matches!( drop, PhysicalOperator::Custom { name: stage, arguments, writes: false, .. } if stage.as_str() == "drop" && arguments.as_ref() == "age, profile.secret" )); assert!(plan_one("distinct", "email").has_distinct()); assert!(plan_one("distinct", "").has_distinct()); assert!(plan_one("count", "as total").has_count()); assert!(plan_one("delete", "").has_delete()); assert!(plan_one("insert", "{ name: \"Alice\" }").has_insert()); assert!(plan_one("group", "country, city").has_group()); }
+    #[test] fn plans_set_with_structured_json_literals() { let plan = plan_one( "set", r#"definition = {"views":{"tile":[{"type":"metric","value":42}]}}, permissions = ["read","write"]"#, ); let assignments = plan .operator(0) .and_then(PhysicalOperator::assignments) .expect("set should expose assignments"); assert_eq!(assignments.len(), 2); assert!(matches!( assignments[0].value().as_literal(), Some(Literal::Json(value)) if value.starts_with('{') )); assert!(matches!( assignments[1].value().as_literal(), Some(Literal::Json(value)) if value.starts_with('[') )); }
     #[test] fn plans_compact_group_with_alias_on_grouping_key_and_measures() { let plan = plan_one( "group", "Receptionnaire_Code as Client, Article_Code as Produit, CAFacture as CA", ); let operator = plan.operator(0).expect("group operator"); let fields = operator.group_keys().expect("group fields"); assert_eq!(fields.len(), 3); assert!(fields[0].to_string().starts_with(GROUP_KEY_MARKER_PREFIX)); assert!(fields[1].to_string().starts_with(GROUP_KEY_MARKER_PREFIX)); assert!(fields[2].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
-    #[test] fn plans_compound_group_with_aliases_on_by_keys() { let group = compound( "group", "", vec![ stage("by", "customer.country as Country, customer.city as City"), stage("sum", "CAFacture as Total_CA"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("data", [group])) .unwrap(); let fields = plan .operator(0) .and_then(LogicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 3); assert!(fields[0].to_string().starts_with(GROUP_KEY_MARKER_PREFIX)); assert!(fields[1].to_string().starts_with(GROUP_KEY_MARKER_PREFIX)); assert!(fields[2].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
-    #[test] fn compact_group_uses_all_but_last_item_as_dimensions() { let plan = plan_one("group", "x, y, z"); let fields = plan .operator(0) .and_then(LogicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 3); assert_eq!(fields[0].to_string(), "x"); assert_eq!(fields[1].to_string(), "y"); assert!(fields[2].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
-    #[test] fn compact_group_with_one_item_remains_a_pure_dimension() { let plan = plan_one("group", "x"); let fields = plan .operator(0) .and_then(LogicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 1); assert_eq!(fields[0].to_string(), "x"); }
+    #[test] fn plans_compound_group_with_aliases_on_by_keys() { let group = compound( "group", "", vec![ stage("by", "customer.country as Country, customer.city as City"), stage("sum", "CAFacture as Total_CA"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("data", [group])) .unwrap(); let fields = plan .operator(0) .and_then(PhysicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 3); assert!(fields[0].to_string().starts_with(GROUP_KEY_MARKER_PREFIX)); assert!(fields[1].to_string().starts_with(GROUP_KEY_MARKER_PREFIX)); assert!(fields[2].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
+    #[test] fn compact_group_uses_all_but_last_item_as_dimensions() { let plan = plan_one("group", "x, y, z"); let fields = plan .operator(0) .and_then(PhysicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 3); assert_eq!(fields[0].to_string(), "x"); assert_eq!(fields[1].to_string(), "y"); assert!(fields[2].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
+    #[test] fn compact_group_with_one_item_remains_a_pure_dimension() { let plan = plan_one("group", "x"); let fields = plan .operator(0) .and_then(PhysicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 1); assert_eq!(fields[0].to_string(), "x"); }
     #[test] fn plans_compact_group_with_automatic_sum_measure() { let plan = plan_one("group", "Article_Code, CAFacture as CA"); let operator = plan.operator(0).expect("group operator"); let fields = operator.group_keys().expect("group fields"); assert_eq!(fields.len(), 2); assert_eq!(fields[0].to_string(), "Article_Code"); assert!(fields[1].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
-    #[test] fn plans_compound_group_with_explicit_sum() { let group = compound( "group", "", vec![ stage("by", "Article_Code"), stage("sum", "CAFacture as Total_CA"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("data", [group])) .unwrap(); let fields = plan .operator(0) .and_then(LogicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 2); assert_eq!(fields[0].to_string(), "Article_Code"); assert!(fields[1].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
+    #[test] fn plans_compound_group_with_explicit_sum() { let group = compound( "group", "", vec![ stage("by", "Article_Code"), stage("sum", "CAFacture as Total_CA"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("data", [group])) .unwrap(); let fields = plan .operator(0) .and_then(PhysicalOperator::group_keys) .expect("group fields"); assert_eq!(fields.len(), 2); assert_eq!(fields[0].to_string(), "Article_Code"); assert!(fields[1].to_string().starts_with(GROUP_SUM_MARKER_PREFIX)); }
     #[test] fn compound_group_requires_by_directive() { let group = compound("group", "", vec![stage("sum", "CAFacture as Total_CA")]); let error = Planner::new() .plan(&PlannerPipeline::new("data", [group])) .unwrap_err(); assert!(error.to_string().contains("requires directive \"by\"")); }
     #[test] fn group_can_be_followed_by_sort() { let plan = Planner::new() .plan(&PlannerPipeline::new( "data", [stage("group", "Article_Code"), stage("sort", "count desc")], )) .unwrap(); assert_eq!(plan.len(), 2); assert!(plan.has_group()); assert!(plan.has_sort()); }
     #[test] fn aggregated_group_can_be_followed_by_sort() { let plan = Planner::new() .plan(&PlannerPipeline::new( "data", [ stage("group", "Article_Code, CAFacture as CA"), stage("sort", "CA desc"), ], )) .unwrap(); assert_eq!(plan.len(), 2); assert!(plan.has_group()); assert!(plan.has_sort()); }
     #[test] fn group_can_be_followed_by_select_and_limit() { let plan = Planner::new() .plan(&PlannerPipeline::new( "data", [ stage("group", "Article_Code"), stage("select", "Article_Code, count"), stage("limit", "10"), ], )) .unwrap(); assert_eq!(plan.len(), 3); assert!(plan.has_group()); assert!(plan.has_select()); assert!(plan.has_limit()); }
-    #[test] fn plans_offset_as_skip() { let plan = Planner::new() .plan(&PlannerPipeline::new("data", [stage("offset", "2")])) .unwrap(); assert!(matches!( plan.operator(0), Some(LogicalOperator::Skip { count: 2 }) )); }
-    #[test] fn plans_first_single_and_unwind() { for (name, args) in [ ("first", ""), ("first", "Article_Code"), ("single", ""), ("single", "Article_Code"), ("unwind", "data"), ] { let plan = Planner::new() .plan(&PlannerPipeline::new("data", [stage(name, args)])) .unwrap(); assert!( matches!(plan.operator(0), Some(LogicalOperator::Custom { stage, .. }) if stage.as_str() == name) ); } }
+    #[test] fn plans_offset_as_skip() { let plan = Planner::new() .plan(&PlannerPipeline::new("data", [stage("offset", "2")])) .unwrap(); assert!(matches!( plan.operator(0), Some(PhysicalOperator::Skip { count: 2 }) )); }
+    #[test] fn plans_first_single_and_unwind() { for (name, args) in [ ("first", ""), ("first", "Article_Code"), ("single", ""), ("single", "Article_Code"), ("unwind", "data"), ] { let plan = Planner::new() .plan(&PlannerPipeline::new("data", [stage(name, args)])) .unwrap(); assert!( matches!(plan.operator(0), Some(PhysicalOperator::Custom { name: stage, .. }) if stage.as_str() == name) ); } }
     #[test] fn validates_rename_syntax() { let error = Planner::new() .plan(&PlannerPipeline::new("users", [stage("rename", "name")])) .unwrap_err(); assert!(error .to_string() .contains("expected `<source> as <target>`")); let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("rename", "name as name")], )) .unwrap_err(); assert!(error.to_string().contains("must be different")); }
     #[test] fn validates_drop_field_list() { let error = Planner::new() .plan(&PlannerPipeline::new("users", [stage("drop", "")])) .unwrap_err(); assert!(error.to_string().contains("requires arguments")); }
     #[test] fn plans_insert_with_nested_object_value() { let specification = r#"{ _id: "u1", name: "John", active: true, tags: ["rust", "database"], address: { city: "Paris", }, }"#; let plan = plan_one("insert", specification); assert!(plan.has_insert()); assert!(!plan.is_read_only()); }
     #[test] fn plans_insert_ast_directly() { let source = r#"from users | insert { _id: "u1", name: "John", tags: ["rust", "database"], }"#; let ast = parse(source).unwrap(); let plan = Planner::new().plan_ast(source, &ast).unwrap(); assert!(plan.has_insert()); }
-    #[test] fn rejects_insert_scalar_value() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#""John""#)], )) .unwrap_err(); assert!(matches!(error.kind(), PlannerErrorKind::LogicalPlan { .. })); assert!(error .to_string() .contains("insert document must be an object")); }
-    #[test] fn plans_insert_array_as_a_batch_load() { let plan = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#"[{name: "John", n: -2}]"#)], )) .unwrap(); assert!(matches!(plan.operator(0), Some(LogicalOperator::StreamingLoad { mode: PhysicalLoadMode::Merge, chunks }) if chunks.len() == 1 && chunks[0].as_ref() == r#"[{"n":-2,"name":"John"}]"#)); let error = Planner::new() .plan(&PlannerPipeline::new("users", [stage("insert", "[1]")])) .unwrap_err(); assert!(error.to_string().contains("array of objects"), "{error}"); }
-    #[test] fn rejects_malformed_insert_object() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#"{name "John"}"#)], )) .unwrap_err(); assert!(matches!(error.kind(), PlannerErrorKind::LogicalPlan { .. })); assert!(error .to_string() .contains("invalid logical insert document")); assert!(error.to_string().contains("expected `:` after object key")); }
-    #[test] fn rejects_multiple_insert_values() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#"{name: "John"} {name: "Jane"}"#)], )) .unwrap_err(); assert!(matches!(error.kind(), PlannerErrorKind::LogicalPlan { .. })); assert!(error.to_string().contains("unexpected token")); }
-    #[test] fn plans_typed_pivot() { let pivot = compound( "pivot", "", vec![ stage("rows", "region"), stage("columns", "month"), stage("values", "revenue"), stage("aggregate", "sum"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("sales", [pivot])) .unwrap(); assert!(plan.has_pivot()); let specification = plan .operator(0) .and_then(LogicalOperator::pivot_specification) .expect("typed pivot specification"); assert_eq!(specification.rows().len(), 1); assert_eq!(specification.columns().len(), 1); assert_eq!(specification.values().len(), 1); assert_eq!(specification.values()[0].aggregate(), PivotAggregate::Sum); }
+    #[test] fn rejects_insert_scalar_value() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#""John""#)], )) .unwrap_err(); assert!(matches!(error.kind(), PlannerErrorKind::Plan { .. })); assert!(error .to_string() .contains("insert document must be an object")); }
+    #[test] fn plans_insert_array_as_a_batch_load() { let plan = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#"[{name: "John", n: -2}]"#)], )) .unwrap(); assert!(matches!(plan.operator(0), Some(PhysicalOperator::StreamingLoad { mode: PhysicalLoadMode::Merge, chunks }) if chunks.len() == 1 && chunks[0].as_ref() == r#"[{"n":-2,"name":"John"}]"#)); let error = Planner::new() .plan(&PlannerPipeline::new("users", [stage("insert", "[1]")])) .unwrap_err(); assert!(error.to_string().contains("array of objects"), "{error}"); }
+    #[test] fn rejects_malformed_insert_object() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#"{name "John"}"#)], )) .unwrap_err(); assert!(matches!(error.kind(), PlannerErrorKind::Plan { .. })); assert!(error .to_string() .contains("invalid insert document")); assert!(error.to_string().contains("expected `:` after object key")); }
+    #[test] fn rejects_multiple_insert_values() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("insert", r#"{name: "John"} {name: "Jane"}"#)], )) .unwrap_err(); assert!(matches!(error.kind(), PlannerErrorKind::Plan { .. })); assert!(error.to_string().contains("unexpected token")); }
+    #[test] fn plans_typed_pivot() { let pivot = compound( "pivot", "", vec![ stage("rows", "region"), stage("columns", "month"), stage("values", "revenue"), stage("aggregate", "sum"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("sales", [pivot])) .unwrap(); assert!(plan.has_pivot()); let specification = plan .operator(0) .and_then(PhysicalOperator::pivot_specification) .expect("typed pivot specification"); assert_eq!(specification.rows().len(), 1); assert_eq!(specification.columns().len(), 1); assert_eq!(specification.values().len(), 1); assert_eq!(specification.values()[0].aggregate(), PivotAggregate::Sum); }
     #[test] fn rejects_incomplete_or_duplicate_pivot_directives() { let incomplete = compound( "pivot", "", vec![stage("rows", "region"), stage("columns", "month")], ); let error = Planner::new() .plan(&PlannerPipeline::new("sales", [incomplete])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::MissingCompoundDirective { directive, .. } if directive.as_ref() == "values" )); let duplicate = compound( "pivot", "", vec![ stage("rows", "region"), stage("rows", "country"), stage("columns", "month"), stage("values", "revenue"), stage("aggregate", "sum"), ], ); let error = Planner::new() .plan(&PlannerPipeline::new("sales", [duplicate])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::DuplicateCompoundDirective { directive, .. } if directive.as_ref() == "rows" )); }
     #[test] fn plans_pivot_ast_directly() { let source = r#"on sales | pivot | rows region | columns month | values revenue | aggregate sum | end"#; let ast = parse(source).unwrap(); let plan = Planner::new().plan_ast(source, &ast).unwrap(); assert!(plan.has_pivot()); }
     #[test] fn normalizes_ast_with_source_alias() { let source = "on users as u | where active == true"; let ast = parse(source).unwrap(); let normalized = PlannerPipeline::from_ast(source, &ast).unwrap(); assert_eq!(normalized.source(), "users"); assert_eq!(normalized.source_alias(), Some("u")); assert_eq!(normalized.len(), 1); assert_eq!(normalized.stages()[0].name().as_str(), "where"); }
     #[test] fn normalizes_project_alias_to_select() { let source = "on users | project name, profile.country"; let ast = parse(source).unwrap(); let normalized = PlannerPipeline::from_ast(source, &ast).unwrap(); assert_eq!(normalized.len(), 1); assert_eq!(normalized.stages()[0].name().as_str(), "select"); assert_eq!(normalized.stages()[0].arguments(), "name, profile.country"); let plan = Planner::new().plan(&normalized).unwrap(); assert!(plan.has_select()); }
     #[test] fn plans_ast_directly() { let source = "on users | where active == true"; let ast = parse(source).unwrap(); let plan = Planner::new().plan_ast(source, &ast).unwrap(); assert!(plan.has_filter()); }
-    #[test] fn plans_lookup_compound_stage() { let lookup = compound( "lookup", "workspace as w", vec![stage("where", "w.public == true"), stage("into", "public")], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [lookup])) .unwrap(); let operator = plan.operator(0).unwrap(); assert!(matches!( operator, LogicalOperator::Lookup { collection, alias: Some(alias), into, pipeline, .. } if collection.as_ref() == "workspace" && alias.as_ref() == "w" && into.as_ref() == "public" && matches!(pipeline.as_ref(), [LogicalOperator::Filter { .. }]) )); }
-    #[test] fn plans_join_as_normalized_lookup() { let join = compound( "join", "workspace as w", vec![stage("where", "w.public == true"), stage("into", "public")], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [join])) .unwrap(); assert!(matches!( plan.operator(0).unwrap(), LogicalOperator::Lookup { .. } )); }
-    #[test] fn plans_union_compound_stage() { let union = compound( "union", "", vec![ stage("on", "archived_users"), stage("where", "active == true"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [union])) .unwrap(); assert!(matches!( plan.operator(0).unwrap(), LogicalOperator::Union { collection, alias: None, pipeline } if collection.as_ref() == "archived_users" && pipeline.len() == 1 )); }
-    #[test] fn plans_streaming_load() { let load = compound( "load", "", vec![ stage("with", "replace"), stage("chunk", "batch1"), stage("chunk", "batch2"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [load])) .unwrap(); assert!(plan.has_load()); assert!(plan.is_mutating()); assert!(matches!( plan.operator(0).unwrap(), LogicalOperator::StreamingLoad { mode: PhysicalLoadMode::Replace, chunks } if chunks.len() == 2 )); }
+    #[test] fn plans_lookup_compound_stage() { let lookup = compound( "lookup", "workspace as w", vec![stage("where", "w.public == true"), stage("into", "public")], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [lookup])) .unwrap(); let operator = plan.operator(0).unwrap(); assert!(matches!( operator, PhysicalOperator::Lookup { collection, alias: Some(alias), into, pipeline, .. } if collection.as_str() == "workspace" && alias.as_ref() == "w" && into.as_ref() == "public" && matches!(pipeline.operators(), [PhysicalOperator::Filter { .. }]) )); }
+    #[test] fn plans_join_as_normalized_lookup() { let join = compound( "join", "workspace as w", vec![stage("where", "w.public == true"), stage("into", "public")], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [join])) .unwrap(); assert!(matches!( plan.operator(0).unwrap(), PhysicalOperator::Lookup { .. } )); }
+    #[test] fn plans_union_compound_stage() { let union = compound( "union", "", vec![ stage("on", "archived_users"), stage("where", "active == true"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [union])) .unwrap(); assert!(matches!( plan.operator(0).unwrap(), PhysicalOperator::Union { collection, alias: None, pipeline } if collection.as_str() == "archived_users" && pipeline.len() == 1 )); }
+    #[test] fn plans_streaming_load() { let load = compound( "load", "", vec![ stage("with", "replace"), stage("chunk", "batch1"), stage("chunk", "batch2"), ], ); let plan = Planner::new() .plan(&PlannerPipeline::new("users", [load])) .unwrap(); assert!(plan.has_load()); assert!(plan.is_mutating()); assert!(matches!( plan.operator(0).unwrap(), PhysicalOperator::StreamingLoad { mode: PhysicalLoadMode::Replace, chunks } if chunks.len() == 2 )); }
     #[test] fn validates_lookup_directives() { let lookup = compound( "lookup", "workspace", vec![stage("where", "public == true")], ); let error = Planner::new() .plan(&PlannerPipeline::new("users", [lookup])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::MissingCompoundDirective { directive, .. } if directive.as_ref() == "into" )); }
     #[test] fn validates_union_source_is_first() { let union = compound( "union", "", vec![ stage("where", "active == true"), stage("on", "archived_users"), ], ); let error = Planner::new() .plan(&PlannerPipeline::new("users", [union])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::InvalidUnionSource { .. } )); }
     #[test] fn validates_streaming_load_directives() { let load = compound("load", "", vec![stage("with", "replace")]); let error = Planner::new() .plan(&PlannerPipeline::new("users", [load])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::MissingLoadChunk { .. } )); }
     #[test] fn rejects_mutating_stage_inside_lookup() { let lookup = compound( "lookup", "workspace", vec![stage("delete", ""), stage("into", "public")], ); let error = Planner::new() .plan(&PlannerPipeline::new("users", [lookup])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::InvalidCompoundChild { .. } )); }
     #[test] fn plans_combined_read_pipeline() { let pipeline = PlannerPipeline::new( "users", [ stage("where", "active == true"), stage("sort", "age desc, name"), stage("skip", "10"), stage("limit", "20"), stage("select", "name, age"), stage("distinct", "name"), ], ); let plan = Planner::new().plan(&pipeline).unwrap(); assert_eq!(plan.len(), 6); assert!(plan.is_read_only()); }
-    #[test] fn select_accepts_mixed_plain_and_aliased_fields() { let plan = plan_one("select", "CAFacture as CA, COGS"); let operator = plan .operator(0) .expect("select should produce one operator"); assert!(matches!( operator, LogicalOperator::Custom { stage, arguments, mutating: false, } if stage.as_str() == "select" && arguments.as_ref() == "CAFacture as CA, COGS" )); }
-    #[test] fn select_accepts_expression_projection_with_alias() { let plan = plan_one("select", "CAFacture as CA, COGS, CA - COGS as Marge"); let operator = plan .operator(0) .expect("select should produce one operator"); assert!(matches!( operator, LogicalOperator::Custom { stage, arguments, mutating: false, } if stage.as_str() == "select" && arguments.as_ref() == "CAFacture as CA, COGS, CA - COGS as Marge" )); }
+    #[test] fn select_accepts_mixed_plain_and_aliased_fields() { let plan = plan_one("select", "CAFacture as CA, COGS"); let operator = plan .operator(0) .expect("select should produce one operator"); assert!(matches!( operator, PhysicalOperator::Custom { name: stage, arguments, writes: false, .. } if stage.as_str() == "select" && arguments.as_ref() == "CAFacture as CA, COGS" )); }
+    #[test] fn select_accepts_expression_projection_with_alias() { let plan = plan_one("select", "CAFacture as CA, COGS, CA - COGS as Marge"); let operator = plan .operator(0) .expect("select should produce one operator"); assert!(matches!( operator, PhysicalOperator::Custom { name: stage, arguments, writes: false, .. } if stage.as_str() == "select" && arguments.as_ref() == "CAFacture as CA, COGS, CA - COGS as Marge" )); }
     #[test] fn select_requires_alias_for_expression_projection() { let error = Planner::new() .plan(&PlannerPipeline::new( "users", [stage("select", "price * quantity")], )) .unwrap_err(); assert!(error .to_string() .contains("expression projection requires an alias")); }
     #[test] fn validates_native_stage_arguments() { for name in [ "where", "near", "root", "sample", "set", "load", "limit", "skip", "sort", "select", "insert", "group", ] { let error = Planner::new() .plan(&PlannerPipeline::new("users", [stage(name, "")])) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::MissingStageArguments { .. } )); } assert!(matches!( Planner::new() .plan(&PlannerPipeline::new("users", [stage("delete", "now")])) .unwrap_err() .kind(), PlannerErrorKind::UnexpectedStageArguments { .. } )); }
     #[test] fn validates_limit_skip_sort_and_count_syntax() { for (name, arguments) in [ ("limit", "-1"), ("limit", "1 2"), ("skip", "one"), ("sample", "-1"), ("sample", "one"), ("sort", "age sideways"), ("count", "total"), ("count", "as total extra"), ] { assert!(matches!( Planner::new() .plan(&PlannerPipeline::new("users", [stage(name, arguments)])) .unwrap_err() .kind(), PlannerErrorKind::InvalidStageSyntax { .. } | PlannerErrorKind::InvalidStageItem { .. } )); } }
@@ -2402,5 +2581,5 @@ mod tests {
     #[test] fn rejects_custom_compound_stage() { let planner = Planner::with_options(PlannerOptions::new(true)); let error = planner .plan(&PlannerPipeline::new( "users", [compound("inspect", "", vec![stage("where", "true")])], )) .unwrap_err(); assert!(matches!( error.kind(), PlannerErrorKind::CompoundCustomStage { .. } )); }
     #[test] fn stage_locations_are_recursive() { let location = StageLocation::root(2).child(4).child(1); assert_eq!(location.to_string(), "2.4.1"); assert_eq!(location.depth(), 3); assert_eq!(location.index(0), Some(2)); assert_eq!(location.index(2), Some(1)); assert_eq!(location.index(3), None); }
     #[test] fn expression_parser_is_still_used_for_where() { let expression = parse_expression("age >= 18").unwrap(); assert_eq!( plan_one("where", "age >= 18") .operator(0) .unwrap() .predicate(), Some(&expression), ); }
-    #[test] fn compound_group_plans_keys_and_several_measures() { let source = "on orders | group | by region as zone, month | sum qty as units | sum price | end"; let ast = crate::query::parse(source).unwrap(); let plan = Planner::new().plan_ast(source, &ast).unwrap(); assert_eq!(plan.operator(0).and_then(LogicalOperator::group_keys).map(<[ExpressionFieldPath]>::len), Some(4)); }
+    #[test] fn compound_group_plans_keys_and_several_measures() { let source = "on orders | group | by region as zone, month | sum qty as units | sum price | end"; let ast = crate::query::parse(source).unwrap(); let plan = Planner::new().plan_ast(source, &ast).unwrap(); assert_eq!(plan.operator(0).and_then(PhysicalOperator::group_keys).map(<[ExpressionFieldPath]>::len), Some(4)); }
 }

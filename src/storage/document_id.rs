@@ -112,15 +112,26 @@ impl fmt::Debug for DocumentId {
         fmt::Display::fmt(self, f)
     }
 }
+impl DocumentId {
+    /// Lowercase hexadecimal, hyphenated, as [`fmt::Display`] writes it.
+    #[must_use]
+    pub fn hyphenated(&self) -> [u8; 36] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut text = [b'-'; 36];
+        let mut at = 0;
+        for (index, byte) in self.0.iter().enumerate() {
+            at += usize::from(matches!(index, 4 | 6 | 8 | 10));
+            text[at] = HEX[usize::from(byte >> 4)];
+            text[at + 1] = HEX[usize::from(byte & 15)];
+            at += 2;
+        }
+        text
+    }
+}
+
 impl fmt::Display for DocumentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, byte) in self.0.iter().enumerate() {
-            if matches!(index, 4 | 6 | 8 | 10) {
-                f.write_str("-")?;
-            }
-            write!(f, "{byte:02x}")?;
-        }
-        Ok(())
+        f.write_str(std::str::from_utf8(&self.hyphenated()).map_err(|_| fmt::Error)?)
     }
 }
 impl TryFrom<&str> for DocumentId {

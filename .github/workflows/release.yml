@@ -14,6 +14,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Loops aligned on 64 bytes: performance no longer moves with unrelated
+  # changes of code layout. With --target, RUSTFLAGS skips build scripts.
+  RUSTFLAGS: "-C llvm-args=-align-loops=64"
   EXPECTED_RELEASE_ARCHIVES: 19
 
 jobs:
@@ -216,9 +219,9 @@ jobs:
         if: matrix.builder == 'cross'
         shell: bash
         env:
-          # Target-specific flags are safer than global RUSTFLAGS here:
-          # host build scripts/proc-macros keep the runner's normal CPU baseline.
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.rustflags || '' }}
+          # Builds pass --target: host build scripts/proc-macros keep the
+          # runner's normal CPU baseline.
+          RUSTFLAGS: "-C llvm-args=-align-loops=64 ${{ matrix.rustflags || '' }}"
         run: |
           set -euo pipefail
 

@@ -842,7 +842,7 @@ impl PromptPrefixCache {
                 common_prefix_tokens: 0,
             };
         };
-        let common_prefix_tokens = common_prefix_len(&entry.reference_tokens, prompt_tokens);
+        let common_prefix_tokens = crate::helpers::common_prefix_len(&entry.reference_tokens, prompt_tokens);
         let can_restore = entry.prefix_tokens >= MIN_PREFIX_CACHE_TOKENS
             && entry.prefix_tokens < prompt_tokens.len()
             && entry.prefix_tokens <= common_prefix_tokens;
@@ -937,13 +937,6 @@ fn cache_capture_length( prompt_tokens: usize, common_prefix_tokens: usize, allo
     } else {
         prompt_tokens
     }
-}
-
-fn common_prefix_len(left: &[LlamaToken], right: &[LlamaToken]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
 }
 
 fn capture_sequence_state( context: &llama_cpp_2::context::LlamaContext<'_>, ) -> Result<Arc<SeqState>, String> {
@@ -1162,6 +1155,6 @@ impl Error for LlmError {}
 mod tests {
     use super::*;
 
-    #[test] fn common_prefix_stops_at_first_difference() { let left = [ LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(3), LlamaToken::new(4), ]; let right = [ LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(9), LlamaToken::new(4), ]; assert_eq!(common_prefix_len(&left, &right), 2); }
+    #[test] fn common_prefix_stops_at_first_difference() { let left = [ LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(3), LlamaToken::new(4), ]; let right = [ LlamaToken::new(1), LlamaToken::new(2), LlamaToken::new(9), LlamaToken::new(4), ]; assert_eq!(crate::helpers::common_prefix_len(&left, &right), 2); }
     #[test] fn cache_capture_prefers_stable_common_prefix() { assert_eq!(cache_capture_length(1000, 0, true), 1000); assert_eq!(cache_capture_length(1000, 650, true), 650); assert_eq!(cache_capture_length(1000, 64, true), 1000); assert_eq!(cache_capture_length(1000, 650, false), 0); }
 }

@@ -49,13 +49,13 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
         RoutedOperation::AuthEnrollComplete(Routed { id, input: ChallengeSignatureInput { challenge_id, signature } }) => {
             let enrollment = authentication.complete_enrollment(&challenge_id, &signature).map_err(auth_failed(id))?;
             let created_at = unix_time_millis();
-            let identity_query = format!("on _identities | insert {{identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}}}", query_string(&enrollment.identity_id), query_string(&enrollment.identity_public_key));
+            let identity_query = insert_query("_identities", serde_json::json!({"identityId": &enrollment.identity_id, "publicKey": &enrollment.identity_public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at}));
             query_documents(engine, id, identity_query)?;
             // Each failed step rolls back the records written before it.
-            let rollback_identity = format!( "on _identities | where identityId == {} | delete", query_string(&enrollment.identity_id) );
-            let device_query = format!("on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}}}", query_string(&enrollment.device_id), query_string(&enrollment.identity_id), query_string(&enrollment.device_public_key));
+            let rollback_identity = quoted!("on _identities | where identityId == {} | delete", &enrollment.identity_id);
+            let device_query = insert_query("_devices", serde_json::json!({"deviceId": &enrollment.device_id, "identityId": &enrollment.identity_id, "publicKey": &enrollment.device_public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at}));
             if let Err(response) = query_documents(engine, id, device_query) {
-                let _ = execute_request(engine, QueryRequest::new(id, rollback_identity));
+                let _ = query_run(engine, id, rollback_identity);
                 return Err(response.into());
             }
 
@@ -64,9 +64,9 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
             // Broader query/system permissions still require explicit grants.
             let permission_query = enrollment_events_permission_query(&enrollment.identity_id, created_at);
             if let Err(response) = query_documents(engine, id, permission_query) {
-                let rollback_device = format!( "on _devices | where deviceId == {} | delete", query_string(&enrollment.device_id) );
-                let _ = execute_request(engine, QueryRequest::new(id, rollback_device));
-                let _ = execute_request(engine, QueryRequest::new(id, rollback_identity));
+                let rollback_device = quoted!("on _devices | where deviceId == {} | delete", &enrollment.device_id);
+                let _ = query_run(engine, id, rollback_device);
+                let _ = query_run(engine, id, rollback_identity);
                 return Err(response.into());
             }
 
@@ -86,11 +86,11 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
             if identifier.is_empty() || identifier.len() > 200 { reject!(id, "auth.invalid_identifier", "identifier must contain between 1 and 200 bytes"); }
             if password.len() < CLASSIC_AUTH_MIN_PASSWORD_BYTES { reject!(id, "auth.weak_password", "password must contain at least 12 bytes"); }
             let normalized = identifier.to_lowercase();
-            let existing = query_documents(engine, id, format!("on _credentials | where loginNormalized == {} or identityId == {} | limit 1", query_string(&normalized), query_string(identity_id)))?;
+            let existing = query_documents(engine, id, quoted!("on _credentials | where loginNormalized == {} or identityId == {} | limit 1", &normalized, identity_id))?;
             if !existing.is_empty() { reject!(id, "auth.identifier_unavailable", "identifier or identity is already registered"); }
             let (salt, hash) = classic_password_hash(&password).map_err(failed(id, "auth.hash_failed"))?;
             let now = unix_time_millis();
-            query_documents(engine, id, format!("on _credentials | insert {{identityId: {}, login: {}, loginNormalized: {}, salt: {}, hash: {}, algorithm: \"argon2id\", memoryKiB: {}, iterations: {}, lanes: {}, state: \"active\", createdAt: {now}}}", query_string(identity_id), query_string(identifier), query_string(&normalized), query_string(&salt), query_string(&hash), CLASSIC_AUTH_MEMORY_KIB, CLASSIC_AUTH_ITERATIONS, CLASSIC_AUTH_LANES))?;
+            query_documents(engine, id, insert_query("_credentials", serde_json::json!({"identityId": identity_id, "login": identifier, "loginNormalized": &normalized, "salt": &salt, "hash": &hash, "algorithm": "argon2id", "memoryKiB": CLASSIC_AUTH_MEMORY_KIB, "iterations": CLASSIC_AUTH_ITERATIONS, "lanes": CLASSIC_AUTH_LANES, "state": "active", "createdAt": now})))?;
             reply(writer, id, serde_json::json!({"registered": true, "identifier": identifier}))?;
         }
         RoutedOperation::AuthClassicLogin(Routed { id, input: ClassicAuthLoginInput { identifier, password, device_id, public_key } }) => {
@@ -98,7 +98,7 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
             let normalized = identifier.trim().to_lowercase();
             if normalized.is_empty() || normalized.len() > 200 { reject!(id, "auth.invalid_credentials", "invalid identifier or password"); }
             if let Some(wait_ms) = classic_login_wait(settings, &normalized) { reject!(id, "auth.rate_limited", format!("retry after {wait_ms}ms")); }
-            let documents = query_documents(engine, id, format!("on _credentials | where loginNormalized == {} and state == \"active\" | limit 1", query_string(&normalized)))?;
+            let documents = query_documents(engine, id, quoted!("on _credentials | where loginNormalized == {} and state == \"active\" | limit 1", &normalized))?;
             let credential = documents.first().and_then(JsonValue::as_object);
             let valid = credential.and_then(|object| Some((object.get("salt")?.as_str()?, object.get("hash")?.as_str()?))).is_some_and(|(salt, hash)| classic_password_verify(&password, salt, hash));
             if !valid {
@@ -110,15 +110,15 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
             let identity_id = credential.and_then(|object| object.get("identityId")).and_then(JsonValue::as_str).unwrap_or_default().to_owned();
             if identity_id.is_empty() { reject!(id, "auth.invalid_credentials", "invalid identifier or password"); }
             validate_ed25519_public_key(&public_key).map_err(failed(id, "auth.invalid_public_key"))?;
-            let identities = query_documents(engine, id, format!("on _identities | where identityId == {} and state == \"active\" | limit 1", query_string(&identity_id)))?;
+            let identities = query_documents(engine, id, quoted!("on _identities | where identityId == {} and state == \"active\" | limit 1", &identity_id))?;
             if identities.is_empty() { reject!(id, "auth.invalid_credentials", "invalid identifier or password"); }
             if let Some(existing) = try_load_device_credential(engine, id, &identity_id, &device_id)? {
                 if !existing.active || existing.public_key != public_key { reject!(id, "auth.device_mismatch", "device identifier is already registered with different credentials"); }
             } else {
-                let collision = query_documents(engine, id, format!("on _devices | where deviceId == {} | limit 1", query_string(&device_id)))?;
+                let collision = query_documents(engine, id, quoted!("on _devices | where deviceId == {} | limit 1", &device_id))?;
                 if !collision.is_empty() { reject!(id, "auth.device_mismatch", "device identifier is already registered"); }
                 let now = unix_time_millis();
-                query_documents(engine, id, format!("on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {now}}}", query_string(&device_id), query_string(&identity_id), query_string(&public_key)))?;
+                query_documents(engine, id, insert_query("_devices", serde_json::json!({"deviceId": &device_id, "identityId": &identity_id, "publicKey": &public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": now})))?;
             }
             reply(writer, id, serde_json::json!({"accepted": true, "identityId": identity_id, "deviceId": device_id}))?;
         }
@@ -136,7 +136,7 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
                 (device, false)
             } else {
                 let now = unix_time_millis();
-                query_documents(engine, id, format!("on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", sourceDeviceId: {}, createdAt: {now}}}", query_string(&target_device_id), query_string(&portable.identity_id), query_string(&portable.public_key), query_string(&source_device_id)))?;
+                query_documents(engine, id, insert_query("_devices", serde_json::json!({"deviceId": &target_device_id, "identityId": &portable.identity_id, "publicKey": &portable.public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "sourceDeviceId": &source_device_id, "createdAt": now})))?;
                 (DeviceCredential { identity_id: portable.identity_id.clone(), device_id: target_device_id.clone(), public_key: portable.public_key.clone(), algorithm: "ed25519".to_owned(), encoding: "spki-der".to_owned(), active: true }, true)
             };
             let principal = authentication.establish(&device).map_err(auth_failed(id))?;
@@ -147,7 +147,7 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
             let portable = IdentityCredential::renew(identity_id).map_err(failed(id, "identity.generate_failed"))?;
             let bytes = identity_file::encrypt_bytes(&portable, password.as_bytes()).map_err(failed(id, "identity.encrypt_failed"))?;
             let now = unix_time_millis();
-            query_documents(engine, id, format!( "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {now}}}", query_string(&portable.device_id), query_string(identity_id), query_string(&portable.public_key), ))?;
+            query_documents(engine, id, insert_query("_devices", serde_json::json!({"deviceId": &portable.device_id, "identityId": identity_id, "publicKey": &portable.public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": now})))?;
             reply(writer, id, serde_json::json!({ "file": encode_base64(&bytes), "fileName": format!("{identity_id}.ogid"), "identityId": identity_id, "deviceId": portable.device_id, }))?;
         }
         RoutedOperation::IdentityRenew(Routed { id, input: IdentityRenewInput { device_id, public_key, password } }) => {
@@ -163,9 +163,9 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
             validate_ed25519_public_key(&public_key).map_err(failed(id, "identity.invalid_public_key"))?;
             let now = unix_time_millis();
             for query in [
-                format!("on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {now}}}", query_string(&device_id), query_string(&identity_id), query_string(&public_key)),
-                format!("on _identities | where identityId == {} | set publicKey = {}, algorithm = \"ed25519\", encoding = \"spki-der\", updatedAt = {now}", query_string(&identity_id), query_string(&public_key)),
-                format!("on _devices | where deviceId == {} and identityId == {} | set state = \"revoked\", revokedAt = {now}", query_string(&current_device_id), query_string(&identity_id)),
+                insert_query("_devices", serde_json::json!({"deviceId": &device_id, "identityId": &identity_id, "publicKey": &public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": now})),
+                quoted!("on _identities | where identityId == {} | set publicKey = {}, algorithm = \"ed25519\", encoding = \"spki-der\", updatedAt = {now}", &identity_id, &public_key),
+                quoted!("on _devices | where deviceId == {} and identityId == {} | set state = \"revoked\", revokedAt = {now}", &current_device_id, &identity_id),
             ] { query_documents(engine, id, query)?; }
             let principal = Principal::Identity { identity_id: identity_id.clone(), device_id: device_id.clone() };
             if portable_file.is_some() {
@@ -182,7 +182,7 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
         }
         RoutedOperation::DeviceIdentify(Routed { id, .. }) => {
             let identity_id = require_identity(authentication.principal(), id, "authentication is required")?;
-            let documents = query_documents(engine, id, format!("on _devices | where identityId == {} and state == \"active\" | sort createdAt asc", query_string(identity_id)))?;
+            let documents = query_documents(engine, id, quoted!("on _devices | where identityId == {} and state == \"active\" | sort createdAt asc", identity_id))?;
             let devices = documents.iter().enumerate().filter_map(|(index, device)| device.str_field("deviceId").map(|device_id| serde_json::json!({"deviceId": device_id, "number": index + 1}))).collect::<Vec<_>>();
             let payload = serde_json::json!({"identityId": identity_id, "expiresAt": unix_time_millis().saturating_add(15_000), "devices": devices});
             event_engine.publish_to(Audience::identities([identity_id.to_owned()]), "device.identify", payload.clone());
@@ -199,12 +199,12 @@ pub(super) fn handle_identity_operation(writer: &mut TcpStream, settings: &Conne
     match operation {
         RoutedOperation::IdentityRegister(Routed { id, input: IdentityRegisterInput { identity_id, public_key, algorithm, encoding, created_at } }) => {
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _identities | insert {{identityId: {}, publicKey: {}, algorithm: {}, encoding: {}, state: \"active\", createdAt: {created_at}}}", query_string(&identity_id), query_string(&public_key), query_string(&algorithm), query_string(&encoding), );
+            let query = insert_query("_identities", serde_json::json!({"identityId": &identity_id, "publicKey": &public_key, "algorithm": &algorithm, "encoding": &encoding, "state": "active", "createdAt": created_at}));
             write_query_then_publish(writer, engine, id, query, Audience::identities([identity_id.clone()]), "identity.created", serde_json::json!({"identityId": identity_id, "createdAt": created_at}))
         }
         RoutedOperation::DeviceList(Routed { id, .. }) => {
             let (identity_id, current_device_id) = authenticated_device(principal, id, "authentication is required")?;
-            let documents = query_documents(engine, id, format!("on _devices | where identityId == {} | sort createdAt asc", query_string(&identity_id)))?;
+            let documents = query_documents(engine, id, quoted!("on _devices | where identityId == {} | sort createdAt asc", &identity_id))?;
             let devices = documents.into_iter().map(|mut device| {
                 if let Some(object) = device.as_object_mut() {
                     let current = object.str_field("deviceId") == Some(current_device_id.as_str());
@@ -222,7 +222,7 @@ pub(super) fn handle_identity_operation(writer: &mut TcpStream, settings: &Conne
                 reject!(id, "device.not_found", "device does not belong to the authenticated identity");
             }
             let updated_at = unix_time_millis();
-            query_documents(engine, id, format!("on _devices | where deviceId == {} and identityId == {} | set name = {}, updatedAt = {updated_at}", query_string(&device_id), query_string(identity_id), query_string(name)))?;
+            query_documents(engine, id, quoted!("on _devices | where deviceId == {} and identityId == {} | set name = {}, updatedAt = {updated_at}", &device_id, identity_id, name))?;
             let renamed = serde_json::json!({"deviceId": device_id, "name": name, "updatedAt": updated_at});
             publish_durable_event(engine, Audience::identities([identity_id.to_owned()]), "device.renamed", renamed.clone());
             Ok(reply(writer, id, renamed)?)
@@ -232,7 +232,7 @@ pub(super) fn handle_identity_operation(writer: &mut TcpStream, settings: &Conne
                 ensure_operation_resource_authorized(settings, engine, principal, id, OperationKind::DeviceRegister, "_devices")?;
             }
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: {}, encoding: {}, state: \"active\", createdAt: {created_at}}}", query_string(&device_id), query_string(&identity_id), query_string(&public_key), query_string(&algorithm), query_string(&encoding), );
+            let query = insert_query("_devices", serde_json::json!({"deviceId": &device_id, "identityId": &identity_id, "publicKey": &public_key, "algorithm": &algorithm, "encoding": &encoding, "state": "active", "createdAt": created_at}));
             write_query_then_publish(writer, engine, id, query, Audience::identities([identity_id.clone()]), "device.registered", serde_json::json!({"deviceId": device_id, "identityId": identity_id, "createdAt": created_at}))
         }
         RoutedOperation::DeviceRevoke(Routed { id, input: DeviceRevokeInput { device_id, revoked_at } }) => {

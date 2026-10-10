@@ -126,10 +126,7 @@ impl<'a> FileSyncSource<'a> {
                 .ok_or_else(|| "app.list returned no apps array".to_owned())?
         } else {
             let id = self.next_request_id();
-            match execute_request(self.engine, QueryRequest::new(id, "on _apps | where state == \"active\" | sort name")) {
-                QueryResponse::Ok { documents, .. } => documents,
-                response => return Err(query_response_message(response)),
-            }
+            query_documents(self.engine, id, "on _apps | where state == \"active\" | sort name").map_err(query_response_message)?
         };
         let mut apps = HashMap::new();
         for document in documents {
@@ -147,11 +144,8 @@ impl<'a> FileSyncSource<'a> {
                 .ok_or_else(|| format!("app.instance.list returned no instances array for Place {place_id}"))?
         } else {
             let id = self.next_request_id();
-            let query = format!("on _app_instances | where placeId == {} and state == \"active\" | sort createdAt", query_string(place_id));
-            match execute_request(self.engine, QueryRequest::new(id, query)) {
-                QueryResponse::Ok { documents, .. } => documents,
-                response => return Err(query_response_message(response)),
-            }
+            let query = quoted!("on _app_instances | where placeId == {} and state == \"active\" | sort createdAt", place_id);
+            query_documents(self.engine, id, query).map_err(query_response_message)?
         };
         let mut instances = HashMap::new();
         for document in documents {

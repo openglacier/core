@@ -260,6 +260,21 @@ pub(super) fn handle_agent_operation(writer: &mut TcpStream, settings: &Connecti
 #[cfg(feature = "database")]
 pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, operation: RoutedOperation) -> Handled {
     match operation {
+        RoutedOperation::QueryStages(Routed { id, .. }) => {
+            use crate::query::{Arguments, Effect, Flow, STAGE_CATALOG};
+            let stages = STAGE_CATALOG.iter().map(|entry| serde_json::json!({
+                "name": entry.name,
+                "aliases": entry.aliases,
+                "simple": entry.simple.map(Arguments::as_str),
+                "compound": entry.compound.map(Arguments::as_str),
+                "placement": entry.placement.as_str(),
+                "terminal": entry.is_terminal(),
+                "writes": entry.effect == Effect::Write,
+                "blocking": entry.flow == Flow::GovernedBlocking,
+                "summary": entry.summary,
+            })).collect::<Vec<_>>();
+            reply(writer, id, serde_json::json!({ "stages": stages }))?;
+        }
         RoutedOperation::CollectionsList(Routed { id, input: CollectionsListInput { stats, place_id, app_instance_id } }) => {
             if let Some(place_id) = place_id.as_deref() {
                 let delegated = delegation.is_some_and(|value| {

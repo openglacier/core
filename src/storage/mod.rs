@@ -4,12 +4,11 @@
 pub mod backend;
 mod common;
 pub mod glacier;
+pub mod history;
 pub mod memory;
+pub use history::{AsOf, Temporal, TemporalCache};
 pub use backend::{
-    glacier::{
-        GlacierBackend, GlacierCollectionMetadata, GlacierFieldMetadata, GlacierFormatInfo,
-        GLACIER_FORMAT_VERSION, GLACIER_PAGE_SIZE,
-    },
+    glacier::{GlacierBackend, GlacierCollectionMetadata, GlacierFieldMetadata, GlacierFormatInfo, GLACIER_FORMAT_VERSION, GLACIER_PAGE_SIZE},
     memory::MemoryBackend,
     StorageBackend,
 };
@@ -17,69 +16,12 @@ pub use glacier::GlacierStorage;
 pub use memory::MemoryStorage;
 
 use common::validate_collection_id;
-use std::{
-    error::Error as StdError,
-    fmt,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-};
+use std::{error::Error as StdError, fmt, sync::Arc};
 
 use crate::model::{Document, FieldPath, FieldPathSegment, Value};
 
 /// Result returned by storage operations.
 pub type StorageResult<T> = std::result::Result<T, StorageError>;
-
-/// Diagnostic counters for the borrowed projected-value group consumer.
-///
-/// Timings are sampled by the execution engine and published in nanoseconds;
-/// hit/miss/materialization counters are exact. Keeping these counters outside
-/// the row loop avoids adding atomics to the analytical hot path.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct GroupConsumerProbeSnapshot {
-    pub samples: u64,
-    pub key_encode_ns: u64,
-    pub lookup_ns: u64,
-    pub insert_ns: u64,
-    pub aggregate_ns: u64,
-    pub lookup_hits: u64,
-    pub lookup_misses: u64,
-    pub key_materializations: u64,
-}
-
-static GROUP_CONSUMER_SAMPLES: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_KEY_ENCODE_NS: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_INSERT_NS: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_AGGREGATE_NS: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_LOOKUP_HITS: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_LOOKUP_MISSES: AtomicU64 = AtomicU64::new(0);
-static GROUP_CONSUMER_KEY_MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn record_group_consumer_probe(delta: GroupConsumerProbeSnapshot) {
-    GROUP_CONSUMER_SAMPLES.fetch_add(delta.samples, Ordering::Relaxed);
-    GROUP_CONSUMER_KEY_ENCODE_NS.fetch_add(delta.key_encode_ns, Ordering::Relaxed);
-    GROUP_CONSUMER_LOOKUP_NS.fetch_add(delta.lookup_ns, Ordering::Relaxed);
-    GROUP_CONSUMER_INSERT_NS.fetch_add(delta.insert_ns, Ordering::Relaxed);
-    GROUP_CONSUMER_AGGREGATE_NS.fetch_add(delta.aggregate_ns, Ordering::Relaxed);
-    GROUP_CONSUMER_LOOKUP_HITS.fetch_add(delta.lookup_hits, Ordering::Relaxed);
-    GROUP_CONSUMER_LOOKUP_MISSES.fetch_add(delta.lookup_misses, Ordering::Relaxed);
-    GROUP_CONSUMER_KEY_MATERIALIZATIONS.fetch_add(delta.key_materializations, Ordering::Relaxed);
-}
-
-pub(crate) fn group_consumer_probe_snapshot() -> GroupConsumerProbeSnapshot {
-    GroupConsumerProbeSnapshot {
-        samples: GROUP_CONSUMER_SAMPLES.load(Ordering::Relaxed),
-        key_encode_ns: GROUP_CONSUMER_KEY_ENCODE_NS.load(Ordering::Relaxed),
-        lookup_ns: GROUP_CONSUMER_LOOKUP_NS.load(Ordering::Relaxed),
-        insert_ns: GROUP_CONSUMER_INSERT_NS.load(Ordering::Relaxed),
-        aggregate_ns: GROUP_CONSUMER_AGGREGATE_NS.load(Ordering::Relaxed),
-        lookup_hits: GROUP_CONSUMER_LOOKUP_HITS.load(Ordering::Relaxed),
-        lookup_misses: GROUP_CONSUMER_LOOKUP_MISSES.load(Ordering::Relaxed),
-        key_materializations: GROUP_CONSUMER_KEY_MATERIALIZATIONS.load(Ordering::Relaxed),
-    }
-}
 
 /// Scalar projected value borrowed directly from storage bytes when possible.
 ///
@@ -396,12 +338,179 @@ impl FieldFacts {
     }
 }
 
+/// Rows of one projected block, column by column: `columns[field][row]` is
+/// the value of field `field` for the row whose locator is `ids[row]`.
+#[derive(Debug)]
+pub struct ProjectedBlock<'b, 'a> {
+    pub rows: usize,
+    /// `rows` locators, or none when the scan was
+    /// [`ScanOptions::without_locators`].
+    pub ids: &'b [(DocumentId, DocumentVersion)],
+    pub columns: &'b [BlockColumn<'b, 'a>],
+    /// Per column, when its strings come from a dictionary: their codes.
+    pub codes: &'b [Option<BlockCodes<'b>>],
+    /// Every row holds a value at every column's path, known before
+    /// decoding (`false` claims nothing).
+    pub complete: bool,
+}
+
+/// Decides from some columns of each block whether a block scan decodes the
+/// others and visits it ([`StorageRead::scan_projected_blocks_each`]).
+pub struct BlockGate<'g> {
+    /// Per field, whether `admit` reads its column; the others are empty,
+    /// and so are the locators.
+    pub fields: Vec<bool>,
+    pub admit: &'g mut dyn for<'a> FnMut(&ProjectedBlock<'_, 'a>) -> StorageResult<bool>,
+}
+
+impl std::fmt::Debug for BlockGate<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("BlockGate").field("fields", &self.fields).finish_non_exhaustive()
+    }
+}
+
+/// Visits `block` unless `gate` refuses it.
+pub fn visit_gated<'a>(gate: &mut Option<BlockGate<'_>>, block: &ProjectedBlock<'_, 'a>, visitor: &mut dyn for<'x> FnMut(&ProjectedBlock<'_, 'x>) -> StorageResult<bool>) -> StorageResult<bool> {
+    if let Some(gate) = gate {
+        if !(gate.admit)(block)? {
+            return Ok(true);
+        }
+    }
+    visitor(block)
+}
+
+/// One column of a [`ProjectedBlock`]: any values, or one slice of a single
+/// kind when every row of the block holds that kind (no copy per cell).
+#[derive(Clone, Copy, Debug)]
+pub enum BlockColumn<'b, 'a> {
+    /// `None`: the row lacks the field.
+    Values(&'b [Option<ProjectedValueRef<'a>>]),
+    Signed(&'b [i64]),
+    Unsigned(&'b [u64]),
+    Floats(&'b [f64]),
+    Strings(&'b [&'a str]),
+}
+
+impl<'a> BlockColumn<'_, 'a> {
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Values(values) => values.len(),
+            Self::Signed(values) => values.len(),
+            Self::Unsigned(values) => values.len(),
+            Self::Floats(values) => values.len(),
+            Self::Strings(values) => values.len(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Value of `row`, as [`StorageRead::scan_projected_row_refs_unordered_each`] gives it.
+    #[inline]
+    #[must_use]
+    pub fn get(&self, row: usize) -> Option<ProjectedValueRef<'a>> {
+        match self {
+            Self::Values(values) => values[row].clone(),
+            Self::Signed(values) => Some(ProjectedValueRef::Signed(values[row])),
+            Self::Unsigned(values) => Some(ProjectedValueRef::Unsigned(values[row])),
+            Self::Floats(values) => Some(ProjectedValueRef::Float(values[row])),
+            Self::Strings(values) => Some(ProjectedValueRef::String(values[row])),
+        }
+    }
+}
+
+/// Dictionary codes of a block column: `codes[row]` for a string cell,
+/// [`BlockCodes::NONE`] for any other cell. Under one `dictionary`, equal
+/// codes are equal strings and different codes different strings; distinct
+/// dictionaries have distinct identifiers within one scan.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockCodes<'b> {
+    pub dictionary: u64,
+    pub codes: &'b [u32],
+}
+
+impl BlockCodes<'_> {
+    pub const NONE: u32 = u32::MAX;
+}
+
+/// What one row group of a stored collection holds for one top-level field
+/// ([`StorageRead::scan_projected_blocks_each`]), deleted rows
+/// included: never narrower than its visible rows.
+#[derive(Clone, Debug)]
+pub struct GroupFacts<'a> {
+    /// Some row lacks the field.
+    pub missing: bool,
+    /// Kinds of the values present.
+    pub kinds: Vec<crate::model::PhysicalKind>,
+    pub bounds: &'a FieldBounds,
+}
+
+/// Bounds of the values one top-level field takes, per kind: every visible
+/// value of that kind lies within them. Bounds may be wider than the visible
+/// values (deleted rows), never narrower; `None` for a kind no value takes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FieldBounds {
+    pub signed: Option<(i64, i64)>,
+    pub unsigned: Option<(u64, u64)>,
+    pub float: Option<(f64, f64)>,
+    /// Smallest and largest string; also `None` when strings exist but
+    /// their bounds are unknown.
+    pub string: Option<(Arc<str>, Arc<str>)>,
+}
+
+impl FieldBounds {
+    /// Widens the bounds to hold `value`.
+    pub fn add(&mut self, value: &Value) {
+        fn widen<T: PartialOrd + Copy>(bounds: &mut Option<(T, T)>, value: T) {
+            *bounds = Some(match *bounds {
+                None => (value, value),
+                Some((low, high)) => (if value < low { value } else { low }, if value > high { value } else { high }),
+            });
+        }
+        match value {
+            Value::Number(crate::Number::Signed(value)) => widen(&mut self.signed, *value),
+            Value::Number(crate::Number::Unsigned(value)) => widen(&mut self.unsigned, *value),
+            Value::Number(crate::Number::Float(value)) => widen(&mut self.float, *value),
+            Value::String(value) => {
+                self.string = Some(match self.string.take() {
+                    None => (value.clone(), value.clone()),
+                    Some((low, high)) => (if value < &low { value.clone() } else { low }, if value > &high { value.clone() } else { high }),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Widens the bounds to hold `other`'s.
+    pub fn merge(&mut self, other: &Self) {
+        for (low, high) in [other.signed].into_iter().flatten() {
+            self.add(&Value::signed(low));
+            self.add(&Value::signed(high));
+        }
+        for (low, high) in [other.unsigned].into_iter().flatten() {
+            self.add(&Value::unsigned(low));
+            self.add(&Value::unsigned(high));
+        }
+        for (low, high) in [other.float].into_iter().flatten() {
+            self.add(&Value::Number(crate::Number::Float(low)));
+            self.add(&Value::Number(crate::Number::Float(high)));
+        }
+        if let Some((low, high)) = &other.string {
+            self.add(&Value::String(low.clone()));
+            self.add(&Value::String(high.clone()));
+        }
+    }
+}
+
 /// Options controlling a collection scan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanOptions {
     limit: Option<usize>,
     direction: ScanDirection,
     reusable_projection: bool,
+    without_locators: bool,
+    number_codes: u64,
 }
 
 impl ScanOptions {
@@ -413,6 +522,8 @@ impl ScanOptions {
             limit: None,
             direction: ScanDirection::Forward,
             reusable_projection: false,
+            without_locators: false,
+            number_codes: 0,
         }
     }
 
@@ -458,6 +569,38 @@ impl ScanOptions {
     #[inline]
     pub const fn reusable_projection(self) -> bool {
         self.reusable_projection
+    }
+
+    /// Tells a block scan the caller never reads identifiers or versions:
+    /// [`ProjectedBlock::ids`] may then be empty.
+    #[must_use]
+    pub const fn without_locators(mut self) -> Self {
+        self.without_locators = true;
+        self
+    }
+
+    /// Returns whether the caller declined identifiers and versions.
+    #[must_use]
+    #[inline]
+    pub const fn locators(self) -> bool {
+        !self.without_locators
+    }
+
+    /// Asks a projected block scan for the dictionary codes of number cells
+    /// of the fields at the set bits (bit `i`: `fields[i]`); string cells
+    /// carry theirs anyway.
+    #[must_use]
+    #[inline]
+    pub const fn with_number_codes(mut self, fields: u64) -> Self {
+        self.number_codes = fields;
+        self
+    }
+
+    /// Fields whose number cells should carry dictionary codes.
+    #[must_use]
+    #[inline]
+    pub const fn number_codes(self) -> u64 {
+        self.number_codes
     }
 }
 
@@ -623,6 +766,20 @@ pub trait StorageRead {
         Ok(None)
     }
 
+    /// A generation no later than the last commit that changed `collection`
+    /// and that changes whenever it does (`None`: the view cannot tell): what
+    /// was computed from the collection holds while it stays the same.
+    fn changed(&self, _collection: &CollectionId) -> StorageResult<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Value bounds of the top-level fields of the collection visible to this
+    /// view (see [`FieldBounds`]); `None` when the view cannot tell. A field
+    /// absent from the map has unknown bounds.
+    fn field_bounds(&self, _collection: &CollectionId) -> StorageResult<Option<std::collections::BTreeMap<String, FieldBounds>>> {
+        Ok(None)
+    }
+
     /// Visits the identifier and version of every visible document, without
     /// reading documents when the backend indexes them; stops when `visitor`
     /// returns `false`. The order is unspecified.
@@ -644,6 +801,19 @@ pub trait StorageRead {
         collection: &CollectionId,
         id: &DocumentId,
     ) -> StorageResult<Option<StoredDocument>>;
+
+    /// Rows by identifier, visited in the order given with their position
+    /// (`None` for an identifier without a row); the visitor stops the
+    /// visit by returning `false`. Ascending identifiers let a native store
+    /// read them like a sparse scan.
+    fn get_each(&self, collection: &CollectionId, ids: &[DocumentId], visitor: &mut dyn FnMut(usize, Option<StoredDocument>) -> StorageResult<bool>) -> StorageResult<()> {
+        for (index, id) in ids.iter().enumerate() {
+            if !visitor(index, self.get(collection, id)?)? {
+                break;
+            }
+        }
+        Ok(())
+    }
 
     /// Scans a collection using deterministic identifier ordering.
     ///
@@ -672,66 +842,6 @@ pub trait StorageRead {
         Ok(())
     }
 
-    /// Visits a collection while retaining only the requested field paths.
-    ///
-    /// The default implementation projects documents after a normal scan so
-    /// existing backends remain compatible. Native stores may override this
-    /// method to avoid materializing unrelated fields.
-    fn scan_projected_each(
-        &self,
-        collection: &CollectionId,
-        options: ScanOptions,
-        fields: &[FieldPath],
-        visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>,
-    ) -> StorageResult<()> {
-        if fields.is_empty() {
-            return self.scan_each(collection, options, visitor);
-        }
-
-        self.scan_each(collection, options, &mut |stored| {
-            let (id, version, document) = stored.into_parts();
-            let projected = project_document(document.as_ref(), fields);
-            let stored = StoredDocument::new(id, version, Arc::new(projected))?;
-            visitor(stored)
-        })
-    }
-
-    /// Visits a collection without requiring identifier order, retaining only requested fields.
-    ///
-    /// Analytical operators whose result is independent of source order should prefer this
-    /// cursor. The default preserves compatibility by using the ordered projected scan. Native
-    /// stores may override it with a physical/sequential scan.
-    fn scan_projected_unordered_each(
-        &self,
-        collection: &CollectionId,
-        options: ScanOptions,
-        fields: &[FieldPath],
-        visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>,
-    ) -> StorageResult<()> {
-        self.scan_projected_each(collection, options, fields, visitor)
-    }
-
-    /// Visits projected field values directly in the same order as `fields`.
-    ///
-    /// Analytical consumers can use this cursor to avoid constructing a
-    /// temporary projected [`Document`] for every source row. Backends with a
-    /// physical field directory should override this method.
-    fn scan_projected_values_unordered_each(
-        &self,
-        collection: &CollectionId,
-        options: ScanOptions,
-        fields: &[FieldPath],
-        visitor: &mut dyn FnMut(&[Option<Value>]) -> StorageResult<bool>,
-    ) -> StorageResult<()> {
-        self.scan_projected_unordered_each(collection, options, fields, &mut |stored| {
-            let values = fields
-                .iter()
-                .map(|path| value_at_field_path(stored.document(), path).cloned())
-                .collect::<Vec<_>>();
-            visitor(&values)
-        })
-    }
-
     /// Visits projected scalar values without materializing owned runtime values.
     ///
     /// The default adapts the established owned projected-value cursor. Native
@@ -754,90 +864,52 @@ pub trait StorageRead {
             &[Option<ProjectedValueRef<'a>>],
         ) -> StorageResult<bool>,
     ) -> StorageResult<()> {
-        self.scan_projected_unordered_each(collection, options, fields, &mut |stored| {
-            let id = *stored.id();
-            let version = stored.version();
+        self.scan_each(collection, options, &mut |stored| {
             let values = fields
                 .iter()
-                .map(|path| {
-                    value_at_field_path(stored.document(), path).map(|value| match value {
-                        Value::Null => ProjectedValueRef::Null,
-                        Value::Bool(value) => ProjectedValueRef::Bool(*value),
-                        Value::Number(crate::Number::Signed(value)) => {
-                            ProjectedValueRef::Signed(*value)
-                        }
-                        Value::Number(crate::Number::Unsigned(value)) => {
-                            ProjectedValueRef::Unsigned(*value)
-                        }
-                        Value::Number(crate::Number::Float(value)) => {
-                            ProjectedValueRef::Float(*value)
-                        }
-                        Value::String(value) => ProjectedValueRef::String(value.as_ref()),
-                        Value::Array(_) | Value::Object(_) => {
-                            ProjectedValueRef::Owned(value.clone())
-                        }
-                    })
-                })
+                .map(|path| value_at_field_path(stored.document(), path).map(ProjectedValueRef::borrowed))
                 .collect::<Vec<_>>();
-            visitor(id, version, &values)
+            visitor(*stored.id(), stored.version(), &values)
         })
     }
 
-    fn scan_projected_value_refs_unordered_each(
+    /// Whether [`Self::scan_projected_blocks_each`] is native
+    /// (several rows per block). Consumers fall back to row cursors otherwise.
+    fn supports_projected_blocks(&self) -> bool {
+        false
+    }
+
+    /// Draws `count` distinct visible documents uniformly at random (from
+    /// `seed`), in no particular order, reading only those: the number of
+    /// visible documents and the drawn locators. `None` when the backend
+    /// cannot draw by position, or `count` is not below the visible count;
+    /// callers then read every locator.
+    fn sample_row_ids(&self, _collection: &CollectionId, _count: usize, _seed: u64) -> StorageResult<Option<(u64, Vec<(DocumentId, DocumentVersion)>)>> {
+        Ok(None)
+    }
+
+    /// Visits projected values block by block (see [`ProjectedBlock`]).
+    /// Values follow the conventions of
+    /// [`Self::scan_projected_row_refs_unordered_each`]; `options.limit()`
+    /// caps the rows. Before reading a row group, a backend that knows its
+    /// facts may call `skip` with them, one per field of `fields` (`None`:
+    /// unknown), and leaves out every row of the group when it returns
+    /// `true`. A `gate` sees each block first (when the scan has no limit);
+    /// a backend may decode only the columns it reads before it decides. The
+    /// default skips nothing and emits one row per block, without codes.
+    fn scan_projected_blocks_each(
         &self,
         collection: &CollectionId,
         options: ScanOptions,
         fields: &[FieldPath],
-        visitor: &mut dyn for<'a> FnMut(&[Option<ProjectedValueRef<'a>>]) -> StorageResult<bool>,
+        _skip: &dyn Fn(&[Option<GroupFacts<'_>>]) -> bool,
+        mut gate: Option<BlockGate<'_>>,
+        visitor: &mut dyn for<'a> FnMut(&ProjectedBlock<'_, 'a>) -> StorageResult<bool>,
     ) -> StorageResult<()> {
-        self.scan_projected_values_unordered_each(collection, options, fields, &mut |values| {
-            let refs = values
-                .iter()
-                .map(|value| {
-                    value.as_ref().map(|value| match value {
-                        Value::Null => ProjectedValueRef::Null,
-                        Value::Bool(value) => ProjectedValueRef::Bool(*value),
-                        Value::Number(crate::Number::Signed(value)) => {
-                            ProjectedValueRef::Signed(*value)
-                        }
-                        Value::Number(crate::Number::Unsigned(value)) => {
-                            ProjectedValueRef::Unsigned(*value)
-                        }
-                        Value::Number(crate::Number::Float(value)) => {
-                            ProjectedValueRef::Float(*value)
-                        }
-                        Value::String(value) => ProjectedValueRef::String(value.as_ref()),
-                        Value::Array(_) | Value::Object(_) => {
-                            ProjectedValueRef::Owned(value.clone())
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            visitor(&refs)
-        })
-    }
-
-    /// Visits projected values with a source-side gate. The first
-    /// `gate_field_count` slots are sufficient for `gate` to decide whether
-    /// downstream-only slots need to be materialized. Backends may override
-    /// this to defer decoding those trailing slots until the gate accepts.
-    fn scan_projected_values_gated_unordered_each(
-        &self,
-        collection: &CollectionId,
-        options: ScanOptions,
-        fields: &[FieldPath],
-        gate_field_count: usize,
-        gate: &mut dyn FnMut(&[Option<Value>]) -> StorageResult<bool>,
-        visitor: &mut dyn FnMut(&[Option<Value>]) -> StorageResult<bool>,
-    ) -> StorageResult<()> {
-        let gate_field_count = gate_field_count.min(fields.len());
-        self.scan_projected_values_unordered_each(collection, options, fields, &mut |values| {
-            let _ = gate_field_count;
-            if gate(values)? {
-                visitor(values)
-            } else {
-                Ok(true)
-            }
+        self.scan_projected_row_refs_unordered_each(collection, options, fields, &mut |id, version, row| {
+            let columns = row.iter().map(std::slice::from_ref).map(BlockColumn::Values).collect::<Vec<_>>();
+            let codes = vec![None; columns.len()];
+            visit_gated(&mut gate, &ProjectedBlock { rows: 1, ids: &[(id, version)], columns: &columns, codes: &codes, complete: false }, visitor)
         })
     }
 
@@ -860,16 +932,15 @@ pub trait StorageRead {
             &[Option<Value>],
         ) -> StorageResult<bool>,
     ) -> StorageResult<()> {
-        let gate_field_count = gate_field_count.min(fields.len());
+        let _ = gate_field_count;
         let mut projected = Vec::with_capacity(fields.len());
-        self.scan_projected_unordered_each(collection, options, fields, &mut |stored| {
+        self.scan_each(collection, options, &mut |stored| {
             projected.clear();
             projected.extend(
                 fields
                     .iter()
                     .map(|path| value_at_field_path(stored.document(), path).cloned()),
             );
-            let _ = gate_field_count;
             if gate(&projected)? {
                 visitor(*stored.id(), stored.version(), &projected)
             } else {
@@ -1062,6 +1133,10 @@ pub trait StorageTransaction: StorageRead {
         Ok(stored)
     }
 
+    /// Moves the pending writes out of memory, to commit them later as
+    /// they are; `false` when the backend keeps them in memory.
+    fn spill(&mut self) -> StorageResult<bool> { Ok(false) }
+
     /// Commits all transaction changes atomically.
     fn commit(self: Box<Self>) -> StorageResult<CommitResult>;
 
@@ -1096,17 +1171,15 @@ impl<B> BackendStorage<B> {
         &self.backend
     }
 
-    /// Consumes the façade and returns its backend.
-    #[must_use]
-    #[inline]
-    pub fn into_backend(self) -> B {
-        self.backend
-    }
 }
 
 impl<B: StorageBackend> StorageEngine for BackendStorage<B> {
     fn read(&self) -> StorageResult<Box<dyn StorageRead + '_>> {
         self.backend.read()
+    }
+
+    fn read_temporal(&self, temporal: &Temporal, cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + '_>> {
+        self.backend.read_temporal(temporal, cache)
     }
 
     fn begin(&self) -> StorageResult<Box<dyn StorageTransaction + '_>> {
@@ -1130,6 +1203,13 @@ impl<B: StorageBackend> StorageEngine for BackendStorage<B> {
 pub trait StorageEngine: Send + Sync {
     /// Opens a consistent read snapshot.
     fn read(&self) -> StorageResult<Box<dyn StorageRead + '_>>;
+
+    /// Opens a read view of a past state (`as of`) or of the stored versions
+    /// of a collection (`history`); see [`history`]. `cache` is shared by
+    /// the reads of one query. The default keeps no history.
+    fn read_temporal(&self, _temporal: &Temporal, _cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + '_>> {
+        Err(StorageError::history_unavailable())
+    }
 
     /// Begins a multi-collection transaction.
     fn begin(&self) -> StorageResult<Box<dyn StorageTransaction + '_>>;
@@ -1285,6 +1365,12 @@ impl StorageError {
             expected,
             actual,
         })
+    }
+
+    /// Creates the error of a temporal read on a store that keeps no history.
+    #[must_use]
+    pub fn history_unavailable() -> Self {
+        Self::backend("history: this store does not keep history (`as of` and `history` need OGD_HISTORY=on, or the glacier backend)")
     }
 
     /// Creates a transaction-closed error.

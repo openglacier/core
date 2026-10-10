@@ -10,9 +10,10 @@ use crate::Document;
 
 use super::super::{
     common::{ensure_version, increment_counter, next_generation},
+    history::{temporal_read, CommitRecord, HistoryEvent, HistoryOp, HistorySource, Timeline},
     CollectionId, CommitResult, DeleteResult, DocumentId, DocumentVersion, InsertResult,
     ReplaceResult, ScanDirection, ScanOptions, StorageError, StorageMutation, StorageRead,
-    StorageResult, StorageTransaction, StoredDocument, VersionPrecondition,
+    StorageResult, StorageTransaction, StoredDocument, Temporal, TemporalCache, VersionPrecondition,
 };
 use super::StorageBackend;
 
@@ -22,6 +23,26 @@ use super::StorageBackend;
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBackend {
     inner: Arc<RwLock<MemoryState>>,
+    /// Every version and deletion since creation, when history is kept.
+    history: Option<Arc<RwLock<MemoryHistory>>>,
+}
+
+/// Events of every collection and the commit records, appended under the
+/// state write lock so they follow the generation order.
+#[derive(Debug, Default)]
+struct MemoryHistory {
+    events: BTreeMap<CollectionId, Vec<HistoryEvent>>,
+    timeline: Vec<CommitRecord>,
+}
+
+impl MemoryHistory {
+    fn put(&mut self, collection: &CollectionId, generation: u64, stored: &StoredDocument) {
+        self.events.entry(collection.clone()).or_default().push(HistoryEvent { generation, op: HistoryOp::Put, id: *stored.id(), version: stored.version(), document: Some(stored.shared_document()) });
+    }
+
+    fn delete(&mut self, collection: &CollectionId, generation: u64, id: DocumentId) {
+        self.events.entry(collection.clone()).or_default().push(HistoryEvent { generation, op: HistoryOp::Delete, id, version: DocumentVersion::NONE, document: None });
+    }
 }
 
 impl MemoryBackend {
@@ -30,6 +51,27 @@ impl MemoryBackend {
     #[inline]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates an empty in-memory storage engine that keeps every version
+    /// (for `as of` and `history` reads). Old versions stay in memory.
+    #[must_use]
+    pub fn with_history() -> Self {
+        let history = MemoryHistory { timeline: vec![CommitRecord::now(0)], ..MemoryHistory::default() };
+        Self { inner: Arc::default(), history: Some(Arc::new(RwLock::new(history))) }
+    }
+
+    /// Whether this engine keeps history.
+    #[must_use]
+    pub const fn keeps_history(&self) -> bool { self.history.is_some() }
+
+    /// Runs `record` on the history, when kept.
+    fn record_history(&self, record: impl FnOnce(&mut MemoryHistory)) -> StorageResult<()> {
+        if let Some(history) = &self.history {
+            let mut history = history.write().map_err(|_| StorageError::backend("in-memory history lock poisoned"))?;
+            record(&mut history);
+        }
+        Ok(())
     }
 
     /// Returns the current committed generation.
@@ -70,8 +112,17 @@ impl MemoryBackend {
             return Ok(());
         }
 
+        let cleared = state.collections.keys().cloned().collect::<Vec<_>>();
         state.collections.clear();
         state.generation = next_generation(state.generation)?;
+        let generation = state.generation;
+        state.changed.extend(cleared.iter().map(|collection| (collection.clone(), generation)));
+        self.record_history(|history| {
+            for collection in &cleared {
+                history.events.entry(collection.clone()).or_default().push(HistoryEvent { generation, op: HistoryOp::Clear, id: DocumentId::from_bytes([0; 16]), version: DocumentVersion::NONE, document: None });
+            }
+            history.timeline.push(CommitRecord::now(generation));
+        })?;
 
         Ok(())
     }
@@ -97,6 +148,18 @@ impl StorageBackend for MemoryBackend {
         };
 
         Ok(Box::new(snapshot))
+    }
+
+    fn read_temporal(&self, temporal: &Temporal, cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + '_>> {
+        let Some(history) = &self.history else {
+            return Err(StorageError::history_unavailable());
+        };
+        let snapshot = {
+            let state = self.read_state()?;
+            MemorySnapshot::from_state(&state)
+        };
+        let source = MemoryHistorySource { history: Arc::clone(history), generation: snapshot.generation };
+        temporal_read(Box::new(snapshot), Box::new(source), temporal, cache)
     }
 
     fn begin(&self) -> StorageResult<Box<dyn StorageTransaction + '_>> {
@@ -158,11 +221,20 @@ impl StorageBackend for MemoryBackend {
             }
         }
 
+        state.generation = next_generation(state.generation)?;
+        let generation = state.generation;
+        state.changed.insert(collection.clone(), generation);
+        self.record_history(|history| {
+            for document in staged.values() {
+                history.put(collection, generation, document);
+            }
+            history.timeline.push(CommitRecord::now(generation));
+        })?;
         let target = state.collections.entry(collection.clone()).or_default();
+        let target = Arc::make_mut(target);
         for (id, document) in staged {
             target.insert(id, document);
         }
-        state.generation = next_generation(state.generation)?;
 
         Ok((stored, CommitResult::new(inserted, replaced, 0)))
     }
@@ -217,11 +289,20 @@ impl StorageBackend for MemoryBackend {
             }
         }
 
+        state.generation = next_generation(state.generation)?;
+        let generation = state.generation;
+        state.changed.insert(collection.clone(), generation);
+        self.record_history(|history| {
+            for document in staged.values() {
+                history.put(collection, generation, document);
+            }
+            history.timeline.push(CommitRecord::now(generation));
+        })?;
         let target = state.collections.entry(collection.clone()).or_default();
+        let target = Arc::make_mut(target);
         for (id, document) in staged {
             target.insert(id, document);
         }
-        state.generation = next_generation(state.generation)?;
 
         Ok(CommitResult::new(inserted, replaced, 0))
     }
@@ -231,9 +312,13 @@ impl StorageBackend for MemoryBackend {
 pub(super) struct MemoryState {
     pub(super) generation: u64,
     pub(super) collections: Collections,
+    /// The generation of the last commit that changed each collection.
+    pub(super) changed: BTreeMap<CollectionId, u64>,
 }
 
-pub(super) type Collections = BTreeMap<CollectionId, Collection>;
+/// Each collection is shared by the snapshots and transactions that read it,
+/// and copied only when one writes it.
+pub(super) type Collections = BTreeMap<CollectionId, Arc<Collection>>;
 pub(crate) type Collection = BTreeMap<DocumentId, StoredDocument>;
 
 /// Immutable in-memory read snapshot.
@@ -241,6 +326,7 @@ pub(crate) type Collection = BTreeMap<DocumentId, StoredDocument>;
 struct MemorySnapshot {
     generation: u64,
     collections: Collections,
+    changed: BTreeMap<CollectionId, u64>,
 }
 
 impl MemorySnapshot {
@@ -248,16 +334,53 @@ impl MemorySnapshot {
         Self {
             generation: state.generation,
             collections: state.collections.clone(),
+            changed: state.changed.clone(),
         }
     }
 
-    #[allow(dead_code)]
-    const fn generation(&self) -> u64 {
-        self.generation
+}
+
+/// History of a [`MemoryBackend`] at one snapshot generation.
+struct MemoryHistorySource {
+    history: Arc<RwLock<MemoryHistory>>,
+    generation: u64,
+}
+
+impl HistorySource for MemoryHistorySource {
+    fn generation(&self) -> u64 { self.generation }
+
+    fn floor(&self) -> u64 { 0 }
+
+    fn events(&self, collection: &CollectionId, after: u64, upto: u64, ids: Option<&std::collections::HashSet<DocumentId>>, _documents: bool, visitor: &mut dyn FnMut(HistoryEvent) -> StorageResult<bool>) -> StorageResult<()> {
+        let upto = upto.min(self.generation);
+        let history = self.history.read().map_err(|_| StorageError::backend("in-memory history lock poisoned"))?;
+        let Some(events) = history.events.get(collection) else { return Ok(()) };
+        let start = events.partition_point(|event| event.generation <= after);
+        for event in &events[start..] {
+            if event.generation > upto {
+                break;
+            }
+            if ids.is_some_and(|ids| event.op != HistoryOp::Clear && !ids.contains(&event.id)) {
+                continue;
+            }
+            if !visitor(event.clone())? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn timeline(&self) -> StorageResult<Timeline> {
+        let history = self.history.read().map_err(|_| StorageError::backend("in-memory history lock poisoned"))?;
+        Ok(Timeline::new(history.timeline.iter().filter(|record| record.generation <= self.generation).cloned().collect()))
     }
 }
 
 impl StorageRead for MemorySnapshot {
+    fn changed(&self, collection: &CollectionId) -> StorageResult<Option<u64>> {
+        Ok(Some(self.changed.get(collection).copied().unwrap_or(0)))
+    }
+
     fn get( &self, collection: &CollectionId, id: &DocumentId, ) -> StorageResult<Option<StoredDocument>> {
         Ok(get_document(&self.collections, collection, id))
     }
@@ -291,7 +414,7 @@ impl StorageRead for MemorySnapshot {
     }
 
     fn count(&self, collection: &CollectionId) -> StorageResult<u64> {
-        let count = self.collections.get(collection).map_or(0, BTreeMap::len);
+        let count = self.collections.get(collection).map_or(0, |documents| documents.len());
         u64::try_from(count).map_err(|_| StorageError::backend("collection count overflow"))
     }
 
@@ -312,6 +435,10 @@ struct MemoryTransaction<'storage> {
     inserted: u64,
     replaced: u64,
     deleted: u64,
+    /// Puts (`Some`) and deletes (`None`) in order, when history is kept.
+    changes: Option<Vec<(CollectionId, DocumentId, Option<StoredDocument>)>>,
+    /// The collections it writes.
+    touched: std::collections::BTreeSet<CollectionId>,
 }
 
 impl<'storage> MemoryTransaction<'storage> {
@@ -323,11 +450,24 @@ impl<'storage> MemoryTransaction<'storage> {
             inserted: 0,
             replaced: 0,
             deleted: 0,
+            changes: storage.history.is_some().then(Vec::new),
+            touched: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn record(&mut self, collection: &CollectionId, id: DocumentId, stored: Option<&StoredDocument>) {
+        if !self.touched.contains(collection) {
+            self.touched.insert(collection.clone());
+        }
+        if let Some(changes) = &mut self.changes {
+            changes.push((collection.clone(), id, stored.cloned()));
         }
     }
 
     fn insert_batch( &mut self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<Vec<StoredDocument>> {
+        self.touched.insert(collection.clone());
         let target = self.collections.entry(collection.clone()).or_default();
+        let target = Arc::make_mut(target);
         let mut pending = BTreeMap::new();
         let mut stored = Vec::with_capacity(mutations.len());
 
@@ -351,6 +491,11 @@ impl<'storage> MemoryTransaction<'storage> {
             .checked_add(stored.len() as u64)
             .ok_or_else(|| StorageError::backend("in-memory mutation counter overflow"))?;
         target.append(&mut pending);
+        if self.changes.is_some() {
+            for document in &stored {
+                self.record(collection, *document.id(), Some(document));
+            }
+        }
         Ok(stored)
     }
 }
@@ -365,7 +510,7 @@ impl StorageRead for MemoryTransaction<'_> {
     }
 
     fn count(&self, collection: &CollectionId) -> StorageResult<u64> {
-        let count = self.collections.get(collection).map_or(0, BTreeMap::len);
+        let count = self.collections.get(collection).map_or(0, |documents| documents.len());
         u64::try_from(count).map_err(|_| StorageError::backend("collection count overflow"))
     }
 
@@ -381,6 +526,7 @@ impl StorageRead for MemoryTransaction<'_> {
 impl StorageTransaction for MemoryTransaction<'_> {
     fn insert( &mut self, collection: &CollectionId, id: DocumentId, document: Arc<Document>, ) -> StorageResult<InsertResult> {
         let target = self.collections.entry(collection.clone()).or_default();
+        let target = Arc::make_mut(target);
 
         match target.entry(id) {
             Entry::Occupied(_) => Err(StorageError::document_already_exists(
@@ -392,6 +538,7 @@ impl StorageTransaction for MemoryTransaction<'_> {
 
                 entry.insert(stored.clone());
                 self.inserted = increment_counter(self.inserted)?;
+                self.record(collection, id, Some(&stored));
 
                 Ok(InsertResult::new(stored))
             }
@@ -402,7 +549,7 @@ impl StorageTransaction for MemoryTransaction<'_> {
         let target = self
             .collections
             .get_mut(collection)
-            .and_then(|documents| documents.get_mut(id))
+            .and_then(|documents| Arc::make_mut(documents).get_mut(id))
             .ok_or_else(|| StorageError::document_not_found(collection.clone(), *id))?;
 
         let previous_version = target.version();
@@ -413,6 +560,7 @@ impl StorageTransaction for MemoryTransaction<'_> {
 
         *target = stored.clone();
         self.replaced = increment_counter(self.replaced)?;
+        self.record(collection, *id, Some(&stored));
 
         Ok(ReplaceResult::new(previous_version, stored))
     }
@@ -433,6 +581,7 @@ impl StorageTransaction for MemoryTransaction<'_> {
                 .get_mut(collection)
                 .ok_or_else(|| StorageError::document_not_found(collection.clone(), *id))?;
 
+            let documents = Arc::make_mut(documents);
             let removed = documents
                 .remove(id)
                 .ok_or_else(|| StorageError::document_not_found(collection.clone(), *id))?;
@@ -446,11 +595,13 @@ impl StorageTransaction for MemoryTransaction<'_> {
         }
 
         self.deleted = increment_counter(self.deleted)?;
+        self.record(collection, *id, None);
 
         Ok(DeleteResult::new(*id, current_version))
     }
 
     fn apply_batch( &mut self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<Vec<StoredDocument>> {
+        self.touched.insert(collection.clone());
         if mutations
             .iter()
             .all(|mutation| matches!(mutation, StorageMutation::Insert { .. }))
@@ -460,6 +611,8 @@ impl StorageTransaction for MemoryTransaction<'_> {
 
         let mut stored = Vec::with_capacity(mutations.len());
         let target = self.collections.entry(collection.clone()).or_default();
+        let target = Arc::make_mut(target);
+        let record = self.changes.is_some();
 
         for mutation in mutations {
             match mutation {
@@ -495,6 +648,11 @@ impl StorageTransaction for MemoryTransaction<'_> {
             }
         }
 
+        if record {
+            for document in &stored {
+                self.record(collection, *document.id(), Some(document));
+            }
+        }
         Ok(stored)
     }
 
@@ -506,6 +664,8 @@ impl StorageTransaction for MemoryTransaction<'_> {
             inserted,
             replaced,
             deleted,
+            changes,
+            touched,
         } = *self;
 
         let mutation_count = inserted
@@ -530,6 +690,18 @@ impl StorageTransaction for MemoryTransaction<'_> {
         let next_generation = next_generation(state.generation)?;
         state.collections = collections;
         state.generation = next_generation;
+        state.changed.extend(touched.into_iter().map(|collection| (collection, next_generation)));
+        if let Some(changes) = changes {
+            storage.record_history(|history| {
+                for (collection, id, stored) in &changes {
+                    match stored {
+                        Some(stored) => history.put(collection, next_generation, stored),
+                        None => history.delete(collection, next_generation, *id),
+                    }
+                }
+                history.timeline.push(CommitRecord::now(next_generation));
+            })?;
+        }
 
         Ok(result)
     }
@@ -576,6 +748,7 @@ mod tests {
     }
 
     #[test] fn new_storage_is_empty() { let storage = MemoryBackend::new(); assert_eq!(storage.generation().unwrap(), 0); assert_eq!(storage.collection_count().unwrap(), 0); assert_eq!(storage.document_count().unwrap(), 0); }
+    #[test] fn snapshots_share_each_collection_until_it_is_written() { let storage = MemoryBackend::new(); let write = |name: &str, id: &str| { let mut transaction = storage.begin().unwrap(); transaction.insert(&collection(name), document_id(id), Arc::new(Document::new())).unwrap(); transaction.commit().unwrap(); }; write("a", "1"); write("b", "2"); let before = MemorySnapshot::from_state(&storage.read_state().unwrap()); write("b", "3"); let after = MemorySnapshot::from_state(&storage.read_state().unwrap()); assert!(Arc::ptr_eq(&before.collections[&collection("a")], &after.collections[&collection("a")])); assert!(!Arc::ptr_eq(&before.collections[&collection("b")], &after.collections[&collection("b")])); assert_eq!((before.collections[&collection("b")].len(), after.collections[&collection("b")].len()), (1, 2)); assert_eq!((before.changed(&collection("a")).unwrap(), after.changed(&collection("b")).unwrap()), (Some(1), Some(3))); }
     #[test] fn empty_snapshot_has_no_collections() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot.collections().unwrap().is_empty()); assert!(!snapshot.collection_exists(&collection("users")).unwrap()); }
     #[test] fn missing_document_returns_none() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot .get(&collection("users"), &document_id("42")) .unwrap() .is_none()); }
     #[test] fn missing_collection_scan_is_empty() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot .scan(&collection("users"), ScanOptions::default()) .unwrap() .is_empty()); }

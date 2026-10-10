@@ -26,6 +26,7 @@ pub mod operation;
 pub mod query;
 pub mod service;
 pub mod daemon;
+pub mod view;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod spill;
@@ -69,5 +70,5 @@ mod tests {
 
 pub mod engine;
 pub mod storage;
-pub use engine::{ Engine, EngineError, EngineErrorKind, EngineResult, PlanLowerer, PlannedQuery, QueryOutput, };
+pub use engine::{ Engine, EngineError, EngineErrorKind, EngineResult, PlannedQuery, QueryOutput, };
 pub mod protocol;

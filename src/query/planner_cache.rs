@@ -15,17 +15,7 @@ pub struct PlannerCacheStats {
     pub misses: u64,
     pub evictions: u64,
 }
-impl PlannerCacheStats {
-    #[must_use]
-    pub fn hit_rate(self) -> f64 {
-        let n = self.hits.saturating_add(self.misses);
-        if n == 0 {
-            0.0
-        } else {
-            self.hits as f64 / n as f64
-        }
-    }
-}
+impl PlannerCacheStats {}
 
 #[derive(Debug)]
 struct CacheEntry {

@@ -10,9 +10,9 @@ use super::execution_properties::{
     Bound, CardinalityEffect, Effect, ExecutionProperties, Fields, Flow, Materialization, Order, Reads,
     ProjectedAccess, ProjectionReuse, Shape,
 };
-use super::{AccessVector, Expression, ExpressionFieldPath, SetAssignment, SortKey, StageName};
+use super::{AccessVector, Expression, ExpressionFieldPath, Placement, SetAssignment, SortKey, Stage, StageName};
 
-use super::logical_plan::{InsertDocument, PivotSpecification};
+use super::plan_values::{InsertDocument, PivotSpecification};
 
 /// Result returned by physical planning operations.
 pub type PhysicalPlanResult<T> = std::result::Result<T, PhysicalPlanError>;
@@ -155,12 +155,6 @@ impl PhysicalPlan {
             .any(|operator| matches!(operator, PhysicalOperator::StreamingLoad { .. }))
     }
 
-    /// Returns whether no operator follows the source scan.
-    #[must_use]
-    pub fn is_scan_only(&self) -> bool {
-        self.operators.is_empty()
-    }
-
     /// Returns the number of operators after the source.
     #[must_use]
     #[inline]
@@ -230,6 +224,7 @@ impl MemoryExecutionMode {
 pub struct PhysicalSource {
     collection: CollectionId,
     access: PhysicalAccess,
+    temporal: Option<crate::storage::Temporal>,
 }
 
 impl PhysicalSource {
@@ -241,6 +236,7 @@ impl PhysicalSource {
             access: PhysicalAccess::CollectionScan {
                 options: ScanOptions::default(),
             },
+            temporal: None,
         }
     }
 
@@ -250,6 +246,7 @@ impl PhysicalSource {
         Self {
             collection,
             access: PhysicalAccess::PrimaryKeyLookup { id },
+            temporal: None,
         }
     }
 
@@ -259,6 +256,7 @@ impl PhysicalSource {
         Self {
             collection,
             access: PhysicalAccess::CollectionScan { options },
+            temporal: None,
         }
     }
 
@@ -279,6 +277,19 @@ impl PhysicalSource {
     pub const fn with_access(mut self, access: PhysicalAccess) -> Self {
         self.access = access;
         self
+    }
+
+    /// Reads the source at a past state or as its history.
+    #[must_use]
+    pub fn with_temporal(mut self, temporal: Option<crate::storage::Temporal>) -> Self {
+        self.temporal = temporal;
+        self
+    }
+
+    /// The temporal read of the source (`as of`, `history`), if any.
+    #[must_use]
+    pub const fn temporal(&self) -> Option<&crate::storage::Temporal> {
+        self.temporal.as_ref()
     }
 }
 
@@ -503,23 +514,19 @@ pub enum PhysicalOperator {
     /// Reshapes rows according to one validated pivot specification.
     Pivot { specification: PivotSpecification },
 
-    /// Extension operator preserved for a registered external executor.
+    /// A stage run through its compiled form or the runtime: a built-in
+    /// stage of the catalogue (`derive`, `first`, `unwind`, `into`, …) or an
+    /// extension stage.
     Custom {
         name: StageName,
         arguments: Arc<str>,
+        /// The built-in stage (`None`: an extension stage).
+        stage: Option<Stage>,
+        /// The stage writes (from the catalogue).
         writes: bool,
-        changes_cardinality: bool,
-        /// Declared maximum number of rows the stage lets through, in order.
+        /// Rows the stage lets through (`first`, `single`) or retains
+        /// (`sample n`) at most.
         row_bound: Option<usize>,
-        /// Declared: the stage leaves the fields of the rows it keeps untouched.
-        preserves_fields: bool,
-        /// Declared: the stage requires exactly `row_bound` rows (`single`).
-        exact_rows: bool,
-        /// Declared: the stage turns one row into zero or more rows, in
-        /// order, without buffering (`unwind`).
-        expands_rows: bool,
-        /// Declared: the stage may drop rows, one at a time, without buffering (`near`).
-        filters_rows: bool,
         /// The stage compiled once for the whole plan, when the runtime
         /// knows it; rows then never re-parse the stage arguments.
         compiled: Option<Arc<super::CompiledStage>>,
@@ -731,8 +738,9 @@ impl PhysicalOperator {
         Self::Pivot { specification }
     }
 
-    /// Creates an extension operator.
-    pub fn custom( name: StageName, arguments: impl AsRef<str>, writes: bool, changes_cardinality: bool, ) -> PhysicalPlanResult<Self> {
+    /// Creates the operator of a stage run through its compiled form or the
+    /// runtime; its effect and row bound come from the stage catalogue.
+    pub fn custom( name: StageName, arguments: impl AsRef<str> ) -> PhysicalPlanResult<Self> {
         let arguments = arguments.as_ref();
         if arguments.chars().any(char::is_control) {
             return Err(PhysicalPlanError::new(
@@ -741,25 +749,17 @@ impl PhysicalOperator {
                 },
             ));
         }
+        let stage = Stage::parse(name.as_str());
+        let writes = stage.is_some_and(|stage| stage.entry().effect == Effect::Write);
+        let row_bound = match stage {
+            Some(Stage::First | Stage::Single) => Some(1),
+            Some(Stage::Sample) => arguments.trim().parse().ok(),
+            _ => None,
+        };
         // A stage that fails to compile keeps its text: running it reports the
         // same error as before, at the first row.
-        let compiled = if writes {
-            None
-        } else {
-            super::CompiledStage::compile(name.as_str(), arguments).ok().flatten().map(Arc::new)
-        };
-        Ok(Self::Custom {
-            name,
-            arguments: Arc::from(arguments),
-            writes,
-            changes_cardinality,
-            row_bound: None,
-            preserves_fields: false,
-            exact_rows: false,
-            expands_rows: false,
-            filters_rows: false,
-            compiled,
-        })
+        let compiled = stage.filter(|_| !writes).and_then(|stage| super::CompiledStage::compile(stage, arguments).ok().flatten()).map(Arc::new);
+        Ok(Self::Custom { name, arguments: Arc::from(arguments), stage, writes, row_bound, compiled })
     }
 
     /// Every input field the stage reads, or `None` when it may read any
@@ -818,76 +818,12 @@ impl PhysicalOperator {
 
     /// Runs a row-local extension operator on one document: through its
     /// compiled stage when the plan holds one, through the runtime otherwise.
-    pub fn apply_custom( &self, runtime: &dyn super::ExecutionRuntime, document: &Document, ) -> super::ExecutionResult<super::CustomOperatorResult> {
+    pub fn apply_custom( &self, runtime: &super::QueryRuntime, document: &Document, scope: Option<super::LookupScope<'_>> ) -> super::ExecutionResult<super::CustomOperatorResult> {
         match self {
-            Self::Custom { compiled: Some(stage), .. } => stage.apply(document),
+            Self::Custom { compiled: Some(stage), .. } => stage.apply(document, scope),
             Self::Custom { name, arguments, writes, .. } => runtime.apply_custom(name, arguments, *writes, document),
             other => Err(super::ExecutionError::unsupported_operator(other.name(), "not an extension operator")),
         }
-    }
-
-    /// Declares that a read-only, row-local extension operator lets at most
-    /// `bound` rows through, preserving their order, and whether it leaves
-    /// their fields untouched.
-    ///
-    /// Executors consume the bound through [`ExecutionProperties`], exactly
-    /// like `limit`, so the stage needs no dedicated execution path. A
-    /// field-preserving bound is a pure reducer and can also bound a blocking
-    /// stage (for example Top-1 after `sort`).
-    #[must_use]
-    pub fn with_row_bound(mut self, bound: usize, keeps_fields: bool) -> Self {
-        if let Self::Custom { writes: false, changes_cardinality: false, row_bound, preserves_fields, .. } = &mut self {
-            *row_bound = Some(bound);
-            *preserves_fields = keeps_fields;
-        }
-        self
-    }
-
-    /// Declares that a read-only blocking extension operator retains at most
-    /// `count` rows (for example `sample n`), so executors can run it with
-    /// memory bounded by `count` instead of the input size.
-    #[must_use]
-    pub fn with_retained_rows(mut self, count: usize) -> Self {
-        if let Self::Custom { writes: false, changes_cardinality: true, row_bound, .. } = &mut self {
-            *row_bound = Some(count);
-        }
-        self
-    }
-
-    /// Declares that a read-only, row-local extension operator requires
-    /// exactly `count` input rows. Executors fail the query otherwise, through
-    /// the same row-bound property that `limit` uses.
-    #[must_use]
-    pub fn with_exact_rows(self, count: usize, keeps_fields: bool) -> Self {
-        let mut operator = self.with_row_bound(count, keeps_fields);
-        if let Self::Custom { row_bound: Some(_), exact_rows, .. } = &mut operator {
-            *exact_rows = true;
-        }
-        operator
-    }
-
-    /// Declares that a read-only extension operator emits zero or more rows
-    /// for each input row, in input order, without buffering (`unwind`).
-    ///
-    /// Streaming executors run such a stage mid-chain: the rows it emits
-    /// continue through the following stages one at a time.
-    #[must_use]
-    pub fn with_row_expansion(mut self) -> Self {
-        if let Self::Custom { writes: false, changes_cardinality: false, row_bound: None, expands_rows, .. } = &mut self {
-            *expands_rows = true;
-        }
-        self
-    }
-
-    /// Declares that a read-only, row-local extension operator may drop rows
-    /// (one row in, zero or one row out), so bounds after it are not pushed
-    /// past it.
-    #[must_use]
-    pub fn with_row_filter(mut self) -> Self {
-        if let Self::Custom { writes: false, changes_cardinality: false, row_bound: None, filters_rows, .. } = &mut self {
-            *filters_rows = true;
-        }
-        self
     }
 
     /// Returns the resolved execution properties for this operator instance.
@@ -903,7 +839,7 @@ impl PhysicalOperator {
         use Order::{Ordered, Preserved, Unknown as NoOrder};
         use ProjectedAccess::{Consumer as PvConsumer, None as NoPv, Stage as PvStage};
         use ProjectionReuse::{None as NoReuse, Reusable as Reuse};
-        use Shape::{Linear as L, Matrix as M, Scalar as C};
+        use Shape::{Linear as L, Scalar as C};
 
         let (
             flow,
@@ -1099,24 +1035,6 @@ impl PhysicalOperator {
                 U,
                 NoOrder,
                 Computed,
-                M,
-                Set,
-                R,
-                NoPv,
-                Materialize,
-                NoReuse,
-            ),
-            Self::Custom {
-                writes: false,
-                changes_cardinality: true,
-                row_bound: Some(bound),
-                ..
-            } => (
-                B,
-                Reduce,
-                AtMost(*bound),
-                NoOrder,
-                SameFields,
                 L,
                 Set,
                 R,
@@ -1124,80 +1042,32 @@ impl PhysicalOperator {
                 Materialize,
                 NoReuse,
             ),
-            Self::Custom {
-                writes: false,
-                expands_rows: true,
-                compiled,
-                ..
-            } => (
-                S,
-                Expand,
-                U,
-                Preserved,
-                compiled_fields(compiled),
-                L,
-                Set,
-                R,
-                NoPv,
-                Materialize,
-                NoReuse,
-            ),
-            Self::Custom {
-                writes: false,
-                filters_rows: true,
-                compiled,
-                ..
-            } => (
-                S, Reduce, U, Preserved, compiled_fields(compiled), L, Row, R, NoPv, Materialize, NoReuse,
-            ),
-            Self::Custom {
-                writes: false,
-                row_bound: Some(bound),
-                preserves_fields,
-                exact_rows,
-                compiled,
-                ..
-            } => (
-                S,
-                Reduce,
-                if *exact_rows { Exact(*bound) } else { AtMost(*bound) },
-                Preserved,
-                if *preserves_fields { SameFields } else { compiled_fields(compiled) },
-                L,
-                Set,
-                R,
-                NoPv,
-                Materialize,
-                NoReuse,
-            ),
-            Self::Custom {
-                writes,
-                changes_cardinality,
-                compiled,
-                ..
-            } => (
-                if *writes {
-                    X
-                } else if *changes_cardinality {
-                    B
-                } else {
-                    S
-                },
-                if *changes_cardinality {
-                    Unknown
-                } else {
-                    Preserve
-                },
-                U,
-                NoOrder,
-                compiled_fields(compiled),
-                L,
-                if *changes_cardinality { Set } else { Row },
-                if *writes { W } else { R },
-                NoPv,
-                Materialize,
-                NoReuse,
-            ),
+            Self::Custom { stage, row_bound, compiled, arguments, .. } => {
+                let entry = stage.map(Stage::entry);
+                let bound = match (stage, row_bound) {
+                    (Some(Stage::Single), Some(count)) => Exact(*count),
+                    (_, Some(count)) => AtMost(*count),
+                    _ => U,
+                };
+                // `unwind`, `near`, `first` and `single` stream in input order;
+                // every stage but `near` and the row-local ones sees the whole set.
+                let in_order = matches!(stage, Some(Stage::Unwind | Stage::Near | Stage::First | Stage::Single));
+                let set_level = matches!(stage, Some(Stage::Sample | Stage::Window | Stage::Fill | Stage::Unwind | Stage::First | Stage::Single));
+                let keeps_fields = matches!(stage, Some(Stage::Sample)) || (matches!(stage, Some(Stage::First | Stage::Single)) && arguments.trim().is_empty());
+                (
+                    entry.map_or(S, |entry| entry.flow),
+                    entry.map_or(Preserve, |entry| entry.cardinality),
+                    bound,
+                    if in_order { Preserved } else { NoOrder },
+                    if keeps_fields { SameFields } else { compiled_fields(compiled) },
+                    L,
+                    if set_level { Set } else { Row },
+                    entry.map_or(R, |entry| entry.effect),
+                    NoPv,
+                    Materialize,
+                    NoReuse,
+                )
+            }
         };
         let reads = match self {
             Self::Select { fields } => Reads::Fields(fields),
@@ -1220,6 +1090,29 @@ impl PhysicalOperator {
             materialization,
             projection_reuse,
         }
+    }
+
+    /// The catalogue stage this operator runs (`None`: an extension stage).
+    #[must_use]
+    pub const fn stage(&self) -> Option<Stage> {
+        Some(match self {
+            Self::Filter { .. } => Stage::Where,
+            Self::Set { .. } => Stage::Set,
+            Self::Lookup { .. } => Stage::Lookup,
+            Self::Union { .. } => Stage::Union,
+            Self::Load { .. } | Self::StreamingLoad { .. } => Stage::Load,
+            Self::Limit { .. } => Stage::Limit,
+            Self::Skip { .. } => Stage::Skip,
+            Self::Sort { .. } => Stage::Sort,
+            Self::Select { .. } => Stage::Select,
+            Self::Distinct { .. } => Stage::Distinct,
+            Self::Count { .. } => Stage::Count,
+            Self::Delete => Stage::Delete,
+            Self::Insert { .. } => Stage::Insert,
+            Self::Group { .. } => Stage::Group,
+            Self::Pivot { .. } => Stage::Pivot,
+            Self::Custom { stage, .. } => return *stage,
+        })
     }
 
     /// Returns this operator's stable category.
@@ -1289,14 +1182,6 @@ impl PhysicalOperator {
     }
 
     #[must_use]
-    pub const fn lookup_collection(&self) -> Option<&CollectionId> {
-        match self {
-            Self::Lookup { collection, .. } => Some(collection),
-            _ => None,
-        }
-    }
-
-    #[must_use]
     pub fn lookup_alias(&self) -> Option<&str> {
         match self {
             Self::Lookup { alias, .. } => alias.as_deref(),
@@ -1308,22 +1193,6 @@ impl PhysicalOperator {
     pub fn lookup_target(&self) -> Option<&str> {
         match self {
             Self::Lookup { into, .. } => Some(into),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn union_collection(&self) -> Option<&CollectionId> {
-        match self {
-            Self::Union { collection, .. } => Some(collection),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn union_alias(&self) -> Option<&str> {
-        match self {
-            Self::Union { alias, .. } => alias.as_deref(),
             _ => None,
         }
     }
@@ -1348,22 +1217,6 @@ impl PhysicalOperator {
     pub fn streaming_load_chunks(&self) -> Option<&[Arc<str>]> {
         match self {
             Self::StreamingLoad { chunks, .. } => Some(chunks),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn load_target(&self) -> Option<&str> {
-        match self {
-            Self::Load { target } => Some(target),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn row_count(&self) -> Option<usize> {
-        match self {
-            Self::Limit { count } | Self::Skip { count } => Some(*count),
             _ => None,
         }
     }
@@ -1456,6 +1309,11 @@ impl PhysicalPlanBuilder {
         self.source = self.source.clone().with_access(access);
     }
 
+    /// Sets the temporal read of the source (`as of`, `history`).
+    pub fn set_source_temporal(&mut self, temporal: Option<crate::storage::Temporal>) {
+        self.source = self.source.clone().with_temporal(temporal);
+    }
+
     /// Creates an empty builder for a source.
     #[must_use]
     #[inline]
@@ -1484,108 +1342,14 @@ impl PhysicalPlanBuilder {
         Ok(self)
     }
 
-    pub fn filter(&mut self, predicate: Expression) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::filter(predicate))
-    }
-
-    pub fn set<I>(&mut self, assignments: I) -> PhysicalPlanResult<&mut Self>
-    where
-        I: IntoIterator<Item = SetAssignment>,
-    {
-        self.push(PhysicalOperator::set(assignments)?)
-    }
-
-    pub fn lookup( &mut self, collection: CollectionId, alias: Option<impl AsRef<str>>, into: impl AsRef<str>, pipeline: PhysicalSubPipeline, ) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::lookup(collection, alias, into, pipeline)?)
-    }
-
-    pub fn union( &mut self, collection: CollectionId, alias: Option<impl AsRef<str>>, pipeline: PhysicalSubPipeline, ) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::union(collection, alias, pipeline)?)
-    }
-
-    pub fn streaming_load<I, S>(
-        &mut self,
-        mode: PhysicalLoadMode,
-        chunks: I,
-    ) -> PhysicalPlanResult<&mut Self>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.push(PhysicalOperator::streaming_load(mode, chunks)?)
-    }
-
-    pub fn load(&mut self, target: impl AsRef<str>) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::load(target)?)
-    }
-
-    pub fn limit(&mut self, count: usize) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::limit(count))
-    }
-
-    pub fn skip(&mut self, count: usize) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::skip(count))
-    }
-
-    pub fn sort<I>(&mut self, keys: I) -> PhysicalPlanResult<&mut Self>
-    where
-        I: IntoIterator<Item = SortKey>,
-    {
-        self.push(PhysicalOperator::sort(keys)?)
-    }
-
-    pub fn select<I>(&mut self, fields: I) -> PhysicalPlanResult<&mut Self>
-    where
-        I: IntoIterator<Item = ExpressionFieldPath>,
-    {
-        self.push(PhysicalOperator::select(fields)?)
-    }
-
-    pub fn distinct<I>(&mut self, fields: I) -> PhysicalPlanResult<&mut Self>
-    where
-        I: IntoIterator<Item = ExpressionFieldPath>,
-    {
-        self.push(PhysicalOperator::distinct(fields)?)
-    }
-
-    pub fn count(&mut self, alias: impl AsRef<str>) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::count(alias)?)
-    }
-
-    pub fn delete(&mut self) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::delete())
-    }
-
-    pub fn insert(&mut self, document: InsertDocument) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::insert(document))
-    }
-
-    pub fn group<I>(&mut self, keys: I) -> PhysicalPlanResult<&mut Self>
-    where
-        I: IntoIterator<Item = ExpressionFieldPath>,
-    {
-        self.push(PhysicalOperator::group(keys)?)
-    }
-
-    pub fn pivot(&mut self, specification: PivotSpecification) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::pivot(specification))
-    }
-
-    pub fn custom( &mut self, name: StageName, arguments: impl AsRef<str>, writes: bool, changes_cardinality: bool, ) -> PhysicalPlanResult<&mut Self> {
-        self.push(PhysicalOperator::custom(
-            name,
-            arguments,
-            writes,
-            changes_cardinality,
-        )?)
-    }
-
-    pub fn build(&self) -> PhysicalPlanResult<PhysicalPlan> {
-        PhysicalPlan::new(self.source.clone(), self.operators.clone())
-    }
-
     pub fn finish(self) -> PhysicalPlanResult<PhysicalPlan> {
         PhysicalPlan::new(self.source, self.operators)
+    }
+
+    /// Moves each filter as close to the source as it can go
+    /// ([`super::pushdown`]).
+    pub(crate) fn push_filters(&mut self) {
+        self.operators = super::pushdown::push_filters(std::mem::take(&mut self.operators));
     }
 }
 
@@ -1773,15 +1537,6 @@ impl fmt::Display for PhysicalPlanError {
                     "insert operator at index {operator_index} must be the only operator",
                 )
             }
-            PhysicalPlanErrorKind::DuplicateOperator {
-                operator_index,
-                operator,
-            } => {
-                write!(
-                    formatter,
-                    "{operator} operator is duplicated at index {operator_index}",
-                )
-            }
             PhysicalPlanErrorKind::OperatorAfterTerminal {
                 operator_index,
                 operator,
@@ -1840,10 +1595,6 @@ pub enum PhysicalPlanErrorKind {
     },
     InsertMustBeOnlyOperator {
         operator_index: usize,
-    },
-    DuplicateOperator {
-        operator_index: usize,
-        operator: PhysicalOperatorKind,
     },
     OperatorAfterTerminal {
         operator_index: usize,
@@ -1920,71 +1671,22 @@ fn validate_plan( _source: &PhysicalSource, operators: &[PhysicalOperator], ) ->
 
 fn validate_next_operator( previous: &[PhysicalOperator], next: &PhysicalOperator, ) -> PhysicalPlanResult<()> {
     let operator_index = previous.len();
-    if matches!(
-        next,
-        PhysicalOperator::Load { .. } | PhysicalOperator::StreamingLoad { .. }
-    ) && operator_index != 0
-    {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::LoadMustBeFirst { operator_index },
-        ));
+    let entry = next.stage().map(Stage::entry);
+    match entry.map(|entry| entry.placement) {
+        Some(Placement::First) if operator_index != 0 => {
+            return Err(PhysicalPlanError::new(PhysicalPlanErrorKind::LoadMustBeFirst { operator_index }));
+        }
+        Some(Placement::Only) if operator_index != 0 => {
+            return Err(PhysicalPlanError::new(PhysicalPlanErrorKind::InsertMustBeOnlyOperator { operator_index }));
+        }
+        _ => {}
     }
-
-    if matches!(next, PhysicalOperator::Insert { .. }) && operator_index != 0 {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::InsertMustBeOnlyOperator { operator_index },
-        ));
+    if previous.iter().any(|operator| operator.stage().is_some_and(|stage| stage.entry().placement == Placement::Only)) {
+        return Err(PhysicalPlanError::new(PhysicalPlanErrorKind::InsertMustBeOnlyOperator { operator_index }));
     }
-
-    if previous
-        .iter()
-        .any(|operator| matches!(operator, PhysicalOperator::Insert { .. }))
-    {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::InsertMustBeOnlyOperator { operator_index },
-        ));
+    if previous.last().is_some_and(|operator| operator.execution_properties().closes_linear_pipeline()) {
+        return Err(PhysicalPlanError::new(PhysicalPlanErrorKind::OperatorAfterTerminal { operator_index, operator: Arc::from(next.name()) }));
     }
-
-    if previous
-        .last()
-        .is_some_and(|operator| operator.execution_properties().closes_linear_pipeline())
-    {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::OperatorAfterTerminal {
-                operator_index,
-                operator: Arc::from(next.name()),
-            },
-        ));
-    }
-
-    let kind = next.kind();
-    let unique = matches!(
-        kind,
-        PhysicalOperatorKind::Lookup
-            | PhysicalOperatorKind::Union
-            | PhysicalOperatorKind::Load
-            | PhysicalOperatorKind::StreamingLoad
-            | PhysicalOperatorKind::Limit
-            | PhysicalOperatorKind::Skip
-            | PhysicalOperatorKind::Sort
-            | PhysicalOperatorKind::Select
-            | PhysicalOperatorKind::Distinct
-            | PhysicalOperatorKind::Count
-            | PhysicalOperatorKind::Delete
-            | PhysicalOperatorKind::Insert
-            | PhysicalOperatorKind::Group
-            | PhysicalOperatorKind::Pivot
-    );
-
-    if unique && previous.iter().any(|operator| operator.kind() == kind) {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::DuplicateOperator {
-                operator_index,
-                operator: kind,
-            },
-        ));
-    }
-
     Ok(())
 }
 
@@ -2201,7 +1903,7 @@ mod tests {
     use super::*;
 
     use crate::query::{
-        logical_plan::{InsertDocument, PivotAggregate, PivotSpecification, PivotValue},
+        plan_values::{InsertDocument, PivotAggregate, PivotSpecification, PivotValue},
         parse_expression, SortDirection,
     };
 
@@ -2246,24 +1948,23 @@ mod tests {
 
     #[test] fn source_defaults_to_forward_collection_scan() { let collection = CollectionId::parse("users").unwrap(); let source = PhysicalSource::collection_scan(collection.clone()); assert_eq!(source.collection(), &collection); assert_eq!(source.access().scan_options(), Some(ScanOptions::default())); }
     #[test] fn planner_applies_scan_direction() { let planner = PhysicalPlanner::with_options( PhysicalPlannerOptions::new().with_scan_direction(ScanDirection::Reverse), ); let plan = planner .plan_collection(CollectionId::parse("users").unwrap()) .finish() .unwrap(); assert_eq!( plan.source().access().scan_options().unwrap().direction(), ScanDirection::Reverse, ); }
-    #[test] fn supports_complete_read_pipeline() { let mut builder = PhysicalPlan::builder(source()); builder .filter(parse_expression("active == true").unwrap()) .unwrap() .sort([ SortKey::new(field(&["age"]), SortDirection::Descending), SortKey::new(field(&["name"]), SortDirection::Ascending), ]) .unwrap() .skip(10) .unwrap() .limit(20) .unwrap() .select([field(&["name"]), field(&["age"])]) .unwrap() .distinct([field(&["name"])]) .unwrap(); let plan = builder.finish().unwrap(); assert_eq!(plan.len(), 6); assert!(!plan.is_write()); assert!(plan.changes_cardinality()); assert_eq!(plan.mode(), ExecutionMode::ReadOnly); }
-    #[test] fn load_requires_a_transaction_and_is_terminal() { let mut builder = PhysicalPlan::builder(source()); builder.load("profile").unwrap(); let error = builder.limit(1).unwrap_err(); assert!(matches!( error.kind(), PhysicalPlanErrorKind::OperatorAfterTerminal { .. } )); let plan = builder.finish().unwrap(); assert!(plan.is_write()); assert_eq!( plan.required_storage_access(), StorageAccessMode::Transaction ); }
+    #[test] fn supports_complete_read_pipeline() { let mut builder = PhysicalPlan::builder(source()); for operator in [ PhysicalOperator::filter(parse_expression("active == true").unwrap()), PhysicalOperator::sort([ SortKey::new(field(&["age"]), SortDirection::Descending), SortKey::new(field(&["name"]), SortDirection::Ascending), ]) .unwrap(), PhysicalOperator::skip(10), PhysicalOperator::limit(20), PhysicalOperator::select([field(&["name"]), field(&["age"])]) .unwrap(), PhysicalOperator::distinct([field(&["name"])]) .unwrap(), ] { builder.push(operator).unwrap(); } let plan = builder.finish().unwrap(); assert_eq!(plan.len(), 6); assert!(!plan.is_write()); assert!(plan.changes_cardinality()); assert_eq!(plan.mode(), ExecutionMode::ReadOnly); }
+    #[test] fn load_requires_a_transaction_and_is_terminal() { let mut builder = PhysicalPlan::builder(source()); builder.push(PhysicalOperator::load("profile").unwrap()).unwrap(); let error = builder.push(PhysicalOperator::limit(1)).unwrap_err(); assert!(matches!( error.kind(), PhysicalPlanErrorKind::OperatorAfterTerminal { .. } )); let plan = builder.finish().unwrap(); assert!(plan.is_write()); assert_eq!( plan.required_storage_access(), StorageAccessMode::Transaction ); }
     #[test] fn insert_preserves_typed_document() { let document = insert_document(); let operator = PhysicalOperator::insert(document.clone()); assert_eq!(operator.kind(), PhysicalOperatorKind::Insert); assert_eq!(operator.insert_document(), Some(&document)); assert!(operator.execution_properties().writes()); assert!(!matches!( operator.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(operator.execution_properties().closes_linear_pipeline()); }
-    #[test] fn insert_requires_transaction_and_must_be_alone() { let mut builder = PhysicalPlan::builder(source()); builder.insert(insert_document()).unwrap(); let plan = builder.finish().unwrap(); assert!(plan.is_write()); assert_eq!( plan.required_storage_access(), StorageAccessMode::Transaction ); let mut invalid = PhysicalPlan::builder(source()); invalid .filter(parse_expression("active == true").unwrap()) .unwrap(); assert!(matches!( invalid.insert(insert_document()).unwrap_err().kind(), PhysicalPlanErrorKind::InsertMustBeOnlyOperator { .. } )); }
-    #[test] fn pivot_preserves_typed_specification() { let specification = pivot_specification(); let operator = PhysicalOperator::pivot(specification.clone()); assert_eq!(operator.kind(), PhysicalOperatorKind::Pivot); assert_eq!(operator.pivot_specification(), Some(&specification)); assert!(!operator.execution_properties().writes()); assert!(!matches!( operator.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(operator.execution_properties().closes_linear_pipeline()); }
-    #[test] fn builder_supports_pivot() { let specification = pivot_specification(); let mut builder = PhysicalPlan::builder(source()); builder.pivot(specification.clone()).unwrap(); let plan = builder.finish().unwrap(); assert_eq!(plan.mode(), ExecutionMode::ReadOnly); assert_eq!( plan.operators()[0].pivot_specification(), Some(&specification) ); }
-    #[test] fn pivot_rejects_following_operators() { let mut builder = PhysicalPlan::builder(source()); builder.pivot(pivot_specification()).unwrap(); assert!(matches!( builder.limit(1).unwrap_err().kind(), PhysicalPlanErrorKind::OperatorAfterTerminal { .. } )); }
+    #[test] fn insert_requires_transaction_and_must_be_alone() { let mut builder = PhysicalPlan::builder(source()); builder.push(PhysicalOperator::insert(insert_document())).unwrap(); let plan = builder.finish().unwrap(); assert!(plan.is_write()); assert_eq!( plan.required_storage_access(), StorageAccessMode::Transaction ); let mut invalid = PhysicalPlan::builder(source()); invalid.push(PhysicalOperator::filter(parse_expression("active == true").unwrap())).unwrap(); assert!(matches!( invalid.push(PhysicalOperator::insert(insert_document())).unwrap_err().kind(), PhysicalPlanErrorKind::InsertMustBeOnlyOperator { .. } )); }
+    #[test] fn pivot_preserves_typed_specification() { let specification = pivot_specification(); let operator = PhysicalOperator::pivot(specification.clone()); assert_eq!(operator.kind(), PhysicalOperatorKind::Pivot); assert_eq!(operator.pivot_specification(), Some(&specification)); assert!(!operator.execution_properties().writes()); assert!(!matches!( operator.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(!operator.execution_properties().closes_linear_pipeline()); }
+    #[test] fn builder_supports_pivot() { let specification = pivot_specification(); let mut builder = PhysicalPlan::builder(source()); builder.push(PhysicalOperator::pivot(specification.clone())).unwrap(); let plan = builder.finish().unwrap(); assert_eq!(plan.mode(), ExecutionMode::ReadOnly); assert_eq!( plan.operators()[0].pivot_specification(), Some(&specification) ); }
+    #[test] fn pivot_accepts_following_operators() { let mut builder = PhysicalPlan::builder(source()); builder.push(PhysicalOperator::pivot(pivot_specification())).unwrap(); builder.push(PhysicalOperator::limit(1)).unwrap(); }
     #[test] fn distinct_without_fields_means_complete_documents() { let operator = PhysicalOperator::distinct([]).unwrap(); assert_eq!(operator.distinct_fields(), Some(&[][..])); }
-    #[test] fn duplicate_unique_operator_is_rejected() { let mut builder = PhysicalPlan::builder(source()); builder.limit(10).unwrap(); assert!(matches!( builder.limit(20).unwrap_err().kind(), PhysicalPlanErrorKind::DuplicateOperator { operator: PhysicalOperatorKind::Limit, .. } )); }
-    #[test] fn compiled_stages_declare_the_fields_they_read_and_write() { let custom = |name: &str, arguments: &str| PhysicalOperator::custom(StageName::parse(name).unwrap(), arguments, false, false).unwrap(); let names = |fields: &Arc<[ExpressionFieldPath]>| fields.iter().map(ToString::to_string).collect::<Vec<_>>(); let derive = custom("derive", "total = price * qty, big = total > 100, meta.flag = round(total)"); let properties = derive.execution_properties(); assert!(matches!(properties.reads, Reads::Fields(fields) if names(fields) == ["price", "qty"])); assert!(matches!(properties.fields, Fields::Rewritten(fields) if names(fields) == ["total", "big", "meta.flag"])); let select = custom("select", "name, price * 2 as double"); assert!(matches!(select.execution_properties().fields, Fields::Projected(fields) if names(fields) == ["name", "double"])); assert!(matches!(select.execution_properties().reads, Reads::Fields(fields) if names(fields) == ["name", "price"])); assert!(matches!(custom("drop", "a, b.c").execution_properties().fields, Fields::Rewritten(fields) if names(fields) == ["a", "b.c"])); assert!(matches!(custom("rename", "a as b").execution_properties().reads, Reads::Fields(fields) if names(fields) == ["a"])); assert!(matches!(custom("root", "profile").execution_properties().fields, Fields::Computed)); for opaque in [custom("frobnicate", "x"), custom("derive", "total = price *")] { assert!(matches!(opaque.execution_properties().reads, Reads::Unknown), "{opaque:?}"); assert!(matches!(opaque.execution_properties().fields, Fields::Unknown), "{opaque:?}"); } assert!(matches!(PhysicalOperator::limit(3).execution_properties().reads, Reads::Nothing)); }
-    #[test] fn field_demand_follows_declared_reads_and_writes() { let custom = |name: &str, arguments: &str| PhysicalOperator::custom(StageName::parse(name).unwrap(), arguments, false, false).unwrap(); let path = |text: &str| ExpressionFieldPath::new(text.split('.')).unwrap(); let names = |fields: Option<Vec<ExpressionFieldPath>>| fields.map(|fields| fields.iter().map(ToString::to_string).collect::<Vec<_>>()); let count = PhysicalOperator::count("n").unwrap(); let derive = custom("derive", "total = price * qty"); let filter = PhysicalOperator::filter(crate::query::parse_expression("total > 20 and region == \"EU\"").unwrap()); assert_eq!(names(source_field_demand(&[derive.clone(), filter.clone(), count.clone()], None)), Some(vec!["region".to_owned(), "price".to_owned(), "qty".to_owned()])); assert_eq!(names(source_field_demand(&[derive.clone(), filter], None)), None); let select = PhysicalOperator::select([path("region")]).unwrap(); assert_eq!(names(source_field_demand(&[select, PhysicalOperator::distinct([]).unwrap()], None)), Some(vec!["region".to_owned()])); assert_eq!(names(source_field_demand(&[derive, count], Some(&[path("other")]))), Some(vec!["price".to_owned(), "qty".to_owned()])); assert_eq!(names(source_field_demand(&[custom("frobnicate", "x")], Some(&[]))), None); }
+    #[test] fn compiled_stages_declare_the_fields_they_read_and_write() { let custom = |name: &str, arguments: &str| PhysicalOperator::custom(StageName::parse(name).unwrap(), arguments).unwrap(); let names = |fields: &Arc<[ExpressionFieldPath]>| fields.iter().map(ToString::to_string).collect::<Vec<_>>(); let derive = custom("derive", "total = price * qty, big = total > 100, meta.flag = round(total)"); let properties = derive.execution_properties(); assert!(matches!(properties.reads, Reads::Fields(fields) if names(fields) == ["price", "qty"])); assert!(matches!(properties.fields, Fields::Rewritten(fields) if names(fields) == ["total", "big", "meta.flag"])); let select = custom("select", "name, price * 2 as double"); assert!(matches!(select.execution_properties().fields, Fields::Projected(fields) if names(fields) == ["name", "double"])); assert!(matches!(select.execution_properties().reads, Reads::Fields(fields) if names(fields) == ["name", "price"])); assert!(matches!(custom("drop", "a, b.c").execution_properties().fields, Fields::Rewritten(fields) if names(fields) == ["a", "b.c"])); assert!(matches!(custom("rename", "a as b").execution_properties().reads, Reads::Fields(fields) if names(fields) == ["a"])); assert!(matches!(custom("root", "profile").execution_properties().fields, Fields::Computed)); for opaque in [custom("frobnicate", "x"), custom("derive", "total = price *")] { assert!(matches!(opaque.execution_properties().reads, Reads::Unknown), "{opaque:?}"); assert!(matches!(opaque.execution_properties().fields, Fields::Unknown), "{opaque:?}"); } assert!(matches!(PhysicalOperator::limit(3).execution_properties().reads, Reads::Nothing)); }
+    #[test] fn field_demand_follows_declared_reads_and_writes() { let custom = |name: &str, arguments: &str| PhysicalOperator::custom(StageName::parse(name).unwrap(), arguments).unwrap(); let path = |text: &str| ExpressionFieldPath::new(text.split('.')).unwrap(); let names = |fields: Option<Vec<ExpressionFieldPath>>| fields.map(|fields| fields.iter().map(ToString::to_string).collect::<Vec<_>>()); let count = PhysicalOperator::count("n").unwrap(); let derive = custom("derive", "total = price * qty"); let filter = PhysicalOperator::filter(crate::query::parse_expression("total > 20 and region == \"EU\"").unwrap()); assert_eq!(names(source_field_demand(&[derive.clone(), filter.clone(), count.clone()], None)), Some(vec!["region".to_owned(), "price".to_owned(), "qty".to_owned()])); assert_eq!(names(source_field_demand(&[derive.clone(), filter], None)), None); let select = PhysicalOperator::select([path("region")]).unwrap(); assert_eq!(names(source_field_demand(&[select, PhysicalOperator::distinct([]).unwrap()], None)), Some(vec!["region".to_owned()])); assert_eq!(names(source_field_demand(&[derive, count], Some(&[path("other")]))), Some(vec!["price".to_owned(), "qty".to_owned()])); assert_eq!(names(source_field_demand(&[custom("frobnicate", "x")], Some(&[]))), None); }
     #[test] fn validates_native_operator_arguments() { assert!(matches!( PhysicalOperator::sort([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptySortKeys )); assert!(matches!( PhysicalOperator::select([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptyFieldList { context: PhysicalFieldContext::Select } )); assert!(matches!( PhysicalOperator::group([]).unwrap_err().kind(), PhysicalPlanErrorKind::EmptyFieldList { context: PhysicalFieldContext::Group } )); }
     #[test] fn supports_lookup_and_union_subpipelines() { let nested = PhysicalSubPipeline::new([PhysicalOperator::filter( parse_expression("active == true").unwrap(), )]) .unwrap(); let lookup = PhysicalOperator::lookup( CollectionId::parse("workspace").unwrap(), Some("w"), "public", nested.clone(), ) .unwrap(); assert_eq!(lookup.kind(), PhysicalOperatorKind::Lookup); assert_eq!(lookup.lookup_alias(), Some("w")); assert_eq!(lookup.lookup_target(), Some("public")); assert!(!lookup.execution_properties().writes()); assert!(!!matches!( lookup.execution_properties().cardinality, CardinalityEffect::Preserve )); let union = PhysicalOperator::union( CollectionId::parse("archived_users").unwrap(), None::<&str>, nested, ) .unwrap(); assert_eq!(union.kind(), PhysicalOperatorKind::Union); assert!(!matches!( union.execution_properties().cardinality, CardinalityEffect::Preserve )); assert!(!union.execution_properties().writes()); }
-    #[test] fn nested_pipeline_rejects_mutations_and_terminal_operators() { assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::delete()]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::pivot(pivot_specification())]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); }
+    #[test] fn nested_pipeline_rejects_mutations_and_accepts_pivot() { assert!(matches!( PhysicalSubPipeline::new([PhysicalOperator::delete()]) .unwrap_err() .kind(), PhysicalPlanErrorKind::InvalidNestedOperator { .. } )); assert!(PhysicalSubPipeline::new([PhysicalOperator::pivot(pivot_specification()), PhysicalOperator::limit(1)]).is_ok()); }
     #[test] fn supports_streaming_load() { let operator = PhysicalOperator::streaming_load(PhysicalLoadMode::Replace, ["batch1", "batch2"]) .unwrap(); assert_eq!(operator.kind(), PhysicalOperatorKind::StreamingLoad); assert_eq!( operator.streaming_load_mode(), Some(PhysicalLoadMode::Replace) ); assert_eq!(operator.streaming_load_chunks().unwrap().len(), 2); assert!(operator.execution_properties().writes()); assert!(operator.execution_properties().closes_linear_pipeline()); }
-    #[test] fn row_local_read_only_custom_operator_is_streaming() { let operator = PhysicalOperator::custom( StageName::parse("select").unwrap(), "CAFacture - COGS as Marge", false, false, ) .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::Streaming )); assert!(!matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); }
-    #[test] fn cardinality_changing_custom_operator_is_set_level() { let operator = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true) .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); assert!(matches!( operator.execution_properties().scope, super::super::execution_properties::Scope::Set )); }
+    #[test] fn row_local_read_only_custom_operator_is_streaming() { let operator = PhysicalOperator::custom( StageName::parse("select").unwrap(), "CAFacture - COGS as Marge") .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::Streaming )); assert!(!matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); }
+    #[test] fn cardinality_changing_custom_operator_is_set_level() { let operator = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3") .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); assert!(matches!( operator.execution_properties().scope, super::super::execution_properties::Scope::Set )); }
     #[test] fn classifies_streaming_and_blocking_memory_contracts() { let collection = CollectionId::parse("users").unwrap(); let streaming = PhysicalPlan::new( PhysicalSource::collection_scan(collection.clone()), [PhysicalOperator::limit(2)], ) .unwrap(); assert_eq!( streaming.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming.is_memory_streaming()); let blocking = PhysicalPlan::new( PhysicalSource::collection_scan(collection), [PhysicalOperator::sort([SortKey::ascending(field(&["name"]))]).unwrap()], ) .unwrap(); assert_eq!( blocking.memory_execution_mode(), MemoryExecutionMode::GovernedBlocking ); assert!(!blocking.is_memory_streaming()); let streaming_count = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), [ PhysicalOperator::filter(parse_expression("active == true").unwrap()), PhysicalOperator::count("count").unwrap(), ], ) .unwrap(); assert_eq!( streaming_count.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming_count.is_memory_streaming()); }
-    #[test] fn declared_row_bound_is_consumed_through_properties() { let name = StageName::parse("first").unwrap(); let pure = PhysicalOperator::custom(name.clone(), "", false, false).unwrap().with_row_bound(1, true); assert_eq!(pure.execution_properties().stream_row_bound(), Some(1)); assert_eq!(pure.execution_properties().linear_bound(), Some(1)); let projecting = PhysicalOperator::custom(name.clone(), "profile", false, false).unwrap().with_row_bound(1, false); assert_eq!(projecting.execution_properties().stream_row_bound(), Some(1)); assert_eq!(projecting.execution_properties().linear_bound(), None); let writing = PhysicalOperator::custom(name, "", true, false).unwrap().with_row_bound(1, true); assert_eq!(writing.execution_properties().stream_row_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().stream_row_bound(), Some(3)); }
-    #[test] fn sample_and_single_declare_their_row_properties() { let single = PhysicalOperator::custom(StageName::parse("single").unwrap(), "", false, false).unwrap().with_exact_rows(1, true); assert_eq!(single.execution_properties().exact_rows(), Some(1)); assert_eq!(single.execution_properties().stream_row_bound(), Some(1)); assert_eq!(single.execution_properties().linear_bound(), None); let sample = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3", false, true).unwrap().with_retained_rows(3); assert_eq!(sample.execution_properties().retained_rows(), Some(3)); assert_eq!(sample.execution_properties().stream_row_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().retained_rows(), None); }
+    #[test] fn declared_row_bound_is_consumed_through_properties() { let name = StageName::parse("first").unwrap(); let pure = PhysicalOperator::custom(name.clone(), "").unwrap(); assert_eq!(pure.execution_properties().stream_row_bound(), Some(1)); assert_eq!(pure.execution_properties().linear_bound(), Some(1)); let projecting = PhysicalOperator::custom(name.clone(), "profile").unwrap(); assert_eq!(projecting.execution_properties().stream_row_bound(), Some(1)); assert_eq!(projecting.execution_properties().linear_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().stream_row_bound(), Some(3)); }
+    #[test] fn sample_and_single_declare_their_row_properties() { let single = PhysicalOperator::custom(StageName::parse("single").unwrap(), "").unwrap(); assert_eq!(single.execution_properties().exact_rows(), Some(1)); assert_eq!(single.execution_properties().stream_row_bound(), Some(1)); assert_eq!(single.execution_properties().linear_bound(), None); let sample = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3").unwrap(); assert_eq!(sample.execution_properties().retained_rows(), Some(3)); assert_eq!(sample.execution_properties().stream_row_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().retained_rows(), None); }
 }

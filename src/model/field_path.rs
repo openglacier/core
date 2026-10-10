@@ -252,10 +252,6 @@ impl FieldPath {
         self.resolve(document).into_option()
     }
 
-    #[must_use]
-    pub fn to_dotted_string(&self) -> String {
-        self.to_string()
-    }
 }
 
 impl fmt::Debug for FieldPath {
@@ -356,14 +352,6 @@ impl<'document> ResolvedValue<'document> {
     pub const fn into_option(self) -> Option<&'document Value> {
         match self {
             Self::Present(value) => Some(value),
-            Self::Missing => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn as_value(&self) -> Option<&'document Value> {
-        match self {
-            Self::Present(value) => Some(*value),
             Self::Missing => None,
         }
     }

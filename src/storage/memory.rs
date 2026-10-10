@@ -12,6 +12,13 @@ impl BackendStorage<MemoryBackend> {
         Self::from_backend(MemoryBackend::new())
     }
 
+    /// Creates an empty in-memory storage engine that keeps every version
+    /// (for `as of` and `history` reads).
+    #[must_use]
+    pub fn with_history() -> Self {
+        Self::from_backend(MemoryBackend::with_history())
+    }
+
     /// Returns the current committed generation.
     pub fn generation(&self) -> StorageResult<u64> {
         self.backend().generation()

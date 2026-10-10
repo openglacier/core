@@ -331,7 +331,7 @@ fn handle_standard_operation(writer: &mut TcpStream, settings: &ConnectionSettin
         #[cfg(feature = "database")]
         HandlerKind::Permission | HandlerKind::Sharing | HandlerKind::Place => super::place_ops::handle_place_operation(writer, settings, database, authentication, operation),
         #[cfg(feature = "database")]
-        HandlerKind::App => super::place_ops::handle_app_operation(writer, settings, database, authentication, operation),
+        HandlerKind::App => super::place_ops::handle_app_operation(writer, settings, database, authentication, delegation, operation),
         _ => Err(routing_error(operation.id(), "execution mode and handler domain diverged").into()),
     }
 }

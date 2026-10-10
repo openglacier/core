@@ -183,7 +183,7 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                     .map_err(|error| AgentError::capability(operation, error.to_string()))?;
                 let plan = crate::query::Planner::new().plan(&pipeline)
                     .map_err(|error| AgentError::capability(operation, error.to_string()))?;
-                if !plan.is_read_only() {
+                if plan.is_write() {
                     return Err(AgentError::capability(operation, "read-only Agent query attempted to mutate storage"));
                 }
                 let access = QueryAccess::analyze(query)

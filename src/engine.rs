@@ -5,95 +5,32 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     error::Error as StdError,
     fmt, io,
-    sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-        Arc,
-    },
+    sync::Arc,
     time::Instant,
 };
 
 const DEFAULT_PLANNER_CACHE_BYTES: usize = 8 * 1024 * 1024;
-static EXTERNAL_GROUP_FLUSHES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_PARTIALS_WRITTEN: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_BYTES_WRITTEN: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_FLUSH_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_PARTIALS_MERGED: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_SOURCE_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_ROWS_CONSUMED: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_CONSUME_SAMPLES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_KEY_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_LOOKUP_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_ACCUMULATE_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_GROUP_HITS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_GROUP_MISSES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_ACCUMULATOR_CREATE_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_FLUSH_TRIGGERS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_ESTIMATED_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_PARTIAL_FINISH_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_FLUSH_SORT_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_ENCODE_WRITE_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_INIT_US: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_SAMPLES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_SELECT_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_PARTIAL_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_READ_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_MERGE_FINISH_NS: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_RSS_SAMPLES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_RSS_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
-static EXTERNAL_GROUP_UNMANAGED_PEAK_BYTES: AtomicU64 = AtomicU64::new(0);
-/// External group counters exposed as global `_memory` fields.
-static EXTERNAL_GROUP_COUNTERS: [(&str, &AtomicU64); 30] = [
-    ("external_group_flushes", &EXTERNAL_GROUP_FLUSHES), ("external_group_partials_written", &EXTERNAL_GROUP_PARTIALS_WRITTEN),
-    ("external_group_bytes_written", &EXTERNAL_GROUP_BYTES_WRITTEN), ("external_group_flush_us", &EXTERNAL_GROUP_FLUSH_US),
-    ("external_group_partials_merged", &EXTERNAL_GROUP_PARTIALS_MERGED), ("external_group_merge_us", &EXTERNAL_GROUP_MERGE_US),
-    ("external_group_peak_groups_per_flush", &EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH), ("external_group_source_us", &EXTERNAL_GROUP_SOURCE_US),
-    ("external_group_rows_consumed", &EXTERNAL_GROUP_ROWS_CONSUMED), ("external_group_consume_samples", &EXTERNAL_GROUP_CONSUME_SAMPLES),
-    ("external_group_key_ns", &EXTERNAL_GROUP_KEY_NS), ("external_group_lookup_ns", &EXTERNAL_GROUP_LOOKUP_NS),
-    ("external_group_accumulate_ns", &EXTERNAL_GROUP_ACCUMULATE_NS), ("external_group_group_hits", &EXTERNAL_GROUP_GROUP_HITS),
-    ("external_group_group_misses", &EXTERNAL_GROUP_GROUP_MISSES), ("external_group_accumulator_create_us", &EXTERNAL_GROUP_ACCUMULATOR_CREATE_US),
-    ("external_group_flush_triggers", &EXTERNAL_GROUP_FLUSH_TRIGGERS), ("external_group_estimated_peak_bytes", &EXTERNAL_GROUP_ESTIMATED_PEAK_BYTES),
-    ("external_group_partial_finish_us", &EXTERNAL_GROUP_PARTIAL_FINISH_US), ("external_group_flush_sort_us", &EXTERNAL_GROUP_FLUSH_SORT_US),
-    ("external_group_encode_write_us", &EXTERNAL_GROUP_ENCODE_WRITE_US), ("external_group_merge_init_us", &EXTERNAL_GROUP_MERGE_INIT_US),
-    ("external_group_merge_samples", &EXTERNAL_GROUP_MERGE_SAMPLES), ("external_group_merge_select_ns", &EXTERNAL_GROUP_MERGE_SELECT_NS),
-    ("external_group_merge_partial_ns", &EXTERNAL_GROUP_MERGE_PARTIAL_NS), ("external_group_merge_read_ns", &EXTERNAL_GROUP_MERGE_READ_NS),
-    ("external_group_merge_finish_ns", &EXTERNAL_GROUP_MERGE_FINISH_NS), ("external_group_rss_samples", &EXTERNAL_GROUP_RSS_SAMPLES),
-    ("external_group_rss_peak_bytes", &EXTERNAL_GROUP_RSS_PEAK_BYTES), ("external_group_unmanaged_peak_bytes", &EXTERNAL_GROUP_UNMANAGED_PEAK_BYTES),
-];
-fn update_atomic_peak(target: &AtomicU64, value: u64) {
-    target.fetch_max(value, AtomicOrdering::Relaxed);
-}
 
-fn sample_external_group_process_memory(governor: &MemoryGovernor) {
-    if let Some(process) = governor.process_memory_snapshot() {
-        EXTERNAL_GROUP_RSS_SAMPLES.fetch_add(1, AtomicOrdering::Relaxed);
-        update_atomic_peak(
-            &EXTERNAL_GROUP_RSS_PEAK_BYTES,
-            usize_to_u64_saturating(process.rss_bytes),
-        );
-        update_atomic_peak(
-            &EXTERNAL_GROUP_UNMANAGED_PEAK_BYTES,
-            usize_to_u64_saturating(process.unmanaged_bytes),
-        );
-    }
-}
+mod execute;
+mod changes;
+use crate::query::codec::{encode_bytes, encode_varint, Decoder};
+mod sinks;
 
 use crate::storage::StorageReadCapability;
 use crate::{
-    helpers::{elapsed_micros, elapsed_nanos, usize_to_u64_saturating},
-    indexing::{IndexingEngine, IndexingSnapshot, ObservedAccess, QueryObservation},
-    memory::{MemoryGovernor, MemorySnapshot, ProcessMemoryPressure},
+    helpers::usize_to_u64_saturating,
+    indexing::{IndexingEngine, ObservedAccess, QueryObservation},
+    memory::{MemoryGovernor, ProcessMemoryPressure, QueryMemory, StageMemory},
     query::{
         decode_execution_row, encode_execution_row_into, execution_row_encoded_len,
-        execution_row_working_bytes, projected_row_working_bytes_refs,
-        reserve_query_memory, stable_projected_order, stable_sort, BoundedProjectedTopN, BoundedTopN,
+        execution_row_working_bytes,
+        stable_sort, BoundedProjectedTopN, BoundedTopN,
         ExecutionError,
-        ExecutionOutput, ExecutionRow, ExecutionRuntime, ExecutionStatistics, ExecutionStrategies,
-        ExecutionStrategy, Executor, LogicalPlan, LookupDocuments, Order, PhysicalOperator,
-        PhysicalPlan, PhysicalPlanError, PhysicalPlanner, PhysicalSubPipeline, Planner,
+        ExecutionOutput, ExecutionRow, ExecutionStatistics, QueryRuntime, ExecutionStrategies,
+        ExecutionStrategy, Order, PhysicalOperator,
+        PhysicalPlan, PhysicalPlanError, PhysicalSubPipeline, Planner,
         PlannerCache, PlannerCacheStats, PlannerError, PlannerPipeline, ProjectedRowLocator,
-        ProjectedRowSet, ProjectedValueLayout, ProjectedValuePipeline, NearSpec, SortDirection, SortKey, vcollections,
+        ProjectedValueLayout, ProjectedValuePipeline, SortKey, vcollections,
     },
     spill::{RunMerge, SpillEngine, SpillRun, SpillRunReader},
     storage::{
@@ -139,51 +76,81 @@ fn retaining_prefix(prefix: &PhysicalPlan, core_reads: Vec<crate::query::Express
 }
 
 /// Equality correlation of a lookup: the sub-pipeline starts with a `where`
-/// whose first conjunct, after optional `exists(…)` guards, is
-/// `joined == outer`. Rows of the joined collection whose key differs cannot
-/// pass that `where`, so an index on `joined` finds every row that can.
+/// whose leading conjuncts, after optional `exists(…)` guards, are
+/// `joined == outer` equalities, or one `starts_with(outer, joined)`
+/// (`prefix`). Rows of the joined collection whose key differs (is no prefix
+/// of the outer value) cannot pass that `where`, so an index on the joined
+/// fields finds every row that can. Several equalities make a composite key:
+/// the array of their values.
 struct LookupEquality {
+    keys: Vec<LookupKey>,
+    prefix: bool,
+}
+
+/// One equality of a lookup key; a side read optionally (`a?`) reads a missing field as `null`.
+struct LookupKey {
     joined: crate::query::ExpressionFieldPath,
     outer: crate::query::ExpressionFieldPath,
+    joined_optional: bool,
+    outer_optional: bool,
 }
 
 impl LookupEquality {
     fn detect(pipeline: &PhysicalSubPipeline, outer_alias: Option<&str>) -> Option<Self> {
-        let [PhysicalOperator::Filter { predicate }, ..] = pipeline.operators() else {
+        // A leading scope filter never fails: rows it keeps or drops cannot
+        // hide an error, and probes replay it on every candidate.
+        let operators = pipeline.operators();
+        let first = operators.iter().position(|operator| !matches!(operator, PhysicalOperator::Filter { predicate } if crate::query::is_scope_restriction(predicate)))?;
+        let PhysicalOperator::Filter { predicate } = &operators[first] else {
             return None;
         };
         let outer_alias = outer_alias?;
+        let is_outer = |field: &crate::query::ExpressionFieldPath| field.first() == outer_alias;
         let mut conjuncts = Vec::new();
-        collect_conjuncts(predicate, &mut conjuncts);
+        crate::helpers::collect_conjuncts(predicate, &mut conjuncts);
+        let mut keys = Vec::new();
         for conjunct in conjuncts {
             match conjunct.view() {
                 // `exists` never fails: skipping rows cannot hide an error.
                 crate::query::ExpressionView::Call { function: "exists", .. } => {}
                 crate::query::ExpressionView::Binary { left, operator: crate::query::BinaryOperator::Equal, right } => {
-                    let (left, right) = (left.ungrouped().as_field()?, right.ungrouped().as_field()?);
-                    let is_outer = |field: &crate::query::ExpressionFieldPath| field.first() == outer_alias;
-                    return match (is_outer(left), is_outer(right)) {
-                        (false, true) => Some(Self { joined: left.clone(), outer: right.clone() }),
-                        (true, false) => Some(Self { joined: right.clone(), outer: left.clone() }),
-                        _ => None,
+                    let (Some(left), Some(right)) = (left.ungrouped().as_read_field(), right.ungrouped().as_read_field()) else { break };
+                    let ((joined, joined_optional), (outer, outer_optional)) = match (is_outer(left.0), is_outer(right.0)) {
+                        (false, true) => (left, right),
+                        (true, false) => (right, left),
+                        _ => break,
                     };
+                    keys.push(LookupKey { joined: joined.clone(), outer: outer.clone(), joined_optional, outer_optional });
                 }
-                _ => return None,
+                crate::query::ExpressionView::Call { function: "starts_with", arguments: [text, prefix] } if keys.is_empty() => {
+                    let (outer, joined) = (text.ungrouped().as_field()?, prefix.ungrouped().as_field()?);
+                    return (outer.first() == outer_alias && joined.first() != outer_alias).then(|| Self { keys: vec![LookupKey { joined: joined.clone(), outer: outer.clone(), joined_optional: false, outer_optional: false }], prefix: true });
+                }
+                _ => break,
             }
         }
-        None
+        (!keys.is_empty()).then_some(Self { keys, prefix: false })
     }
-}
 
-/// Conjuncts of a predicate in evaluation order (`a and b and c` → a, b, c).
-fn collect_conjuncts<'a>(expression: &'a crate::query::Expression, output: &mut Vec<&'a crate::query::Expression>) {
-    let expression = expression.ungrouped();
-    match expression.view() {
-        crate::query::ExpressionView::Binary { left, operator: crate::query::BinaryOperator::And, right } => {
-            collect_conjuncts(left, output);
-            collect_conjuncts(right, output);
-        }
-        _ => output.push(expression),
+    fn outer(&self) -> &crate::query::ExpressionFieldPath {
+        &self.keys[0].outer
+    }
+
+    fn composite(&self) -> bool {
+        self.keys.len() > 1
+    }
+
+    /// The key of the joined row (`outer`: of the outer row) `fields` read: its value, or the array of the values of a
+    /// composite key; `None` when one is missing.
+    fn key_of(&self, fields: &crate::query::LookupFields<'_>, outer: bool) -> Option<Value> {
+        let mut values = self.keys.iter().map(|key| {
+            let (field, optional) = if outer { (&key.outer, key.outer_optional) } else { (&key.joined, key.joined_optional) };
+            match crate::query::ExpressionFieldResolver::resolve_field(fields, field) {
+                crate::query::SemanticValue::Present(value) => Some(value),
+                crate::query::SemanticValue::Missing => optional.then_some(Value::Null),
+            }
+        }).collect::<Option<Vec<_>>>()?;
+        if values.len() == 1 { values.pop() } else { Some(Value::Array(values.into())) }
     }
 }
 
@@ -218,6 +185,16 @@ fn equality_key(value: &Value) -> (KeyKind, Vec<u8>) {
         }
         Value::Null => (KeyKind::Other, vec![b'z']),
         Value::Bool(flag) => (KeyKind::Other, vec![b'b', u8::from(*flag)]),
+        // An array (a composite key): the keys of its items, each after its length.
+        Value::Array(items) => {
+            let mut key = vec![b'a'];
+            for item in items.iter() {
+                let item = equality_key(item).1;
+                key.extend_from_slice(&u32::try_from(item.len()).unwrap_or(u32::MAX).to_be_bytes());
+                key.extend_from_slice(&item);
+            }
+            (KeyKind::Other, key)
+        }
         other => {
             let mut key = vec![b'j'];
             key.extend_from_slice(crate::helpers::value_to_json(other).to_string().as_bytes());
@@ -237,13 +214,33 @@ struct LookupIndex {
     /// Rows of the joined collection read to build the index.
     scanned: u64,
     rows: Vec<IndexedRow>,
-    buckets: HashMap<Vec<u8>, Vec<u32>>,
+    buckets: HashMap<Vec<u8>, Vec<u32>, std::hash::BuildHasherDefault<crate::query::keys::KeyHasher>>,
     /// Rows whose key is a number or a string: comparing those two kinds
     /// raises an error, so they stay candidates for keys of the other kind.
     numbers: Vec<u32>,
     strings: Vec<u32>,
     /// Rows without the key: the `where` decides (a guard, or an error).
     missing: Vec<u32>,
+    /// Rows whose key is neither a number nor a string.
+    others: Vec<u32>,
+    /// Byte lengths of the string keys, for a prefix correlation.
+    lengths: std::collections::BTreeSet<usize>,
+    /// Rows keyed by an array (a composite key), by the kinds of its items:
+    /// an item that is a number (string) where the outer key's is a string
+    /// (number) raises, so those rows stay candidates.
+    shapes: HashMap<Vec<u8>, Vec<u32>>,
+}
+
+/// The kinds of the items of an array key ([`equality_key`]): `n`, `s` or `o`.
+fn item_kinds(key: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = key.strip_prefix(b"a")?;
+    let mut kinds = Vec::new();
+    while let Some((length, tail)) = rest.split_first_chunk::<4>() {
+        let (item, tail) = tail.split_at(u32::from_be_bytes(*length) as usize);
+        kinds.push(match item.first() { Some(b'n') => b'n', Some(b's') => b's', _ => b'o' });
+        rest = tail;
+    }
+    Some(kinds)
 }
 
 impl LookupIndex {
@@ -253,25 +250,51 @@ impl LookupIndex {
         match key {
             None => self.missing.push(position),
             Some((kind, key)) => {
-                self.buckets.entry(key).or_default().push(position);
                 match kind {
                     KeyKind::Number => self.numbers.push(position),
-                    KeyKind::String => self.strings.push(position),
-                    KeyKind::Other => {}
+                    KeyKind::String => {
+                        self.strings.push(position);
+                        self.lengths.insert(key.len() - 1);
+                    }
+                    KeyKind::Other => self.others.push(position),
                 }
+                if let Some(kinds) = item_kinds(&key) {
+                    self.shapes.entry(kinds).or_default().push(position);
+                }
+                self.buckets.entry(key).or_default().push(position);
             }
         }
     }
 
     /// Positions of every row that can pass the correlation for `outer_key`,
-    /// in collection order.
-    fn candidates(&self, outer_key: Option<&Value>) -> Vec<u32> {
+    /// in collection order. A prefix correlation probes the outer text's
+    /// prefixes of every key length; rows keyed by a number or another
+    /// kind stay candidates (the `where` decides, or raises its error).
+    fn candidates(&self, outer_key: Option<&Value>, prefix: bool) -> Vec<u32> {
         let Some(outer_key) = outer_key else {
             return (0..self.rows.len() as u32).collect();
         };
+        if prefix {
+            let Value::String(text) = outer_key else {
+                return (0..self.rows.len() as u32).collect();
+            };
+            let mut candidates = [&self.missing, &self.numbers, &self.others].into_iter().flatten().copied().collect::<Vec<_>>();
+            let mut key = vec![b's'];
+            for length in self.lengths.iter().copied().filter(|length| text.is_char_boundary(*length)) {
+                key.truncate(1);
+                key.extend_from_slice(&text.as_bytes()[..length]);
+                candidates.extend(self.buckets.get(&key).into_iter().flatten());
+            }
+            candidates.sort_unstable();
+            return candidates;
+        }
         let (kind, key) = equality_key(outer_key);
         let mut candidates = self.missing.clone();
         candidates.extend(self.buckets.get(&key).into_iter().flatten());
+        if let Some(outer) = item_kinds(&key) {
+            let raises = |kinds: &Vec<u8>| kinds.len() == outer.len() && kinds.iter().zip(&outer).any(|pair| matches!(pair, (b'n', b's') | (b's', b'n')));
+            candidates.extend(self.shapes.iter().filter(|(kinds, _)| raises(kinds)).flat_map(|(_, rows)| rows));
+        }
         match kind {
             KeyKind::Number => candidates.extend(&self.strings),
             KeyKind::String => candidates.extend(&self.numbers),
@@ -293,10 +316,12 @@ const SEMI_JOIN_MAX_OUTER_ROWS: usize = 4096;
 /// outer key is a string (number), a pairing whose comparison raises.
 #[derive(Default)]
 struct LookupKeyFilter {
-    numbers: std::collections::HashSet<u64>,
-    strings: std::collections::HashSet<Arc<str>>,
-    others: std::collections::HashSet<Vec<u8>>,
+    numbers: KeySet<u64>,
+    strings: KeySet<Arc<str>>,
+    others: KeySet<Vec<u8>>,
 }
+
+type KeySet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<crate::query::keys::KeyHasher>>;
 
 impl LookupKeyFilter {
     fn insert(&mut self, value: &Value) {
@@ -377,136 +402,229 @@ fn take_partial_documents_used() -> bool {
     PARTIAL_DOCUMENTS_USED.with(|used| used.replace(false))
 }
 
-/// Top-level stored fields to decode for a field demand, or `None` when the
-/// storage cannot read chosen fields natively. Nested paths are read through
-/// their top-level field; `_id` comes from the row identifier.
+/// Stored fields to decode for a field demand, or `None` when the storage
+/// cannot read chosen fields natively. A nested path is read on its own,
+/// unless its top-level field is demanded too; `_id` comes from the row
+/// identifier.
 fn partial_source_fields(read: &dyn crate::storage::StorageRead, demand: &[crate::query::ExpressionFieldPath]) -> Option<Vec<crate::query::ExpressionFieldPath>> {
     if read.support(StorageReadCapability::ProjectedValuesGatedUnordered) != crate::storage::StorageSupport::Native {
         return None;
     }
     let mut fields = Vec::new();
     for field in demand.iter().filter(|field| field.first() != "_id") {
-        let top = crate::query::ExpressionFieldPath::new([field.first()]).ok()?;
-        if !fields.contains(&top) {
-            fields.push(top);
+        let top_demanded = demand.iter().any(|other| other.len() == 1 && other.first() == field.first());
+        let field = if top_demanded { crate::query::ExpressionFieldPath::new([field.first()]).ok()? } else { field.clone() };
+        if !fields.contains(&field) {
+            fields.push(field);
         }
     }
     Some(fields)
 }
 
-/// Multiply-rotate hasher with a murmur3 final mix: grouping codes stored
-/// as floats have zero low mantissa bits, which a bare multiplicative hash
-/// would send to the same buckets.
-#[derive(Default)]
-struct KeyHasher(u64);
-
-impl std::hash::Hasher for KeyHasher {
-    #[inline]
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks(8) {
-            let mut word = [0u8; 8];
-            word[..chunk.len()].copy_from_slice(chunk);
-            self.write_u64(u64::from_le_bytes(word));
-        }
-    }
-
-    #[inline]
-    fn write_u8(&mut self, value: u8) {
-        self.write_u64(u64::from(value));
-    }
-
-    #[inline]
-    fn write_usize(&mut self, value: usize) {
-        self.write_u64(value as u64);
-    }
-
-    #[inline]
-    fn write_u64(&mut self, value: u64) {
-        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    #[inline]
-    fn finish(&self) -> u64 {
-        let mut hash = self.0;
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-        hash ^ (hash >> 33)
-    }
-}
-
-type KeyMap<K> = HashMap<K, u32, std::hash::BuildHasherDefault<KeyHasher>>;
-
-/// In-memory `group` fed from batches or rows: a group is found by its typed
-/// key (one scalar column: tag and bits, or borrowed text), and its encoded
-/// key is built once, when the group is created. Output order, the `group |
-/// limit` frontier and the working-set estimate use that encoded key, as the
-/// row-at-a-time consumer does.
-struct TypedGroups<'a> {
+/// In-memory `group` fed from batches or rows: a row's key is found in a
+/// [`crate::query::keys::KeyTable`] from its typed cells, and the encoded
+/// key of a group is built once, when the group is created. Output order,
+/// the `group | limit` frontier and the working-set estimate use that
+/// encoded key, as the row-at-a-time consumer does. Measures fold column by
+/// column ([`crate::query::DenseGroups::push_batch`]).
+struct BatchGroups<'a> {
     keys: &'a [crate::query::ExpressionFieldPath],
     /// Position of each grouping key among the group input fields.
     key_indexes: &'a [usize],
-    budget: usize,
+    memory: &'a StageMemory<'a>,
     limit: Option<usize>,
-    scalars: KeyMap<(u8, u64)>,
-    texts: KeyMap<Box<str>>,
-    encoded: KeyMap<Box<[u8]>>,
+    table: crate::query::keys::KeyTable,
+    /// Group of each key of `table` ([`crate::query::DenseGroups::SKIP`]:
+    /// left out of a bounded group, for good: its frontier only shrinks;
+    /// [`UNSEEN_KEY`]: not looked up yet).
+    key_groups: Vec<u32>,
     /// Encoded key of each group, `None` once evicted.
     groups: Vec<Option<Arc<[u8]>>>,
+    /// Key of each group in `table` (`u32::MAX`: not seen since a reset).
+    group_keys: Vec<u32>,
     dense: crate::query::DenseGroups,
+    /// Bounded group: kept groups by encoded key.
     ordered: BTreeMap<Arc<[u8]>, u32>,
     estimated_bytes: usize,
     exceeded: bool,
-    materializer: crate::query::RuntimeMaterializer,
     key_buffer: Vec<u8>,
-    /// Group of the previous row's scalar or text key: rows sharing a key
-    /// often follow each other.
-    last_scalar: Option<((u8, u64), u32)>,
-    last_text: Option<(String, u32)>,
+    batch_keys: Vec<u32>,
+    batch_groups: Vec<u32>,
+    /// Bounded group, once full: per value of the first key field,
+    /// [`ABOVE_FRONTIER`] when it sorts above the frontier's (then so does
+    /// every key holding it, for good), else the frontier version it was
+    /// found not to (0: never checked). One word, read once per row.
+    first_frontier: Vec<u32>,
+    frontier_version: u32,
+    component: Vec<u8>,
+    /// Batch positions not left out by their first key field.
+    kept: Vec<u32>,
+    /// Rows of a batch not left out by their first number ([`Self::narrow`]).
+    narrowed: Vec<u32>,
 }
 
-/// Typed key of one row: what `TypedGroups` looks groups up by.
-enum RowKey<'k> {
-    Scalar(u8, u64),
-    Text(&'k str),
-    Encoded,
-}
+/// Decides a block from its columns at the given positions
+/// ([`Engine::stream_slot_batches_gated`]).
+type BlockAdmit<'g> = &'g mut dyn FnMut(&crate::storage::ProjectedBlock<'_, '_>, &[usize]) -> EngineResult<bool>;
 
-impl<'a> TypedGroups<'a> {
-    fn new(dense: crate::query::DenseGroups, keys: &'a [crate::query::ExpressionFieldPath], key_indexes: &'a [usize], budget: usize, limit: Option<usize>) -> Self {
+/// Fields and admission of a consumer's block gate
+/// ([`Engine::stream_slot_batches_gated`]), and whether it only refuses
+/// blocks (their rows otherwise go on as usual).
+type BlockGateOn<'g> = (&'g [crate::query::ExpressionFieldPath], BlockAdmit<'g>, bool);
+
+/// A sort right after a `group`, and its bound ([`BatchGroups::finish`]).
+type GroupTop<'k> = Option<(&'k [crate::query::SortKey], Option<usize>)>;
+
+/// A first key value above the frontier ([`BatchGroups::first_frontier`]).
+const ABOVE_FRONTIER: u32 = u32::MAX;
+
+/// A key of `BatchGroups::key_groups` not looked up yet.
+const UNSEEN_KEY: u32 = u32::MAX - 1;
+
+/// Bytes past which a bounded group's key table starts over (small in debug
+/// builds, so tests start over too).
+const BOUNDED_KEY_TABLE_BYTES: usize = if cfg!(debug_assertions) { 256 << 10 } else { 64 << 20 };
+
+impl<'a> BatchGroups<'a> {
+    fn new(dense: crate::query::DenseGroups, keys: &'a [crate::query::ExpressionFieldPath], key_indexes: &'a [usize], memory: &'a StageMemory<'a>, limit: Option<usize>) -> Self {
         Self {
             keys,
             key_indexes,
-            budget,
+            memory,
             limit,
-            scalars: KeyMap::default(),
-            texts: KeyMap::default(),
-            encoded: KeyMap::default(),
+            table: crate::query::keys::KeyTable::new(key_indexes.len()),
+            key_groups: Vec::new(),
             groups: Vec::new(),
+            group_keys: Vec::new(),
             dense,
             ordered: BTreeMap::new(),
             estimated_bytes: 0,
             exceeded: false,
-            materializer: crate::query::RuntimeMaterializer::new(),
             key_buffer: Vec::with_capacity(64),
-            last_scalar: None,
-            last_text: None,
+            batch_keys: Vec::with_capacity(crate::query::BATCH_ROWS),
+            batch_groups: Vec::with_capacity(crate::query::BATCH_ROWS),
+            first_frontier: Vec::new(),
+            frontier_version: 1,
+            component: Vec::with_capacity(32),
+            kept: Vec::with_capacity(crate::query::BATCH_ROWS),
+            narrowed: Vec::with_capacity(crate::query::BATCH_ROWS),
         }
     }
 
-    fn row_key<'k>(&self, values: &[Option<ProjectedValueRef<'k>>]) -> RowKey<'k> {
-        let [index] = self.key_indexes else { return RowKey::Encoded };
-        match values[*index] {
-            None => RowKey::Scalar(0, 0),
-            Some(ProjectedValueRef::Null) => RowKey::Scalar(1, 0),
-            Some(ProjectedValueRef::Bool(value)) => RowKey::Scalar(2, u64::from(value)),
-            Some(ProjectedValueRef::Signed(value)) => RowKey::Scalar(3, value as u64),
-            Some(ProjectedValueRef::Unsigned(value)) => RowKey::Scalar(4, value),
-            Some(ProjectedValueRef::Float(value)) => RowKey::Scalar(5, value.to_bits()),
-            Some(ProjectedValueRef::String(text)) => RowKey::Text(text),
-            Some(ProjectedValueRef::Owned(_)) => RowKey::Encoded,
+    /// Folds a whole block of an unbounded one-key group: `columns` holds the
+    /// block column of each group input field. Every block folds here, so
+    /// rows fold in scan order.
+    fn push_block(&mut self, block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]) -> Result<(), StorageError> {
+        if self.exceeded {
+            return Ok(());
         }
+        let inputs = columns.iter().map(|column| &block.columns[*column]).collect::<Vec<_>>();
+        let key = columns[self.key_indexes[0]];
+        let mut keys = std::mem::take(&mut self.batch_keys);
+        self.table.block_keys(&block.columns[key], block.codes[key], &mut keys);
+        self.create_new(&keys)?;
+        if !self.exceeded {
+            self.dense.fold_block(&keys, &inputs).map_err(execution_storage_error)?;
+        }
+        self.batch_keys = keys;
+        Ok(())
+    }
+
+    /// Creates the groups of the new keys among `keys`, under an unbounded
+    /// group, whose keys are its groups ([`Self::group_of`]).
+    fn create_new(&mut self, keys: &[u32]) -> Result<(), StorageError> {
+        for &key in keys {
+            if key as usize >= self.group_keys.len() && self.group_of(key).map(|_| self.exceeded)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Folds the selected rows of a batch; `columns` holds the group input
+    /// fields.
+    fn push_batch(&mut self, columns: &[Option<&crate::query::Column>], selection: &[u32]) -> Result<(), StorageError> {
+        if self.exceeded {
+            return Ok(());
+        }
+        let key_columns = self.key_indexes.iter().map(|index| columns[*index]).collect::<Vec<_>>();
+        let mut narrowed = std::mem::take(&mut self.narrowed);
+        let selection = if self.narrow(key_columns[0], selection, &mut narrowed) { narrowed.as_slice() } else { selection };
+        let mut batch_groups = std::mem::take(&mut self.batch_groups);
+        batch_groups.clear();
+        let mut batch_keys = std::mem::take(&mut self.batch_keys);
+        if self.limit.is_some() {
+            // A row whose first key field sorts above the frontier's is left
+            // out without building its key.
+            self.table.batch_field(0, key_columns[0], selection, None);
+            let mut kept = std::mem::take(&mut self.kept);
+            kept.clear();
+            for position in 0..selection.len() {
+                if !self.first_above_frontier(self.table.batch_value(0, position)) {
+                    kept.push(position as u32);
+                }
+            }
+            for (field, column) in key_columns.iter().enumerate().skip(1) {
+                self.table.batch_field(field, *column, selection, Some(&kept));
+            }
+            self.kept = kept;
+            for position in 0..selection.len() {
+                // Checked again: a group created by an earlier row of the
+                // batch may have moved the frontier.
+                if self.first_above_frontier(self.table.batch_value(0, position)) {
+                    batch_groups.push(crate::query::DenseGroups::SKIP);
+                    continue;
+                }
+                let key = self.table.key_at(position);
+                match self.group_of(key) {
+                    Ok(group) => batch_groups.push(group),
+                    Err(error) => {
+                        self.batch_groups = batch_groups;
+                        self.batch_keys = batch_keys;
+                        return Err(error);
+                    }
+                }
+            }
+        } else {
+            self.table.batch(&key_columns, selection, &mut batch_keys);
+            self.create_new(&batch_keys)?;
+        }
+        // An unbounded group's keys are its groups ([`Self::group_of`]).
+        let groups = if self.limit.is_some() { &batch_groups } else { &batch_keys };
+        let folded = if self.exceeded { Ok(()) } else { self.dense.push_batch(groups, selection, columns).map_err(execution_storage_error) };
+        self.batch_keys = batch_keys;
+        self.batch_groups = batch_groups;
+        self.narrowed = narrowed;
+        folded?;
+        self.trim();
+        Ok(())
+    }
+
+    /// Keeps in `narrowed` the rows of `selection` a full bounded group may
+    /// still keep by its first key field: a number whose key component
+    /// sorts above the frontier's first one is left out before any id is
+    /// looked up. `false` (nothing decided) while the group is not full.
+    fn narrow(&self, column: Option<&crate::query::Column>, selection: &[u32], narrowed: &mut Vec<u32>) -> bool {
+        use crate::query::Tag;
+        let (Some(limit), Some(column)) = (self.limit, column) else { return false };
+        let Some((largest, _)) = self.ordered.last_key_value().filter(|_| self.ordered.len() >= limit) else { return false };
+        // A component is its presence byte, its tag (3 signed, 4 unsigned,
+        // 5 float), then a number's big-endian word: as these bytes, it
+        // compares as (presence, tag, word), with no word but a number's.
+        let at = crate::query::keys::KeyTable::KEY_HEADER;
+        let frontier = match largest.get(at..) {
+            Some([1, tag @ 3..=5, word @ ..]) if word.len() >= 8 => (1u8, *tag, u64::from_be_bytes(word[..8].try_into().expect("eight bytes"))),
+            Some([1, tag @ 0..=2, ..]) => (1, *tag, 0),
+            Some([1, ..]) => return false,
+            _ => (0, 0, 0),
+        };
+        narrowed.clear();
+        narrowed.extend_from_slice(selection);
+        crate::query::keep(narrowed, |row| {
+            let tag = match column.tag(row) { Tag::Signed => 3, Tag::Unsigned => 4, Tag::Float => 5, _ => return true };
+            (1, tag, column.bits(row)) <= frontier
+        });
+        true
     }
 
     /// Folds one row, its group input fields in `values`.
@@ -514,130 +632,199 @@ impl<'a> TypedGroups<'a> {
         if self.exceeded {
             return Ok(());
         }
-        let key = self.row_key(values);
-        match &key {
-            RowKey::Scalar(tag, bits) => {
-                if let Some((last, group)) = self.last_scalar {
-                    if last == (*tag, *bits) {
-                        return self.dense.push(group, values).map_err(backend_storage_error);
-                    }
-                }
-            }
-            RowKey::Text(text) => {
-                if let Some((last, group)) = &self.last_text {
-                    if last.as_str() == *text {
-                        return self.dense.push(*group, values).map_err(backend_storage_error);
-                    }
-                }
-            }
-            RowKey::Encoded => {}
+        let key_values = self.key_indexes.iter().map(|index| values[*index].clone()).collect::<Vec<_>>();
+        let key = self.table.row(&key_values);
+        let group = self.group_of(key)?;
+        if self.exceeded || group == crate::query::DenseGroups::SKIP {
+            return Ok(());
         }
-        let found = match &key {
-            RowKey::Scalar(tag, bits) => self.scalars.get(&(*tag, *bits)),
-            RowKey::Text(text) => self.texts.get(*text),
-            RowKey::Encoded => {
-                self.materializer.write_projected_ref_distinct_key_indexes(values, self.key_indexes, &mut self.key_buffer);
-                // A key above every kept group of a full bounded group is
-                // no group: it is left out without a lookup.
-                if self.limit.is_some_and(|limit| self.ordered.len() >= limit)
-                    && self.ordered.last_key_value().is_some_and(|(largest, _)| self.key_buffer.as_slice() > largest.as_ref())
-                {
-                    return Ok(());
-                }
-                self.encoded.get(self.key_buffer.as_slice())
-            }
-        }
-        .copied();
-        let group = match found {
-            Some(group) => group,
-            None => {
-                if !matches!(key, RowKey::Encoded) {
-                    self.materializer.write_projected_ref_distinct_key_indexes(values, self.key_indexes, &mut self.key_buffer);
-                }
-                let Some(group) = self.create(&key, values)? else { return Ok(()) };
-                group
-            }
-        };
-        match key {
-            RowKey::Scalar(tag, bits) => self.last_scalar = Some(((tag, bits), group)),
-            RowKey::Text(text) => {
-                let (last, last_group) = self.last_text.get_or_insert_with(|| (String::new(), group));
-                last.clear();
-                last.push_str(text);
-                *last_group = group;
-            }
-            RowKey::Encoded => {}
-        }
-        self.dense.push(group, values).map_err(backend_storage_error)
+        self.dense.push(group, values).map_err(execution_storage_error)?;
+        self.trim();
+        Ok(())
     }
 
-    /// Creates the group whose encoded key is in `key_buffer`; `None` when
-    /// the row is left out (bounded group) or the working set is exceeded.
-    fn create(&mut self, key: &RowKey<'_>, values: &[Option<ProjectedValueRef<'_>>]) -> Result<Option<u32>, StorageError> {
+    /// Whether value `id` of the first key field sorts above the first
+    /// field of the largest kept key of a full bounded group: a key holding
+    /// it is above that key and would be left out.
+    #[inline]
+    fn first_above_frontier(&mut self, id: u32) -> bool {
+        let Some(limit) = self.limit else { return false };
+        let index = id as usize;
+        match self.first_frontier.get(index) {
+            Some(&ABOVE_FRONTIER) => return true,
+            Some(&version) if version == self.frontier_version => return false,
+            _ if self.ordered.len() < limit => return false,
+            Some(_) => {}
+            None => self.first_frontier.resize(index + 1, 0),
+        }
+        self.component.clear();
+        self.table.write_component(0, id, &mut self.component);
+        let (largest, _) = self.ordered.last_key_value().expect("a full bounded group has a frontier");
+        let start = crate::query::keys::KeyTable::KEY_HEADER;
+        // Components are prefix-free: two different ones differ within the
+        // shorter, so this byte range decides when it differs.
+        let above = largest.get(start..start + self.component.len()).is_some_and(|frontier| self.component.as_slice() > frontier);
+        self.first_frontier[index] = if above { ABOVE_FRONTIER } else { self.frontier_version };
+        above
+    }
+
+    /// Group of `key`, created when the key is new.
+    #[inline]
+    fn group_of(&mut self, key: u32) -> Result<u32, StorageError> {
+        // Unbounded, every key gets its group when first seen, in key order:
+        // a key is its group.
+        if self.limit.is_none() && (key as usize) < self.group_keys.len() {
+            return Ok(key);
+        }
+        if let Some(&group) = self.key_groups.get(key as usize) {
+            if group != UNSEEN_KEY {
+                return Ok(group);
+            }
+        }
+        self.table.write_key(key, &mut self.key_buffer);
+        let group = match self.ordered.get(self.key_buffer.as_slice()) {
+            // A kept group whose key was forgotten by a reset.
+            Some(group) => *group,
+            None => self.create(key)?,
+        };
+        if group != crate::query::DenseGroups::SKIP {
+            self.group_keys[group as usize] = key;
+        }
+        // Keys skip numbers when rows left out by the first key field
+        // still numbered their value (single-field keys).
+        if key as usize >= self.key_groups.len() {
+            self.key_groups.resize(key as usize + 1, UNSEEN_KEY);
+        }
+        self.key_groups[key as usize] = group;
+        Ok(group)
+    }
+
+    /// Creates the group whose encoded key is in `key_buffer`;
+    /// [`crate::query::DenseGroups::SKIP`] when it is left out (bounded
+    /// group) or the working set is exceeded.
+    fn create(&mut self, key: u32) -> Result<u32, StorageError> {
+        debug_assert!(self.limit.is_some() || key as usize == self.group_keys.len(), "unbounded keys are their groups");
         let state_estimate = group_state_estimate(self.key_buffer.len(), self.keys.len());
         if let Some(limit) = self.limit {
             if self.ordered.len() >= limit {
                 let (largest, evicted) = self.ordered.last_key_value().expect("bounded group frontier exists");
                 if self.key_buffer.as_slice() >= largest.as_ref() {
-                    return Ok(None);
+                    return Ok(crate::query::DenseGroups::SKIP);
                 }
                 let (largest_len, evicted) = (largest.len(), *evicted);
                 self.ordered.pop_last();
                 self.forget(evicted);
                 self.estimated_bytes = self.estimated_bytes.saturating_sub(group_state_estimate(largest_len, self.keys.len()));
             }
-            if self.estimated_bytes.saturating_add(state_estimate) > self.budget {
+            if !self.memory.fits(self.estimated_bytes.saturating_add(state_estimate)) {
                 return Err(StorageError::backend("bounded group limit exceeds the governed working set"));
             }
-        } else if self.estimated_bytes.saturating_add(state_estimate) > self.budget {
+        } else if !self.memory.fits(self.estimated_bytes.saturating_add(state_estimate).saturating_add(self.table.bytes())) {
             self.exceeded = true;
             self.groups.clear();
-            return Ok(None);
+            return Ok(crate::query::DenseGroups::SKIP);
         }
         self.estimated_bytes = self.estimated_bytes.saturating_add(state_estimate);
-        let group = self.dense.add(values);
-        let encoded: Arc<[u8]> = Arc::from(self.key_buffer.as_slice());
-        match key {
-            RowKey::Scalar(tag, bits) => { self.scalars.insert((*tag, *bits), group); }
-            RowKey::Text(text) => { self.texts.insert(Box::from(*text), group); }
-            RowKey::Encoded => { self.encoded.insert(Box::from(self.key_buffer.as_slice()), group); }
-        }
+        let group = self.dense.add_keys((0..self.key_indexes.len()).map(|field| self.table.value(key, field).cloned()).collect());
+        // An unbounded group orders its keys at the end, by rank
+        // ([`crate::query::keys::KeyTable::sort_by_key`]).
         if self.limit.is_some() {
+            let encoded: Arc<[u8]> = Arc::from(self.key_buffer.as_slice());
             self.ordered.insert(Arc::clone(&encoded), group);
+            self.frontier_version = self.frontier_version % (ABOVE_FRONTIER - 1) + 1;
+            self.groups.push(Some(encoded));
+        } else {
+            self.groups.push(None);
         }
-        self.groups.push(Some(encoded));
-        Ok(Some(group))
+        self.group_keys.push(key);
+        Ok(group)
     }
 
-    /// Drops an evicted group and its index entry.
+    /// Drops an evicted group: its key is left out from now on.
     fn forget(&mut self, group: u32) {
         self.groups[group as usize] = None;
         self.dense.evict(group);
-        self.last_scalar = self.last_scalar.filter(|(_, last)| *last != group);
-        self.last_text = self.last_text.take().filter(|(_, last)| *last != group);
-        self.scalars.retain(|_, candidate| *candidate != group);
-        self.texts.retain(|_, candidate| *candidate != group);
-        self.encoded.retain(|_, candidate| *candidate != group);
+        let key = self.group_keys[group as usize];
+        if let Some(slot) = self.key_groups.get_mut(key as usize) {
+            *slot = crate::query::DenseGroups::SKIP;
+        }
+    }
+
+    /// A bounded group keeps few groups but may see many keys: past a size,
+    /// the key table starts over, and keys seen again find their kept group
+    /// by encoded key.
+    fn trim(&mut self) {
+        if self.limit.is_none() || self.table.bytes() <= BOUNDED_KEY_TABLE_BYTES {
+            return;
+        }
+        self.table = crate::query::keys::KeyTable::new(self.key_indexes.len());
+        self.key_groups.clear();
+        self.group_keys.fill(u32::MAX);
+        self.first_frontier.clear();
     }
 
     /// Groups in encoded-key order, as rows; `None` when the working set
-    /// was exceeded.
-    fn finish(self) -> EngineResult<Option<Vec<ExecutionRow>>> {
+    /// was exceeded. Under `top` (a sort right after, and its bound), the
+    /// groups come sorted ([`GroupRows::sorted`]) when the sort reads only
+    /// their fields: each group's sort values are read once, only the first
+    /// `limit` kept (ties in key order).
+    fn finish(self, top: GroupTop<'_>) -> EngineResult<Option<GroupRows>> {
         if self.exceeded {
             return Ok(None);
         }
-        let mut dense = self.dense;
-        let mut groups = self.groups.into_iter().enumerate().filter_map(|(group, key)| Some((key?, group as u32))).collect::<Vec<_>>();
-        groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, (_, group))| {
-                let ordinal = usize_to_u64_saturating(index).saturating_add(1);
-                Ok(ExecutionRow::synthetic(dense.finish(group, ordinal).map_err(EngineError::execution)?))
-            })
-            .collect::<EngineResult<Vec<_>>>()
-            .map(Some)
+        let dense = self.dense;
+        let groups = if self.limit.is_some() {
+            let mut groups = self.groups.into_iter().enumerate().filter_map(|(group, key)| Some((key?, group as u32))).collect::<Vec<_>>();
+            groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            groups.into_iter().map(|(_, group)| group).collect::<Vec<_>>()
+        } else {
+            let mut groups = (0..self.group_keys.len() as u32).collect::<Vec<_>>();
+            let group_keys = &self.group_keys;
+            self.table.sort_by_key(&mut groups, |group| group_keys[*group as usize]);
+            groups
+        };
+        let names = top.map(|(keys, _)| keys.iter().map(|key| key.field().first()).collect::<Vec<_>>()).filter(|names| !names.contains(&"_id"));
+        let (Some((keys, limit)), Some(names), None) = (top, names, self.limit) else {
+            return Ok(Some(GroupRows { dense, groups: groups.into_iter().enumerate().collect::<Vec<_>>().into_iter(), sorted: false }));
+        };
+        type Keyed = (usize, Vec<Option<Value>>);
+        let compare = |left: &Keyed, right: &Keyed| crate::query::compare_owned_projected_rows(keys, &left.1, &right.1);
+        let mut selection = limit.map(crate::query::TopSelection::new);
+        let mut keyed = Vec::new();
+        for (index, group) in groups.iter().enumerate() {
+            let fields = dense.fields(*group, &names).map_err(EngineError::execution)?;
+            let entry = (index, keys.iter().map(|key| crate::query::path_value(&fields, key.field()).cloned()).collect());
+            match &mut selection {
+                Some(selection) => drop(selection.offer(entry, |entry, worst| Ok(compare(entry, worst)?.is_lt()), Ok, compare).map_err(EngineError::execution)?),
+                None => keyed.push(entry),
+            }
+        }
+        keyed = selection.map_or(keyed, crate::query::TopSelection::into_arrival_order);
+        let mut failed = None;
+        keyed.sort_by(|left, right| compare(left, right).unwrap_or_else(|error| { failed.get_or_insert(error); std::cmp::Ordering::Equal }));
+        match failed {
+            Some(error) => Err(EngineError::execution(error)),
+            None => Ok(Some(GroupRows { dense, groups: keyed.into_iter().map(|(index, _)| (index, groups[index])).collect::<Vec<_>>().into_iter(), sorted: true })),
+        }
+    }
+}
+
+/// Finished groups, each built into its row when it is taken: the rows of
+/// all groups never coexist.
+struct GroupRows {
+    dense: crate::query::DenseGroups,
+    groups: std::vec::IntoIter<(usize, u32)>,
+    /// Already in the order of the sort after the group.
+    sorted: bool,
+}
+
+impl Iterator for GroupRows {
+    type Item = EngineResult<ExecutionRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (index, group) = self.groups.next()?;
+        let ordinal = usize_to_u64_saturating(index).saturating_add(1);
+        Some(self.dense.finish(group, ordinal).map(ExecutionRow::synthetic).map_err(EngineError::execution))
     }
 }
 
@@ -646,16 +833,28 @@ impl<'a> TypedGroups<'a> {
 /// `on_batch`; a batch that aborted is replayed row by row through
 /// `on_row` (the row-at-a-time path), with its source values. Both run
 /// inside the storage visitor, as the row-at-a-time path does, so an error
-/// surfaces exactly as it would there. Returns the rows read.
+/// surfaces exactly as it would there. Returns the rows read. Under
+/// [`ScanOptions::without_locators`], rows carry [`NO_LOCATOR`].
+///
+/// Leading filters that read only some fields see each block's columns of
+/// those first ([`crate::query::BatchProgram::head`]): a block none of whose
+/// rows passes them is not decoded further, its rows dropped by the filters;
+/// they stop deciding first once they refuse fewer than one block in eight.
+/// `consumer` may refuse blocks too, from its own columns, its rows then
+/// only read.
+#[allow(clippy::too_many_arguments)]
 fn scan_batched(
     read: &dyn crate::storage::StorageRead,
     collection: &CollectionId,
     options: ScanOptions,
     storage_fields: &[crate::FieldPath],
     program: &Arc<crate::query::BatchProgram>,
+    pruning: Option<&crate::query::GroupPruning>,
+    mut consumer: Option<crate::storage::BlockGate<'_>>,
     on_batch: &mut dyn FnMut(&crate::query::BatchRunner) -> Result<bool, StorageError>,
     on_row: &mut dyn FnMut(DocumentId, DocumentVersion, &[Option<Value>]) -> Result<bool, StorageError>,
 ) -> Result<u64, StorageError> {
+    let options = options.with_number_codes(program.number_codes());
     let mut runner = crate::query::BatchRunner::new(Arc::clone(program));
     let mut values = Vec::new();
     let mut scanned = 0u64;
@@ -666,7 +865,7 @@ fn scan_batched(
         } else {
             let mut more = true;
             for row in 0..runner.len() {
-                let (id, version) = runner.id(row);
+                let (id, version) = if options.locators() { runner.id(row) } else { NO_LOCATOR };
                 runner.source_values(row, &mut values);
                 if !on_row(id, version, &values)? {
                     more = false;
@@ -679,18 +878,103 @@ fn scan_batched(
         Ok(more)
     };
     let mut stopped = false;
-    read.scan_projected_row_refs_unordered_each(collection, options, storage_fields, &mut |id, version, row| {
-        runner.push(id, version, row);
-        if runner.is_full() && !flush(&mut runner)? {
-            stopped = true;
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
-    if !stopped && !runner.is_empty() {
+    // Rows of refused blocks: all of them, and those the filters dropped
+    // not yet counted by a batch.
+    let (refused, dropped) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
+    if read.supports_projected_blocks() {
+        let head = program.head();
+        let mut head_runner = crate::query::BatchRunner::new(Arc::clone(program));
+        let (tried, refusals) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
+        let fields = (0..storage_fields.len()).map(|field| head.as_ref().is_some_and(|(_, reads)| reads[field]) || consumer.as_ref().is_some_and(|gate| gate.fields[field])).collect();
+        let gated = head.is_some() || consumer.is_some();
+        let mut admit = |block: &crate::storage::ProjectedBlock<'_, '_>| -> Result<bool, StorageError> {
+            if let Some((stages, _)) = head.as_ref().filter(|_| tried.get() < 32 || refusals.get() * 8 >= tried.get()) {
+                tried.set(tried.get() + 1);
+                let mut passes = false;
+                for from in (0..block.rows).step_by(crate::query::BATCH_ROWS) {
+                    head_runner.push_rows(&[], block.columns, block.codes, from, crate::query::BATCH_ROWS.min(block.rows - from));
+                    // An aborted batch is decided row by row, with its errors.
+                    passes |= head_runner.run_stages(*stages).is_err() || !head_runner.selection().is_empty();
+                    head_runner.clear();
+                }
+                if !passes {
+                    refusals.set(refusals.get() + 1);
+                    refused.set(refused.get() + block.rows);
+                    dropped.set(dropped.get() + block.rows);
+                    return Ok(false);
+                }
+            }
+            let admitted = match consumer.as_mut() { Some(gate) => (gate.admit)(block)?, None => true };
+            if !admitted {
+                refused.set(refused.get() + block.rows);
+            }
+            Ok(admitted)
+        };
+        let gate = gated.then(|| crate::storage::BlockGate { fields, admit: &mut admit });
+        // Row groups `pruning` proves the leading filters drop are left out
+        // ([`crate::query::GroupPruning`]), never under a scan limit, which
+        // counts rows before those filters.
+        let pruning = pruning.filter(|_| options.limit().is_none());
+        read.scan_projected_blocks_each(collection, options, storage_fields, &|facts| pruning.is_some_and(|pruning| pruning.skip(facts)), gate, &mut |block| {
+            runner.skip(dropped.take());
+            let (ids, columns) = (block.ids, block.columns);
+            let mut from = 0;
+            while from < block.rows {
+                let count = (crate::query::BATCH_ROWS - runner.len()).min(block.rows - from);
+                runner.push_rows(ids, columns, block.codes, from, count);
+                from += count;
+                if runner.is_full() && !flush(&mut runner)? {
+                    stopped = true;
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })?;
+    } else {
+        read.scan_projected_row_refs_unordered_each(collection, options, storage_fields, &mut |id, version, row| {
+            runner.push(id, version, row);
+            if runner.is_full() && !flush(&mut runner)? {
+                stopped = true;
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+    }
+    let pending = dropped.take();
+    runner.skip(pending);
+    if !stopped && (!runner.is_empty() || pending > 0) {
         flush(&mut runner)?;
     }
-    Ok(scanned)
+    Ok(scanned.saturating_add(refused.get() as u64))
+}
+
+/// Locator handed to a visitor whose scan declined locators
+/// ([`ScanOptions::without_locators`]).
+const NO_LOCATOR: (DocumentId, DocumentVersion) = (DocumentId::from_bytes([0; 16]), DocumentVersion::new(0));
+
+/// Kinds of each top-level field of `collection` held by every document,
+/// from the storage's exact facts and bounds (`None`: no facts).
+fn source_kinds(read: &dyn crate::storage::StorageRead, collection: &CollectionId) -> EngineResult<Option<impl Fn(&str) -> Option<crate::query::Kinds>>> {
+    let Some(facts) = read.field_facts(collection).map_err(storage_engine_error)? else { return Ok(None) };
+    let bounds = read.field_bounds(collection).map_err(storage_engine_error)?.unwrap_or_default();
+    Ok(Some(move |name: &str| {
+        facts.kinds_when_always_present(name).map(|kinds| {
+            let kinds = crate::query::Kinds::from_kinds(kinds);
+            bounds.get(name).map_or(kinds, |bounds| kinds.with_bounds(bounds))
+        })
+    }))
+}
+
+/// Whether every stage of `prefix` is a filter proven total from the
+/// storage's exact field facts: it may drop rows, never fail.
+fn only_total_filters(read: &dyn crate::storage::StorageRead, prefix: &PhysicalPlan) -> EngineResult<bool> {
+    let operators = prefix.operators();
+    if !operators.iter().all(|operator| matches!(operator, PhysicalOperator::Filter { .. })) {
+        return Ok(false);
+    }
+    let Some(kinds) = source_kinds(read, prefix.source().collection())? else { return Ok(false) };
+    let field = |path: &crate::query::ExpressionFieldPath| if path.len() == 1 { kinds(path.first()) } else { None };
+    Ok(operators.iter().all(|operator| matches!(operator, PhysicalOperator::Filter { predicate } if crate::query::total_kinds(predicate, &field) == Some(crate::query::Kinds::of(crate::model::PhysicalKind::Bool)))))
 }
 
 /// First stage of `prefix` from which every later stage is proven total
@@ -704,7 +988,7 @@ fn sample_commuting_start(read: &dyn crate::storage::StorageRead, prefix: &Physi
     if first == operators.len() {
         return Ok(first);
     }
-    let Some(facts) = read.field_facts(prefix.source().collection()).map_err(storage_engine_error)? else {
+    let Some(source_kinds) = source_kinds(read, prefix.source().collection())? else {
         return Ok(operators.len());
     };
     'start: for start in first..operators.len() {
@@ -720,7 +1004,7 @@ fn sample_commuting_start(read: &dyn crate::storage::StorageRead, prefix: &Physi
             let PhysicalOperator::Custom { compiled: Some(stage), .. } = operator else { continue 'start };
             let kinds = |path: &crate::query::ExpressionFieldPath| match written.iter().rev().find(|(field, _)| field.first() == path.first()) {
                 Some((_, kinds)) => kinds.filter(|_| path.len() == 1),
-                None if path.len() == 1 => facts.kinds_when_always_present(path.first()).map(crate::query::Kinds::from_kinds),
+                None if path.len() == 1 => source_kinds(path.first()),
                 None => None,
             };
             let Some(effects) = stage.total_effects(&kinds) else { continue 'start };
@@ -758,6 +1042,100 @@ fn slot_prefix(read: &dyn crate::storage::StorageRead, prefix: &PhysicalPlan, do
     Ok(program.slots(downstream).is_some().then_some((gate, program)))
 }
 
+/// Sort keys of the worst row a full Top-N keeps, for checking batch cells
+/// against them without building values: only comparisons that cannot
+/// fail and that the row path makes the same way (a number against a
+/// number of its kind, text against text).
+#[derive(Default)]
+struct TopBound(Vec<KeyBound>);
+
+enum KeyBound {
+    Other,
+    Signed(i64),
+    Unsigned(u64),
+    Float(f64),
+    Text(Box<str>),
+}
+
+impl TopBound {
+    fn of(top: &BoundedProjectedTopN) -> Self {
+        let Some(values) = top.boundary() else { return Self::default() };
+        Self(values.iter().map(|value| match value {
+            Some(Value::Number(crate::model::Number::Signed(value))) => KeyBound::Signed(*value),
+            Some(Value::Number(crate::model::Number::Unsigned(value))) => KeyBound::Unsigned(*value),
+            Some(Value::Number(crate::model::Number::Float(value))) => KeyBound::Float(*value),
+            Some(Value::String(text)) => KeyBound::Text(Box::from(text.as_ref())),
+            _ => KeyBound::Other,
+        }).collect())
+    }
+
+    /// Whether the row at `row` of the key `columns` cannot enter: its keys
+    /// sort after the bound's, or equal them (a later equal row never
+    /// displaces a kept one). `false` when it cannot tell.
+    #[inline]
+    fn rejects(&self, keys: &[crate::query::SortKey], columns: &[Option<&crate::query::Column>], row: usize) -> bool {
+        use crate::query::Tag;
+        self.rejects_cells(keys, |key| {
+            let column = columns[key]?;
+            Some(match column.tag(row) {
+                Tag::Signed => ProjectedValueRef::Signed(column.bits(row) as i64),
+                Tag::Unsigned => ProjectedValueRef::Unsigned(column.bits(row)),
+                Tag::Float => ProjectedValueRef::Float(f64::from_bits(column.bits(row))),
+                Tag::Str => ProjectedValueRef::String(column.str(row)),
+                _ => return None,
+            })
+        })
+    }
+
+    /// Whether some row of a block can enter, told from the typed column of
+    /// its first key alone (`None`: cannot tell so): a row whose first key
+    /// sorts after the bound's cannot, nor one equal to it under one key.
+    fn admits_block(&self, keys: &[crate::query::SortKey], column: &crate::storage::BlockColumn<'_, '_>) -> Option<bool> {
+        use crate::storage::BlockColumn;
+        let (descending, strict) = (matches!(keys.first()?.direction(), crate::query::SortDirection::Descending), keys.len() == 1);
+        // Incomparable values (NaN) are left to the row path.
+        let enters = |ordering: Option<std::cmp::Ordering>| ordering.is_none_or(|ordering| {
+            let ordering = if descending { ordering.reverse() } else { ordering };
+            if strict { ordering.is_lt() } else { ordering.is_le() }
+        });
+        Some(match (self.0.first()?, column) {
+            (KeyBound::Float(bound), BlockColumn::Floats(values)) => values.iter().any(|value| enters(value.partial_cmp(bound))),
+            (KeyBound::Signed(bound), BlockColumn::Signed(values)) => values.iter().any(|value| enters(Some(value.cmp(bound)))),
+            (KeyBound::Unsigned(bound), BlockColumn::Unsigned(values)) => values.iter().any(|value| enters(Some(value.cmp(bound)))),
+            (KeyBound::Text(bound), BlockColumn::Strings(values)) => values.iter().any(|value| enters(Some((*value).cmp(bound)))),
+            _ => return None,
+        })
+    }
+
+    /// [`Self::rejects`] for the key cells `cell` gives (`None`: cannot tell).
+    #[inline]
+    fn rejects_cells<'v>(&self, keys: &[crate::query::SortKey], cell: impl Fn(usize) -> Option<ProjectedValueRef<'v>>) -> bool {
+        use std::cmp::Ordering;
+        if self.0.is_empty() {
+            return false;
+        }
+        for (index, (bound, key)) in self.0.iter().zip(keys).enumerate() {
+            let ordering = match (bound, cell(index)) {
+                (KeyBound::Signed(bound), Some(ProjectedValueRef::Signed(value))) => value.cmp(bound),
+                (KeyBound::Unsigned(bound), Some(ProjectedValueRef::Unsigned(value))) => value.cmp(bound),
+                (KeyBound::Float(bound), Some(ProjectedValueRef::Float(value))) => match value.partial_cmp(bound) {
+                    Some(ordering) => ordering,
+                    None => return false,
+                },
+                (KeyBound::Text(bound), Some(ProjectedValueRef::String(value))) => value.cmp(bound),
+                _ => return false,
+            };
+            let ordering = if matches!(key.direction(), crate::query::SortDirection::Descending) { ordering.reverse() } else { ordering };
+            match ordering {
+                Ordering::Greater => return true,
+                Ordering::Less => return false,
+                Ordering::Equal => {}
+            }
+        }
+        true
+    }
+}
+
 /// One row of a streamed prefix held as slot values, with its identity.
 #[derive(Clone, Copy)]
 struct SlotRowRef<'a> {
@@ -768,14 +1146,14 @@ struct SlotRowRef<'a> {
 }
 
 /// Document holding the decoded top-level `fields` present in `values`.
+/// The document of `fields`, read at `slots` of `values`.
+fn selected_document(fields: &[crate::query::ExpressionFieldPath], slots: &[usize], values: &[Option<Value>]) -> Document {
+    let picked = slots.iter().map(|slot| values.get(*slot).cloned().flatten()).collect::<Vec<_>>();
+    crate::query::document_of_fields(fields, &picked)
+}
+
 fn partial_document(fields: &[crate::query::ExpressionFieldPath], values: &[Option<Value>]) -> Document {
-    let mut document = Document::new();
-    for (field, value) in fields.iter().zip(values) {
-        if let Some(value) = value {
-            document.insert(field.first(), value.clone());
-        }
-    }
-    document
+    crate::query::document_of_fields(fields, values)
 }
 
 #[inline]
@@ -796,6 +1174,9 @@ const fn reusable_projected_scan_options( options: ScanOptions, plan: &PhysicalP
 const fn storage_engine_error(error: StorageError) -> EngineError { EngineError::execution(ExecutionError::storage(error)) }
 #[inline]
 fn backend_storage_error(error: impl fmt::Display) -> StorageError { StorageError::backend(error.to_string()) }
+/// A row evaluation failure raised inside a scan, worded as the document
+/// path words it.
+fn execution_storage_error(error: ExecutionError) -> StorageError { backend_storage_error(EngineError::execution(error)) }
 #[inline]
 fn engine_spill_error(error: io::Error) -> EngineError { EngineError::execution(spill_engine_error(error)) }
 
@@ -807,56 +1188,14 @@ const fn group_state_estimate(key_len: usize, field_count: usize) -> usize {
         .saturating_add(384)
 }
 
-type GroupAccumulator = Box<dyn crate::query::IncrementalGroupAccumulator>;
-
-fn admit_bounded_hash_group( groups: &mut HashMap<Arc<[u8]>, GroupAccumulator>, frontier: &mut Option<Arc<[u8]>>, estimated_bytes: &mut usize, key: &[u8], state_estimate: usize, field_count: usize, budget: usize, limit: usize, ) -> Result<bool, StorageError> {
-    if groups.len() >= limit {
-        let largest = frontier.as_ref().expect("bounded group frontier exists");
-        if key >= largest.as_ref() {
-            return Ok(false);
-        }
-        let largest = frontier.take().expect("bounded group frontier exists");
-        groups.remove(largest.as_ref());
-        *estimated_bytes =
-            estimated_bytes.saturating_sub(group_state_estimate(largest.len(), field_count));
+/// Whether a stage runs row by row: on a `lookup`/`union` sub-pipeline,
+/// or on the output of a blocking stage.
+const fn is_row_operator(operator: &PhysicalOperator) -> bool {
+    match operator {
+        PhysicalOperator::Filter { .. } | PhysicalOperator::Select { .. } | PhysicalOperator::Skip { .. } | PhysicalOperator::Limit { .. } => true,
+        PhysicalOperator::Custom { writes: false, stage, .. } => !matches!(stage, Some(crate::query::Stage::Sample | crate::query::Stage::Window | crate::query::Stage::Fill)),
+        _ => false,
     }
-    if estimated_bytes.saturating_add(state_estimate) > budget {
-        return Err(StorageError::backend(
-            "bounded group limit exceeds the governed working set",
-        ));
-    }
-    Ok(true)
-}
-
-const fn is_bounded_secondary_row_operator(operator: &PhysicalOperator) -> bool {
-    matches!(
-        operator,
-        PhysicalOperator::Filter { .. }
-            | PhysicalOperator::Select { .. }
-            | PhysicalOperator::Skip { .. }
-            | PhysicalOperator::Limit { .. }
-            | PhysicalOperator::Custom {
-                writes: false,
-                changes_cardinality: false,
-                ..
-            }
-    )
-}
-
-/// Whether a stage can run row by row on the output of a blocking stage.
-const fn is_streaming_tail_operator(operator: &PhysicalOperator) -> bool {
-    matches!(
-        operator,
-        PhysicalOperator::Filter { .. }
-            | PhysicalOperator::Select { .. }
-            | PhysicalOperator::Skip { .. }
-            | PhysicalOperator::Limit { .. }
-            | PhysicalOperator::Custom {
-                writes: false,
-                changes_cardinality: false,
-                ..
-            }
-    )
 }
 
 /// How many rows a blocking core must produce for the streaming tail that
@@ -888,12 +1227,16 @@ fn preserves_each_row(properties: &crate::query::ExecutionProperties<'_>) -> boo
         && !properties.writes()
 }
 
-/// Decomposition of a governed read plan: a streaming prefix, one blocking
-/// core with a bounded executor, then a row-local streaming tail.
+/// Decomposition of a governed read plan: a streaming prefix, a first
+/// blocking core with a bounded executor, its row-local streaming tail, then
+/// the later segments, each a blocking sink and its row-local tail
+/// ([`sinks`]).
 struct GovernedShape<'a> {
     blocking_index: usize,
     core_end: usize,
     tail: &'a [PhysicalOperator],
+    /// The later segments, without the terminal `count`.
+    rest: &'a [PhysicalOperator],
     count_alias: Option<&'a str>,
     output_limit: Option<usize>,
 }
@@ -913,21 +1256,29 @@ fn governed_shape(operators: &[PhysicalOperator]) -> Option<GovernedShape<'_>> {
     }) {
         return None;
     }
-    let rest = &operators[blocking_index..];
-    let core_len = match rest {
-        [PhysicalOperator::Group { .. }, PhysicalOperator::Sort { .. }, ..]
-        | [PhysicalOperator::Sort { .. }, PhysicalOperator::Distinct { .. }, ..] => 2,
-        _ => 1,
-    };
+    // A pair the core runs at once, when it applies; its stages run one after
+    // the other otherwise.
+    let pair = matches!(
+        &operators[blocking_index..],
+        [PhysicalOperator::Group { .. }, PhysicalOperator::Sort { .. }, ..] | [PhysicalOperator::Sort { .. }, PhysicalOperator::Distinct { .. }, ..]
+    );
+    if pair {
+        if let Some(shape) = governed_shape_with_core(operators, blocking_index, 2) {
+            return Some(shape);
+        }
+    }
+    governed_shape_with_core(operators, blocking_index, 1)
+}
+
+fn governed_shape_with_core(operators: &[PhysicalOperator], blocking_index: usize, core_len: usize) -> Option<GovernedShape<'_>> {
     let core_end = blocking_index + core_len;
-    let mut tail = &operators[core_end..];
-    let count_alias = tail.last().and_then(PhysicalOperator::count_alias);
+    let mut after = &operators[core_end..];
+    let count_alias = after.last().and_then(PhysicalOperator::count_alias);
     if count_alias.is_some() {
-        tail = &tail[..tail.len() - 1];
+        after = &after[..after.len() - 1];
     }
-    if !tail.iter().all(is_streaming_tail_operator) {
-        return None;
-    }
+    let (tail, rest) = after.split_at(after.iter().position(|operator| !is_row_operator(operator)).unwrap_or(after.len()));
+    sinks::later_segments(rest)?;
     let output_limit = tail_row_limit(tail);
     let core = &operators[blocking_index..core_end];
     let supported = match core {
@@ -938,11 +1289,10 @@ fn governed_shape(operators: &[PhysicalOperator]) -> Option<GovernedShape<'_>> {
                     operator,
                     PhysicalOperator::Distinct { .. } | PhysicalOperator::Group { .. } | PhysicalOperator::Pivot { .. }
                 )
+                || matches!(operator, PhysicalOperator::Union { .. })
                 || matches!(
                     operator,
-                    PhysicalOperator::Lookup { pipeline, .. }
-                        | PhysicalOperator::Union { pipeline, .. }
-                        if pipeline.operators().iter().all(is_bounded_secondary_row_operator)
+                    PhysicalOperator::Lookup { pipeline, .. } if sinks::runs_lookup_pipeline(pipeline)
                 )
         }
         [PhysicalOperator::Group { .. }, PhysicalOperator::Sort { .. }] => true,
@@ -953,6 +1303,7 @@ fn governed_shape(operators: &[PhysicalOperator]) -> Option<GovernedShape<'_>> {
         blocking_index,
         core_end,
         tail,
+        rest,
         count_alias,
         output_limit,
     })
@@ -1026,80 +1377,94 @@ fn ensure_exact_rows(operators: &[PhysicalOperator], remaining: &[Option<usize>]
 /// Result returned by engine operations.
 pub type EngineResult<T> = std::result::Result<T, EngineError>;
 
-/// Converts a validated logical plan into an executable physical plan.
-///
-/// Keeping lowering behind an object-safe trait allows the initial scan-based
-/// implementation to evolve into a cost-based optimizer without changing
-/// [`Engine`] callers.
-pub trait PlanLowerer: Send + Sync {
-    /// Lowers one logical plan.
-    fn lower( &self, logical: &LogicalPlan, physical_planner: &PhysicalPlanner, ) -> Result<PhysicalPlan, PhysicalPlanError>;
-}
-
 /// High-level OG database engine.
 pub struct Engine {
     storage: Arc<dyn StorageEngine>,
-    runtime: Arc<dyn ExecutionRuntime>,
-    lowerer: Arc<dyn PlanLowerer>,
+    runtime: Arc<QueryRuntime>,
     planner: Planner,
-    physical_planner: PhysicalPlanner,
-    executor: Executor,
-    planner_cache: PlannerCache,
-    indexing: IndexingEngine,
+    planner_cache: Arc<PlannerCache>,
+    indexing: Arc<IndexingEngine>,
     memory_governor: MemoryGovernor,
+    changes: Arc<changes::Changes>,
+    /// Set on the engine a temporal or system-collection query runs on (its
+    /// storage is already that view).
+    bound: bool,
 }
 
 impl Engine {
     /// Creates an engine with default logical and physical planner options.
     #[must_use]
     #[inline]
-    pub fn new( storage: Arc<dyn StorageEngine>, runtime: Arc<dyn ExecutionRuntime>, lowerer: Arc<dyn PlanLowerer>, ) -> Self {
+    pub fn new(storage: Arc<dyn StorageEngine>) -> Self {
         let memory_governor = MemoryGovernor::unlimited();
         Self {
             storage,
-            runtime,
-            lowerer,
+            runtime: Arc::new(QueryRuntime::new()),
             planner: Planner::new(),
-            physical_planner: PhysicalPlanner::new(),
-            executor: Executor::new_governed(memory_governor.clone()),
-            planner_cache: PlannerCache::new_governed(
+            planner_cache: Arc::new(PlannerCache::new_governed(
                 128,
                 DEFAULT_PLANNER_CACHE_BYTES,
                 memory_governor.clone(),
-            ),
-            indexing: IndexingEngine::new(),
+            )),
+            indexing: Arc::new(IndexingEngine::new()),
             memory_governor,
+            changes: Arc::new(changes::Changes::new()),
+            bound: false,
         }
     }
 
-    /// Creates an engine from explicitly configured components.
+    /// What changes when `collection` changes for `place` (`None`: for any
+    /// Place), to tell whether rows computed from it still hold; `None` when
+    /// the storage cannot tell.
     #[must_use]
-    pub fn with_components( storage: Arc<dyn StorageEngine>, runtime: Arc<dyn ExecutionRuntime>, lowerer: Arc<dyn PlanLowerer>, planner: Planner, physical_planner: PhysicalPlanner, executor: Executor, ) -> Self {
-        let memory_governor = MemoryGovernor::unlimited();
-        Self {
-            storage,
-            runtime,
-            lowerer,
-            planner,
-            physical_planner,
-            executor: executor.with_memory_governor(memory_governor.clone()),
-            planner_cache: PlannerCache::new_governed(
-                128,
-                DEFAULT_PLANNER_CACHE_BYTES,
-                memory_governor.clone(),
-            ),
-            indexing: IndexingEngine::new(),
-            memory_governor,
-        }
+    pub fn change_token(&self, collection: &str, place: Option<&str>) -> Option<serde_json::Value> {
+        self.changes.token(self.storage.as_ref(), collection, place)
     }
 
     #[must_use]
     pub fn storage(&self) -> &dyn StorageEngine {
         self.storage.as_ref()
     }
+
+    /// The engine a temporal plan (`on c as of …`, `on c history`) runs on:
+    /// the same components over the temporal view of the storage. `None`
+    /// for an ordinary plan. Only temporal queries pay for it.
+    fn temporal_view(&self, physical: &PhysicalPlan) -> EngineResult<Option<Self>> {
+        let Some(temporal) = physical.source().temporal() else { return Ok(None) };
+        if self.bound {
+            return Ok(None);
+        }
+        if physical.source().collection().as_str().starts_with('_') {
+            return Err(EngineError::execution(ExecutionError::unsupported_operator(
+                "temporal-system-collection",
+                "`as of` and `history` are not available on system collections",
+            )));
+        }
+        if !temporal_plan_writes_allowed(physical) {
+            return Err(EngineError::execution(ExecutionError::unsupported_operator(
+                "temporal-write",
+                "an `as of` or `history` source is read-only (only a terminal `into` may write)",
+            )));
+        }
+        Ok(Some(self.view(Arc::new(crate::storage::history::TemporalStorage::new(Arc::clone(&self.storage), temporal.clone())))))
+    }
+
+    /// The same components over `storage`.
+    fn view(&self, storage: Arc<dyn StorageEngine>) -> Self {
+        Self {
+            storage,
+            runtime: Arc::clone(&self.runtime),
+            planner: self.planner.clone(),
+            planner_cache: Arc::clone(&self.planner_cache),
+            indexing: Arc::clone(&self.indexing),
+            memory_governor: self.memory_governor.clone(),
+            changes: Arc::clone(&self.changes),
+            bound: true,
+        }
+    }
     
     #[must_use]
-    pub fn runtime(&self) -> &dyn ExecutionRuntime {
+    pub fn runtime(&self) -> &QueryRuntime {
         self.runtime.as_ref()
     }
 
@@ -1108,33 +1473,77 @@ impl Engine {
         &self.planner
     }
 
-    #[must_use]
-    pub const fn physical_planner(&self) -> &PhysicalPlanner {
-        &self.physical_planner
-    }
-
-    #[must_use]
-    pub const fn executor(&self) -> &Executor {
-        &self.executor
-    }
-
-    /// Builds a validated logical plan from a normalized pipeline.
-    pub fn plan_logical(&self, pipeline: &PlannerPipeline) -> EngineResult<LogicalPlan> {
-        self.planner.plan(pipeline).map_err(EngineError::planning)
-    }
-
-    /// Lowers a validated logical plan to a physical plan.
-    pub fn plan_physical(&self, logical: &LogicalPlan) -> EngineResult<PhysicalPlan> {
-        self.lowerer
-            .lower(logical, &self.physical_planner)
-            .map_err(EngineError::physical_planning)
-    }
-
-    /// Plans a normalized pipeline through both planning layers.
+    /// Plans a normalized pipeline.
     pub fn plan(&self, pipeline: &PlannerPipeline) -> EngineResult<PlannedQuery> {
-        let logical = self.plan_logical(pipeline)?;
-        let physical = self.plan_physical(&logical)?;
-        Ok(PlannedQuery { logical, physical })
+        self.planner.plan(pipeline).map(PlannedQuery::new).map_err(EngineError::planning)
+    }
+
+    /// The rows of a collection scan that the leading filters `gate` keep,
+    /// run on batches over a block scan that leaves out the row groups
+    /// they drop, as (identifier, version) in scan direction order, with the
+    /// rows read. `None` when that cannot give exactly the rows and errors
+    /// of the filters run row by row in that order: the storage reads no
+    /// blocks, the filters do not run on batches, a filter fails on some row
+    /// (the ordered scan raises it, or stops before it), or more rows pass
+    /// than are kept in memory.
+    fn gate_on_batches( &self, read: &dyn StorageRead, physical: &PhysicalPlan, options: ScanOptions, gate: &ProjectedValuePipeline, filters: &[PhysicalOperator], ) -> EngineResult<Option<(u64, Vec<(DocumentId, DocumentVersion)>)>> {
+        const MAX_KEPT: usize = 1 << 20;
+        if !read.supports_projected_blocks() {
+            return Ok(None);
+        }
+        let Some(program) = crate::query::BatchProgram::compile(filters, gate.layout().fields(), &[]) else {
+            return Ok(None);
+        };
+        let program = Arc::new(program);
+        let (kept, abandoned) = (std::cell::RefCell::new(Vec::new()), std::cell::Cell::new(false));
+        let scanned = scan_batched(
+            read,
+            physical.source().collection(),
+            reusable_projected_scan_options(options, physical, gate),
+            gate.layout().storage_fields(),
+            &program,
+            crate::query::GroupPruning::new(filters, gate.layout().storage_fields()).as_ref(),
+            None,
+            &mut |runner| {
+                let mut kept = kept.borrow_mut();
+                kept.extend(runner.selection().iter().map(|row| runner.id(*row as usize)));
+                if kept.len() > MAX_KEPT {
+                    abandoned.set(true);
+                    return Ok(false);
+                }
+                Ok(true)
+            },
+            &mut |id, version, values| {
+                match gate.accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver)) {
+                    Ok(true) => kept.borrow_mut().push((id, version)),
+                    Ok(false) => {}
+                    Err(_) => {
+                        abandoned.set(true);
+                        return Ok(false);
+                    }
+                }
+                Ok(kept.borrow().len() <= MAX_KEPT || { abandoned.set(true); false })
+            },
+        )
+        .map_err(storage_engine_error)?;
+        if abandoned.get() {
+            return Ok(None);
+        }
+        let mut kept = kept.into_inner();
+        kept.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        if options.direction() == crate::storage::ScanDirection::Reverse {
+            kept.reverse();
+        }
+        Ok(Some((scanned, kept)))
+    }
+
+    /// Plans a read restricted to a Place (and an App instance): every
+    /// source it reads keeps only the rows of that scope
+    /// ([`crate::query::scoped_read_plan`]). `None` for a plan that writes.
+    /// Never cached: the plan cache is keyed by request text alone.
+    pub fn plan_scoped(&self, pipeline: &PlannerPipeline, place: &str, app_instance: Option<&str>) -> EngineResult<Option<PlannedQuery>> {
+        let planned = self.plan(pipeline)?;
+        Ok(crate::query::scoped_read_plan(planned.physical(), place, app_instance).map(PlannedQuery::new))
     }
 
     /// Plans with a bounded cache keyed by normalized request text.
@@ -1174,7 +1583,7 @@ impl Engine {
         let mut document = Document::new();
         document.insert("collection", Value::string(physical.source().collection().as_str()));
         document.insert("access", Value::string(access));
-        document.insert("read_only", Value::bool(planned.logical().is_read_only()));
+        document.insert("read_only", Value::bool(!physical.is_write()));
         document.insert("mode", Value::string(physical.memory_execution_mode().as_str()));
         document.insert("executor", Value::string(executor));
         document.insert("operators", Value::array(operators));
@@ -1188,22 +1597,10 @@ impl Engine {
         self.planner_cache.invalidate_all();
     }
 
-    /// Returns a point-in-time snapshot of passive indexing observations.
-    #[must_use]
-    pub fn indexing_snapshot(&self) -> IndexingSnapshot {
-        self.indexing.snapshot()
-    }
-
     /// Returns the shared memory governor.
     #[must_use]
     pub const fn memory_governor(&self) -> &MemoryGovernor {
         &self.memory_governor
-    }
-
-    /// Returns current memory-governor diagnostics.
-    #[must_use]
-    pub fn memory_snapshot(&self) -> MemorySnapshot {
-        self.memory_governor.snapshot()
     }
 
     /// Replaces the governor used by this engine and its planner cache.
@@ -1213,8 +1610,7 @@ impl Engine {
     #[must_use]
     pub fn with_memory_governor(mut self, governor: MemoryGovernor) -> Self {
         let planner_cache_bytes = governor.profile().planner_cache_bytes;
-        self.planner_cache = PlannerCache::new_governed(128, planner_cache_bytes, governor.clone());
-        self.executor = Executor::new_governed(governor.clone());
+        self.planner_cache = Arc::new(PlannerCache::new_governed(128, planner_cache_bytes, governor.clone()));
         self.memory_governor = governor;
         self
     }
@@ -1224,7 +1620,10 @@ impl Engine {
     /// Returns `Ok(None)` when the physical plan contains an operator that
     /// requires set-level materialization or performs writes.
     pub fn stream_read_pipeline( &self, physical: &PhysicalPlan, visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
-        if self.system_collection_storage(physical)?.is_some() || !physical.is_memory_streaming() {
+        if let Some(view) = self.temporal_view(physical)? {
+            return view.stream_read_pipeline(physical, visitor);
+        }
+        if self.is_virtual(physical.source().collection()) || !physical.is_memory_streaming() {
             return Ok(None);
         }
 
@@ -1261,69 +1660,35 @@ impl Engine {
             (count_alias, physical.source().access())
         {
             if data_operator_len > 0 {
-                if let (true, Some(value_pipeline)) = (
-                    read.support(StorageReadCapability::ProjectedValuesGatedUnordered)
-                        .available(),
-                    ProjectedValuePipeline::compile(
-                        &physical.operators()[..data_operator_len],
-                        std::iter::empty::<crate::query::ExpressionFieldPath>(),
-                    )
-                    .map_err(EngineError::execution)?,
-                ) {
-                    let mut projected_count = 0u64;
-                    let mut projected_scanned = 0u64;
-                    let mut projected_filtered = 0u64;
-                    let batch = crate::query::BatchProgram::compile(&physical.operators()[..data_operator_len], value_pipeline.layout().fields(), &[]).map(Arc::new);
-                    if let Some(program) = batch {
-                        let counted = std::cell::Cell::new(0u64);
-                        projected_scanned = scan_batched(
-                            read.as_ref(),
-                            physical.source().collection(),
-                            reusable_projected_scan_options(*options, physical, &value_pipeline),
-                            value_pipeline.layout().storage_fields(),
-                            &program,
-                            &mut |runner| {
-                                counted.set(counted.get() + runner.selection().len() as u64);
-                                Ok(true)
-                            },
-                            &mut |_, _, values| {
-                                let accepted = value_pipeline
-                                    .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
-                                    .map_err(backend_storage_error)?;
-                                counted.set(counted.get() + u64::from(accepted));
-                                Ok(true)
-                            },
-                        )
-                        .map_err(storage_engine_error)?;
-                        projected_count = counted.get();
-                        projected_filtered = projected_scanned.saturating_sub(projected_count);
-                    } else {
-                    read.scan_projected_values_gated_unordered_each(
+                let value_pipeline = ProjectedValuePipeline::compile(&physical.operators()[..data_operator_len], std::iter::empty::<crate::query::ExpressionFieldPath>())
+                    .map_err(EngineError::execution)?
+                    .filter(|_| read.support(StorageReadCapability::ProjectedValuesGatedUnordered).available());
+                let batch = value_pipeline.as_ref().and_then(|value_pipeline| crate::query::BatchProgram::compile(&physical.operators()[..data_operator_len], value_pipeline.layout().fields(), &[]).map(|program| (value_pipeline, Arc::new(program))));
+                if let Some((value_pipeline, program)) = batch {
+                    let counted = std::cell::Cell::new(0u64);
+                    let projected_scanned = scan_batched(
+                        read.as_ref(),
                         physical.source().collection(),
-                        reusable_projected_scan_options(*options, physical, &value_pipeline),
+                        reusable_projected_scan_options(*options, physical, value_pipeline).without_locators(),
                         value_pipeline.layout().storage_fields(),
-                        value_pipeline.gate_field_count(),
-                        &mut |values| {
-                            projected_scanned = projected_scanned.saturating_add(1);
-                            let accepted = value_pipeline
-                                .accepts_with(values, |expression, resolver| {
-                                    self.runtime
-                                        .evaluate_resolved_predicate(expression, resolver)
-                                })
-                                .map_err(backend_storage_error)?;
-                            if !accepted {
-                                projected_filtered = projected_filtered.saturating_add(1);
-                            }
-                            Ok(accepted)
+                        &program,
+                        crate::query::GroupPruning::new(&physical.operators()[..data_operator_len], value_pipeline.layout().storage_fields()).as_ref(),
+                        None,
+                        &mut |runner| {
+                            counted.set(counted.get() + runner.selection().len() as u64);
+                            Ok(true)
                         },
-                        &mut |_values| {
-                            projected_count = projected_count.saturating_add(1);
+                        &mut |_, _, values| {
+                            let accepted = value_pipeline
+                                .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                                .map_err(backend_storage_error)?;
+                            counted.set(counted.get() + u64::from(accepted));
                             Ok(true)
                         },
                     )
                     .map_err(storage_engine_error)?;
-                    }
-
+                    let projected_count = counted.get();
+                    let projected_filtered = projected_scanned.saturating_sub(projected_count);
                     emit_streaming_count(visitor, alias, projected_count)?;
                     let statistics = ExecutionStatistics::streamed_with_strategies(
                         projected_scanned,
@@ -1443,54 +1808,55 @@ impl Engine {
                             .layout()
                             .slots(selected_fields)
                             .map_err(EngineError::execution)?;
-
-                        read.scan_projected_row_values_gated_unordered_each(
-                            physical.source().collection(),
-                            reusable_projected_scan_options(storage_options, physical, &value_pipeline),
-                            value_pipeline.layout().storage_fields(),
-                            value_pipeline.gate_field_count(),
-                            &mut |values| {
-                                scanned = scanned.saturating_add(1);
-                                let accepted = value_pipeline
-                                    .accepts_with(values, |expression, resolver| {
-                                        self.runtime
-                                            .evaluate_resolved_predicate(expression, resolver)
-                                    })
-                                    .map_err(backend_storage_error)?;
-                                if !accepted {
-                                    filtered = filtered.saturating_add(1);
-                                }
-                                Ok(accepted)
-                            },
-                            &mut |id, version, values| {
-                                let mut selected = Document::new();
-                                for (field, slot) in selected_fields.iter().zip(&selected_slots) {
-                                    if let Some(value) = values.get(*slot).and_then(Option::as_ref)
-                                    {
-                                        selected.insert(field.first(), value.clone());
-                                    }
-                                }
-
-                                let output = StoredDocument::new(id, version, Arc::new(selected))?;
-                                visitor(output).map_err(backend_storage_error)?;
-                                returned = returned.saturating_add(1);
+                        let select = |values: &[Option<Value>]| selected_document(selected_fields, &selected_slots, values);
+                        // Filters and selects on batches, read by blocks in the
+                        // same storage order; a batch that fails is replayed
+                        // row by row, so a failure surfaces on the same row.
+                        // The selects only pick fields from the source values.
+                        if let Some(batch) = crate::query::BatchProgram::compile(data_operators, value_pipeline.layout().fields(), &[]) {
+                            let mut values = Vec::new();
+                            let (returned_cell, filtered_cell) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
+                            let visitor_cell = std::cell::RefCell::new(&mut *visitor);
+                            let mut emit = |id: DocumentId, version: DocumentVersion, document: Document| -> Result<bool, StorageError> {
+                                (visitor_cell.borrow_mut())(StoredDocument::new(id, version, Arc::new(document))?).map_err(backend_storage_error)?;
+                                returned_cell.set(returned_cell.get() + 1);
                                 Ok(true)
-                            },
-                        )
-                        .map_err(storage_engine_error)?;
-
-                        let statistics = ExecutionStatistics::streamed_pipeline(
-                            scanned,
-                            filtered,
-                            returned,
-                            ExecutionStrategy::CollectionScan,
-                        );
-                        self.indexing.observe(QueryObservation::from_execution(
-                            physical,
-                            statistics,
-                            started.elapsed(),
-                        ));
-                        return Ok(Some(statistics));
+                            };
+                            let emit = std::cell::RefCell::new(&mut emit);
+                            scanned = scan_batched(
+                                read.as_ref(),
+                                physical.source().collection(),
+                                reusable_projected_scan_options(storage_options, physical, &value_pipeline),
+                                value_pipeline.layout().storage_fields(),
+                                &Arc::new(batch),
+                                crate::query::GroupPruning::new(data_operators, value_pipeline.layout().storage_fields()).as_ref(),
+                                None,
+                                &mut |runner| {
+                                    filtered_cell.set(filtered_cell.get() + runner.dropped() as u64);
+                                    for &row in runner.selection() {
+                                        let (id, version) = runner.id(row as usize);
+                                        runner.source_values(row as usize, &mut values);
+                                        (emit.borrow_mut())(id, version, select(&values))?;
+                                    }
+                                    Ok(true)
+                                },
+                                &mut |id, version, values| {
+                                    let accepted = value_pipeline
+                                        .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
+                                        .map_err(backend_storage_error)?;
+                                    if !accepted {
+                                        filtered_cell.set(filtered_cell.get() + 1);
+                                        return Ok(true);
+                                    }
+                                    (emit.borrow_mut())(id, version, select(values))
+                                },
+                            )
+                            .map_err(storage_engine_error)?;
+                            (filtered, returned) = (filtered_cell.get(), returned_cell.get());
+                            let statistics = ExecutionStatistics::streamed_pipeline(scanned, filtered, returned, ExecutionStrategy::CollectionScan);
+                            self.indexing.observe(QueryObservation::from_execution(physical, statistics, started.elapsed()));
+                            return Ok(Some(statistics));
+                        }
                     }
                 }
 
@@ -1595,12 +1961,15 @@ impl Engine {
                         .and_then(|program| crate::query::BatchProgram::compile(data_operators, slot_fields, program.fields()).map(|batch| (Arc::new(batch), program)));
                     if let Some((batch, program)) = batch {
                         let mut output = Vec::new();
+                        let batch_options = reusable_projected_scan_options(storage_options, physical, &value_pipeline);
                         let batch_scanned = scan_batched(
                             read.as_ref(),
                             physical.source().collection(),
-                            reusable_projected_scan_options(storage_options, physical, &value_pipeline),
+                            if count_only { batch_options.without_locators() } else { batch_options },
                             value_pipeline.layout().storage_fields(),
                             &batch,
+                            crate::query::GroupPruning::new(data_operators, value_pipeline.layout().storage_fields()).as_ref(),
+                            None,
                             &mut |runner| {
                                 let passed = runner.selection().len() as u64;
                                 filtered_cell.set(filtered_cell.get().saturating_add(runner.dropped() as u64));
@@ -1668,7 +2037,26 @@ impl Engine {
                         )
                     };
 
-                    if let Some(value_pipeline) = leading_filter_pipeline {
+                    // Leading filters on batches: the rows they keep, then
+                    // those rows whole, by identifier.
+                    let gated = match &leading_filter_pipeline {
+                        Some(value_pipeline) if storage_options.limit().is_none() && !data_operators.iter().any(keeps_rows_by_order) => {
+                            self.gate_on_batches(read.as_ref(), physical, storage_options, value_pipeline, &data_operators[..leading_filter_len])?
+                        }
+                        _ => None,
+                    };
+                    if let Some((gated_scanned, kept)) = gated {
+                        let gated_filtered = gated_scanned.saturating_sub(kept.len() as u64);
+                        // The same snapshot: every kept row is there, unchanged.
+                        let ids = kept.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                        read.get_each(physical.source().collection(), &ids, &mut |index, stored| match stored {
+                            Some(stored) if stored.version() == kept[index].1 => process_stored(stored),
+                            _ => Ok(true),
+                        })
+                        .map_err(storage_engine_error)?;
+                        scanned = scanned.saturating_add(gated_scanned);
+                        filtered = filtered.saturating_add(gated_filtered);
+                    } else if let Some(value_pipeline) = leading_filter_pipeline {
                         let mut gated_scanned = 0u64;
                         let mut gated_filtered = 0u64;
                         read.scan_projected_gated_each(
@@ -1747,59 +2135,6 @@ impl Engine {
         Ok(Some(statistics))
     }
 
-    /// Compatibility alias for source-only callers.
-    pub fn stream_source_only( &self, physical: &PhysicalPlan, visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
-        self.stream_read_pipeline(physical, visitor)
-    }
-
-    /// Executes an already validated physical plan.
-    pub fn execute_physical(&self, physical: &PhysicalPlan) -> EngineResult<ExecutionOutput> {
-        let started = Instant::now();
-        let output = if let Some(storage) = self.system_collection_storage(physical)? {
-            self.executor
-                .execute(&storage, self.runtime.as_ref(), physical)
-                .map_err(EngineError::execution)?
-        } else {
-            self.executor
-                .execute(self.storage.as_ref(), self.runtime.as_ref(), physical)
-                .map_err(EngineError::execution)?
-        };
-        self.indexing.observe(QueryObservation::from_execution(
-            physical,
-            output.statistics(),
-            started.elapsed(),
-        ));
-        Ok(output)
-    }
-
-    /// Executes a physical plan under a trusted Place or `AppInstance` document scope.
-    pub fn execute_physical_scoped( &self, physical: &PhysicalPlan, scope: &crate::query::DocumentScope, ) -> EngineResult<ExecutionOutput> {
-        let started = Instant::now();
-        if physical.source().collection().as_str().starts_with('_') {
-            return Err(EngineError::execution(
-                ExecutionError::unsupported_operator(
-                    "scoped-system-collection",
-                    "Place-scoped queries cannot target system collections",
-                ),
-            ));
-        }
-        let output = self
-            .executor
-            .execute_scoped(
-                self.storage.as_ref(),
-                self.runtime.as_ref(),
-                physical,
-                Some(scope),
-            )
-            .map_err(EngineError::execution)?;
-        self.indexing.observe(QueryObservation::from_execution(
-            physical,
-            output.statistics(),
-            started.elapsed(),
-        ));
-        Ok(output)
-    }
-
     /// Streams one bounded read-only secondary branch used by UNION and LOOKUP.
     ///
     /// The branch keeps row-local stages streaming and shares one implementation
@@ -1809,36 +2144,46 @@ impl Engine {
     /// Reads the joined collection once and indexes its rows on the joined
     /// side of `equality`, in collection order. `None` when the rows do not
     /// fit `budget`: the lookup then keeps its per-row scan.
-    fn build_lookup_index( &self, collection: &CollectionId, equality: &LookupEquality, inner_alias: Option<&str>, outer_alias: Option<&str>, budget: usize, filter: Option<&LookupKeyFilter>, ) -> EngineResult<Option<LookupIndex>> {
+    fn build_lookup_index( &self, collection: &CollectionId, equality: &LookupEquality, inner_alias: Option<&str>, outer_alias: Option<&str>, memory: &StageMemory<'_>, filter: Option<&LookupKeyFilter>, ) -> EngineResult<Option<LookupIndex>> {
         let read = self.storage.read().map_err(storage_engine_error)?;
         let no_outer = Document::new();
-        let mut index = LookupIndex { scanned: 0, rows: Vec::new(), buckets: HashMap::new(), numbers: Vec::new(), strings: Vec::new(), missing: Vec::new() };
+        let mut index = LookupIndex { scanned: 0, rows: Vec::new(), buckets: HashMap::default(), numbers: Vec::new(), strings: Vec::new(), missing: Vec::new(), others: Vec::new(), lengths: std::collections::BTreeSet::new(), shapes: HashMap::default() };
         let mut bytes = 0usize;
         let mut exceeded = false;
         // The key is read the way the `where` reads it; the copy carrying the
-        // virtual `_id` is only built when the key is `_id`.
-        let joined = &equality.joined;
-        let key_path = match joined.segment(0) {
-            Some(first) if Some(first) == inner_alias => joined.iter().skip(1).collect::<Vec<_>>(),
-            _ => joined.iter().collect::<Vec<_>>(),
-        };
-        let key_is_id = key_path.first() == Some(&"_id");
+        // virtual `_id` is only built when a key is `_id`.
+        let key_paths = equality.keys.iter().map(|key| match key.joined.segment(0) {
+            Some(first) if Some(first) == inner_alias => key.joined.iter().skip(1).collect::<Vec<_>>(),
+            _ => key.joined.iter().collect::<Vec<_>>(),
+        }).collect::<Vec<_>>();
+        let key_path = &key_paths[0];
+        let key_is_id = key_paths.iter().any(|path| path.first() == Some(&"_id"));
         let key_value_of = |row: &ExecutionRow| {
             let input = row.stage_input(key_is_id);
-            let fields = crate::query::LookupFields { inner: &input, inner_alias, outer: &no_outer, outer_alias };
-            match crate::query::ExpressionFieldResolver::resolve_field(&fields, &equality.joined) {
-                crate::query::SemanticValue::Present(value) => Some(value),
-                crate::query::SemanticValue::Missing => None,
-            }
+            equality.key_of(&crate::query::LookupFields { inner: &input, inner_alias, outer: &no_outer, outer_alias }, false)
         };
         let admits = |key: Option<&Value>| filter.is_none_or(|filter| filter.admits(key));
         // Late materialization: index rows read as partial documents holding
-        // only the key; probes load the complete candidate rows by `_id`.
+        // only the key fields; probes load the complete candidate rows by `_id`.
+        let mut tops = Vec::<&str>::new();
+        let slots = key_paths.iter().map(|path| path.first().map(|top| tops.iter().position(|known| known == top).unwrap_or_else(|| { tops.push(top); tops.len() - 1 }))).collect::<Option<Vec<_>>>();
         let key_field = key_path.first().filter(|_| !key_is_id).and_then(|field| crate::query::ExpressionFieldPath::new([*field]).ok());
-        let partial_fields = if key_is_id { Some(Vec::new()) } else { key_field.map(|field| vec![field]) };
+        let partial_fields = if key_is_id { Some(Vec::new()) } else { slots.as_ref().and_then(|_| tops.iter().map(|top| crate::query::ExpressionFieldPath::new([*top]).ok()).collect::<Option<Vec<_>>>()) };
         // A top-level key is read borrowed: rows a filter rejects cost no
         // allocation.
-        if let (false, 1) = (key_is_id, key_path.len()) {
+        if let (false, 1, false) = (key_is_id, key_path.len(), equality.composite()) {
+            if let Some(field) = &key_field {
+                if let Some(keyed) = self.lookup_keys_on_batches(collection, field, memory, filter)? {
+                    let Some((scanned, keyed)) = keyed else {
+                        return Ok(None);
+                    };
+                    index.scanned = scanned;
+                    for (id, version, key) in keyed {
+                        index.push(IndexedRow::Pending(ProjectedRowLocator::new(id, version)), key);
+                    }
+                    return Ok(Some(index));
+                }
+            }
             if let Some(fields) = partial_fields.as_ref().and_then(|fields| partial_source_fields(read.as_ref(), fields)) {
                 let layout = crate::query::ProjectedValueLayout::new(fields).map_err(EngineError::execution)?;
                 let mut keyed = Vec::new();
@@ -1850,7 +2195,7 @@ impl Engine {
                     }
                     let key = key.map(|key| equality_key(&key.to_value()));
                     bytes = bytes.saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 96);
-                    if bytes > budget {
+                    if !memory.fits(bytes) {
                         exceeded = true;
                         return Ok(false);
                     }
@@ -1882,6 +2227,10 @@ impl Engine {
                         return Ok(true);
                     }
                     value.as_ref().map(equality_key)
+                } else if let (true, Some(slots)) = (equality.composite(), &slots) {
+                    let walk = |slot: usize, path: &[&str]| path[1..].iter().fold(values.get(slot).and_then(Option::as_ref), |value, segment| value.and_then(Value::as_object).and_then(|object| object.get(segment)));
+                    let parts = equality.keys.iter().zip(&key_paths).zip(slots).map(|((key, path), slot)| walk(*slot, path).cloned().or_else(|| key.joined_optional.then_some(Value::Null))).collect::<Option<Vec<_>>>();
+                    parts.map(|parts| equality_key(&Value::Array(parts.into())))
                 } else {
                     let mut value = values.first().and_then(Option::as_ref);
                     for segment in &key_path[1..] {
@@ -1893,7 +2242,7 @@ impl Engine {
                     value.map(equality_key)
                 };
                 bytes = bytes.saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 96);
-                if bytes > budget {
+                if !memory.fits(bytes) {
                     exceeded = true;
                     return Ok(false);
                 }
@@ -1922,7 +2271,7 @@ impl Engine {
             bytes = bytes
                 .saturating_add(execution_row_working_bytes(&row).map_err(backend_storage_error)?)
                 .saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 48);
-            if bytes > budget {
+            if !memory.fits(bytes) {
                 exceeded = true;
                 return Ok(false);
             }
@@ -1933,41 +2282,153 @@ impl Engine {
         Ok((!exceeded).then_some(index))
     }
 
+    /// Rows of a lookup index on a top-level key, read on batches: the
+    /// locator and key of every row `filter` admits, in collection order,
+    /// the filter decided once per dictionary code of a batch's key column.
+    /// `None` when the collection cannot be read so; `Some(None)` when the
+    /// rows exceed `memory`.
+    #[allow(clippy::type_complexity)]
+    fn lookup_keys_on_batches( &self, collection: &CollectionId, field: &crate::query::ExpressionFieldPath, memory: &StageMemory<'_>, filter: Option<&LookupKeyFilter>, ) -> EngineResult<Option<Option<(u64, Vec<(DocumentId, DocumentVersion, Option<(KeyKind, Vec<u8>)>)>)>>> {
+        let Ok(prefix) = PhysicalPlan::new(crate::query::PhysicalSource::collection_scan(collection.clone()), []) else {
+            return Ok(None);
+        };
+        let fields = std::slice::from_ref(field);
+        // Kept rows, their bytes, and whether they exceeded `memory`.
+        let kept = std::cell::RefCell::new((Vec::new(), 0usize, false));
+        let keep = |id: DocumentId, version: DocumentVersion, key: Option<&crate::storage::ProjectedValueRef<'_>>| {
+            let (keyed, bytes, exceeded) = &mut *kept.borrow_mut();
+            let key = key.map(|key| equality_key(&key.to_value()));
+            *bytes = bytes.saturating_add(key.as_ref().map_or(0, |(_, key)| key.len()) + 96);
+            *exceeded |= !memory.fits(*bytes);
+            if !*exceeded {
+                keyed.push((id, version, key));
+            }
+        };
+        let exceeded = || kept.borrow().2;
+        // Admission of each code of the current dictionary: 0 unknown, 1 in, 2 out.
+        let mut dictionary = None;
+        let mut admitted = Vec::<u8>::new();
+        let Some(statistics) = self.stream_slot_batches(
+            &prefix,
+            fields,
+            fields,
+            true,
+            &mut |runner, _| {
+                if exceeded() {
+                    return Ok(());
+                }
+                let column = runner.output(0);
+                for &row in runner.selection() {
+                    let row = row as usize;
+                    // The cell is read only to decide a new code or keep a row.
+                    let key = || column.and_then(|column| column.value_ref(row));
+                    let admits = match (filter, column.and_then(|column| column.code(row))) {
+                        (None, _) => true,
+                        (Some(filter), Some((words, code))) => {
+                            if dictionary != Some(words) {
+                                dictionary = Some(words);
+                                admitted.clear();
+                            }
+                            let code = code as usize;
+                            if admitted.len() <= code {
+                                admitted.resize(code + 1, 0);
+                            }
+                            if admitted[code] == 0 {
+                                admitted[code] = if filter.admits_ref(key().as_ref()) { 1 } else { 2 };
+                            }
+                            admitted[code] == 1
+                        }
+                        (Some(filter), None) => filter.admits_ref(key().as_ref()),
+                    };
+                    if admits {
+                        let (id, version) = runner.id(row);
+                        keep(id, version, key().as_ref());
+                    }
+                }
+                Ok(())
+            },
+            &mut |row| {
+                let key = row.values.first().and_then(Option::as_ref).map(crate::storage::ProjectedValueRef::borrowed);
+                if !exceeded() && filter.is_none_or(|filter| filter.admits_ref(key.as_ref())) {
+                    keep(row.id, row.version, key.as_ref());
+                }
+                Ok(())
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let (mut keyed, _, exceeded) = kept.into_inner();
+        if exceeded {
+            return Ok(Some(None));
+        }
+        // The batches are unordered: restore collection (`_id`) order.
+        keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Ok(Some(Some((statistics.scanned(), keyed))))
+    }
+
     /// Runs the lookup sub-pipeline for one outer row over the indexed rows
     /// that can match it, in collection order, exactly as a full scan would.
     fn probe_lookup_index( &self, collection: &CollectionId, index: &LookupIndex, equality: &LookupEquality, pipeline: &PhysicalSubPipeline, lookup_context: Option<(&Document, Option<&str>, Option<&str>)>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<ExecutionStatistics> {
         let (outer, inner_alias, outer_alias) = lookup_context.expect("a lookup probe has an outer row");
         let no_inner = Document::new();
         let fields = crate::query::LookupFields { inner: &no_inner, inner_alias, outer, outer_alias };
-        let outer_key = match crate::query::ExpressionFieldResolver::resolve_field(&fields, &equality.outer) {
-            crate::query::SemanticValue::Present(value) => Some(value),
-            crate::query::SemanticValue::Missing => None,
-        };
+        let outer_key = equality.key_of(&fields, true);
         let read = self.storage.read().map_err(storage_engine_error)?;
         let mut chain = StreamingRowChain::new(pipeline.operators());
         let mut returned = 0u64;
-        for position in index.candidates(outer_key.as_ref()) {
-            let row = match &index.rows[position as usize] {
-                IndexedRow::Loaded(row) => row.clone(),
-                // A row changed or deleted since the index was built is skipped.
-                IndexedRow::Pending(locator) => match read.get(collection, &locator.id()).map_err(storage_engine_error)? {
-                    Some(stored) if stored.version() == locator.version() => ExecutionRow::from_stored(stored),
-                    _ => continue,
-                },
-            };
-            let more = self
-                .drive_streaming_row(&mut chain, 0, row, lookup_context, &mut |row| {
-                    visitor(row).map_err(backend_storage_error)?;
-                    returned = returned.saturating_add(1);
-                    Ok(())
-                })
-                .map_err(storage_engine_error)?;
-            if !more {
-                break;
+        // Pending candidates are read a chunk at a time, in collection order.
+        const CHUNK: usize = 64;
+        let candidates = index.candidates(outer_key.as_ref(), equality.prefix);
+        let mut ids = Vec::with_capacity(CHUNK);
+        let mut loaded = Vec::<Option<ExecutionRow>>::with_capacity(CHUNK);
+        'chunks: for chunk in candidates.chunks(CHUNK) {
+            ids.clear();
+            ids.extend(chunk.iter().filter_map(|position| match &index.rows[*position as usize] {
+                IndexedRow::Pending(locator) => Some(locator.id()),
+                IndexedRow::Loaded(_) => None,
+            }));
+            loaded.clear();
+            read.get_each(collection, &ids, &mut |_, stored| {
+                loaded.push(stored.map(ExecutionRow::from_stored));
+                Ok(true)
+            })
+            .map_err(storage_engine_error)?;
+            let mut pending = loaded.drain(..);
+            for position in chunk {
+                let row = match &index.rows[*position as usize] {
+                    IndexedRow::Loaded(row) => row.clone(),
+                    // A row changed or deleted since the index was built is skipped.
+                    IndexedRow::Pending(locator) => match pending.next().flatten() {
+                        Some(row) if row.version() == locator.version() => row,
+                        _ => continue,
+                    },
+                };
+                let more = self
+                    .drive_streaming_row(&mut chain, 0, row, lookup_context, &mut |row| {
+                        visitor(row).map_err(backend_storage_error)?;
+                        returned = returned.saturating_add(1);
+                        Ok(())
+                    })
+                    .map_err(storage_engine_error)?;
+                if !more {
+                    break 'chunks;
+                }
             }
         }
         ensure_exact_rows(pipeline.operators(), &chain.limit_remaining)?;
         Ok(ExecutionStatistics::streamed_pipeline(0, chain.filtered, returned, ExecutionStrategy::CollectionScan))
+    }
+
+    /// An order-free union branch read as a main pipeline, on batches when
+    /// its stages allow, its rows marked as union rows. `None` when it cannot
+    /// run so (nothing was emitted).
+    fn stream_union_batches( &self, collection: &CollectionId, pipeline: &PhysicalSubPipeline, consumer_demand: Option<&[crate::query::ExpressionFieldPath]>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let Ok(plan) = PhysicalPlan::new(crate::query::PhysicalSource::collection_scan(collection.clone()), pipeline.operators().iter().cloned()) else {
+            return Ok(None);
+        };
+        let plan = plan.with_order_free_consumer(consumer_demand.map(<[_]>::to_vec));
+        self.stream_read_pipeline(&plan, &mut |stored| visitor(ExecutionRow::from_union(stored)))
     }
 
     /// Streams a lookup or union sub-pipeline. `union_demand` is `Some` for a
@@ -1977,7 +2438,12 @@ impl Engine {
         let union_origin = lookup_context.is_none();
         let read = self.storage.read().map_err(storage_engine_error)?;
         let operators = pipeline.operators();
-        if !operators.iter().all(is_bounded_secondary_row_operator) {
+        if !operators.iter().all(is_row_operator) {
+            // A union branch with blocking stages runs as a query of its own, governed like any other.
+            if union_origin {
+                let branch = PhysicalPlan::new(crate::query::PhysicalSource::collection_scan(collection.clone()), operators.iter().cloned()).map_err(|error| EngineError::execution(ExecutionError::evaluation(error.to_string())))?;
+                return self.stream_rows(&branch, None, |row| visitor(row.into_union()));
+            }
             return Err(EngineError::execution(ExecutionError::evaluation(
                 "secondary pipeline contains an operator without a bounded streaming executor",
             )));
@@ -2104,13 +2570,15 @@ impl Engine {
                             .map_err(backend_storage_error)?;
                         row.replace_document(selected, false);
                     }
-                    PhysicalOperator::Custom {
-                        writes: false,
-                        changes_cardinality: false,
-                        ..
-                    } => {
+                    // A `derive` changes the row's own document: copied only when shared.
+                    PhysicalOperator::Custom { writes: false, compiled: Some(compiled), .. } if !needs_id && compiled.derives() => {
+                        let document = row.document_mut();
+                        compiled.derive(document).expect("a derive").map_err(backend_storage_error)?;
+                        document.remove("_id");
+                    }
+                    PhysicalOperator::Custom { writes: false, stage, .. } if !matches!(stage, Some(crate::query::Stage::Sample | crate::query::Stage::Window | crate::query::Stage::Fill)) => {
                         match operator
-                            .apply_custom(self.runtime.as_ref(), &row.stage_input(needs_id))
+                            .apply_custom(self.runtime.as_ref(), &row.stage_input(needs_id), lookup_context)
                             .map_err(backend_storage_error)?
                         {
                             crate::query::CustomOperatorResult::Keep => {}
@@ -2144,7 +2612,16 @@ impl Engine {
                             continue 'rows;
                         }
                     }
-                    PhysicalOperator::Limit { .. } => {}
+                    PhysicalOperator::Limit { .. } | PhysicalOperator::Delete => {}
+                    // Writing stages, run by a write (see `execute`).
+                    PhysicalOperator::Set { assignments } => {
+                        let document = self.runtime.apply_set(assignments, &row.evaluation_document()).map_err(execution_storage_error)?;
+                        row.replace_document(document, true);
+                    }
+                    PhysicalOperator::Load { target } => {
+                        let document = self.runtime.apply_load(target, &row.evaluation_document()).map_err(execution_storage_error)?;
+                        row.replace_document(document, true);
+                    }
                     _ => unreachable!("validated streaming row operator"),
                 }
             }
@@ -2156,102 +2633,17 @@ impl Engine {
     /// Returns whether the governed blocking streaming executor supports this plan shape.
     #[must_use]
     pub fn supports_governed_blocking_streaming(&self, physical: &PhysicalPlan) -> bool {
-        if physical.source().collection().as_str().starts_with('_') {
-            return false;
-        }
-        if physical.is_write() || physical.is_memory_streaming() {
+        if self.is_virtual(physical.source().collection()) || physical.is_write() || physical.is_memory_streaming() {
             return false;
         }
         let Some(shape) = governed_shape(physical.operators()) else {
             return false;
         };
         // A pivot is bounded only when the runtime can aggregate it incrementally.
-        match &physical.operators()[shape.blocking_index..shape.core_end] {
-            [PhysicalOperator::Pivot { specification }] => self
-                .runtime
-                .incremental_pivot_accumulator(specification)
-                .is_ok_and(|accumulator| accumulator.is_some()),
+        physical.operators()[shape.blocking_index..shape.core_end].iter().chain(shape.rest).all(|operator| match operator {
+            PhysicalOperator::Pivot { specification } => self.runtime.incremental_pivot_accumulator(specification).is_ok(),
             _ => true,
-        }
-    }
-
-    /// Compiles the standard projected-value source prefix for one blocking
-    /// consumer. This is the single query/storage boundary used by projected
-    /// sort, distinct and Top-N; unsupported shapes return `None` and preserve
-    /// the established Document pipeline.
-    fn projected_collection_pipeline<I>(
-        &self,
-        prefix: &PhysicalPlan,
-        downstream_fields: I,
-    ) -> EngineResult<Option<(ScanOptions, ProjectedValuePipeline)>>
-    where
-        I: IntoIterator<Item = crate::query::ExpressionFieldPath>,
-    {
-        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access()
-        else {
-            return Ok(None);
-        };
-        let Some(projected) = ProjectedValuePipeline::compile(
-            prefix.operators(),
-            downstream_fields,
-        )
-        .map_err(EngineError::execution)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((*options, projected)))
-    }
-
-    /// Scans one projected source prefix and applies all compatible row stages
-    /// before handing the borrowed row to a blocking consumer. The method owns
-    /// no operator semantics beyond access-vector composition.
-    #[inline]
-    fn scan_projected_prefix_refs<F>(
-        &self,
-        read: &dyn StorageRead,
-        prefix: &PhysicalPlan,
-        options: ScanOptions,
-        projected: &ProjectedValuePipeline,
-        visitor: &mut F,
-    ) -> EngineResult<ExecutionStatistics>
-    where
-        F: for<'a> FnMut(
-            DocumentId,
-            DocumentVersion,
-            &[Option<ProjectedValueRef<'a>>],
-        ) -> EngineResult<bool>,
-    {
-        let mut scanned = 0u64;
-        let mut filtered = 0u64;
-        let mut returned = 0u64;
-        read.scan_projected_row_refs_unordered_each(
-            prefix.source().collection(),
-            reusable_projected_scan_options(options, prefix, projected),
-            projected.layout().storage_fields(),
-            &mut |id, version, values| {
-                scanned = scanned.saturating_add(1);
-                let accepted = projected
-                    .accepts_refs_with(values, |expression, resolver| {
-                        self.runtime
-                            .evaluate_resolved_predicate(expression, resolver)
-                    })
-                    .map_err(backend_storage_error)?;
-                if !accepted {
-                    filtered = filtered.saturating_add(1);
-                    return Ok(true);
-                }
-                returned = returned.saturating_add(1);
-                visitor(id, version, values).map_err(backend_storage_error)
-            },
-        )
-        .map_err(storage_engine_error)?;
-
-        Ok(ExecutionStatistics::streamed_pipeline(
-            scanned,
-            filtered,
-            returned,
-            ExecutionStrategy::CollectionScan,
-        ))
+        })
     }
 
     /// Streams the rows of a collection-scan `prefix` as values of top-level
@@ -2260,14 +2652,15 @@ impl Engine {
     /// built. `None` when a stage or field does not allow it.
     fn stream_slot_rows( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], visitor: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
-            return Ok(None);
+            return self.stream_document_rows(prefix, downstream, visitor);
         };
-        if self.system_collection_storage(prefix)?.is_some() {
+        if self.is_virtual(prefix.source().collection()) {
             return Ok(None);
         }
         let read = self.storage.read().map_err(storage_engine_error)?;
         let Some((gate, program)) = slot_prefix(read.as_ref(), prefix, downstream, true)? else {
-            return Ok(None);
+            drop(read);
+            return self.stream_document_rows(prefix, downstream, visitor);
         };
         PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
         let (mut scanned, mut filtered, mut slot_filtered, mut returned) = (0u64, 0u64, 0u64, 0u64);
@@ -2321,36 +2714,78 @@ impl Engine {
         )))
     }
 
+    /// The output documents of any streaming `prefix`, handed as slot rows
+    /// holding `downstream`: the path for prefixes that do not run on slots.
+    fn stream_document_rows( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], visitor: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let mut values = Vec::with_capacity(downstream.len());
+        self.stream_read_pipeline(prefix, &mut |stored| {
+            values.clear();
+            values.extend(downstream.iter().map(|field| field.iter().skip(1).try_fold(stored.document().get(field.first())?, |value, segment| value.as_object()?.get(segment)).cloned()));
+            visitor(SlotRowRef { id: *stored.id(), version: stored.version(), fields: downstream, values: &values })
+        })
+    }
+
     /// [`Self::stream_slot_rows`] for a consumer that reads batches: when
     /// every stage of `prefix` runs on batches, `on_batch` receives each
     /// batch that ran (its selection holds the rows that passed, its outputs
     /// follow the returned field order); rows of a batch that aborted, and
     /// every row when the stages cannot run on batches, go to `on_row`.
-    /// The field order is that of [`SlotRowRef::fields`].
-    fn stream_slot_batches( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], on_batch: &mut dyn FnMut(&crate::query::BatchRunner, &[crate::query::ExpressionFieldPath]) -> EngineResult<()>, on_row: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+    /// The field order is that of [`SlotRowRef::fields`]. Without
+    /// `locators`, rows may carry [`NO_LOCATOR`].
+    fn stream_slot_batches( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], keyed: &[crate::query::ExpressionFieldPath], locators: bool, on_batch: &mut dyn FnMut(&crate::query::BatchRunner, &[crate::query::ExpressionFieldPath]) -> EngineResult<()>, on_row: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        self.stream_slot_batches_gated(prefix, downstream, keyed, locators, None, on_batch, on_row)
+    }
+
+    /// [`Self::stream_slot_batches`], where `gate` may refuse blocks from the
+    /// source columns of its fields (their positions among the block's
+    /// columns), when each is a source ([`scan_batched`]) and no stage runs
+    /// before (whose errors and dropped rows a refused block would skip), or,
+    /// for a gate that only refuses, only filters that cannot fail.
+    fn stream_slot_batches_gated( &self, prefix: &PhysicalPlan, downstream: &[crate::query::ExpressionFieldPath], keyed: &[crate::query::ExpressionFieldPath], locators: bool, gate_on: Option<BlockGateOn<'_>>, on_batch: &mut dyn FnMut(&crate::query::BatchRunner, &[crate::query::ExpressionFieldPath]) -> EngineResult<()>, on_row: &mut dyn FnMut(SlotRowRef<'_>) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
-            return Ok(None);
+            return self.stream_document_rows(prefix, downstream, on_row);
         };
-        if self.system_collection_storage(prefix)?.is_some() {
+        if self.is_virtual(prefix.source().collection()) {
             return Ok(None);
         }
         let read = self.storage.read().map_err(storage_engine_error)?;
         let Some((gate, program)) = slot_prefix(read.as_ref(), prefix, downstream, false)? else {
+            drop(read);
             return self.stream_slot_rows(prefix, downstream, on_row);
         };
-        let Some(batch) = crate::query::BatchProgram::compile(prefix.operators(), gate.layout().fields(), program.fields()).map(Arc::new) else {
+        let Some(mut batch) = crate::query::BatchProgram::compile(prefix.operators(), gate.layout().fields(), program.fields()) else {
             return self.stream_slot_rows(prefix, downstream, on_row);
         };
+        batch.code_outputs(&keyed.iter().filter_map(|field| program.fields().iter().position(|output| output == field)).collect::<Vec<_>>());
+        let batch = Arc::new(batch);
         PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
         let (filtered, returned) = (std::cell::Cell::new(0u64), std::cell::Cell::new(0u64));
         let on_row = std::cell::RefCell::new(on_row);
         let mut row = Vec::new();
+        let sources = gate.layout().fields();
+        // A gate that only refuses blocks may sit behind filters that cannot
+        // fail: they would only drop rows.
+        let behind = |refuses: bool| -> EngineResult<bool> { Ok(prefix.operators().is_empty() || (refuses && only_total_filters(read.as_ref(), prefix)?)) };
+        let gate_on = match gate_on {
+            Some(gate) if behind(gate.2)? => Some(gate),
+            _ => None,
+        };
+        let mut consumer = gate_on.and_then(|(fields, admit, _)| {
+            let columns = fields.iter().map(|field| sources.iter().position(|source| source == field)).collect::<Option<Vec<_>>>()?;
+            let mask = (0..sources.len()).map(|source| columns.contains(&source)).collect::<Vec<_>>();
+            Some((mask, move |block: &crate::storage::ProjectedBlock<'_, '_>| admit(block, &columns).map_err(backend_storage_error)))
+        });
         let scanned = scan_batched(
             read.as_ref(),
             prefix.source().collection(),
-            reusable_projected_scan_options(*options, prefix, &gate),
+            {
+                let options = reusable_projected_scan_options(*options, prefix, &gate);
+                if locators { options } else { options.without_locators() }
+            },
             gate.layout().storage_fields(),
             &batch,
+            crate::query::GroupPruning::new(prefix.operators(), gate.layout().storage_fields()).as_ref(),
+            consumer.as_mut().map(|(fields, admit)| crate::storage::BlockGate { fields: fields.clone(), admit }),
             &mut |runner| {
                 let passed = runner.selection().len() as u64;
                 filtered.set(filtered.get() + runner.dropped() as u64);
@@ -2411,16 +2846,21 @@ impl Engine {
     /// A row changed since it was read is dropped, as a scan would not see it.
     fn hydrate_replayed( &self, prefix: &PhysicalPlan, locators: impl IntoIterator<Item = (DocumentId, DocumentVersion)>, ) -> EngineResult<Vec<ExecutionRow>> {
         let read = self.storage.read().map_err(storage_engine_error)?;
+        // Rows are read in identifier order, then replayed in the order given.
+        let locators = locators.into_iter().collect::<Vec<_>>();
+        let mut order = (0..locators.len()).collect::<Vec<_>>();
+        order.sort_unstable_by_key(|position| locators[*position].0);
+        let ids = order.iter().map(|position| locators[*position].0).collect::<Vec<_>>();
+        let mut loaded = std::iter::repeat_with(|| None).take(locators.len()).collect::<Vec<Option<StoredDocument>>>();
+        read.get_each(prefix.source().collection(), &ids, &mut |index, stored| {
+            let position = order[index];
+            loaded[position] = stored.filter(|stored| stored.version() == locators[position].1);
+            Ok(true)
+        })
+        .map_err(storage_engine_error)?;
         let mut chain = StreamingRowChain::new(prefix.operators());
         let mut hydrated = Vec::new();
-        for (id, version) in locators {
-            let Some(stored) = read
-                .get(prefix.source().collection(), &id)
-                .map_err(storage_engine_error)?
-                .filter(|stored| stored.version() == version)
-            else {
-                continue;
-            };
+        for stored in loaded.into_iter().flatten() {
             self.drive_streaming_row(&mut chain, 0, ExecutionRow::from_stored(stored), None, &mut |row| {
                 hydrated.push(row);
                 Ok(())
@@ -2430,261 +2870,6 @@ impl Engine {
         Ok(hydrated)
     }
 
-    fn hydrate_projected_locator( &self, read: &dyn StorageRead, collection: &CollectionId, locator: ProjectedRowLocator, projected: &ProjectedValuePipeline, ) -> EngineResult<Option<ExecutionRow>> {
-        let Some(stored) = read
-            .get(collection, &locator.id())
-            .map_err(storage_engine_error)?
-        else {
-            return Ok(None);
-        };
-        if stored.version() != locator.version() {
-            return Ok(None);
-        }
-
-        let mut row = ExecutionRow::from_stored(stored);
-        if let Some(fields) = projected.hydration_projection() {
-            let evaluation_document = row.evaluation_document();
-            let document = self
-                .runtime
-                .apply_select(fields, &evaluation_document)
-                .map_err(EngineError::execution)?;
-            row.replace_document(document, false);
-        }
-        Ok(Some(row))
-    }
-
-    /// Executes the native `near -> sort _distance -> limit` shape from projected
-    /// values and hydrates only retained winners. The query vector is parsed once
-    /// for the scan instead of once per source document.
-    fn try_projected_near_top_n( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], limit: usize, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
-        if limit == 0
-            || keys.len() != 1
-            || keys[0].field().to_string() != "_distance"
-            || keys[0].direction() != SortDirection::Ascending
-        {
-            return Ok(None);
-        }
-
-        let Some((near, filter_operators)) = prefix.operators().split_last() else {
-            return Ok(None);
-        };
-        let PhysicalOperator::Custom {
-            name,
-            arguments,
-            writes: false,
-            changes_cardinality: false,
-            ..
-        } = near
-        else {
-            return Ok(None);
-        };
-        if name.as_str() != "near"
-            || filter_operators
-                .iter()
-                .any(|operator| !matches!(operator, PhysicalOperator::Filter { .. }))
-        {
-            return Ok(None);
-        }
-
-        // Invalid specs keep the established document-path semantics, including
-        // the fact that an empty source never evaluates a row-local stage.
-        let Ok(spec) = NearSpec::parse(arguments) else {
-            return Ok(None);
-        };
-        let filter_prefix = PhysicalPlan::new(
-            prefix.source().clone(),
-            filter_operators.iter().cloned(),
-        )
-        .map_err(EngineError::physical_planning)?;
-        let Some((options, projected)) = self.projected_collection_pipeline(
-            &filter_prefix,
-            std::iter::once(spec.field().clone()),
-        )? else {
-            return Ok(None);
-        };
-        let Some(embedding_slot) = projected.layout().slot(spec.field()) else {
-            return Ok(None);
-        };
-
-        let read = self.storage.read().map_err(storage_engine_error)?;
-        let mut top = BoundedProjectedTopN::new(limit);
-        let distance_slot = [0usize];
-        let prefix_stats = if projected.gate_field_count() > 0
-            && read
-                .support(StorageReadCapability::ProjectedValuesGatedUnordered)
-                .available()
-        {
-            let mut scanned = 0u64;
-            let mut filtered = 0u64;
-            let mut accepted = 0u64;
-            read.scan_projected_row_values_gated_unordered_each(
-                filter_prefix.source().collection(),
-                reusable_projected_scan_options(options, &filter_prefix, &projected),
-                projected.layout().storage_fields(),
-                projected.gate_field_count(),
-                &mut |values| {
-                    scanned = scanned.saturating_add(1);
-                    let keep = projected
-                        .accepts_with(values, |expression, resolver| {
-                            self.runtime.evaluate_resolved_predicate(expression, resolver)
-                        })
-                        .map_err(backend_storage_error)?;
-                    if !keep {
-                        filtered = filtered.saturating_add(1);
-                    }
-                    Ok(keep)
-                },
-                &mut |id, version, values| {
-                    accepted = accepted.saturating_add(1);
-                    let Some(value) = values.get(embedding_slot).and_then(Option::as_ref) else {
-                        return Ok(true);
-                    };
-                    let distance = spec.distance_value(value).map_err(backend_storage_error)?;
-                    let distance_values = [Some(ProjectedValueRef::Float(distance))];
-                    top.push_refs(keys, &distance_slot, id, version, &distance_values)
-                        .map_err(backend_storage_error)?;
-                    Ok(true)
-                },
-            )
-            .map_err(storage_engine_error)?;
-            ExecutionStatistics::streamed_pipeline(
-                scanned,
-                filtered,
-                accepted,
-                ExecutionStrategy::CollectionScan,
-            )
-        } else {
-            self.scan_projected_prefix_refs(
-                read.as_ref(),
-                &filter_prefix,
-                options,
-                &projected,
-                &mut |id, version, values| {
-                    let Some(value) = values.get(embedding_slot).and_then(Option::as_ref) else {
-                        return Ok(true);
-                    };
-                    let distance = spec
-                        .distance_projected(value)
-                        .map_err(EngineError::execution)?;
-                    let distance_values = [Some(ProjectedValueRef::Float(distance))];
-                    top.push_refs(keys, &distance_slot, id, version, &distance_values)
-                        .map_err(EngineError::execution)?;
-                    Ok(true)
-                },
-            )?
-        };
-        let winners = top
-            .into_sorted_winners(keys)
-            .map_err(EngineError::execution)?;
-        let mut hydrated = Vec::with_capacity(winners.len());
-        for winner in winners {
-            let Some(distance) = winner.value(0).cloned() else {
-                continue;
-            };
-            let locator = ProjectedRowLocator::new(*winner.id(), winner.version());
-            if let Some(mut row) = self.hydrate_projected_locator(
-                read.as_ref(),
-                prefix.source().collection(),
-                locator,
-                &projected,
-            )? {
-                let mut document = row.document().clone();
-                document.insert("_distance", distance);
-                row.replace_document(Arc::new(document), false);
-                hydrated.push(row);
-            }
-        }
-        let returned = hydrated.len() as u64;
-        Ok(Some((
-            hydrated,
-            ExecutionStatistics::streamed_with_strategies(
-                prefix_stats.scanned(),
-                prefix_stats
-                    .filtered()
-                    .saturating_add(prefix_stats.returned().saturating_sub(returned)),
-                returned,
-                ExecutionStrategies::default()
-                    .with(ExecutionStrategy::CollectionScan)
-                    .with(ExecutionStrategy::TopN),
-            ),
-        )))
-    }
-
-    /// Executes Top-N from the shared projected-value access vector and
-    /// hydrates only retained winners. Filter prefixes compose on the same
-    /// borrowed scalar row, so combinations inherit late materialization
-    /// without adding stage-specific execution paths.
-    fn try_projected_top_n( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], limit: usize, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
-        if limit == 0
-            || prefix
-                .operators()
-                .iter()
-                .any(|operator| !matches!(operator, PhysicalOperator::Filter { .. }))
-        {
-            return Ok(None);
-        }
-
-        let Some((options, projected)) = self.projected_collection_pipeline(
-            prefix,
-            keys.iter().map(|key| key.field().clone()),
-        )? else {
-            return Ok(None);
-        };
-        let sort_fields = keys
-            .iter()
-            .map(|key| key.field().clone())
-            .collect::<Vec<_>>();
-        let sort_slots = projected
-            .layout()
-            .slots(&sort_fields)
-            .map_err(EngineError::execution)?;
-
-        let read = self.storage.read().map_err(storage_engine_error)?;
-        let mut top = BoundedProjectedTopN::new(limit);
-        let prefix_stats = self.scan_projected_prefix_refs(
-            read.as_ref(),
-            prefix,
-            options,
-            &projected,
-            &mut |id, version, values| {
-                top.push_refs(keys, &sort_slots, id, version, values)
-                    .map_err(EngineError::execution)?;
-                Ok(true)
-            },
-        )?;
-
-        let projected_winners = top
-            .into_sorted_winners(keys)
-            .map_err(EngineError::execution)?;
-        let mut hydrated = Vec::with_capacity(projected_winners.len());
-        for winner in projected_winners {
-            let locator = ProjectedRowLocator::new(*winner.id(), winner.version());
-            if let Some(row) = self.hydrate_projected_locator(
-                read.as_ref(),
-                prefix.source().collection(),
-                locator,
-                &projected,
-            )? {
-                hydrated.push(row);
-            }
-        }
-
-        let returned = hydrated.len() as u64;
-        Ok(Some((
-            hydrated,
-            ExecutionStatistics::streamed_with_strategies(
-                prefix_stats.scanned(),
-                prefix_stats
-                    .filtered()
-                    .saturating_add(prefix_stats.returned().saturating_sub(returned)),
-                returned,
-                ExecutionStrategies::default()
-                    .with(ExecutionStrategy::CollectionScan)
-                    .with(ExecutionStrategy::TopN),
-            ),
-        )))
-    }
-
     /// Executes a complete blocking sort from projected values when the compact
     /// locator+key working set fits the governed budget. If it does not fit, the
     /// caller falls back to the established external Document sort.
@@ -2692,10 +2877,113 @@ impl Engine {
     /// `select … as`, `rename`, `drop`, `where`), such as the hidden `derive`
     /// of `sort <expression>`: only the key values of the current winners are
     /// kept; the winners are then loaded and the prefix replayed on them.
+    /// Unbounded `sort` on batches (or slot rows): the sort keys of every
+    /// row, ordered by key then identifier in scan direction, then the rows
+    /// reloaded in that order. A consumer that declares the fields it reads
+    /// gets them from the slots instead, as partial documents. `None` once
+    /// the kept values exceed the stage's memory.
+    fn try_slot_sort( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], memory: &StageMemory<'_>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
+            return Ok(None);
+        };
+        // Reloaded rows are complete, whatever the consumer reads of them.
+        if keys.is_empty() || !prefix.operators().iter().all(replays_one_row) {
+            return Ok(None);
+        }
+        let reverse = matches!(options.direction(), crate::storage::ScanDirection::Reverse);
+        // The keys come first in the slots, then the other fields the
+        // consumer reads.
+        let mut key_fields = keys.iter().map(|key| key.field().clone()).collect::<Vec<_>>();
+        let consumer = prefix.field_demand();
+        for field in consumer.unwrap_or_default() {
+            if !key_fields.contains(field) {
+                key_fields.push(field.clone());
+            }
+        }
+        let slots = (0..key_fields.len()).collect::<Vec<_>>();
+        let rows = std::cell::RefCell::new(Vec::<(Vec<Option<Value>>, DocumentId, DocumentVersion)>::new());
+        let bytes = std::cell::Cell::new(0usize);
+        let keep = |values: &[Option<ProjectedValueRef<'_>>], id: DocumentId, version: DocumentVersion| -> EngineResult<()> {
+            bytes.set(bytes.get().saturating_add(crate::query::projected_row_working_bytes_refs(values, &slots)));
+            if memory.fits(bytes.get()) {
+                rows.borrow_mut().push((values.iter().map(|value| value.as_ref().map(ProjectedValueRef::to_value)).collect(), id, version));
+            }
+            Ok(())
+        };
+        let positions_of = |fields: &[crate::query::ExpressionFieldPath]| -> Vec<usize> {
+            key_fields.iter().map(|field| fields.iter().position(|slot| slot == field).expect("slot prefix holds every key")).collect()
+        };
+        let Some(prefix_stats) = self.stream_slot_batches(
+            prefix,
+            &key_fields,
+            &[],
+            true,
+            &mut |runner, fields| {
+                if !memory.fits(bytes.get()) {
+                    return Ok(());
+                }
+                let columns = positions_of(fields).into_iter().map(|position| runner.output(position)).collect::<Vec<_>>();
+                let mut values = Vec::with_capacity(columns.len());
+                for &row in runner.selection() {
+                    values.clear();
+                    values.extend(columns.iter().map(|column| column.and_then(|column| column.value_ref(row as usize))));
+                    let (id, version) = runner.id(row as usize);
+                    keep(&values, id, version)?;
+                }
+                Ok(())
+            },
+            &mut |row| {
+                let values = positions_of(row.fields).into_iter().map(|position| row.values[position].as_ref().map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
+                keep(&values, row.id, row.version)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        if !memory.fits(bytes.get()) {
+            return Ok(None);
+        }
+        let mut rows = rows.into_inner();
+        crate::query::check_sort_kinds(keys, rows.len(), |row, key| rows[row].0[key].as_ref())?;
+        let mut failure = None;
+        rows.sort_by(|left, right| {
+            let ordering = crate::query::compare_owned_projected_rows(keys, &left.0, &right.0).unwrap_or_else(|error| {
+                failure.get_or_insert(error);
+                Ordering::Equal
+            });
+            let by_id = if reverse { right.1.cmp(&left.1) } else { left.1.cmp(&right.1) };
+            ordering.then(by_id)
+        });
+        if let Some(error) = failure {
+            return Err(EngineError::execution(error));
+        }
+        let mut returned = 0u64;
+        if consumer.is_some() {
+            PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+            for (values, id, version) in rows {
+                let document = Arc::new(partial_document(&key_fields, &values));
+                visitor(ExecutionRow::from_stored(StoredDocument::new(id, version, document).map_err(storage_engine_error)?))?;
+                returned += 1;
+            }
+        } else {
+            for row in self.hydrate_replayed(prefix, rows.into_iter().map(|(_, id, version)| (id, version)))? {
+                visitor(row)?;
+                returned += 1;
+            }
+        }
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            prefix_stats.scanned(),
+            prefix_stats.filtered(),
+            returned,
+            ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::InMemorySort),
+        )))
+    }
+
     fn try_slot_top_n( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], limit: usize, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
         const MAX_KEYS: usize = 4;
         const KEY_SLOTS: [usize; MAX_KEYS] = [0, 1, 2, 3];
-        if limit == 0 || keys.len() > MAX_KEYS || prefix.field_demand().is_some() || !prefix.operators().iter().all(replays_one_row) {
+        // Reloaded rows are complete, whatever the consumer reads of them.
+        if limit == 0 || keys.len() > MAX_KEYS || !prefix.operators().iter().all(replays_one_row) {
             return Ok(None);
         }
         let key_fields = keys.iter().map(|key| key.field().clone()).collect::<Vec<_>>();
@@ -2705,21 +2993,34 @@ impl Engine {
         };
         let mut positions: Option<Vec<usize>> = None;
         let mut batch_positions: Option<Vec<usize>> = None;
-        let Some(prefix_stats) = self.stream_slot_batches(
+        // A block none of whose rows passes the bound is not decoded further.
+        let mut admit = |block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]| -> EngineResult<bool> {
+            let bound = TopBound::of(&top.borrow());
+            Ok(bound.admits_block(keys, &block.columns[columns[0]]).unwrap_or_else(|| (0..block.rows).any(|row| !bound.rejects_cells(keys, |key| block.columns[columns[key]].get(row)))))
+        };
+        let Some(prefix_stats) = self.stream_slot_batches_gated(
             prefix,
             &key_fields,
+            &[],
+            true,
+            Some((&key_fields[..], &mut admit, true)),
             &mut |runner, fields| {
                 let positions = batch_positions.get_or_insert_with(|| positions_of(fields));
                 let columns = positions.iter().map(|position| runner.output(*position)).collect::<Vec<_>>();
                 let mut top = top.borrow_mut();
+                let mut bound = TopBound::of(&top);
                 for &row in runner.selection() {
                     let row = row as usize;
+                    if bound.rejects(keys, &columns, row) {
+                        continue;
+                    }
                     let mut values: [Option<ProjectedValueRef<'_>>; MAX_KEYS] = [None, None, None, None];
                     for (value, column) in values.iter_mut().zip(&columns) {
                         *value = column.and_then(|column| column.value_ref(row));
                     }
                     let (id, version) = runner.id(row);
                     top.push_refs(keys, &KEY_SLOTS[..keys.len()], id, version, &values[..keys.len()]).map_err(EngineError::execution)?;
+                    bound = TopBound::of(&top);
                 }
                 Ok(())
             },
@@ -2744,92 +3045,15 @@ impl Engine {
             rows,
             ExecutionStatistics::streamed_with_strategies(
                 prefix_stats.scanned(),
-                prefix_stats.filtered().saturating_add(prefix_stats.returned().saturating_sub(returned)),
+                // Each read row is dropped or returned (blocks the gate
+                // refused included).
+                prefix_stats.scanned().saturating_sub(returned),
                 returned,
-                ExecutionStrategies::default()
-                    .with(ExecutionStrategy::CollectionScan)
-                    .with(ExecutionStrategy::TopN)
-                    .with(ExecutionStrategy::PartialDocuments),
+                {
+                    let strategies = ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::TopN);
+                    if prefix_stats.strategies().contains(ExecutionStrategy::PartialDocuments) { strategies.with(ExecutionStrategy::PartialDocuments) } else { strategies }
+                },
             ),
-        )))
-    }
-
-    fn try_projected_in_memory_sort( &self, prefix: &PhysicalPlan, keys: &[crate::query::SortKey], budget: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
-        if keys.is_empty() || !self.runtime.supports_projected_sort() {
-            return Ok(None);
-        }
-
-        let sort_fields = keys
-            .iter()
-            .map(|key| key.field().clone())
-            .collect::<Vec<_>>();
-        let Some((options, projected)) =
-            self.projected_collection_pipeline(prefix, sort_fields.clone())?
-        else {
-            return Ok(None);
-        };
-        let sort_slots = projected
-            .layout()
-            .slots(&sort_fields)
-            .map_err(EngineError::execution)?;
-
-        let read = self.storage.read().map_err(storage_engine_error)?;
-        let mut rows = ProjectedRowSet::new(sort_slots.len());
-        let mut estimated_bytes = 0usize;
-        let exceeded = std::cell::Cell::new(false);
-        let prefix_stats = self.scan_projected_prefix_refs(
-            read.as_ref(),
-            prefix,
-            options,
-            &projected,
-            &mut |id, version, values| {
-                let estimate = projected_row_working_bytes_refs(values, &sort_slots);
-                if estimated_bytes.saturating_add(estimate) > budget {
-                    exceeded.set(true);
-                    return Ok(false);
-                }
-                estimated_bytes = estimated_bytes.saturating_add(estimate);
-                rows.push_refs(id, version, values, &sort_slots)
-                    .map_err(EngineError::execution)?;
-                Ok(true)
-            },
-        )?;
-        if exceeded.get() {
-            return Ok(None);
-        }
-
-        let order = stable_projected_order(
-            self.runtime.as_ref(),
-            keys,
-            &rows,
-            options.direction(),
-        )
-        .map_err(EngineError::execution)?;
-        let mut returned = 0u64;
-        for index in order {
-            let locator = rows
-                .locator(index)
-                .expect("projected sort permutation must reference a locator");
-            if let Some(row) = self.hydrate_projected_locator(
-                read.as_ref(),
-                prefix.source().collection(),
-                locator,
-                &projected,
-            )? {
-                visitor(row)?;
-                returned = returned.saturating_add(1);
-            }
-        }
-
-        Ok(Some(ExecutionStatistics::streamed_with_strategies(
-            prefix_stats.scanned(),
-            prefix_stats
-                .filtered()
-                .saturating_add(prefix_stats.returned().saturating_sub(returned)),
-            returned,
-            ExecutionStrategies::default()
-                .with(ExecutionStrategy::CollectionScan)
-                .with(ExecutionStrategy::InMemorySort),
         )))
     }
 
@@ -2837,941 +3061,351 @@ impl Engine {
     /// canonical key remains owned by the runtime; the engine retains only one
     /// source locator per key and hydrates winners after deduplication. A trailing
     /// limit bounds the retained key frontier without changing key-order output.
-    fn try_projected_in_memory_distinct( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], budget: usize, output_limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
-        let read = self.storage.read().map_err(storage_engine_error)?;
-        // Full-document distinct ranks the same keys from projected values
-        // when the view knows every top-level field of the collection: the
-        // document key encodes the present fields in name order. Only the
-        // retained rows are read back, so it needs a bound on the output and
-        // a prefix that keeps documents whole (filters).
-        let whole_document = fields.is_empty();
-        let document_fields;
-        let fields = if whole_document {
-            if output_limit.is_none()
-                || !prefix.operators().iter().all(|operator| matches!(operator, PhysicalOperator::Filter { .. }))
-            {
-                return Ok(None);
-            }
-            let Some(names) = read
-                .top_level_fields(prefix.source().collection())
-                .map_err(storage_engine_error)?
-            else {
-                return Ok(None);
-            };
-            let Ok(names) = names
-                .iter()
-                .map(|name| crate::query::ExpressionFieldPath::new([name.as_str()]))
-                .collect::<Result<Vec<_>, _>>()
-            else {
-                return Ok(None);
-            };
-            document_fields = names;
-            &document_fields[..]
-        } else {
-            if !self.runtime.supports_projected_distinct() {
-                return Ok(None);
-            }
-            fields
-        };
-
-        let Some((options, projected)) =
-            self.projected_collection_pipeline(prefix, fields.iter().cloned())?
-        else {
-            return Ok(None);
-        };
-        let field_slots = projected
-            .layout()
-            .slots(fields)
-            .map_err(EngineError::execution)?;
-        // Each catalog name must reach storage as that one top-level field.
-        if whole_document
-            && !fields.iter().zip(&field_slots).all(|(field, slot)| {
-                let storage = &projected.layout().storage_fields()[*slot];
-                storage.len() == 1 && storage.get(0).is_some_and(|segment| segment.as_str() == field.first())
-            })
-        {
-            return Ok(None);
-        }
-
-        let mut rows: BTreeMap<Arc<[u8]>, (ProjectedRowLocator, usize)> = BTreeMap::new();
-        let mut key_buffer = Vec::<u8>::with_capacity(64);
-        let mut estimated_bytes = 0usize;
-        let exceeded = std::cell::Cell::new(false);
-
-        let prefix_stats = self.scan_projected_prefix_refs(
-            read.as_ref(),
-            prefix,
-            options,
-            &projected,
-            &mut |id, version, values| {
-                key_buffer.clear();
-                let supported = if whole_document {
-                    self.runtime.write_projected_document_distinct_key(fields, values, &field_slots, &mut key_buffer)
-                } else {
-                    self.runtime.write_projected_distinct_key(fields, values, &field_slots, &mut key_buffer)
-                }
-                .map_err(EngineError::execution)?;
-                if !supported {
-                    return Err(EngineError::execution(ExecutionError::unsupported_operator(
-                        "distinct",
-                        "projected distinct-key runtime is not configured",
-                    )));
-                }
-                if output_limit == Some(0) {
-                    return Ok(true);
-                }
-                let locator = ProjectedRowLocator::new(id, version);
-                if let Some((retained, _)) = rows.get_mut(key_buffer.as_slice()) {
-                    let earlier = match options.direction() {
-                        crate::storage::ScanDirection::Forward => locator.id() < retained.id(),
-                        crate::storage::ScanDirection::Reverse => locator.id() > retained.id(),
-                    };
-                    if earlier {
-                        *retained = locator;
-                    }
-                    return Ok(true);
-                }
-
-                let estimate = key_buffer.len().saturating_mul(2).saturating_add(160);
-                if estimate > budget {
-                    exceeded.set(true);
-                    return Ok(false);
-                }
-                if let Some(limit) = output_limit {
-                    if rows.len() >= limit {
-                        let keep = rows
-                            .last_key_value()
-                            .is_some_and(|(largest, _)| key_buffer.as_slice() < largest.as_ref());
-                        if !keep {
-                            return Ok(true);
-                        }
-                        if let Some((_, (_, removed_bytes))) = rows.pop_last() {
-                            estimated_bytes = estimated_bytes.saturating_sub(removed_bytes);
-                        }
-                    }
-                } else if estimated_bytes.saturating_add(estimate) > budget {
-                    exceeded.set(true);
-                    return Ok(false);
-                }
-                if estimated_bytes.saturating_add(estimate) > budget {
-                    exceeded.set(true);
-                    return Ok(false);
-                }
-                estimated_bytes = estimated_bytes.saturating_add(estimate);
-                rows.insert(Arc::from(key_buffer.as_slice()), (locator, estimate));
-                Ok(true)
-            },
-        )?;
-        if exceeded.get() {
-            return Ok(None);
-        }
-
-        let mut returned = 0u64;
-        for (_, (locator, _)) in rows {
-            if let Some(row) = self.hydrate_projected_locator(
-                read.as_ref(),
-                prefix.source().collection(),
-                locator,
-                &projected,
-            )? {
-                visitor(row)?;
-                returned = returned.saturating_add(1);
-            }
-        }
-
-        Ok(Some(ExecutionStatistics::streamed_with_strategies(
-            prefix_stats.scanned(),
-            prefix_stats.filtered(),
-            returned,
-            ExecutionStrategies::default()
-                .with(ExecutionStrategy::CollectionScan)
-                .with(ExecutionStrategy::InMemoryDistinct),
-        )))
-    }
-
-    fn try_in_memory_distinct( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], budget: usize, output_limit: Option<usize>, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
-        let mut rows: BTreeMap<Arc<[u8]>, (ExecutionRow, usize)> = BTreeMap::new();
-        let mut estimated_bytes = 0usize;
-        let exceeded = std::cell::Cell::new(false);
-        let buffered_keys = self.runtime.supports_buffered_distinct();
-        let mut key_buffer = Vec::<u8>::with_capacity(128);
-        let statistics = self
-            .stream_read_pipeline(prefix, &mut |stored| {
-                if exceeded.get() {
-                    return Ok(());
-                }
-                let row = ExecutionRow::from_stored(stored);
-
-                let buffered = if buffered_keys {
-                    key_buffer.clear();
-                    self.runtime
-                        .write_distinct_key(fields, row.document(), &mut key_buffer)
-                        .map_err(EngineError::execution)?
-                } else {
-                    false
-                };
-                let owned_key = if buffered {
-                    None
-                } else {
-                    Some(
-                        self.runtime
-                            .distinct_key(fields, row.document())
-                            .map_err(EngineError::execution)?,
-                    )
-                };
-                let key_bytes = owned_key
-                    .as_deref()
-                    .unwrap_or(key_buffer.as_slice());
-
-                if output_limit == Some(0) {
-                    return Ok(());
-                }
-                if rows.contains_key(key_bytes) {
-                    return Ok(());
-                }
-
-                // DISTINCT emits canonical-key order. With a trailing LIMIT only
-                // the N smallest keys can ever be observable, so keys above the
-                // moving frontier need no retained Document or tree node.
-                if let Some(limit) = output_limit {
-                    if rows.len() >= limit {
-                        let keep = rows
-                            .last_key_value()
-                            .is_some_and(|(largest, _)| key_bytes < largest.as_ref());
-                        if !keep {
-                            return Ok(());
-                        }
-                    }
-                }
-
-                let row_bytes = execution_row_encoded_len(&row);
-                let estimate = key_bytes
-                    .len()
-                    .saturating_add(row_bytes)
-                    .saturating_add(96);
-                if estimate > budget {
-                    exceeded.set(true);
-                    rows.clear();
-                    return Ok(());
-                }
-
-                if let Some(limit) = output_limit {
-                    if rows.len() >= limit {
-                        if let Some((_, (_, removed_bytes))) = rows.pop_last() {
-                            estimated_bytes = estimated_bytes.saturating_sub(removed_bytes);
-                        }
-                    }
-                }
-
-                if estimated_bytes.saturating_add(estimate) > budget {
-                    exceeded.set(true);
-                    rows.clear();
-                    return Ok(());
-                }
-                estimated_bytes = estimated_bytes.saturating_add(estimate);
-                let key = owned_key.unwrap_or_else(|| Arc::from(key_buffer.as_slice()));
-                rows.insert(key, (row, estimate));
-                Ok(())
-            })?
-            .expect("validated streaming prefix");
-        if exceeded.get() {
-            Ok(None)
-        } else {
-            Ok(Some((
-                rows.into_values().map(|(row, _)| row).collect(),
-                statistics,
-            )))
-        }
-    }
-
-    /// In-memory `group` over batches ([`TypedGroups`]): `None` when the
-    /// prefix cannot run on batches, `Some(None)` when the groups exceed the
-    /// working set.
-    fn try_batch_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], grouping_keys: &[crate::query::ExpressionFieldPath], required: &[crate::query::ExpressionFieldPath], budget: usize, group_limit: Option<usize>, ) -> EngineResult<Option<Option<(Vec<ExecutionRow>, ExecutionStatistics)>>> {
+    /// In-memory `distinct` over batches: rows find their key in a
+    /// [`crate::query::keys::KeyTable`] from typed cells, and the encoded key
+    /// that orders the output is built once per key. Explicit top-level
+    /// fields, or the fields a `select` leaves (whole-document distinct).
+    /// The first row of each key (lowest identifier in scan direction) is
+    /// loaded and replayed once at the end, unless only a `count` follows
+    /// (`rows_unused`). Unbounded output only: a bounded one keeps its
+    /// frontier of the smallest keys. `None` when the plan does not fit or
+    /// the keys exceed `budget`.
+    /// `distinct | limit n` on batches, whatever the key cardinality: the
+    /// `n` smallest keys, each with its earliest row, then those rows
+    /// reloaded in key order. A key is encoded field by field and a row is
+    /// dropped once its key sorts after the largest key kept.
+    fn try_batch_distinct_limited( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], limit: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
             return Ok(None);
         };
-        let read = self.storage.read().map_err(storage_engine_error)?;
-        let Some((gate, program)) = slot_prefix(read.as_ref(), prefix, required, false)? else {
+        // Rows are reloaded by identity: each must come from one document.
+        if !prefix.operators().iter().all(replays_one_row) {
             return Ok(None);
+        }
+        let reverse = matches!(options.direction(), crate::storage::ScanDirection::Reverse);
+        // Full-document distinct reads every top-level field the collection
+        // holds, under filters that keep documents whole.
+        let whole_document = fields.is_empty();
+        let catalog;
+        let fields = if whole_document {
+            if !prefix.operators().iter().all(|operator| matches!(operator, PhysicalOperator::Filter { .. })) {
+                return Ok(None);
+            }
+            let read = self.storage.read().map_err(storage_engine_error)?;
+            let Some(names) = read.top_level_fields(prefix.source().collection()).map_err(storage_engine_error)? else {
+                return Ok(None);
+            };
+            let Ok(names) = names.iter().map(|name| crate::query::ExpressionFieldPath::new([name.as_str()])).collect::<Result<Vec<_>, _>>() else {
+                return Ok(None);
+            };
+            catalog = names;
+            &catalog[..]
+        } else {
+            fields
         };
-        let Some(batch) = crate::query::BatchProgram::compile(prefix.operators(), gate.layout().fields(), program.fields()).map(Arc::new) else {
+        if fields.iter().any(|field| field.first() == "_id") {
             return Ok(None);
+        }
+        let kept = std::cell::RefCell::new(BTreeMap::<Box<[u8]>, (DocumentId, DocumentVersion)>::new());
+        let key = std::cell::RefCell::new(Vec::<u8>::with_capacity(128));
+        // A first key field read as dictionary codes: a code whose component
+        // passes the frontier rejects every row holding it (with as many
+        // fields present) while its dictionary lasts, the frontier only
+        // falling. Per code, the field count it was rejected with.
+        let rejected = std::cell::RefCell::new((None::<u64>, Vec::<u8>::new()));
+        #[allow(clippy::too_many_arguments)]
+        fn rejects<'v>(runtime: &crate::query::QueryRuntime, fields: &[crate::query::ExpressionFieldPath], limit: usize, kept: &BTreeMap<Box<[u8]>, (DocumentId, DocumentVersion)>, key: &mut Vec<u8>, rejected: &mut (Option<u64>, Vec<u8>), (dictionary, code): (u64, u32), present: Option<usize>, value: impl FnOnce() -> Option<ProjectedValueRef<'v>>) -> bool {
+            let Some(count) = present.map_or(Some(0), |present| u8::try_from(present).ok().filter(|count| *count < u8::MAX)) else { return false };
+            if rejected.0 != Some(dictionary) {
+                rejected.0 = Some(dictionary);
+                rejected.1.clear();
+            }
+            let code = code as usize;
+            if code >= rejected.1.len() {
+                rejected.1.resize(code + 1, u8::MAX);
+            }
+            if rejected.1[code] == count {
+                return true;
+            }
+            // Later fields written missing: a key passing the frontier so
+            // passes it with any values there. The cell is read only here,
+            // once per code.
+            if kept.len() < limit {
+                return false;
+            }
+            let value = value();
+            let passes = !runtime.write_bounded_distinct_key(fields, present, |index| if index == 0 { value.clone() } else { None }, kept.last_key_value().map(|(largest, _)| largest.as_ref()), key);
+            if passes {
+                rejected.1[code] = count;
+            }
+            passes
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn consider<'v>(runtime: &crate::query::QueryRuntime, fields: &[crate::query::ExpressionFieldPath], limit: usize, reverse: bool, kept: &mut BTreeMap<Box<[u8]>, (DocumentId, DocumentVersion)>, key: &mut Vec<u8>, present: Option<usize>, value: impl Fn(usize) -> Option<ProjectedValueRef<'v>>, locator: (DocumentId, DocumentVersion)) {
+            let frontier = if kept.len() >= limit { kept.last_key_value().map(|(largest, _)| largest.as_ref()) } else { None };
+            if !runtime.write_bounded_distinct_key(fields, present, value, frontier, key) {
+                return;
+            }
+            match kept.get_mut(key.as_slice()) {
+                Some(retained) => {
+                    if (locator.0 < retained.0) != reverse && locator.0 != retained.0 {
+                        *retained = locator;
+                    }
+                }
+                None => {
+                    kept.insert(Box::from(key.as_slice()), locator);
+                    if kept.len() > limit {
+                        kept.pop_last();
+                    }
+                }
+            }
+        }
+        let positions_of = |available: &[crate::query::ExpressionFieldPath]| -> Option<Vec<usize>> { fields.iter().map(|field| available.iter().position(|other| other == field)).collect() };
+        // A block whose rows all hold rejected codes is not decoded further: a
+        // whole document's field count must be known first.
+        let mut admit = |block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]| -> EngineResult<bool> {
+            let (Some(codes), true) = (block.codes[columns[0]], block.complete || !whole_document) else { return Ok(true) };
+            let (kept, mut key, mut rejected) = (kept.borrow(), key.borrow_mut(), rejected.borrow_mut());
+            let present = whole_document.then_some(fields.len());
+            Ok(!codes.codes.iter().enumerate().all(|(row, code)| *code != crate::storage::BlockCodes::NONE && rejects(&self.runtime, fields, limit, &kept, &mut key, &mut rejected, (codes.dictionary, *code), present, || block.columns[columns[0]].get(row))))
         };
-        let group_layout = ProjectedValueLayout::new(required.iter().cloned()).map_err(EngineError::execution)?;
-        let Some(sources) = program.slots(group_layout.fields()) else {
-            return Ok(None);
-        };
-        let key_indexes = group_layout.slots(grouping_keys).map_err(EngineError::execution)?;
-        let Some(dense) = self
-            .runtime
-            .incremental_group_accumulator(keys)
-            .map_err(EngineError::execution)?
-            .and_then(crate::query::IncrementalGroupAccumulator::into_dense)
+        let Some(statistics) = self.stream_slot_batches_gated(
+            prefix,
+            fields,
+            fields,
+            true,
+            Some((fields, &mut admit, false)),
+            &mut |runner, available| {
+                let Some(positions) = positions_of(available) else {
+                    return Err(EngineError::execution(ExecutionError::evaluation("distinct fields are absent from the batch outputs")));
+                };
+                let columns = positions.iter().map(|position| runner.output(*position)).collect::<Vec<_>>();
+                let (mut kept, mut key, mut rejected) = (kept.borrow_mut(), key.borrow_mut(), rejected.borrow_mut());
+                for &row in runner.selection() {
+                    let row = row as usize;
+                    let present = whole_document.then(|| columns.iter().filter(|column| column.is_some_and(|column| column.tag(row) != crate::query::Tag::Missing)).count());
+                    let value = |index: usize| columns[index].and_then(|column| column.value_ref(row));
+                    if columns[0].and_then(|column| column.code(row)).is_some_and(|code| rejects(&self.runtime, fields, limit, &kept, &mut key, &mut rejected, code, present, || value(0))) {
+                        continue;
+                    }
+                    consider(&self.runtime, fields, limit, reverse, &mut kept, &mut key, present, value, runner.id(row));
+                }
+                Ok(())
+            },
+            &mut |row| {
+                let Some(positions) = positions_of(row.fields) else {
+                    return Err(EngineError::execution(ExecutionError::evaluation("distinct fields are absent from the slot row")));
+                };
+                let values = positions.iter().map(|position| row.values[*position].as_ref()).collect::<Vec<_>>();
+                let present = whole_document.then(|| values.iter().filter(|value| value.is_some()).count());
+                consider(&self.runtime, fields, limit, reverse, &mut kept.borrow_mut(), &mut key.borrow_mut(), present, |index| values[index].map(ProjectedValueRef::borrowed), (row.id, row.version));
+                Ok(())
+            },
+        )?
         else {
             return Ok(None);
         };
-        if !prefix.operators().iter().all(|operator| matches!(operator, PhysicalOperator::Filter { .. } | PhysicalOperator::Select { .. })) {
-            PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
+        let mut returned = 0u64;
+        for row in self.hydrate_replayed(prefix, kept.into_inner().into_values())? {
+            visitor(row)?;
+            returned += 1;
         }
-        let groups = std::cell::RefCell::new(TypedGroups::new(dense, keys, &key_indexes, budget, group_limit));
-        // Nothing to evaluate: rows go straight from the borrowed cursor.
-        if prefix.operators().is_empty() && sources.iter().copied().eq(0..gate.layout().fields().len()) {
-            let mut scanned = 0u64;
-            read.scan_projected_value_refs_unordered_each(
-                prefix.source().collection(),
-                reusable_projected_scan_options(*options, prefix, &gate),
-                gate.layout().storage_fields(),
-                &mut |values| {
-                    scanned += 1;
-                    let mut groups = groups.borrow_mut();
-                    groups.push(values)?;
-                    Ok(!groups.exceeded)
-                },
-            )
-            .map_err(storage_engine_error)?;
-            let Some(rows) = groups.into_inner().finish()? else {
-                return Ok(Some(None));
-            };
-            return Ok(Some(Some((rows, ExecutionStatistics::streamed_pipeline(scanned, 0, scanned, ExecutionStrategy::CollectionScan)))));
-        }
-        let filtered = std::cell::Cell::new(0u64);
-        let mut row = Vec::new();
-        let scanned = scan_batched(
-            read.as_ref(),
-            prefix.source().collection(),
-            reusable_projected_scan_options(*options, prefix, &gate),
-            gate.layout().storage_fields(),
-            &batch,
-            &mut |runner| {
-                let mut groups = groups.borrow_mut();
-                if groups.exceeded {
-                    return Ok(false);
-                }
-                filtered.set(filtered.get() + runner.dropped() as u64);
-                let columns = sources.iter().map(|source| runner.output(*source)).collect::<Vec<_>>();
-                let mut values: Vec<Option<ProjectedValueRef<'_>>> = Vec::with_capacity(columns.len());
-                for &position in runner.selection() {
-                    values.clear();
-                    values.extend(columns.iter().map(|column| column.and_then(|column| column.value_ref(position as usize))));
-                    groups.push(&values)?;
-                }
-                Ok(!groups.exceeded)
-            },
-            &mut |_, _, values| {
-                let accepted = gate
-                    .accepts_with(values, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
-                    .map_err(backend_storage_error)?;
-                if !accepted {
-                    filtered.set(filtered.get() + 1);
-                    return Ok(true);
-                }
-                row.clear();
-                row.extend_from_slice(values);
-                row.resize(program.width(), None);
-                let kept = program
-                    .run(&mut row, |expression, resolver| self.runtime.evaluate_resolved_predicate(expression, resolver))
-                    .map_err(backend_storage_error)?;
-                if !kept {
-                    filtered.set(filtered.get() + 1);
-                    return Ok(true);
-                }
-                let mut groups = groups.borrow_mut();
-                let values = sources.iter().map(|source| row[*source].as_ref().map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
-                groups.push(&values)?;
-                Ok(!groups.exceeded)
-            },
-        )
-        .map_err(storage_engine_error)?;
-        let Some(rows) = groups.into_inner().finish()? else {
-            return Ok(Some(None));
-        };
-        let filtered = filtered.get();
-        Ok(Some(Some((
-            rows,
-            ExecutionStatistics::streamed_pipeline(scanned, filtered, scanned.saturating_sub(filtered), ExecutionStrategy::CollectionScan),
-        ))))
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            statistics.scanned(),
+            statistics.filtered(),
+            returned,
+            ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::InMemoryDistinct),
+        )))
     }
 
-    fn try_in_memory_incremental_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], budget: usize, group_limit: Option<usize>, ) -> EngineResult<Option<(Vec<ExecutionRow>, ExecutionStatistics)>> {
-        if self
-            .runtime
-            .incremental_group_accumulator(keys)
-            .map_err(EngineError::execution)?
-            .is_none()
-        {
+    fn try_batch_distinct( &self, prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], memory: &StageMemory<'_>, output_limit: Option<usize>, rows_unused: bool, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() else {
+            return Ok(None);
+        };
+        // Rows are reloaded by identity: each must come from one document.
+        if !rows_unused && !prefix.operators().iter().all(replays_one_row) {
             return Ok(None);
         }
-
-        let (grouping_keys, required_input_fields) =
-            crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
-        if let Some(result) = self.try_batch_group(prefix, keys, &grouping_keys, &required_input_fields, budget, group_limit)? {
-            return Ok(result);
-        }
-
-        // Standard projected-value access vector: any compatible streaming
-        // prefix can stay on physical values until the group consumer. `.25`
-        // starts with Filter stages; unsupported prefixes fall back to the
-        // established Document pipeline below.
-        if let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access() {
-            let read = self.storage.read().map_err(storage_engine_error)?;
-            // A prefix with row-local stages beyond filters runs them on slots
-            // between the projected scan and the group consumer.
-            let compiled = match ProjectedValuePipeline::compile(prefix.operators(), required_input_fields.clone())
-                .map_err(EngineError::execution)?
-            {
-                Some(pipeline) => Some((pipeline, None)),
-                None => slot_prefix(read.as_ref(), prefix, &required_input_fields, false)?
-                    .map(|(pipeline, program)| (pipeline, Some(program))),
-            };
-            if let Some((value_pipeline, slot_program)) = compiled {
-                let layout = value_pipeline.layout();
-                let group_layout = ProjectedValueLayout::new(required_input_fields)
-                    .map_err(EngineError::execution)?;
-                let group_source_slots = match &slot_program {
-                    Some(program) => program.slots(group_layout.fields()).ok_or_else(|| {
-                        EngineError::execution(crate::query::ExecutionError::evaluation("group input is absent from the slot program"))
-                    })?,
-                    None => layout.slots(group_layout.fields()).map_err(EngineError::execution)?,
-                };
-                let key_indexes = group_layout
-                    .slots(&grouping_keys)
-                    .map_err(EngineError::execution)?;
-                let mut slot_values = Vec::new();
-                let mut slot_filtered = 0u64;
-                if slot_program.is_some() {
-                    PARTIAL_DOCUMENTS_USED.with(|used| used.set(true));
-                }
-
-                if !read
-                    .support(StorageReadCapability::ProjectedValuesGatedUnordered)
-                    .available()
-                {
-                    return Ok(None);
-                }
-                // Projected group keys are already encoded into `key_buffer`. Use a
-                // hash table so the overwhelmingly-common hit path performs one
-                // borrowed `[u8]` lookup and never materializes an owned key.
-                // Owned `Arc<[u8]>` keys are created only on misses.
-                let mut groups: HashMap<
-                    Arc<[u8]>,
-                    Box<dyn crate::query::IncrementalGroupAccumulator>,
-                > = HashMap::new();
-                let mut estimated_bytes = 0usize;
-                let mut bounded_frontier: Option<Arc<[u8]>> = None;
-                let exceeded = std::cell::Cell::new(false);
-                let mut scanned = 0u64;
-                let mut filtered = 0u64;
-                let key_materializer = crate::query::RuntimeMaterializer::new();
-                let mut key_buffer = Vec::<u8>::with_capacity(64);
-                let mut group_values = vec![None; group_source_slots.len()];
-                let mut group_probe = crate::storage::GroupConsumerProbeSnapshot::default();
-
-                if value_pipeline.gate_field_count() == 0 && slot_program.is_none() {
-                    let storage_key_indexes = key_indexes
-                        .iter()
-                        .map(|index| group_source_slots[*index])
-                        .collect::<Vec<_>>();
-                    read.scan_projected_value_refs_unordered_each(
-                        prefix.source().collection(),
-                        reusable_projected_scan_options(*options, prefix, &value_pipeline),
-                        layout.storage_fields(),
-                        &mut |values| {
-                            if exceeded.get() {
-                                return Ok(false);
-                            }
-                            scanned = scanned.saturating_add(1);
-                            let sampled = crate::debug::query_instrumentation_enabled() && scanned & 1023 == 0;
-                            if sampled {
-                                group_probe.samples = group_probe.samples.saturating_add(1);
-                            }
-
-                            let key_started = sampled.then(Instant::now);
-                            key_materializer.write_projected_ref_distinct_key_indexes(
-                                values,
-                                &storage_key_indexes,
-                                &mut key_buffer,
-                            );
-                            if let Some(started) = key_started {
-                                group_probe.key_encode_ns = group_probe
-                                    .key_encode_ns
-                                    .saturating_add(elapsed_nanos(started));
-                            }
-
-                            let lookup_started = sampled.then(Instant::now);
-                            if let Some(accumulator) = groups.get_mut(key_buffer.as_slice()) {
-                                if let Some(started) = lookup_started {
-                                    group_probe.lookup_ns = group_probe
-                                        .lookup_ns
-                                        .saturating_add(elapsed_nanos(started));
-                                }
-                                group_probe.lookup_hits = group_probe.lookup_hits.saturating_add(1);
-                                let aggregate_started = sampled.then(Instant::now);
-                                let accepted = accumulator
-                                    .push_projected_value_refs(values, &group_source_slots)
-                                    .map_err(backend_storage_error)?;
-                                if let Some(started) = aggregate_started {
-                                    group_probe.aggregate_ns = group_probe
-                                        .aggregate_ns
-                                        .saturating_add(elapsed_nanos(started));
-                                }
-                                if !accepted {
-                                    return Err(StorageError::backend(
-                                        "incremental group runtime rejected borrowed projected-value pipeline",
-                                    ));
-                                }
-                                return Ok(true);
-                            }
-                            if let Some(started) = lookup_started {
-                                group_probe.lookup_ns = group_probe
-                                    .lookup_ns
-                                    .saturating_add(elapsed_nanos(started));
-                            }
-                            group_probe.lookup_misses = group_probe.lookup_misses.saturating_add(1);
-
-                            let insert_started = sampled.then(Instant::now);
-                            let state_estimate = group_state_estimate(key_buffer.len(), keys.len());
-                            if let Some(limit) = group_limit {
-                                if !admit_bounded_hash_group(
-                                    &mut groups,
-                                    &mut bounded_frontier,
-                                    &mut estimated_bytes,
-                                    key_buffer.as_slice(),
-                                    state_estimate,
-                                    keys.len(),
-                                    budget,
-                                    limit,
-                                )? {
-                                    return Ok(true);
-                                }
-                            } else if estimated_bytes.saturating_add(state_estimate) > budget {
-                                exceeded.set(true);
-                                groups.clear();
-                                return Ok(false);
-                            }
-                            let mut accumulator = self
-                                .runtime
-                                .incremental_group_accumulator(keys)
-                                .map_err(backend_storage_error)?
-                                .expect("incremental group capability was probed above");
-                            estimated_bytes = estimated_bytes.saturating_add(state_estimate);
-                            group_probe.key_materializations = group_probe
-                                .key_materializations
-                                .saturating_add(grouping_keys.len() as u64);
-                            let aggregate_started = sampled.then(Instant::now);
-                            let accepted = accumulator
-                                .push_projected_value_refs(values, &group_source_slots)
-                                .map_err(backend_storage_error)?;
-                            if let Some(started) = aggregate_started {
-                                group_probe.aggregate_ns = group_probe
-                                    .aggregate_ns
-                                    .saturating_add(elapsed_nanos(started));
-                            }
-                            if !accepted {
-                                return Err(StorageError::backend(
-                                    "incremental group runtime rejected borrowed projected-value pipeline",
-                                ));
-                            }
-                            groups.insert(Arc::from(key_buffer.as_slice()), accumulator);
-                            if group_limit.is_some_and(|limit| groups.len() >= limit) {
-                                bounded_frontier = groups.keys().max().cloned();
-                            }
-                            if let Some(started) = insert_started {
-                                group_probe.insert_ns = group_probe
-                                    .insert_ns
-                                    .saturating_add(elapsed_nanos(started));
-                            }
-                            Ok(true)
-                        },
-                    )
-                    .map_err(storage_engine_error)?;
-                    crate::storage::record_group_consumer_probe(group_probe);
-                } else {
-                    read.scan_projected_values_gated_unordered_each(
-                        prefix.source().collection(),
-                        reusable_projected_scan_options(*options, prefix, &value_pipeline),
-                        layout.storage_fields(),
-                        value_pipeline.gate_field_count(),
-                        &mut |values| {
-                            if exceeded.get() {
-                                return Ok(false);
-                            }
-                            scanned = scanned.saturating_add(1);
-                            let accepted = value_pipeline
-                                .accepts_with(values, |expression, resolver| {
-                                    self.runtime
-                                        .evaluate_resolved_predicate(expression, resolver)
-                                })
-                                .map_err(backend_storage_error)?;
-                            if !accepted {
-                                filtered = filtered.saturating_add(1);
-                            }
-                            Ok(accepted)
-                        },
-                        &mut |values| {
-                            if exceeded.get() {
-                                return Ok(false);
-                            }
-                            let values: &[Option<crate::Value>] = match &slot_program {
-                                Some(program) => {
-                                    slot_values.clear();
-                                    slot_values.extend_from_slice(values);
-                                    slot_values.resize(program.width(), None);
-                                    let accepted = program
-                                        .run(&mut slot_values, |expression, resolver| {
-                                            self.runtime.evaluate_resolved_predicate(expression, resolver)
-                                        })
-                                        .map_err(backend_storage_error)?;
-                                    if !accepted {
-                                        slot_filtered = slot_filtered.saturating_add(1);
-                                        return Ok(true);
-                                    }
-                                    &slot_values
-                                }
-                                None => values,
-                            };
-                            for (target, source) in group_values
-                                .iter_mut()
-                                .zip(group_source_slots.iter().copied())
-                            {
-                                *target = values.get(source).cloned().flatten();
-                            }
-
-                            key_materializer.write_projected_distinct_key_indexes(
-                                &group_values,
-                                &key_indexes,
-                                &mut key_buffer,
-                            );
-                            if !groups.contains_key(key_buffer.as_slice()) {
-                                let state_estimate =
-                                    group_state_estimate(key_buffer.len(), keys.len());
-                                if let Some(limit) = group_limit {
-                                    if !admit_bounded_hash_group(
-                                        &mut groups,
-                                        &mut bounded_frontier,
-                                        &mut estimated_bytes,
-                                        key_buffer.as_slice(),
-                                        state_estimate,
-                                        keys.len(),
-                                        budget,
-                                        limit,
-                                    )? {
-                                        return Ok(true);
-                                    }
-                                } else if estimated_bytes.saturating_add(state_estimate) > budget {
-                                    exceeded.set(true);
-                                    groups.clear();
-                                    return Ok(false);
-                                }
-                                let accumulator = self
-                                    .runtime
-                                    .incremental_group_accumulator(keys)
-                                    .map_err(backend_storage_error)?
-                                    .expect("incremental group capability was probed above");
-                                estimated_bytes = estimated_bytes.saturating_add(state_estimate);
-                                groups.insert(Arc::from(key_buffer.as_slice()), accumulator);
-                                if group_limit.is_some_and(|limit| groups.len() >= limit) {
-                                    bounded_frontier = groups.keys().max().cloned();
-                                }
-                            }
-                            let accepted = groups
-                                .get_mut(key_buffer.as_slice())
-                                .expect("group accumulator exists")
-                                .push_projected_values(&group_values)
-                                .map_err(backend_storage_error)?;
-                            if !accepted {
-                                return Err(StorageError::backend(
-                                    "incremental group runtime rejected projected-value pipeline",
-                                ));
-                            }
-                            Ok(true)
-                        },
-                    )
-                    .map_err(storage_engine_error)?;
-                }
-
-                filtered = filtered.saturating_add(slot_filtered);
-                if exceeded.get() {
-                    return Ok(None);
-                }
-                let mut ordered_groups = groups.into_iter().collect::<Vec<_>>();
-                ordered_groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-                let mut rows = Vec::with_capacity(ordered_groups.len());
-                for (index, (_, accumulator)) in ordered_groups.into_iter().enumerate() {
-                    let ordinal = usize_to_u64_saturating(index).saturating_add(1);
-                    rows.push(ExecutionRow::synthetic(
-                        accumulator
-                            .finish(ordinal)
-                            .map_err(EngineError::execution)?,
-                    ));
-                }
-                return Ok(Some((
-                    rows,
-                    ExecutionStatistics::streamed_pipeline(
-                        scanned,
-                        filtered,
-                        scanned.saturating_sub(filtered),
-                        ExecutionStrategy::CollectionScan,
-                    ),
-                )));
+        let reverse = matches!(options.direction(), crate::storage::ScanDirection::Reverse);
+        // Whole-document distinct after a final `select` of top-level fields:
+        // the selected values are the key, read under the stages before it.
+        let scan_prefix;
+        let (scan, key_fields, names) = if fields.is_empty() {
+            let operators = prefix.operators();
+            let Some(PhysicalOperator::Select { fields: selected }) = operators.last() else { return Ok(None) };
+            let mut names = selected.iter().map(|field| field.first()).collect::<Vec<_>>();
+            names.sort_unstable();
+            names.dedup();
+            if names.len() != selected.len() || selected.iter().any(|field| field.len() != 1 || field.first() == "_id") {
+                return Ok(None);
             }
-        }
-
-        // Bounded GROUP has a dedicated exact fallback in the blocking executor.
-        // Do not probe an unbounded document group first and rescan the source.
-        if group_limit.is_some() {
-            return Ok(None);
-        }
-
-        // Established fallback for nested fields, lookups and transformed prefixes.
-        let mut groups: BTreeMap<Arc<[u8]>, Box<dyn crate::query::IncrementalGroupAccumulator>> =
-            BTreeMap::new();
-        let mut estimated_bytes = 0usize;
+            let kept = operators.len() - 1;
+            scan_prefix = PhysicalPlan::new(prefix.source().clone(), operators[..kept].iter().cloned())
+                .map_err(EngineError::physical_planning)?
+                .with_source_access_negotiation(prefix.source_access_vector(), prefix.projected_prefix_len().min(kept), prefix.source_projection_reuse());
+            let Ok(paths) = names.iter().map(|name| crate::query::ExpressionFieldPath::new([*name])).collect::<Result<Vec<_>, _>>() else { return Ok(None) };
+            (&scan_prefix, paths, Some(names))
+        } else {
+            if fields.iter().any(|field| field.first() == "_id") {
+                return Ok(None);
+            }
+            (prefix, fields.to_vec(), None)
+        };
+        let table = std::cell::RefCell::new(crate::query::keys::KeyTable::new(key_fields.len()));
+        let locators = std::cell::RefCell::new(Vec::<(DocumentId, DocumentVersion)>::new());
         let exceeded = std::cell::Cell::new(false);
-        let mut process = |stored: StoredDocument| -> EngineResult<()> {
-            if exceeded.get() {
-                return Ok(());
+        let first = |locators: &mut Vec<(DocumentId, DocumentVersion)>, key: u32, locator: (DocumentId, DocumentVersion)| {
+            match locators.get_mut(key as usize) {
+                Some(kept) => {
+                    if (locator.0 < kept.0) != reverse && locator.0 != kept.0 {
+                        *kept = locator;
+                    }
+                }
+                None => locators.push(locator),
             }
-            let row = ExecutionRow::from_stored(stored);
-            let key = self
-                .runtime
-                .distinct_key(&grouping_keys, row.document())
-                .map_err(EngineError::execution)?;
-            if !groups.contains_key(&key) {
-                let state_estimate = group_state_estimate(key.len(), keys.len());
-                if estimated_bytes.saturating_add(state_estimate) > budget {
-                    exceeded.set(true);
-                    groups.clear();
+        };
+        let over = |table: &crate::query::keys::KeyTable| !memory.fits(table.bytes().saturating_add(table.len().saturating_mul(32)));
+        let positions_of = |fields: &[crate::query::ExpressionFieldPath]| -> Option<Vec<usize>> { key_fields.iter().map(|key| fields.iter().position(|field| field == key)).collect() };
+        let mut batch_positions: Option<Option<Vec<usize>>> = None;
+        let mut row_positions: Option<Option<Vec<usize>>> = None;
+        let mut keys = Vec::new();
+        let Some(statistics) = self.stream_slot_batches(
+            scan,
+            &key_fields,
+            &key_fields,
+            !rows_unused,
+            &mut |runner, fields| {
+                if exceeded.get() {
                     return Ok(());
                 }
-                let accumulator = self
-                    .runtime
-                    .incremental_group_accumulator(keys)
-                    .map_err(EngineError::execution)?
-                    .expect("incremental group capability was probed above");
-                estimated_bytes = estimated_bytes.saturating_add(state_estimate);
-                groups.insert(key.clone(), accumulator);
-            }
-            groups
-                .get_mut(&key)
-                .expect("group accumulator exists")
-                .push(row.document())
-                .map_err(EngineError::execution)
+                let Some(positions) = batch_positions.get_or_insert_with(|| positions_of(fields)) else {
+                    exceeded.set(true);
+                    return Ok(());
+                };
+                let columns = positions.iter().map(|position| runner.output(*position)).collect::<Vec<_>>();
+                let mut table = table.borrow_mut();
+                table.batch(&columns, runner.selection(), &mut keys);
+                if !rows_unused {
+                    let mut locators = locators.borrow_mut();
+                    for (key, row) in keys.iter().zip(runner.selection()) {
+                        first(&mut locators, *key, runner.id(*row as usize));
+                    }
+                }
+                exceeded.set(over(&table));
+                Ok(())
+            },
+            &mut |row| {
+                if exceeded.get() {
+                    return Ok(());
+                }
+                let Some(positions) = row_positions.get_or_insert_with(|| positions_of(row.fields)) else {
+                    exceeded.set(true);
+                    return Ok(());
+                };
+                let values = positions.iter().map(|position| row.values[*position].as_ref().map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
+                let mut table = table.borrow_mut();
+                let key = table.row(&values);
+                if !rows_unused {
+                    first(&mut locators.borrow_mut(), key, (row.id, row.version));
+                }
+                exceeded.set(over(&table));
+                Ok(())
+            },
+        )?
+        else {
+            return Ok(None);
         };
-
-        let statistics = self
-            .stream_read_pipeline(prefix, &mut |stored| process(stored))?
-            .expect("validated streaming prefix");
         if exceeded.get() {
             return Ok(None);
         }
-
-        let mut rows = Vec::with_capacity(groups.len());
-        for (index, (_, accumulator)) in groups.into_iter().enumerate() {
-            let ordinal = usize_to_u64_saturating(index).saturating_add(1);
-            rows.push(ExecutionRow::synthetic(
-                accumulator
-                    .finish(ordinal)
-                    .map_err(EngineError::execution)?,
-            ));
+        let table = table.into_inner();
+        let mut order = Vec::with_capacity(table.len());
+        let mut buffer = Vec::with_capacity(64);
+        for key in 0..table.len() as u32 {
+            match &names {
+                Some(names) => table.write_document_key(key, names, &mut buffer),
+                None => table.write_key(key, &mut buffer),
+            }
+            order.push((Box::<[u8]>::from(buffer.as_slice()), key));
         }
-        Ok(Some((rows, statistics)))
-    }
-
-    /// Spills standard incremental GROUP states directly from the shared projected-value
-    /// scanner. This is the external counterpart of `try_in_memory_incremental_group`:
-    /// compatible collection/filter prefixes never fall back to full-document pointer scans.
-    fn try_projected_external_group_runs( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], budget: usize, spill: &SpillEngine, ) -> EngineResult<Option<(Vec<SpillRun>, ExecutionStatistics)>> {
-        if self
-            .runtime
-            .incremental_group_accumulator(keys)
-            .map_err(EngineError::execution)?
-            .is_none()
-        {
-            return Ok(None);
-        }
-        let crate::query::PhysicalAccess::CollectionScan { options } = prefix.source().access()
-        else {
-            return Ok(None);
-        };
-        let (grouping_keys, required_input_fields) =
-            crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
-        let Some(value_pipeline) =
-            ProjectedValuePipeline::compile(prefix.operators(), required_input_fields.clone())
-                .map_err(EngineError::execution)?
-        else {
-            return Ok(None);
-        };
-        let layout = value_pipeline.layout();
-        let group_layout =
-            ProjectedValueLayout::new(required_input_fields).map_err(EngineError::execution)?;
-        let group_source_slots = layout
-            .slots(group_layout.fields())
-            .map_err(EngineError::execution)?;
-        let key_indexes = group_layout
-            .slots(&grouping_keys)
-            .map_err(EngineError::execution)?;
-        let read = self.storage.read().map_err(storage_engine_error)?;
-        if !read
-            .support(StorageReadCapability::ProjectedValuesGatedUnordered)
-            .available()
-        {
-            return Ok(None);
-        }
-
-        let mut groups: HashMap<Arc<[u8]>, GroupAccumulator> = HashMap::new();
-        let mut bytes = 0usize;
-        let mut runs = Vec::new();
-        let mut scanned = 0u64;
-        let mut filtered = 0u64;
-        let mut key_buffer = Vec::with_capacity(64);
-        let materializer = crate::query::RuntimeMaterializer::new();
-        let mut group_values = vec![None; group_source_slots.len()];
-        let started = Instant::now();
-
-        if value_pipeline.gate_field_count() == 0 {
-            let storage_key_indexes = key_indexes
-                .iter()
-                .map(|index| group_source_slots[*index])
-                .collect::<Vec<_>>();
-            read.scan_projected_value_refs_unordered_each(
-                prefix.source().collection(),
-                reusable_projected_scan_options(*options, prefix, &value_pipeline),
-                layout.storage_fields(),
-                &mut |values| {
-                    scanned = scanned.saturating_add(1);
-                    materializer.write_projected_ref_distinct_key_indexes(
-                        values,
-                        &storage_key_indexes,
-                        &mut key_buffer,
-                    );
-                    if let Some(accumulator) = groups.get_mut(key_buffer.as_slice()) {
-                        if !accumulator
-                            .push_projected_value_refs(values, &group_source_slots)
-                            .map_err(backend_storage_error)?
-                        {
-                            return Err(StorageError::backend(
-                                "incremental group runtime rejected borrowed projected values",
-                            ));
-                        }
-                        return Ok(true);
-                    }
-                    let estimate = group_state_estimate(key_buffer.len(), keys.len());
-                    if !groups.is_empty() && bytes.saturating_add(estimate) > budget {
-                        EXTERNAL_GROUP_FLUSH_TRIGGERS.fetch_add(1, AtomicOrdering::Relaxed);
-                        flush_partial_group_run(
-                            self.runtime.as_ref(),
-                            keys,
-                            spill,
-                            &mut groups,
-                            &mut runs,
-                        )
-                        .map_err(backend_storage_error)?;
-                        bytes = 0;
-                    }
-                    let mut accumulator = self
-                        .runtime
-                        .incremental_group_accumulator(keys)
-                        .map_err(backend_storage_error)?
-                        .expect("incremental group capability was probed above");
-                    if !accumulator
-                        .push_projected_value_refs(values, &group_source_slots)
-                        .map_err(backend_storage_error)?
-                    {
-                        return Err(StorageError::backend(
-                            "incremental group runtime rejected borrowed projected values",
-                        ));
-                    }
-                    bytes = bytes.saturating_add(estimate);
-                    groups.insert(Arc::from(key_buffer.as_slice()), accumulator);
-                    Ok(true)
-                },
-            )
-            .map_err(storage_engine_error)?;
+        order.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        order.truncate(output_limit.unwrap_or(usize::MAX));
+        let mut returned = 0u64;
+        if rows_unused {
+            for (ordinal, _) in order.iter().enumerate() {
+                let id = DocumentId::synthetic(0x6469_7374, usize_to_u64_saturating(ordinal));
+                visitor(ExecutionRow::synthetic(crate::query::SyntheticDocument::new(id, Arc::new(Document::new()))))?;
+                returned += 1;
+            }
         } else {
-            read.scan_projected_values_gated_unordered_each(
-                prefix.source().collection(),
-                reusable_projected_scan_options(*options, prefix, &value_pipeline),
-                layout.storage_fields(),
-                value_pipeline.gate_field_count(),
-                &mut |values| {
-                    scanned = scanned.saturating_add(1);
-                    let accepted = value_pipeline
-                        .accepts_with(values, |expression, resolver| {
-                            self.runtime
-                                .evaluate_resolved_predicate(expression, resolver)
-                        })
-                        .map_err(backend_storage_error)?;
-                    if !accepted {
-                        filtered = filtered.saturating_add(1);
-                    }
-                    Ok(accepted)
-                },
-                &mut |values| {
-                    for (target, source) in group_values
-                        .iter_mut()
-                        .zip(group_source_slots.iter().copied())
-                    {
-                        *target = values.get(source).cloned().flatten();
-                    }
-                    materializer.write_projected_distinct_key_indexes(
-                        &group_values,
-                        &key_indexes,
-                        &mut key_buffer,
-                    );
-                    if !groups.contains_key(key_buffer.as_slice()) {
-                        let estimate = group_state_estimate(key_buffer.len(), keys.len());
-                        if !groups.is_empty() && bytes.saturating_add(estimate) > budget {
-                            EXTERNAL_GROUP_FLUSH_TRIGGERS.fetch_add(1, AtomicOrdering::Relaxed);
-                            flush_partial_group_run(
-                                self.runtime.as_ref(),
-                                keys,
-                                spill,
-                                &mut groups,
-                                &mut runs,
-                            )
-                            .map_err(backend_storage_error)?;
-                            bytes = 0;
-                        }
-                        let accumulator = self
-                            .runtime
-                            .incremental_group_accumulator(keys)
-                            .map_err(backend_storage_error)?
-                            .expect("incremental group capability was probed above");
-                        bytes = bytes.saturating_add(estimate);
-                        groups.insert(Arc::from(key_buffer.as_slice()), accumulator);
-                    }
-                    if !groups
-                        .get_mut(key_buffer.as_slice())
-                        .expect("group accumulator exists")
-                        .push_projected_values(&group_values)
-                        .map_err(backend_storage_error)?
-                    {
-                        return Err(StorageError::backend(
-                            "incremental group runtime rejected projected values",
-                        ));
-                    }
-                    Ok(true)
-                },
-            )
-            .map_err(storage_engine_error)?;
+            let locators = locators.into_inner();
+            for row in self.hydrate_replayed(prefix, order.iter().map(|(_, key)| locators[*key as usize]))? {
+                visitor(row)?;
+                returned += 1;
+            }
         }
-        if !groups.is_empty() {
-            flush_partial_group_run(self.runtime.as_ref(), keys, spill, &mut groups, &mut runs)?;
-        }
-        EXTERNAL_GROUP_SOURCE_US.fetch_add(elapsed_micros(started), AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_ROWS_CONSUMED
-            .fetch_add(scanned.saturating_sub(filtered), AtomicOrdering::Relaxed);
-        Ok(Some((
-            runs,
-            ExecutionStatistics::streamed_pipeline(
-                scanned,
-                filtered,
-                scanned.saturating_sub(filtered),
-                ExecutionStrategy::CollectionScan,
-            ),
+        Ok(Some(ExecutionStatistics::streamed_with_strategies(
+            statistics.scanned(),
+            statistics.filtered(),
+            returned,
+            ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::InMemoryDistinct),
         )))
     }
+
+    /// In-memory `group` over batches ([`BatchGroups`]): `None` when the
+    /// prefix cannot run on batches, `Some(None)` when the groups exceed the
+    /// working set.
+    /// `group` on batches, slot rows or the prefix's output documents,
+    /// whichever the prefix runs on; `Some(None)` when the groups exceed
+    /// `budget`, `None` when the measures cannot fold densely.
+    fn try_batch_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], grouping_keys: &[crate::query::ExpressionFieldPath], required: &[crate::query::ExpressionFieldPath], memory: &StageMemory<'_>, group_limit: Option<usize>, top: GroupTop<'_>, ) -> EngineResult<Option<Option<(GroupRows, ExecutionStatistics)>>> {
+        let group_layout = ProjectedValueLayout::new(required.iter().cloned()).map_err(EngineError::execution)?;
+        let key_indexes = group_layout.slots(grouping_keys).map_err(EngineError::execution)?;
+        let Some(dense) = self.runtime.incremental_group_accumulator(keys).map_err(EngineError::execution)?.into_dense() else {
+            return Ok(None);
+        };
+        let groups = std::cell::RefCell::new(BatchGroups::new(dense, keys, &key_indexes, memory, group_limit));
+        let positions_of = |fields: &[crate::query::ExpressionFieldPath]| -> EngineResult<Vec<usize>> {
+            group_layout.fields().iter().map(|field| fields.iter().position(|slot| slot == field))
+                .collect::<Option<_>>()
+                .ok_or_else(|| EngineError::execution(ExecutionError::evaluation("group input is absent from the rows")))
+        };
+        // A one-key group folds whole blocks.
+        let mut fold_block = |block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]| -> EngineResult<bool> { groups.borrow_mut().push_block(block, columns).map_err(storage_engine_error).map(|()| false) };
+        let gate = (key_indexes.len() == 1 && group_limit.is_none() && groups.borrow().dense.folds_blocks()).then_some((group_layout.fields(), &mut fold_block as BlockAdmit<'_>, false));
+        let Some(statistics) = self.stream_slot_batches_gated(
+            prefix,
+            group_layout.fields(),
+            grouping_keys,
+            false,
+            gate,
+            &mut |runner, fields| {
+                let columns = positions_of(fields)?.into_iter().map(|position| runner.output(position)).collect::<Vec<_>>();
+                groups.borrow_mut().push_batch(&columns, runner.selection()).map_err(storage_engine_error)
+            },
+            &mut |row| {
+                let values = positions_of(row.fields)?.into_iter().map(|position| row.values[position].as_ref().map(ProjectedValueRef::borrowed)).collect::<Vec<_>>();
+                groups.borrow_mut().push(&values).map_err(storage_engine_error)
+            },
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(rows) = groups.into_inner().finish(top)? else {
+            return Ok(Some(None));
+        };
+        Ok(Some(Some((rows, statistics))))
+    }
+
+    fn try_in_memory_incremental_group( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], memory: &StageMemory<'_>, group_limit: Option<usize>, top: GroupTop<'_>, ) -> EngineResult<Option<(GroupRows, ExecutionStatistics)>> {
+        // Rejects keys the group accumulator cannot hold before any scan.
+        self.runtime.incremental_group_accumulator(keys).map_err(EngineError::execution)?;
+
+        let (grouping_keys, required_input_fields) =
+            crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
+        Ok(self.try_batch_group(prefix, keys, &grouping_keys, &required_input_fields, memory, group_limit, top)?.flatten())
+    }
+
 
     /// Streams a governed blocking read plan without materializing its full input or output.
     ///
@@ -3781,6 +3415,9 @@ impl Engine {
     /// algorithms remain local to the executor. External runs keep blocking work inside the
     /// governed memory budget.
     pub fn stream_governed_blocking_pipeline( &self, physical: &PhysicalPlan, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+        if let Some(view) = self.temporal_view(physical)? {
+            return view.stream_governed_blocking_pipeline(physical, visitor);
+        }
         if !self.supports_governed_blocking_streaming(physical) {
             return Ok(None);
         }
@@ -3790,35 +3427,55 @@ impl Engine {
         // The streaming tail (`select`, `skip`, `first`, `unwind`, a terminal
         // `count`, …) runs row by row on the core's output. A leading `skip`/
         // bound of the tail was already pushed into the core as a row limit.
+        // Later blocking stages take the tail's rows, each in turn.
+        let memory = QueryMemory::new(&self.memory_governor);
+        let mut stages = self.later_stages(shape.rest, &memory)?;
         let mut chain = StreamingRowChain::new(shape.tail);
         let mut counted = 0u64;
         let mut delivered = 0u64;
         let mut open = !chain.has_empty_bound();
-        let shared = if shape.tail.is_empty() && shape.count_alias.is_some() { self.try_shared_union_count(physical, &shape)? } else { None };
-        let statistics = if let Some((count, statistics)) = shared {
-            counted = count;
+        let shared = if shape.tail.is_empty() && shape.rest.is_empty() && shape.count_alias.is_some() { self.try_shared_union_count(physical, &shape)? } else { None };
+        let mut last = |row: ExecutionRow| -> EngineResult<()> {
+            if shape.count_alias.is_some() {
+                counted = counted.saturating_add(1);
+                return Ok(());
+            }
+            visitor(row)?;
+            delivered = delivered.saturating_add(1);
+            Ok(())
+        };
+        let shared_count = shared.as_ref().map(|(count, _)| *count);
+        let statistics = if let Some((_, statistics)) = shared {
             Some(statistics)
         } else {
             let mut tail_visitor = |row: ExecutionRow| -> EngineResult<()> {
                 if !open {
                     return Ok(());
                 }
-                let mut sink = |row: ExecutionRow| -> Result<(), StorageError> {
-                    if shape.count_alias.is_some() {
-                        counted = counted.saturating_add(1);
-                        return Ok(());
-                    }
-                    visitor(row).map_err(backend_storage_error)?;
-                    delivered = delivered.saturating_add(1);
-                    Ok(())
+                let mut failure = None;
+                let driven = self.drive_streaming_row(&mut chain, 0, row, None, &mut |row| {
+                    // An engine error comes back as it is, not reworded.
+                    self.feed_later(&mut stages, row, None, &mut last).map_err(|error| {
+                        let storage = backend_storage_error(&error);
+                        failure = Some(error);
+                        storage
+                    })
+                });
+                open = match (driven, failure) {
+                    (Ok(open), _) => open,
+                    (Err(_), Some(error)) => return Err(error),
+                    (Err(error), None) => return Err(storage_engine_error(error)),
                 };
-                open = self
-                    .drive_streaming_row(&mut chain, 0, row, None, &mut sink)
-                    .map_err(storage_engine_error)?;
                 Ok(())
             };
-            self.stream_governed_core(physical, &shape, &mut tail_visitor)?
+            let statistics = self.stream_governed_core(physical, &shape, &memory, &mut tail_visitor)?;
+            if statistics.is_some() {
+                self.finish_later(&mut stages, None, &mut last)?;
+            }
+            statistics
         };
+        drop(last);
+        counted = shared_count.unwrap_or(counted);
         let Some(mut statistics) = statistics else {
             return Ok(None);
         };
@@ -3831,6 +3488,7 @@ impl Engine {
             );
         }
         ensure_exact_rows(shape.tail, &chain.limit_remaining)?;
+        sinks::ensure_later_exact_rows(&stages)?;
         if let Some(alias) = shape.count_alias {
             let document = Arc::new(Document::from_fields([(alias, Value::from(counted))]));
             let stored = StoredDocument::new(DocumentId::synthetic(0x0063_6f75_6e74, 1), DocumentVersion::INITIAL, document)
@@ -3838,15 +3496,76 @@ impl Engine {
             visitor(ExecutionRow::from_stored(stored))?;
             delivered = 1;
         }
-        if shape.tail.is_empty() && shape.count_alias.is_none() {
+        if shape.tail.is_empty() && shape.rest.is_empty() && shape.count_alias.is_none() {
             return Ok(Some(statistics));
         }
+        let (later_scanned, later_filtered, later_strategies) = sinks::later_statistics(&stages);
         Ok(Some(ExecutionStatistics::streamed_with_strategies(
-            statistics.scanned(),
-            statistics.filtered().saturating_add(chain.filtered),
+            statistics.scanned().saturating_add(later_scanned),
+            statistics.filtered().saturating_add(chain.filtered).saturating_add(later_filtered),
             delivered,
-            statistics.strategies(),
+            later_strategies.iter().fold(statistics.strategies(), ExecutionStrategies::with),
         )))
+    }
+
+    /// `group` state spilled to sorted runs whenever it exceeds `budget`:
+    /// from projected values when the prefix allows, from documents
+    /// otherwise. External group is aggregate-first: bounded mergeable
+    /// states stay in memory and compact partials are spilled.
+    fn external_group_runs( &self, prefix: &PhysicalPlan, keys: &[crate::query::ExpressionFieldPath], memory: &StageMemory<'_>, spill: &SpillEngine, ) -> EngineResult<(Vec<SpillRun>, ExecutionStatistics)> {
+        let mut partial_groups: HashMap<
+            Arc<[u8]>,
+            Box<dyn crate::query::IncrementalGroupAccumulator>,
+        > = HashMap::new();
+        let mut partial_bytes = 0usize;
+        let mut runs = Vec::<SpillRun>::new();
+        let (grouping_keys, _) =
+            crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
+        let prefix_stats = self
+            .stream_read_pipeline(prefix, &mut |stored| {
+                let row = ExecutionRow::from_stored(stored);
+                let key = self
+                    .runtime
+                    .distinct_key(&grouping_keys, row.document())
+                    .map_err(EngineError::execution)?;
+                if !partial_groups.contains_key(key.as_ref()) {
+                    let estimate = group_state_estimate(key.len(), keys.len());
+                    if !partial_groups.is_empty()
+                        && !memory.fits(partial_bytes.saturating_add(estimate))
+                    {
+                        flush_partial_group_run(
+                            self.runtime.as_ref(),
+                            keys,
+                            spill,
+                            &mut partial_groups,
+                            &mut runs,
+                        )?;
+                        partial_bytes = 0;
+                    }
+                    let accumulator = self
+                        .runtime
+                        .incremental_group_accumulator(keys)
+                        .map_err(EngineError::execution)?;
+                    partial_bytes = partial_bytes.saturating_add(estimate);
+                    partial_groups.insert(key.clone(), accumulator);
+                }
+                partial_groups
+                    .get_mut(key.as_ref())
+                    .expect("partial group accumulator exists")
+                    .push(row.document())
+                    .map_err(EngineError::execution)
+            })?
+            .expect("validated streaming prefix");
+        if !partial_groups.is_empty() {
+            flush_partial_group_run(
+                self.runtime.as_ref(),
+                keys,
+                spill,
+                &mut partial_groups,
+                &mut runs,
+            )?;
+        }
+        Ok((runs, prefix_stats))
     }
 
     /// `… | union | on <same collection> | … | end | count` with row-local
@@ -3857,10 +3576,13 @@ impl Engine {
         let [PhysicalOperator::Union { collection, alias: None, pipeline }] = &physical.operators()[shape.blocking_index..shape.core_end] else {
             return Ok(None);
         };
+        if !pipeline.operators().iter().all(is_row_operator) {
+            return Ok(None);
+        }
         let crate::query::PhysicalAccess::CollectionScan { options } = physical.source().access() else {
             return Ok(None);
         };
-        if collection != physical.source().collection() || options.limit().is_some() || self.system_collection_storage(physical)?.is_some() {
+        if collection != physical.source().collection() || options.limit().is_some() || self.is_virtual(physical.source().collection()) {
             return Ok(None);
         }
         let read = self.storage.read().map_err(storage_engine_error)?;
@@ -3920,7 +3642,7 @@ impl Engine {
 
     /// Runs the streaming prefix and the blocking core of a governed plan,
     /// emitting up to `shape.output_limit` rows to `visitor`.
-    fn stream_governed_core( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+    fn stream_governed_core( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, memory: &QueryMemory, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         let blocking_index = shape.blocking_index;
         let core = &physical.operators()[blocking_index..shape.core_end];
         let output_limit = shape.output_limit;
@@ -3938,7 +3660,7 @@ impl Engine {
         // A core that does not keep its input order (sort, group, distinct,
         // pivot, sample, union), or a terminal count, lets the prefix read only
         // the fields the core and tail need, from an unordered cursor.
-        let order_free = shape.count_alias.is_some()
+        let order_free = (shape.count_alias.is_some() && shape.rest.is_empty())
             || !matches!(core[0].execution_properties().order, crate::query::Order::Preserved);
         let consumer_demand = order_free
             .then(|| crate::query::source_field_demand(&physical.operators()[blocking_index..], None))
@@ -3952,12 +3674,6 @@ impl Engine {
                 ExecutionStrategy::PrimaryKeyLookup
             }
         };
-
-        // Blocking operators use the query profile and currently available
-        // managed memory; spill follows that resource contract.
-        let query_budget = self.memory_governor.profile().query_budget_bytes;
-        let available = self.memory_governor.available_bytes().unwrap_or(query_budget);
-        let working_budget = available.min(query_budget).max(1024 * 1024);
 
         // A stage that retains at most N rows (`sample N`) keeps a reservoir of
         // N rows while the prefix streams; memory is bounded by N.
@@ -3974,28 +3690,31 @@ impl Engine {
                 let read = self.storage.read().map_err(storage_engine_error)?;
                 let start = sample_commuting_start(read.as_ref(), &prefix)?;
                 let plain_scan = matches!(prefix.source().access(), crate::query::PhysicalAccess::CollectionScan { options } if options.limit().is_none())
-                    && self.system_collection_storage(&prefix)?.is_none();
+                    && !self.is_virtual(prefix.source().collection());
                 if start == 0 && plain_scan {
-                    // Nothing runs before the reservoir: draw from the
-                    // primary index, reading only the retained rows.
-                    let mut reservoir = crate::query::Reservoir::new(capacity);
-                    read.visit_row_ids(prefix.source().collection(), &mut |id, version| {
-                        reservoir.push((id, version));
-                        Ok(true)
-                    })
-                    .map_err(storage_engine_error)?;
+                    // Nothing runs before the reservoir: draw by position when
+                    // the storage can, from the primary index otherwise,
+                    // reading only the retained rows.
+                    let drawn = read.sample_row_ids(prefix.source().collection(), capacity, crate::query::sample_seed()).map_err(storage_engine_error)?;
+                    let (seen, mut locators) = match drawn {
+                        Some(drawn) => drawn,
+                        None => {
+                            let mut reservoir = crate::query::Reservoir::new(capacity);
+                            read.visit_row_ids(prefix.source().collection(), &mut |id, version| {
+                                reservoir.push((id, version));
+                                Ok(true)
+                            })
+                            .map_err(storage_engine_error)?;
+                            (reservoir.seen(), reservoir.into_items())
+                        }
+                    };
                     drop(read);
-                    let seen = reservoir.seen();
                     let dropped = seen.saturating_sub(capacity as u64);
-                    let mut locators = reservoir.into_items();
                     if let Some(limit) = output_limit {
                         locators.truncate(limit);
                     }
                     let rows = self.hydrate_replayed(&prefix, locators)?;
-                    let returned = rows.len() as u64;
-                    for row in rows {
-                        visitor(row)?;
-                    }
+                    let returned = visit_all(visitor, rows)?;
                     return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                         seen,
                         dropped,
@@ -4014,6 +3733,8 @@ impl Engine {
                 if let Some(prefix_stats) = self.stream_slot_batches(
                     &sampled_prefix,
                     &core_reads,
+                    &[],
+                    true,
                     &mut |runner, _| {
                         let mut reservoir = reservoir.borrow_mut();
                         for &row in runner.selection() {
@@ -4033,10 +3754,7 @@ impl Engine {
                         locators.truncate(limit);
                     }
                     let rows = self.hydrate_replayed(&prefix, locators)?;
-                    let returned = rows.len() as u64;
-                    for row in rows {
-                        visitor(row)?;
-                    }
+                    let returned = visit_all(visitor, rows)?;
                     return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                         prefix_stats.scanned(),
                         prefix_stats.filtered().saturating_add(dropped),
@@ -4060,10 +3778,7 @@ impl Engine {
             if late && prefix_stats.strategies().contains(ExecutionStrategy::PartialDocuments) {
                 rows = self.hydrate_replayed_rows(&prefix, rows)?;
             }
-            let returned = rows.len() as u64;
-            for row in rows {
-                visitor(row)?;
-            }
+            let returned = visit_all(visitor, rows)?;
             return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                 prefix_stats.scanned(),
                 prefix_stats.filtered().saturating_add(dropped),
@@ -4082,20 +3797,18 @@ impl Engine {
             let mut accumulator = self
                 .runtime
                 .incremental_pivot_accumulator(specification)
-                .map_err(EngineError::execution)?
-                .ok_or_else(|| EngineError::execution(ExecutionError::evaluation("pivot runtime has no incremental accumulator")))?;
-            let reservation = reserve_query_memory(&self.memory_governor, "pivot working set", working_budget)
                 .map_err(EngineError::execution)?;
+            let stage = memory.stage();
             let over_budget = |accumulator: &dyn crate::query::IncrementalPivotAccumulator| {
-                if accumulator.retained_bytes() > working_budget {
+                if !stage.fits(accumulator.retained_bytes()) {
                     return Err(EngineError::execution(ExecutionError::evaluation(
                         "pivot cells exceed the governed query working set; reduce the row or column cardinality",
                     )));
                 }
                 Ok(())
             };
-            // Rows reach the accumulator as slots when it folds them and
-            // every pivot field is top-level; documents otherwise.
+            // Rows reach the accumulator as batches or slots when it folds
+            // them; documents otherwise.
             let pivot_fields = specification
                 .rows()
                 .iter()
@@ -4103,15 +3816,17 @@ impl Engine {
                 .chain(specification.values().iter().map(|value| value.field()))
                 .cloned()
                 .collect::<Vec<_>>();
-            let top_level = pivot_fields.iter().all(|field| field.len() == 1);
-            let slot_stats = if accumulator.folds_refs() && top_level {
+            let slot_stats = if accumulator.folds_refs() {
                 // Batches: each pivot path is read from its output column.
                 let accumulator = std::cell::RefCell::new(&mut accumulator);
                 let groups = [specification.rows(), specification.columns()];
                 let position = |fields: &[crate::query::ExpressionFieldPath], path: &crate::query::ExpressionFieldPath| fields.iter().position(|field| field == path);
+                let keyed = specification.rows().iter().chain(specification.columns()).cloned().collect::<Vec<_>>();
                 self.stream_slot_batches(
                     &prefix,
                     &pivot_fields,
+                    &keyed,
+                    false,
                     &mut |runner, fields| {
                         let columns = |paths: &[crate::query::ExpressionFieldPath]| paths.iter().map(|path| position(fields, path).and_then(|index| runner.output(index))).collect::<Vec<_>>();
                         let (rows, cols) = (columns(groups[0]), columns(groups[1]));
@@ -4122,6 +3837,9 @@ impl Engine {
                         }
                         let (mut row_refs, mut column_refs, mut value_refs) = (Vec::new(), Vec::new(), Vec::new());
                         let mut accumulator = accumulator.borrow_mut();
+                        if accumulator.push_batch(&rows, &cols, &values, runner.selection()).map_err(EngineError::execution)? {
+                            return over_budget(accumulator.as_ref());
+                        }
                         for &row in runner.selection() {
                             let row = row as usize;
                             read(&rows, row, &mut row_refs);
@@ -4156,7 +3874,7 @@ impl Engine {
                 Ok,
             )?;
             let rows = accumulator.finish().map_err(EngineError::execution)?;
-            drop(reservation);
+            drop(stage);
             let returned = rows.len() as u64;
             for row in rows {
                 visitor(ExecutionRow::synthetic(row))?;
@@ -4173,15 +3891,7 @@ impl Engine {
 
         if let [core_operator] = core {
             match core_operator {
-                PhysicalOperator::Union {
-                    collection,
-                    alias,
-                    pipeline,
-                } if pipeline
-                    .operators()
-                    .iter()
-                    .all(is_bounded_secondary_row_operator) =>
-                {
+                PhysicalOperator::Union { collection, alias, pipeline } => {
                     let mut returned = 0u64;
                     let prefix_stats = self
                         .stream_read_pipeline(&prefix, &mut |stored| {
@@ -4192,20 +3902,22 @@ impl Engine {
                         .expect("validated streaming prefix");
                     // The branch rows meet the same consumer as the main rows. An
                     // aliased branch may name fields through the alias: read whole rows.
-                    let branch_demand = (order_free && alias.is_none())
+                    let branch_demand = (order_free && alias.is_none() && pipeline.operators().iter().all(is_row_operator))
                         .then(|| crate::query::source_field_demand(pipeline.operators(), consumer_demand.as_deref()))
                         .flatten();
-                    let branch_stats = self.stream_bounded_secondary_pipeline(
-                        collection,
-                        pipeline,
-                        None,
-                        branch_demand.as_deref(),
-                        &mut |row| {
-                            visitor(row)?;
-                            returned = returned.saturating_add(1);
-                            Ok(())
-                        },
-                    )?;
+                    let mut emit_branch = |row: ExecutionRow| {
+                        visitor(row)?;
+                        returned = returned.saturating_add(1);
+                        Ok(())
+                    };
+                    let batched = match branch_demand {
+                        Some(_) => self.stream_union_batches(collection, pipeline, consumer_demand.as_deref(), &mut emit_branch)?,
+                        None => None,
+                    };
+                    let branch_stats = match batched {
+                        Some(statistics) => statistics,
+                        None => self.stream_bounded_secondary_pipeline(collection, pipeline, None, branch_demand.as_deref(), &mut emit_branch)?,
+                    };
                     let strategies = ExecutionStrategies::default().with(source_strategy);
                     return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                         prefix_stats
@@ -4218,75 +3930,17 @@ impl Engine {
                         strategies,
                     )));
                 }
-                PhysicalOperator::Lookup {
-                    collection,
-                    alias,
-                    outer_alias,
-                    into,
-                    pipeline,
-                } if pipeline
-                    .operators()
-                    .iter()
-                    .all(is_bounded_secondary_row_operator) =>
-                {
-                    let reservation = reserve_query_memory(
-                        &self.memory_governor,
-                        "bounded lookup working set",
-                        working_budget,
-                    )
-                    .map_err(EngineError::execution)?;
-                    let mut inner_scanned = 0u64;
-                    let mut inner_filtered = 0u64;
+                PhysicalOperator::Lookup { pipeline, .. } if sinks::runs_lookup_pipeline(pipeline) => {
+                    let mut join = sinks::LookupJoin::new(core_operator, memory).expect("a lookup operator");
                     let mut returned = 0u64;
-                    // An equality correlation is served by an index built once,
-                    // at the first outer row, within the working budget.
-                    let equality = LookupEquality::detect(pipeline, outer_alias.as_deref());
-                    let mut index: Option<Option<LookupIndex>> = None;
-                    let mut join_row = |stored: StoredDocument, index: &mut Option<Option<LookupIndex>>, filter: Option<&LookupKeyFilter>| -> EngineResult<()> {
-                        let mut outer = ExecutionRow::from_stored(stored);
-                        let mut matches = Vec::<Arc<Document>>::new();
-                        let mut retained_bytes = 0usize;
-                        if let (Some(equality), None) = (&equality, &index) {
-                            let built = self.build_lookup_index(collection, equality, alias.as_deref(), outer_alias.as_deref(), working_budget, filter)?;
-                            if let Some(built) = &built {
-                                inner_scanned = inner_scanned.saturating_add(built.scanned);
-                            }
-                            *index = Some(built);
-                        }
-                        let lookup_context = Some((outer.document(), alias.as_deref(), outer_alias.as_deref()));
-                        let mut collect = |row: ExecutionRow| -> EngineResult<()> {
-                            let estimated = execution_row_working_bytes(&row).map_err(EngineError::execution)?;
-                            if estimated > working_budget || retained_bytes.saturating_add(estimated) > working_budget {
-                                return Err(EngineError::execution(ExecutionError::evaluation(
-                                    "one lookup result exceeds the governed query working set",
-                                )));
-                            }
-                            retained_bytes = retained_bytes.saturating_add(estimated);
-                            matches.push(row.shared_document());
-                            Ok(())
-                        };
-                        let inner_stats = if let (Some(equality), Some(Some(index))) = (&equality, &*index) {
-                            self.probe_lookup_index(collection, index, equality, pipeline, lookup_context, &mut collect)?
-                        } else {
-                            self.stream_bounded_secondary_pipeline(collection, pipeline, lookup_context, None, &mut collect)?
-                        };
-                        drop(collect);
-                        inner_scanned = inner_scanned.saturating_add(inner_stats.scanned());
-                        inner_filtered = inner_filtered.saturating_add(inner_stats.filtered());
-                        let documents = LookupDocuments::new(matches);
-                        let evaluation = outer.evaluation_document();
-                        let document = self
-                            .runtime
-                            .apply_lookup(into, &evaluation, &documents)
-                            .map_err(EngineError::execution)?;
-                        outer.replace_document(document, false);
-                        visitor(outer)?;
+                    let mut join_row = |join: &mut sinks::LookupJoin<'_, '_>, stored: StoredDocument, filter: Option<&LookupKeyFilter>| -> EngineResult<()> {
+                        visitor(join.join(self, ExecutionRow::from_stored(stored), filter)?)?;
                         returned = returned.saturating_add(1);
                         Ok(())
                     };
                     // Semi-join: a bounded outer side is read first, and the
                     // index keeps only joined rows that can match its keys.
-                    let semi_join = equality.is_some() && prefix_row_bound(&prefix).is_some_and(|bound| bound <= SEMI_JOIN_MAX_OUTER_ROWS);
+                    let semi_join = join.equality().is_some_and(|equality| !equality.prefix && !equality.composite()) && prefix_row_bound(&prefix).is_some_and(|bound| bound <= SEMI_JOIN_MAX_OUTER_ROWS);
                     let prefix_stats = if semi_join {
                         let mut outer_rows = Vec::new();
                         let prefix_stats = self
@@ -4294,12 +3948,12 @@ impl Engine {
                                 outer_rows.push(stored);
                                 Ok(())
                             })?;
-                        let equality = equality.as_ref().expect("semi-join has an equality");
+                        let equality = join.equality().expect("semi-join has an equality");
                         let mut filter = Some(LookupKeyFilter::default());
                         let no_inner = Document::new();
                         for stored in &outer_rows {
-                            let fields = crate::query::LookupFields { inner: &no_inner, inner_alias: alias.as_deref(), outer: stored.document(), outer_alias: outer_alias.as_deref() };
-                            match crate::query::ExpressionFieldResolver::resolve_field(&fields, &equality.outer) {
+                            let fields = crate::query::LookupFields { inner: &no_inner, inner_alias: join.alias(), outer: stored.document(), outer_alias: join.outer_alias() };
+                            match crate::query::ExpressionFieldResolver::resolve_field(&fields, equality.outer()) {
                                 crate::query::SemanticValue::Present(value) => {
                                     if let Some(filter) = &mut filter {
                                         filter.insert(&value);
@@ -4310,23 +3964,18 @@ impl Engine {
                             }
                         }
                         for stored in outer_rows {
-                            join_row(stored, &mut index, filter.as_ref())?;
+                            join_row(&mut join, stored, filter.as_ref())?;
                         }
                         prefix_stats
                     } else {
-                        self.stream_read_pipeline(&prefix, &mut |stored| join_row(stored, &mut index, None))?
+                        self.stream_read_pipeline(&prefix, &mut |stored| join_row(&mut join, stored, None))?
                     }
                         .expect("validated streaming prefix");
-                    drop(reservation);
-                    let mut strategies = ExecutionStrategies::default().with(source_strategy);
-                    if matches!(index, Some(Some(_))) {
-                        strategies = strategies.with(ExecutionStrategy::HashJoin);
-                    }
                     return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned().saturating_add(inner_scanned),
-                        prefix_stats.filtered().saturating_add(inner_filtered),
+                        prefix_stats.scanned().saturating_add(join.scanned),
+                        prefix_stats.filtered().saturating_add(join.filtered),
                         returned,
-                        strategies,
+                        join.strategies(ExecutionStrategies::default().with(source_strategy)),
                     )));
                 }
                 _ => {}
@@ -4340,14 +3989,8 @@ impl Engine {
             let Some(limit) = output_limit else {
                 return Ok(None);
             };
-            let reservation = reserve_query_memory(
-                &self.memory_governor,
-                "bounded sort-distinct-limit working set",
-                working_budget,
-            )
-            .map_err(EngineError::execution)?;
+            let stage = memory.stage();
             let spill = SpillEngine::default();
-            let sort_input_budget = bounded_sort_input_budget(working_budget);
             let mut chunk = Vec::<ExecutionRow>::new();
             let mut chunk_bytes = 0usize;
             let mut runs = Vec::<SpillRun>::new();
@@ -4359,7 +4002,7 @@ impl Engine {
                         sort_keys,
                         &spill,
                         row,
-                        sort_input_budget,
+                        &stage,
                         &mut chunk,
                         &mut chunk_bytes,
                         &mut runs,
@@ -4368,9 +4011,11 @@ impl Engine {
                 })?
                 .expect("validated streaming prefix");
 
+            // Emitted rows pass to the stages after the core, which count them.
             let returned = if runs.is_empty() {
                 stable_sort(self.runtime.as_ref(), sort_keys, &mut chunk)
                     .map_err(EngineError::execution)?;
+                stage.release();
                 emit_distinct_limited_rows(
                     self.runtime.as_ref(),
                     distinct_fields,
@@ -4389,6 +4034,7 @@ impl Engine {
                     )
                     .map_err(EngineError::execution)?;
                 }
+                stage.release();
                 merge_sorted_distinct_limited_runs(
                     self.runtime.as_ref(),
                     sort_keys,
@@ -4398,7 +4044,7 @@ impl Engine {
                     visitor,
                 )?
             };
-            drop(reservation);
+            drop(stage);
             let strategies = ExecutionStrategies::default()
                 .with(source_strategy)
                 .with(if runs.is_empty() {
@@ -4421,316 +4067,42 @@ impl Engine {
             // Reuse the same governed in-memory group primitive used by GROUP
             // alone before choosing the external path. Chaining SORT/LIMIT must
             // not force spill when the grouped state already fits the contract.
-            if let Some((grouped_rows, prefix_stats)) =
-                self.try_in_memory_incremental_group(&prefix, group_keys, working_budget, None)?
-            {
-                if let Some(limit) = output_limit {
+            let group_memory = memory.stage();
+            if let Some((mut grouped_rows, prefix_stats)) = self.try_in_memory_incremental_group(&prefix, group_keys, &group_memory, None, Some((&sort_keys[..], output_limit)))? {
+                // Groups come sorted, and bounded, when the sort reads only
+                // their own fields; else their rows are sorted here.
+                let rows = if grouped_rows.sorted {
+                    None
+                } else if let Some(limit) = output_limit {
                     let mut top = BoundedTopN::new(limit);
-                    for row in grouped_rows {
-                        top.push_lazy(self.runtime.as_ref(), sort_keys, row, |candidate| {
-                            execution_row_working_bytes(candidate)
-                        })
-                        .map_err(EngineError::execution)?;
+                    for row in grouped_rows.by_ref() {
+                        top.push_lazy(self.runtime.as_ref(), sort_keys, row?, execution_row_working_bytes).map_err(EngineError::execution)?;
                     }
-                    let top = top
-                        .into_sorted_rows(self.runtime.as_ref(), sort_keys)
-                        .map_err(EngineError::execution)?;
-                    let returned = top.len() as u64;
-                    for row in top {
-                        visitor(row)?;
-                    }
-                    let strategies = ExecutionStrategies::default()
-                        .with(source_strategy)
-                        .with(ExecutionStrategy::InMemoryGroup)
-                        .with(ExecutionStrategy::TopN);
-                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned(),
-                        prefix_stats.filtered(),
-                        returned,
-                        strategies,
-                    )));
+                    Some(top.into_sorted_rows(self.runtime.as_ref(), sort_keys).map_err(EngineError::execution)?)
                 } else {
-                    let mut grouped_rows = grouped_rows;
-                    stable_sort(self.runtime.as_ref(), sort_keys, &mut grouped_rows)
-                        .map_err(EngineError::execution)?;
-                    let returned = grouped_rows.len() as u64;
-                    for row in grouped_rows {
-                        visitor(row)?;
-                    }
-                    let strategies = ExecutionStrategies::default()
-                        .with(source_strategy)
-                        .with(ExecutionStrategy::InMemoryGroup)
-                        .with(ExecutionStrategy::InMemorySort);
-                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned(),
-                        prefix_stats.filtered(),
-                        returned,
-                        strategies,
-                    )));
-                }
-            }
-
-            let reservation = reserve_query_memory(
-                &self.memory_governor,
-                "external group-sort working set",
-                working_budget,
-            )
-            .map_err(EngineError::execution)?;
-            let stage_budget = working_budget.saturating_div(2).max(512 * 1024);
-
-            if let Some((mut grouped, prefix_stats)) =
-                self.try_in_memory_incremental_group(&prefix, group_keys, stage_budget, None)?
-            {
-                let sort_strategy = if let Some(limit) = output_limit {
-                    stable_sort(self.runtime.as_ref(), sort_keys, &mut grouped)
-                        .map_err(EngineError::execution)?;
-                    grouped.truncate(limit);
-                    ExecutionStrategy::TopN
-                } else {
-                    stable_sort(self.runtime.as_ref(), sort_keys, &mut grouped)
-                        .map_err(EngineError::execution)?;
-                    ExecutionStrategy::InMemorySort
+                    let mut rows = grouped_rows.by_ref().collect::<EngineResult<Vec<_>>>()?;
+                    stable_sort(self.runtime.as_ref(), sort_keys, &mut rows).map_err(EngineError::execution)?;
+                    Some(rows)
                 };
-                let returned = grouped.len() as u64;
-                for row in grouped {
-                    visitor(row)?;
-                }
-                drop(reservation);
-                let strategies = ExecutionStrategies::default()
-                    .with(source_strategy)
-                    .with(ExecutionStrategy::InMemoryGroup)
-                    .with(sort_strategy);
-                return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                    prefix_stats.scanned(),
-                    prefix_stats.filtered(),
-                    returned,
-                    strategies,
-                )));
+                group_memory.release();
+                let returned = match rows {
+                    Some(rows) => visit_all(visitor, rows)?,
+                    None => visit_each(visitor, grouped_rows)?,
+                };
+                let strategies = ExecutionStrategies::default().with(source_strategy).with(ExecutionStrategy::InMemoryGroup).with(if output_limit.is_some() { ExecutionStrategy::TopN } else { ExecutionStrategy::InMemorySort });
+                return Ok(Some(streamed_after(&prefix_stats, returned, strategies)));
             }
 
             let spill = SpillEngine::default();
-            // Keep compatible GROUP pipelines on the physical projected scanner even
-            // after the in-memory state crosses its budget. The old fallback rebuilt
-            // full documents through `scan_each`, turning one analytical scan into a
-            // second 16M-row pointer walk.
-            if let Some((group_runs, prefix_stats)) =
-                self.try_projected_external_group_runs(&prefix, group_keys, stage_budget, &spill)?
-            {
-                let (returned, sort_strategy) = if let Some(limit) = output_limit {
-                    let mut top = BoundedTopN::new(limit);
-                    merge_group_runs(
-                        self.runtime.as_ref(),
-                        group_keys,
-                        stage_budget,
-                        &group_runs,
-                        None,
-                        &mut |row| {
-                            top.push_lazy(self.runtime.as_ref(), sort_keys, row, |candidate| {
-                                execution_row_working_bytes(candidate)
-                            })
-                            .map_err(EngineError::execution)?;
-                            if top.live_bytes() > stage_budget {
-                                return Err(EngineError::execution(ExecutionError::evaluation(
-                                    "group-sort Top-N candidates exceed the governed working set",
-                                )));
-                            }
-                            Ok(())
-                        },
-                    )?;
-                    let top = top
-                        .into_sorted_rows(self.runtime.as_ref(), sort_keys)
-                        .map_err(EngineError::execution)?;
-                    let returned = top.len() as u64;
-                    for row in top {
-                        visitor(row)?;
-                    }
-                    (returned, ExecutionStrategy::TopN)
-                } else {
-                    let mut sort_chunk = Vec::<ExecutionRow>::new();
-                    let mut sort_chunk_bytes = 0usize;
-                    let mut sort_runs = Vec::<SpillRun>::new();
-                    merge_group_runs(
-                        self.runtime.as_ref(),
-                        group_keys,
-                        stage_budget,
-                        &group_runs,
-                        None,
-                        &mut |row| {
-                            push_bounded_sort_row(
-                                self.runtime.as_ref(),
-                                sort_keys,
-                                &spill,
-                                row,
-                                stage_budget,
-                                &mut sort_chunk,
-                                &mut sort_chunk_bytes,
-                                &mut sort_runs,
-                                "one grouped row exceeds the governed sort working set",
-                            )
-                        },
-                    )?;
-                    if sort_runs.is_empty() {
-                        stable_sort(self.runtime.as_ref(), sort_keys, &mut sort_chunk)
-                            .map_err(EngineError::execution)?;
-                        let returned = sort_chunk.len() as u64;
-                        for row in sort_chunk {
-                            visitor(row)?;
-                        }
-                        (returned, ExecutionStrategy::InMemorySort)
-                    } else {
-                        if !sort_chunk.is_empty() {
-                            flush_sorted_run(
-                                self.runtime.as_ref(),
-                                sort_keys,
-                                &spill,
-                                &mut sort_chunk,
-                                &mut sort_runs,
-                            )
-                            .map_err(EngineError::execution)?;
-                        }
-                        let returned = merge_sorted_runs(
-                            self.runtime.as_ref(),
-                            sort_keys,
-                            &sort_runs,
-                            None,
-                            visitor,
-                        )?;
-                        (returned, ExecutionStrategy::ExternalSort)
-                    }
-                };
-                drop(reservation);
-                let strategies = ExecutionStrategies::default()
-                    .with(source_strategy)
-                    .with(ExecutionStrategy::ExternalGroup)
-                    .with(sort_strategy);
-                return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                    prefix_stats.scanned(),
-                    prefix_stats.filtered(),
-                    returned,
-                    strategies,
-                )));
-            }
-            // External group is aggregate-first: keep bounded mergeable states
-            // in RAM and spill compact partials only when required.
-            let mut partial_groups: HashMap<
-                Arc<[u8]>,
-                Box<dyn crate::query::IncrementalGroupAccumulator>,
-            > = HashMap::new();
-            let mut partial_bytes = 0usize;
-            let mut group_runs = Vec::<SpillRun>::new();
-            let (grouping_keys, _) =
-                crate::query::group_field_layout(group_keys).map_err(EngineError::execution)?;
-            let mut ext_rows = 0u64;
-            let mut ext_samples = 0u64;
-            let mut ext_key_ns = 0u64;
-            let mut ext_lookup_ns = 0u64;
-            let mut ext_accumulate_ns = 0u64;
-            let mut ext_hits = 0u64;
-            let mut ext_misses = 0u64;
-            let source_started = Instant::now();
-            let prefix_stats = self
-                .stream_read_pipeline(&prefix, &mut |stored| {
-                    ext_rows = ext_rows.saturating_add(1);
-                    let sampled =
-                        crate::debug::query_instrumentation_enabled() && ext_rows & 1023 == 0;
-                    if sampled {
-                        ext_samples = ext_samples.saturating_add(1);
-                    }
-                    if ext_rows & 65535 == 0 {
-                        sample_external_group_process_memory(&self.memory_governor);
-                    }
-                    let row = ExecutionRow::from_stored(stored);
-                    let key_started = sampled.then(Instant::now);
-                    let key = self
-                        .runtime
-                        .distinct_key(&grouping_keys, row.document())
-                        .map_err(EngineError::execution)?;
-                    if let Some(started) = key_started {
-                        ext_key_ns = ext_key_ns.saturating_add(elapsed_nanos(started));
-                    }
-                    let lookup_started = sampled.then(Instant::now);
-                    let exists = partial_groups.contains_key(key.as_ref());
-                    if let Some(started) = lookup_started {
-                        ext_lookup_ns = ext_lookup_ns.saturating_add(elapsed_nanos(started));
-                    }
-                    if exists {
-                        ext_hits = ext_hits.saturating_add(1);
-                    } else {
-                        ext_misses = ext_misses.saturating_add(1);
-                        let estimate = group_state_estimate(key.len(), group_keys.len());
-                        if !partial_groups.is_empty()
-                            && partial_bytes.saturating_add(estimate) > stage_budget
-                        {
-                            EXTERNAL_GROUP_FLUSH_TRIGGERS.fetch_add(1, AtomicOrdering::Relaxed);
-                            flush_partial_group_run(
-                                self.runtime.as_ref(),
-                                group_keys,
-                                &spill,
-                                &mut partial_groups,
-                                &mut group_runs,
-                            )?;
-                            partial_bytes = 0;
-                            sample_external_group_process_memory(&self.memory_governor);
-                        }
-                        let create_started = Instant::now();
-                        let accumulator = self
-                            .runtime
-                            .incremental_group_accumulator(group_keys)
-                            .map_err(EngineError::execution)?
-                            .ok_or_else(|| {
-                                EngineError::execution(ExecutionError::evaluation(
-                                    "external group runtime has no incremental accumulator",
-                                ))
-                            })?;
-                        EXTERNAL_GROUP_ACCUMULATOR_CREATE_US
-                            .fetch_add(elapsed_micros(create_started), AtomicOrdering::Relaxed);
-                        partial_bytes = partial_bytes.saturating_add(estimate);
-                        update_atomic_peak(
-                            &EXTERNAL_GROUP_ESTIMATED_PEAK_BYTES,
-                            usize_to_u64_saturating(partial_bytes),
-                        );
-                        partial_groups.insert(key.clone(), accumulator);
-                    }
-                    let accumulate_started = sampled.then(Instant::now);
-                    let result = partial_groups
-                        .get_mut(key.as_ref())
-                        .expect("partial group accumulator exists")
-                        .push(row.document())
-                        .map_err(EngineError::execution);
-                    if let Some(started) = accumulate_started {
-                        ext_accumulate_ns =
-                            ext_accumulate_ns.saturating_add(elapsed_nanos(started));
-                    }
-                    result
-                })?
-                .expect("validated streaming prefix");
-            EXTERNAL_GROUP_SOURCE_US
-                .fetch_add(elapsed_micros(source_started), AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_ROWS_CONSUMED.fetch_add(ext_rows, AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_CONSUME_SAMPLES.fetch_add(ext_samples, AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_KEY_NS.fetch_add(ext_key_ns, AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_LOOKUP_NS.fetch_add(ext_lookup_ns, AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_ACCUMULATE_NS.fetch_add(ext_accumulate_ns, AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_GROUP_HITS.fetch_add(ext_hits, AtomicOrdering::Relaxed);
-            EXTERNAL_GROUP_GROUP_MISSES.fetch_add(ext_misses, AtomicOrdering::Relaxed);
-            if !partial_groups.is_empty() {
-                flush_partial_group_run(
-                    self.runtime.as_ref(),
-                    group_keys,
-                    &spill,
-                    &mut partial_groups,
-                    &mut group_runs,
-                )?;
-            }
-
-            let returned: u64;
-            let sort_strategy;
-            if let Some(limit) = output_limit {
+            let (group_runs, prefix_stats) = self.external_group_runs(&prefix, group_keys, &group_memory, &spill)?;
+            // The partial groups are spilled: the sort takes their memory.
+            drop(group_memory);
+            let sort_memory = memory.stage();
+            let (returned, sort_strategy) = if let Some(limit) = output_limit {
                 let mut top = BoundedTopN::new(limit);
                 merge_group_runs(
                     self.runtime.as_ref(),
                     group_keys,
-                    stage_budget,
                     &group_runs,
                     None,
                     &mut |row| {
@@ -4738,7 +4110,7 @@ impl Engine {
                             execution_row_working_bytes(candidate)
                         })
                         .map_err(EngineError::execution)?;
-                        if top.live_bytes() > stage_budget {
+                        if !sort_memory.fits(top.live_bytes()) {
                             return Err(EngineError::execution(ExecutionError::evaluation(
                                 "group-sort Top-N candidates exceed the governed working set",
                             )));
@@ -4749,11 +4121,9 @@ impl Engine {
                 let top = top
                     .into_sorted_rows(self.runtime.as_ref(), sort_keys)
                     .map_err(EngineError::execution)?;
-                returned = top.len() as u64;
-                for row in top {
-                    visitor(row)?;
-                }
-                sort_strategy = ExecutionStrategy::TopN;
+                sort_memory.release();
+                let returned = visit_all(visitor, top)?;
+                (returned, ExecutionStrategy::TopN)
             } else {
                 let mut sort_chunk = Vec::<ExecutionRow>::new();
                 let mut sort_chunk_bytes = 0usize;
@@ -4761,7 +4131,6 @@ impl Engine {
                 merge_group_runs(
                     self.runtime.as_ref(),
                     group_keys,
-                    stage_budget,
                     &group_runs,
                     None,
                     &mut |row| {
@@ -4770,7 +4139,7 @@ impl Engine {
                             sort_keys,
                             &spill,
                             row,
-                            stage_budget,
+                            &sort_memory,
                             &mut sort_chunk,
                             &mut sort_chunk_bytes,
                             &mut sort_runs,
@@ -4778,14 +4147,12 @@ impl Engine {
                         )
                     },
                 )?;
+                sort_memory.release();
                 if sort_runs.is_empty() {
                     stable_sort(self.runtime.as_ref(), sort_keys, &mut sort_chunk)
                         .map_err(EngineError::execution)?;
-                    returned = sort_chunk.len() as u64;
-                    for row in sort_chunk {
-                        visitor(row)?;
-                    }
-                    sort_strategy = ExecutionStrategy::InMemorySort;
+                    let returned = visit_all(visitor, sort_chunk)?;
+                    (returned, ExecutionStrategy::InMemorySort)
                 } else {
                     if !sort_chunk.is_empty() {
                         flush_sorted_run(
@@ -4797,55 +4164,34 @@ impl Engine {
                         )
                         .map_err(EngineError::execution)?;
                     }
-                    returned = merge_sorted_runs(
+                    let returned = merge_sorted_runs(
                         self.runtime.as_ref(),
                         sort_keys,
                         &sort_runs,
                         None,
                         visitor,
                     )?;
-                    sort_strategy = ExecutionStrategy::ExternalSort;
+                    (returned, ExecutionStrategy::ExternalSort)
                 }
-            }
-            drop(reservation);
+            };
+            drop(sort_memory);
             let strategies = ExecutionStrategies::default()
                 .with(source_strategy)
                 .with(ExecutionStrategy::ExternalGroup)
                 .with(sort_strategy);
-            return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                prefix_stats.scanned(),
-                prefix_stats.filtered(),
-                returned,
-                strategies,
-            )));
+            return Ok(Some(streamed_after(&prefix_stats, returned, strategies)));
         }
 
         match &core[0] {
             PhysicalOperator::Sort { keys } if output_limit.is_some() => {
                 let limit = output_limit.expect("checked Top-N limit");
-                if let Some((rows, statistics)) =
-                    self.try_projected_near_top_n(&prefix, keys, limit)?
-                {
-                    for row in rows {
-                        visitor(row)?;
-                    }
-                    return Ok(Some(statistics));
-                }
-                if let Some((rows, statistics)) = self.try_projected_top_n(&prefix, keys, limit)? {
-                    for row in rows {
-                        visitor(row)?;
-                    }
-                    return Ok(Some(statistics));
-                }
                 if let Some((rows, statistics)) = self.try_slot_top_n(&prefix, keys, limit)? {
                     for row in rows {
                         visitor(row)?;
                     }
                     return Ok(Some(statistics));
                 }
-                let reservation =
-                    reserve_query_memory(&self.memory_governor, "streaming top-n", working_budget)
-                        .map_err(EngineError::execution)?;
+                let stage = memory.stage();
                 // Late materialization: when the prefix can be replayed on one
                 // row, rank rows read as partial documents holding only what the
                 // prefix and the sort keys read, then hydrate the winners.
@@ -4859,7 +4205,7 @@ impl Engine {
                             execution_row_working_bytes(candidate)
                         })
                         .map_err(EngineError::execution)?;
-                        if top.live_bytes() > working_budget {
+                        if !stage.fits(top.live_bytes()) {
                             return Err(EngineError::execution(ExecutionError::evaluation(
                                 "top-n candidates exceed the governed query working set",
                             )));
@@ -4867,7 +4213,7 @@ impl Engine {
                         Ok(())
                     })?
                     .expect("validated streaming prefix");
-                drop(reservation);
+                drop(stage);
 
                 let mut top = top
                     .into_sorted_rows(self.runtime.as_ref(), keys)
@@ -4875,10 +4221,7 @@ impl Engine {
                 if late && prefix_stats.strategies().contains(ExecutionStrategy::PartialDocuments) {
                     top = self.hydrate_replayed_rows(&prefix, top)?;
                 }
-                let returned = top.len() as u64;
-                for row in top {
-                    visitor(row)?;
-                }
+                let returned = visit_all(visitor, top)?;
                 let strategies = prefix_stats.strategies().with(source_strategy).with(ExecutionStrategy::TopN);
                 return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                     prefix_stats.scanned(),
@@ -4890,28 +4233,21 @@ impl Engine {
                 )));
             }
             PhysicalOperator::Sort { keys } => {
-                let reservation = reserve_query_memory(
-                    &self.memory_governor,
-                    "external sort working set",
-                    working_budget,
-                )
-                .map_err(EngineError::execution)?;
-                if let Some(statistics) = self.try_projected_in_memory_sort(
-                    &prefix,
-                    keys,
-                    working_budget,
-                    visitor,
-                )? {
-                    drop(reservation);
+                let stage = memory.stage();
+                // A consumer that declares the fields it reads gets rows
+                // holding them, as the prefix reads them: never reloaded
+                // whole.
+                let consumer_reads = prefix.field_demand().is_some();
+                if let Some(statistics) = self.try_slot_sort(&prefix, keys, &stage, visitor)? {
                     return Ok(Some(statistics));
                 }
 
                 let spill = SpillEngine::default();
-                let sort_input_budget = bounded_sort_input_budget(working_budget);
-                let late_materialize = prefix
-                    .operators()
-                    .iter()
-                    .all(|operator| matches!(operator, PhysicalOperator::Filter { .. }));
+                let late_materialize = !consumer_reads
+                    && prefix
+                        .operators()
+                        .iter()
+                        .all(|operator| matches!(operator, PhysicalOperator::Filter { .. }));
                 let sort_fields = keys
                     .iter()
                     .map(|key| key.field().clone())
@@ -4934,7 +4270,7 @@ impl Engine {
                             keys,
                             &spill,
                             row,
-                            sort_input_budget,
+                            &stage,
                             &mut chunk,
                             &mut chunk_bytes,
                             &mut runs,
@@ -4969,6 +4305,9 @@ impl Engine {
                 if runs.is_empty() {
                     stable_sort(self.runtime.as_ref(), keys, &mut chunk)
                         .map_err(EngineError::execution)?;
+                    // Emitted rows pass to the stages after the core, which
+                    // count them.
+                    stage.release();
                     for row in chunk {
                         emit(row)?;
                         returned = returned.saturating_add(1);
@@ -4984,10 +4323,11 @@ impl Engine {
                         )
                         .map_err(EngineError::execution)?;
                     }
+                    stage.release();
                     returned =
                         merge_sorted_runs(self.runtime.as_ref(), keys, &runs, None, &mut emit)?;
                 }
-                drop(reservation);
+                drop(stage);
                 let strategies =
                     ExecutionStrategies::default()
                         .with(source_strategy)
@@ -4996,51 +4336,26 @@ impl Engine {
                         } else {
                             ExecutionStrategy::ExternalSort
                         });
-                return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                    prefix_stats.scanned(),
-                    prefix_stats.filtered(),
-                    returned,
-                    strategies,
-                )));
+                return Ok(Some(streamed_after(&prefix_stats, returned, strategies)));
             }
             PhysicalOperator::Distinct { fields } => {
-                let reservation = reserve_query_memory(
-                    &self.memory_governor,
-                    "adaptive distinct working set",
-                    working_budget,
-                )
-                .map_err(EngineError::execution)?;
-                if let Some(statistics) = self.try_projected_in_memory_distinct(
-                    &prefix,
-                    fields,
-                    working_budget,
-                    output_limit,
-                    visitor,
-                )? {
-                    drop(reservation);
+                let stage = memory.stage();
+                let rows_unused = shape.tail.is_empty() && shape.rest.is_empty() && shape.count_alias.is_some();
+                // A bound keeps only its frontier of smallest keys: first for
+                // a key of several fields, whose distinct tuples would
+                // otherwise all be built; a one-field key finds its values
+                // per dictionary code, faster.
+                let limited = |visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>| output_limit.filter(|limit| *limit > 0).map(|limit| self.try_batch_distinct_limited(&prefix, fields, limit, visitor)).transpose().map(Option::flatten);
+                if fields.len() > 1 {
+                    if let Some(statistics) = limited(visitor)? {
+                        return Ok(Some(statistics));
+                    }
+                }
+                if let Some(statistics) = self.try_batch_distinct(&prefix, fields, &stage, output_limit, rows_unused, visitor)? {
                     return Ok(Some(statistics));
                 }
-                if let Some((rows, prefix_stats)) =
-                    self.try_in_memory_distinct(&prefix, fields, working_budget, output_limit)?
-                {
-                    let mut returned = 0u64;
-                    for row in rows {
-                        if output_limit.is_some_and(|limit| (returned as usize) >= limit) {
-                            break;
-                        }
-                        visitor(row)?;
-                        returned = returned.saturating_add(1);
-                    }
-                    drop(reservation);
-                    let strategies = ExecutionStrategies::default()
-                        .with(source_strategy)
-                        .with(ExecutionStrategy::InMemoryDistinct);
-                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned(),
-                        prefix_stats.filtered(),
-                        returned,
-                        strategies,
-                    )));
+                if let Some(statistics) = limited(visitor)? {
+                    return Ok(Some(statistics));
                 }
                 let spill = SpillEngine::default();
                 let mut chunk = Vec::<KeyedRow>::new();
@@ -5057,13 +4372,13 @@ impl Engine {
                             .len()
                             .saturating_add(execution_row_encoded_len(&row))
                             .saturating_add(72);
-                        if estimated > working_budget {
+                        if !stage.fits(estimated) {
                             return Err(EngineError::execution(ExecutionError::evaluation(
                                 "one distinct row exceeds the governed query working set",
                             )));
                         }
                         if !chunk.is_empty()
-                            && chunk_bytes.saturating_add(estimated) > working_budget
+                            && !stage.fits(chunk_bytes.saturating_add(estimated))
                         {
                             flush_keyed_run(&spill, &mut chunk, &mut runs)?;
                             chunk_bytes = 0;
@@ -5073,14 +4388,25 @@ impl Engine {
                         Ok(())
                     })?
                     .expect("validated streaming prefix");
-                if !chunk.is_empty() {
-                    flush_keyed_run(&spill, &mut chunk, &mut runs)?;
-                }
-                let returned = merge_distinct_runs(&runs, output_limit, visitor)?;
-                drop(reservation);
+                // Rows that fit the working set are deduplicated in memory,
+                // exactly as one spilled run would be.
+                let (returned, strategy) = if runs.is_empty() {
+                    chunk.sort_by(|left, right| left.key.cmp(&right.key));
+                    chunk.dedup_by(|later, earlier| later.key == earlier.key);
+                    let rows = chunk.into_iter().take(output_limit.unwrap_or(usize::MAX)).map(|keyed| keyed.row).collect();
+                    stage.release();
+                    (visit_all(visitor, rows)?, ExecutionStrategy::InMemoryDistinct)
+                } else {
+                    if !chunk.is_empty() {
+                        flush_keyed_run(&spill, &mut chunk, &mut runs)?;
+                    }
+                    stage.release();
+                    (merge_distinct_runs(&runs, output_limit, visitor)?, ExecutionStrategy::ExternalDistinct)
+                };
+                drop(stage);
                 let strategies = ExecutionStrategies::default()
                     .with(source_strategy)
-                    .with(ExecutionStrategy::ExternalDistinct);
+                    .with(strategy);
                 return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                     prefix_stats.scanned(),
                     prefix_stats
@@ -5091,14 +4417,7 @@ impl Engine {
                 )));
             }
             PhysicalOperator::Group { keys } => {
-                let reservation = reserve_query_memory(
-                    &self.memory_governor,
-                    "external group working set",
-                    working_budget,
-                )
-                .map_err(EngineError::execution)?;
                 if output_limit == Some(0) {
-                    drop(reservation);
                     let strategies = ExecutionStrategies::default()
                         .with(source_strategy)
                         .with(ExecutionStrategy::InMemoryGroup);
@@ -5106,272 +4425,38 @@ impl Engine {
                         0, 0, 0, strategies,
                     )));
                 }
+                let stage = memory.stage();
                 if let Some((grouped, prefix_stats)) = self.try_in_memory_incremental_group(
                     &prefix,
                     keys,
-                    working_budget,
+                    &stage,
                     output_limit,
+                    None,
                 )? {
-                    let mut returned = 0u64;
-                    for row in grouped {
-                        if output_limit.is_some_and(|limit| (returned as usize) >= limit) {
-                            break;
-                        }
-                        visitor(row)?;
-                        returned = returned.saturating_add(1);
-                    }
-                    drop(reservation);
+                    // Emitted groups pass to the stages after the core, which
+                    // count them.
+                    stage.release();
+                    let returned = visit_each(visitor, grouped.take(output_limit.unwrap_or(usize::MAX)))?;
                     let strategies = ExecutionStrategies::default()
                         .with(source_strategy)
                         .with(ExecutionStrategy::InMemoryGroup);
-                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned(),
-                        prefix_stats.filtered(),
-                        returned,
-                        strategies,
-                    )));
-                }
-
-                // A terminal `group | limit N` has a stronger boundedness guarantee
-                // than generic external grouping: group results are emitted in encoded
-                // key order, so only the N smallest group keys can ever be observable.
-                // Keep those groups exact in memory and discard keys above the moving
-                // Nth-key frontier. The frontier only moves downward, therefore a key
-                // once discarded can never become observable later. This preserves the
-                // language semantics while preventing high-cardinality dimensions from
-                // generating unbounded spill volume merely to throw almost everything
-                // away at `limit`.
-                if let Some(limit) = output_limit.filter(|limit| *limit > 0) {
-                    let (grouping_keys, _) =
-                        crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
-                    let mut groups: BTreeMap<
-                        Arc<[u8]>,
-                        (Box<dyn crate::query::IncrementalGroupAccumulator>, usize),
-                    > = BTreeMap::new();
-                    let mut estimated_bytes = 0usize;
-                    let prefix_stats = self
-                        .stream_read_pipeline(&prefix, &mut |stored| {
-                            let row = ExecutionRow::from_stored(stored);
-                            let key = self
-                                .runtime
-                                .distinct_key(&grouping_keys, row.document())
-                                .map_err(EngineError::execution)?;
-
-                            if let Some((accumulator, _)) = groups.get_mut(key.as_ref()) {
-                                return accumulator
-                                    .push(row.document())
-                                    .map_err(EngineError::execution);
-                            }
-
-                            if groups.len() >= limit {
-                                let keep = groups
-                                    .last_key_value()
-                                    .is_some_and(|(largest, _)| key.as_ref() < largest.as_ref());
-                                if !keep {
-                                    return Ok(());
-                                }
-                                if let Some((_, (_, bytes))) = groups.pop_last() {
-                                    estimated_bytes = estimated_bytes.saturating_sub(bytes);
-                                }
-                            }
-
-                            let estimate = group_state_estimate(key.len(), keys.len());
-                            if estimated_bytes.saturating_add(estimate) > working_budget {
-                                return Err(EngineError::execution(ExecutionError::evaluation(
-                                    "bounded group limit exceeds the governed working set",
-                                )));
-                            }
-                            let mut accumulator = self
-                                .runtime
-                                .incremental_group_accumulator(keys)
-                                .map_err(EngineError::execution)?
-                                .ok_or_else(|| {
-                                    EngineError::execution(ExecutionError::evaluation(
-                                        "group runtime has no incremental accumulator",
-                                    ))
-                                })?;
-                            accumulator
-                                .push(row.document())
-                                .map_err(EngineError::execution)?;
-                            estimated_bytes = estimated_bytes.saturating_add(estimate);
-                            groups.insert(key, (accumulator, estimate));
-                            Ok(())
-                        })?
-                        .expect("validated streaming prefix");
-
-                    let mut returned = 0u64;
-                    for (_, (accumulator, _)) in groups {
-                        let ordinal = returned.saturating_add(1);
-                        visitor(ExecutionRow::synthetic(
-                            accumulator
-                                .finish(ordinal)
-                                .map_err(EngineError::execution)?,
-                        ))?;
-                        returned = returned.saturating_add(1);
-                    }
-                    drop(reservation);
-                    let strategies = ExecutionStrategies::default()
-                        .with(source_strategy)
-                        .with(ExecutionStrategy::InMemoryGroup);
-                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned(),
-                        prefix_stats.filtered(),
-                        returned,
-                        strategies,
-                    )));
+                    return Ok(Some(streamed_after(&prefix_stats, returned, strategies)));
                 }
 
                 let spill = SpillEngine::default();
-                if let Some((runs, prefix_stats)) =
-                    self.try_projected_external_group_runs(&prefix, keys, working_budget, &spill)?
-                {
-                    let returned = merge_group_runs(
-                        self.runtime.as_ref(),
-                        keys,
-                        working_budget,
-                        &runs,
-                        None,
-                        visitor,
-                    )?;
-                    drop(reservation);
-                    let strategies = ExecutionStrategies::default()
-                        .with(source_strategy)
-                        .with(ExecutionStrategy::ExternalGroup);
-                    return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                        prefix_stats.scanned(),
-                        prefix_stats.filtered(),
-                        returned,
-                        strategies,
-                    )));
-                }
-                let mut partial_groups: HashMap<
-                    Arc<[u8]>,
-                    Box<dyn crate::query::IncrementalGroupAccumulator>,
-                > = HashMap::new();
-                let mut partial_bytes = 0usize;
-                let mut runs = Vec::<SpillRun>::new();
-                let (grouping_keys, _) =
-                    crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
-                let mut ext_rows = 0u64;
-                let mut ext_samples = 0u64;
-                let mut ext_key_ns = 0u64;
-                let mut ext_lookup_ns = 0u64;
-                let mut ext_accumulate_ns = 0u64;
-                let mut ext_hits = 0u64;
-                let mut ext_misses = 0u64;
-                let source_started = Instant::now();
-                let prefix_stats = self
-                    .stream_read_pipeline(&prefix, &mut |stored| {
-                        ext_rows = ext_rows.saturating_add(1);
-                        let sampled =
-                            crate::debug::query_instrumentation_enabled() && ext_rows & 1023 == 0;
-                        if sampled {
-                            ext_samples = ext_samples.saturating_add(1);
-                        }
-                        if ext_rows & 65535 == 0 {
-                            sample_external_group_process_memory(&self.memory_governor);
-                        }
-                        let row = ExecutionRow::from_stored(stored);
-                        let key_started = sampled.then(Instant::now);
-                        let key = self
-                            .runtime
-                            .distinct_key(&grouping_keys, row.document())
-                            .map_err(EngineError::execution)?;
-                        if let Some(started) = key_started {
-                            ext_key_ns = ext_key_ns.saturating_add(elapsed_nanos(started));
-                        }
-                        let lookup_started = sampled.then(Instant::now);
-                        let exists = partial_groups.contains_key(key.as_ref());
-                        if let Some(started) = lookup_started {
-                            ext_lookup_ns = ext_lookup_ns.saturating_add(elapsed_nanos(started));
-                        }
-                        if exists {
-                            ext_hits = ext_hits.saturating_add(1);
-                        } else {
-                            ext_misses = ext_misses.saturating_add(1);
-                            let estimate = group_state_estimate(key.len(), keys.len());
-                            if !partial_groups.is_empty()
-                                && partial_bytes.saturating_add(estimate) > working_budget
-                            {
-                                EXTERNAL_GROUP_FLUSH_TRIGGERS.fetch_add(1, AtomicOrdering::Relaxed);
-                                flush_partial_group_run(
-                                    self.runtime.as_ref(),
-                                    keys,
-                                    &spill,
-                                    &mut partial_groups,
-                                    &mut runs,
-                                )?;
-                                partial_bytes = 0;
-                                sample_external_group_process_memory(&self.memory_governor);
-                            }
-                            let create_started = Instant::now();
-                            let accumulator = self
-                                .runtime
-                                .incremental_group_accumulator(keys)
-                                .map_err(EngineError::execution)?
-                                .ok_or_else(|| {
-                                    EngineError::execution(ExecutionError::evaluation(
-                                        "external group runtime has no incremental accumulator",
-                                    ))
-                                })?;
-                            EXTERNAL_GROUP_ACCUMULATOR_CREATE_US
-                                .fetch_add(elapsed_micros(create_started), AtomicOrdering::Relaxed);
-                            partial_bytes = partial_bytes.saturating_add(estimate);
-                            update_atomic_peak(
-                                &EXTERNAL_GROUP_ESTIMATED_PEAK_BYTES,
-                                usize_to_u64_saturating(partial_bytes),
-                            );
-                            partial_groups.insert(key.clone(), accumulator);
-                        }
-                        let accumulate_started = sampled.then(Instant::now);
-                        let result = partial_groups
-                            .get_mut(key.as_ref())
-                            .expect("partial group accumulator exists")
-                            .push(row.document())
-                            .map_err(EngineError::execution);
-                        if let Some(started) = accumulate_started {
-                            ext_accumulate_ns =
-                                ext_accumulate_ns.saturating_add(elapsed_nanos(started));
-                        }
-                        result
-                    })?
-                    .expect("validated streaming prefix");
-                EXTERNAL_GROUP_SOURCE_US
-                    .fetch_add(elapsed_micros(source_started), AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_ROWS_CONSUMED.fetch_add(ext_rows, AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_CONSUME_SAMPLES.fetch_add(ext_samples, AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_KEY_NS.fetch_add(ext_key_ns, AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_LOOKUP_NS.fetch_add(ext_lookup_ns, AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_ACCUMULATE_NS.fetch_add(ext_accumulate_ns, AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_GROUP_HITS.fetch_add(ext_hits, AtomicOrdering::Relaxed);
-                EXTERNAL_GROUP_GROUP_MISSES.fetch_add(ext_misses, AtomicOrdering::Relaxed);
-                if !partial_groups.is_empty() {
-                    flush_partial_group_run(
-                        self.runtime.as_ref(),
-                        keys,
-                        &spill,
-                        &mut partial_groups,
-                        &mut runs,
-                    )?;
-                }
+                let (runs, prefix_stats) = self.external_group_runs(&prefix, keys, &stage, &spill)?;
+                drop(stage);
                 let returned = merge_group_runs(
                     self.runtime.as_ref(),
                     keys,
-                    working_budget,
                     &runs,
                     output_limit,
                     visitor,
                 )?;
-                drop(reservation);
                 let strategies = ExecutionStrategies::default()
                     .with(source_strategy)
                     .with(ExecutionStrategy::ExternalGroup);
-                return Ok(Some(ExecutionStatistics::streamed_with_strategies(
-                    prefix_stats.scanned(),
-                    prefix_stats.filtered(),
-                    returned,
-                    strategies,
-                )));
+                return Ok(Some(streamed_after(&prefix_stats, returned, strategies)));
             }
             _ => {}
         }
@@ -5379,28 +4464,17 @@ impl Engine {
         Ok(None)
     }
 
-    /// Executes a physical plan while suppressing streaming-load result rows.
-    pub fn execute_physical_compact( &self, physical: &PhysicalPlan, ) -> EngineResult<ExecutionOutput> {
-        let started = Instant::now();
-        let output = if let Some(storage) = self.system_collection_storage(physical)? {
-            self.executor
-                .execute_compact(&storage, self.runtime.as_ref(), physical)
-                .map_err(EngineError::execution)?
-        } else {
-            self.executor
-                .execute_compact(self.storage.as_ref(), self.runtime.as_ref(), physical)
-                .map_err(EngineError::execution)?
-        };
-        self.indexing.observe(QueryObservation::from_execution(
-            physical,
-            output.statistics(),
-            started.elapsed(),
-        ));
-        Ok(output)
+    /// Whether `collection` is a system collection built on demand (`_memory`, …).
+    fn is_virtual(&self, collection: &CollectionId) -> bool {
+        !self.bound && matches!(collection.as_str(), vcollections::INDEX_OBSERVATIONS | vcollections::MEMORY | vcollections::MEMORY_EVENTS | vcollections::QUERY_MEMORY)
     }
 
+    /// The storage holding the system collection `physical` reads, built now.
     fn system_collection_storage( &self, physical: &PhysicalPlan, ) -> EngineResult<Option<MemoryStorage>> {
         let collection = physical.source().collection();
+        if !self.is_virtual(collection) {
+            return Ok(None);
+        }
         let storage = match collection.as_str() {
             vcollections::INDEX_OBSERVATIONS => self.index_observations_storage()?,
             vcollections::MEMORY => self.memory_storage()?,
@@ -5444,7 +4518,7 @@ impl Engine {
         };
         let mut transaction = storage.begin().map_err(storage_engine_error)?;
 
-        let mut global = Document::from_fields([
+        let global = Document::from_fields([
             ("scope", Value::from("global")),
             ("class", Value::from("all")),
             ("profile", Value::from(profile.effective_profile_label())),
@@ -5491,7 +4565,6 @@ impl Engine {
             ("spill_flush_us", Value::from(spill.flush_us)),
             ("spill_sync_us", Value::from(spill.sync_us)),
         ]);
-        global.extend(EXTERNAL_GROUP_COUNTERS.iter().map(|(name, counter)| (*name, Value::from(counter.load(AtomicOrdering::Relaxed)))));
         // Class rows share the global schema; fields without a per-class meaning stay null.
         let class_template = Document::from_fields(global.keys().map(|name| (name.clone(), Value::Null)));
         insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x6d65_6d6f_7279, 0), global)?;
@@ -5626,6 +4699,19 @@ impl Engine {
     }
 }
 
+/// A temporal plan may only write through a terminal `into` (a restore into
+/// another collection); every other stage must read.
+fn temporal_plan_writes_allowed(physical: &PhysicalPlan) -> bool {
+    if !physical.is_write() {
+        return true;
+    }
+    let operators = physical.operators();
+    let Some((PhysicalOperator::Custom { stage: Some(crate::query::Stage::Into), .. }, prefix)) = operators.split_last() else {
+        return false;
+    };
+    PhysicalPlan::new(physical.source().clone(), prefix.iter().cloned()).is_ok_and(|plan| !plan.is_write())
+}
+
 fn usize_value(value: usize) -> Value {
     Value::from(usize_to_u64_saturating(value))
 }
@@ -5643,8 +4729,6 @@ impl fmt::Debug for Engine {
         formatter
             .debug_struct("Engine")
             .field("planner", &self.planner)
-            .field("physical_planner", &self.physical_planner)
-            .field("executor", &self.executor)
             .finish_non_exhaustive()
     }
 }
@@ -5686,37 +4770,23 @@ fn describe_operator(operator: &PhysicalOperator) -> String {
     }
 }
 
-/// Logical and physical representations of one planned query.
+/// One planned query.
 #[derive(Clone, Debug)]
 pub struct PlannedQuery {
-    logical: LogicalPlan,
     physical: PhysicalPlan,
 }
 
 impl PlannedQuery {
-    /// Creates a paired planned query.
     #[must_use]
     #[inline]
-    pub const fn new(logical: LogicalPlan, physical: PhysicalPlan) -> Self {
-        Self { logical, physical }
+    pub const fn new(physical: PhysicalPlan) -> Self {
+        Self { physical }
     }
 
-    /// Returns the logical plan.
-    #[must_use]
-    pub const fn logical(&self) -> &LogicalPlan {
-        &self.logical
-    }
-
-    /// Returns the physical plan.
+    /// Returns the executable plan.
     #[must_use]
     pub const fn physical(&self) -> &PhysicalPlan {
         &self.physical
-    }
-
-    /// Consumes the pair.
-    #[must_use]
-    pub fn into_parts(self) -> (LogicalPlan, PhysicalPlan) {
-        (self.logical, self.physical)
     }
 }
 
@@ -5747,6 +4817,22 @@ impl QueryOutput {
     }
 }
 
+/// Hands every row to `visitor`; returns how many it received.
+fn visit_all(visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, rows: Vec<ExecutionRow>) -> EngineResult<u64> {
+    visit_each(visitor, rows.into_iter().map(Ok))
+}
+
+/// [`visit_all`] for rows built as they are taken.
+fn visit_each(visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, rows: impl Iterator<Item = EngineResult<ExecutionRow>>) -> EngineResult<u64> {
+    rows.map(|row| visitor(row?)).try_fold(0u64, |returned, visited| visited.map(|()| returned + 1))
+}
+
+/// Statistics of a stage that returned `returned` rows from what its
+/// prefix scanned and filtered.
+fn streamed_after(prefix: &ExecutionStatistics, returned: u64, strategies: ExecutionStrategies) -> ExecutionStatistics {
+    ExecutionStatistics::streamed_with_strategies(prefix.scanned(), prefix.filtered(), returned, strategies)
+}
+
 fn emit_streaming_count( visitor: &mut dyn FnMut(StoredDocument) -> EngineResult<()>, alias: &str, count: u64, ) -> EngineResult<()> {
     let document = Arc::new(Document::from_fields([(alias, Value::from(count))]));
     let stored = StoredDocument::new(
@@ -5775,22 +4861,18 @@ struct GroupSpillRecord {
 }
 
 #[inline]
-fn bounded_sort_input_budget(working_budget: usize) -> usize {
-    // Keep half of the governed working set available for the stable sort scratch
-    // buffer. This makes every run self-contained inside the same memory contract.
-    working_budget.saturating_div(2).max(512 * 1024)
-}
-
-fn push_bounded_sort_row( runtime: &dyn ExecutionRuntime, keys: &[SortKey], spill: &SpillEngine, row: ExecutionRow, budget: usize, chunk: &mut Vec<ExecutionRow>, chunk_bytes: &mut usize, runs: &mut Vec<SpillRun>, oversized_message: &'static str, ) -> EngineResult<()> {
+fn push_bounded_sort_row( runtime: &QueryRuntime, keys: &[SortKey], spill: &SpillEngine, row: ExecutionRow, memory: &StageMemory<'_>, chunk: &mut Vec<ExecutionRow>, chunk_bytes: &mut usize, runs: &mut Vec<SpillRun>, oversized_message: &'static str, ) -> EngineResult<()> {
+    // As much again is kept for the scratch buffer of the stable sort: every
+    // run is sorted within the stage's memory.
     let estimated = execution_row_working_bytes(&row).map_err(EngineError::execution)?;
-    if estimated > budget {
+    if !chunk.is_empty() && !memory.fits(chunk_bytes.saturating_add(estimated).saturating_mul(2)) {
+        flush_sorted_run(runtime, keys, spill, chunk, runs).map_err(EngineError::execution)?;
+        *chunk_bytes = 0;
+    }
+    if !memory.fits(estimated.saturating_mul(2)) {
         return Err(EngineError::execution(ExecutionError::evaluation(
             oversized_message,
         )));
-    }
-    if !chunk.is_empty() && chunk_bytes.saturating_add(estimated) > budget {
-        flush_sorted_run(runtime, keys, spill, chunk, runs).map_err(EngineError::execution)?;
-        *chunk_bytes = 0;
     }
     *chunk_bytes = chunk_bytes.saturating_add(estimated);
     chunk.push(row);
@@ -5798,7 +4880,7 @@ fn push_bounded_sort_row( runtime: &dyn ExecutionRuntime, keys: &[SortKey], spil
 }
 
 fn flush_sorted_run(
-    runtime: &dyn ExecutionRuntime,
+    runtime: &QueryRuntime,
     keys: &[crate::query::SortKey],
     spill: &SpillEngine,
     chunk: &mut Vec<ExecutionRow>,
@@ -5816,7 +4898,7 @@ fn flush_sorted_run(
     Ok(())
 }
 
-fn emit_distinct_limited_rows( runtime: &dyn ExecutionRuntime, fields: &[crate::query::ExpressionFieldPath], limit: usize, rows: impl IntoIterator<Item = ExecutionRow>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
+fn emit_distinct_limited_rows( runtime: &QueryRuntime, fields: &[crate::query::ExpressionFieldPath], limit: usize, rows: impl IntoIterator<Item = ExecutionRow>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     if limit == 0 {
         return Ok(0);
     }
@@ -5842,7 +4924,7 @@ fn emit_distinct_limited_rows( runtime: &dyn ExecutionRuntime, fields: &[crate::
     Ok(returned)
 }
 
-fn merge_sorted_distinct_limited_runs( runtime: &dyn ExecutionRuntime, sort_keys: &[crate::query::SortKey], distinct_fields: &[crate::query::ExpressionFieldPath], runs: &[SpillRun], limit: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
+fn merge_sorted_distinct_limited_runs( runtime: &QueryRuntime, sort_keys: &[crate::query::SortKey], distinct_fields: &[crate::query::ExpressionFieldPath], runs: &[SpillRun], limit: usize, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     if limit == 0 {
         return Ok(0);
     }
@@ -5872,7 +4954,7 @@ fn merge_sorted_distinct_limited_runs( runtime: &dyn ExecutionRuntime, sort_keys
     Ok(returned)
 }
 
-fn merge_sorted_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::SortKey], runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
+fn merge_sorted_runs( runtime: &QueryRuntime, keys: &[crate::query::SortKey], runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
     let mut merge = merge_runs(runs, SpillRun::reader, read_spilled_row)?;
     let mut returned = 0u64;
     while limit.is_none_or(|limit| (returned as usize) < limit) {
@@ -5901,7 +4983,7 @@ fn merge_runs<R, T>( runs: &[SpillRun], open: fn(&SpillRun) -> io::Result<R>, ne
 }
 
 /// Whether `left` sorts strictly before `right` on `keys`.
-fn row_before( runtime: &dyn ExecutionRuntime, keys: &[crate::query::SortKey], left: &ExecutionRow, right: &ExecutionRow, ) -> Result<bool, ExecutionError> {
+fn row_before( runtime: &QueryRuntime, keys: &[crate::query::SortKey], left: &ExecutionRow, right: &ExecutionRow, ) -> Result<bool, ExecutionError> {
     Ok(runtime.compare_documents(keys, left.document(), right.document())? == Ordering::Less)
 }
 
@@ -5913,12 +4995,7 @@ fn read_spilled_row(reader: &mut SpillRunReader) -> Result<Option<ExecutionRow>,
         .transpose()
 }
 
-fn flush_partial_group_run( _runtime: &dyn ExecutionRuntime, _keys: &[crate::query::ExpressionFieldPath], spill: &SpillEngine, groups: &mut HashMap<Arc<[u8]>, Box<dyn crate::query::IncrementalGroupAccumulator>>, runs: &mut Vec<SpillRun>, ) -> EngineResult<()> {
-    let started = Instant::now();
-    let group_count = usize_to_u64_saturating(groups.len());
-    update_atomic_peak(&EXTERNAL_GROUP_PEAK_GROUPS_PER_FLUSH, group_count);
-
-    let finish_started = Instant::now();
+fn flush_partial_group_run( _runtime: &QueryRuntime, _keys: &[crate::query::ExpressionFieldPath], spill: &SpillEngine, groups: &mut HashMap<Arc<[u8]>, Box<dyn crate::query::IncrementalGroupAccumulator>>, runs: &mut Vec<SpillRun>, ) -> EngineResult<()> {
     let mut chunk = Vec::<GroupSpillRecord>::with_capacity(groups.len());
     for (ordinal, (key, accumulator)) in groups.drain().enumerate() {
         let partial = if let Some(payload) = accumulator
@@ -5939,14 +5016,7 @@ fn flush_partial_group_run( _runtime: &dyn ExecutionRuntime, _keys: &[crate::que
         };
         chunk.push(GroupSpillRecord { key, partial });
     }
-    EXTERNAL_GROUP_PARTIAL_FINISH_US
-        .fetch_add(elapsed_micros(finish_started), AtomicOrdering::Relaxed);
-
-    let sort_started = Instant::now();
     chunk.sort_by(|left, right| left.key.cmp(&right.key));
-    EXTERNAL_GROUP_FLUSH_SORT_US.fetch_add(elapsed_micros(sort_started), AtomicOrdering::Relaxed);
-
-    let encode_write_started = Instant::now();
     let mut writer = spill.create_run().map_err(engine_spill_error)?;
     // Group runs are block-framed and prefix-compressed. This amortizes the
     // generic spill engine's 8-byte framing across many groups and avoids
@@ -5971,75 +5041,33 @@ fn flush_partial_group_run( _runtime: &dyn ExecutionRuntime, _keys: &[crate::que
     if !block.is_empty() {
         writer.append(&block).map_err(engine_spill_error)?;
     }
-    let run = writer.finish().map_err(engine_spill_error)?;
-    let bytes = run.bytes();
-    runs.push(run);
-    chunk.clear();
-    EXTERNAL_GROUP_ENCODE_WRITE_US.fetch_add(
-        elapsed_micros(encode_write_started),
-        AtomicOrdering::Relaxed,
-    );
-
-    EXTERNAL_GROUP_FLUSHES.fetch_add(1, AtomicOrdering::Relaxed);
-    EXTERNAL_GROUP_PARTIALS_WRITTEN.fetch_add(group_count, AtomicOrdering::Relaxed);
-    EXTERNAL_GROUP_BYTES_WRITTEN.fetch_add(bytes, AtomicOrdering::Relaxed);
-    EXTERNAL_GROUP_FLUSH_US.fetch_add(elapsed_micros(started), AtomicOrdering::Relaxed);
+    runs.push(writer.finish().map_err(engine_spill_error)?);
     Ok(())
 }
 
 const GROUP_SPILL_BLOCK_TAG: u8 = 0xB2;
 const GROUP_SPILL_BLOCK_BYTES: usize = 64 * 1024;
 
-fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right.iter())
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn put_group_varint(output: &mut Vec<u8>, mut value: usize) {
-    while value >= 0x80 {
-        output.push((value as u8) | 0x80);
-        value >>= 7;
-    }
-    output.push(value as u8);
-}
-
-fn take_group_varint(bytes: &[u8], position: &mut usize) -> Result<usize, ExecutionError> {
-    let mut value = 0usize;
-    for shift in (0..usize::BITS).step_by(7) {
-        let byte = *bytes
-            .get(*position)
-            .ok_or_else(|| ExecutionError::evaluation("truncated group spill varint"))?;
-        *position += 1;
-        value |= usize::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-    Err(ExecutionError::evaluation("group spill varint overflow"))
-}
-
 fn append_group_spill_block_record( block: &mut Vec<u8>, previous_key: &mut Vec<u8>, payload_scratch: &mut Vec<u8>, record: &GroupSpillRecord, ) -> Result<(), ExecutionError> {
     if block.is_empty() {
         block.push(GROUP_SPILL_BLOCK_TAG);
     }
-    let common = common_prefix_len(previous_key, &record.key);
+    let common = crate::helpers::common_prefix_len(previous_key, &record.key);
     let suffix = &record.key[common..];
 
-    put_group_varint(block, common);
-    put_group_varint(block, suffix.len());
+    encode_varint(block, common as u64);
+    encode_varint(block, suffix.len() as u64);
     match &record.partial {
         GroupSpillPartial::Compact(payload) => {
             block.push(1);
-            put_group_varint(block, payload.len());
+            encode_varint(block, payload.len() as u64);
             block.extend_from_slice(suffix);
             block.extend_from_slice(payload);
         }
         GroupSpillPartial::Document(row) => {
             encode_execution_row_into(row, payload_scratch)?;
             block.push(0);
-            put_group_varint(block, payload_scratch.len());
+            encode_varint(block, payload_scratch.len() as u64);
             block.extend_from_slice(suffix);
             block.extend_from_slice(payload_scratch);
         }
@@ -6057,22 +5085,6 @@ fn decode_group_spill_partial( tag: u8, payload: &[u8], ) -> Result<GroupSpillPa
             "invalid group spill tag {tag}"
         ))),
     }
-}
-
-// Legacy one-record framing remains readable for compatibility with tests and
-// custom spill producers; new engine runs use GROUP_SPILL_BLOCK_TAG blocks.
-fn decode_group_spill_record(bytes: &[u8]) -> Result<GroupSpillRecord, ExecutionError> {
-    if bytes.len() < 5 {
-        return Err(ExecutionError::evaluation("truncated group spill row"));
-    }
-    let key_len = u32::from_le_bytes(bytes[1..5].try_into().expect("four bytes")) as usize;
-    if bytes.len() < 5 + key_len {
-        return Err(ExecutionError::evaluation("truncated group spill key"));
-    }
-    Ok(GroupSpillRecord {
-        key: Arc::from(&bytes[5..5 + key_len]),
-        partial: decode_group_spill_partial(bytes[0], &bytes[5 + key_len..])?,
-    })
 }
 
 struct GroupSpillRunReader {
@@ -6096,45 +5108,19 @@ impl GroupSpillRunReader {
             return Ok(None);
         };
         if bytes.first().copied() != Some(GROUP_SPILL_BLOCK_TAG) {
-            return decode_group_spill_record(&bytes).map(Some);
+            return Err(ExecutionError::evaluation("invalid group spill block"));
         }
-        let mut position = 1usize;
+        let mut input = Decoder::new(&bytes[1..]);
         let mut previous_key = Vec::<u8>::new();
-        while position < bytes.len() {
-            let common = take_group_varint(&bytes, &mut position)?;
-            let suffix_len = take_group_varint(&bytes, &mut position)?;
-            let tag = *bytes
-                .get(position)
-                .ok_or_else(|| ExecutionError::evaluation("truncated group spill block tag"))?;
-            position += 1;
-            let payload_len = take_group_varint(&bytes, &mut position)?;
+        while !input.is_empty() {
+            let (common, suffix_len, tag, payload_len) = (input.size()?, input.size()?, input.byte()?, input.size()?);
             if common > previous_key.len() {
                 return Err(ExecutionError::evaluation("invalid group spill key prefix"));
             }
-            let suffix_end = position
-                .checked_add(suffix_len)
-                .ok_or_else(|| ExecutionError::evaluation("group spill suffix overflow"))?;
-            let suffix = bytes
-                .get(position..suffix_end)
-                .ok_or_else(|| ExecutionError::evaluation("truncated group spill key suffix"))?;
-            position = suffix_end;
-            let payload_end = position
-                .checked_add(payload_len)
-                .ok_or_else(|| ExecutionError::evaluation("group spill payload overflow"))?;
-            let payload = bytes
-                .get(position..payload_end)
-                .ok_or_else(|| ExecutionError::evaluation("truncated group spill payload"))?;
-            position = payload_end;
-
-            let mut key = Vec::with_capacity(common + suffix.len());
-            key.extend_from_slice(&previous_key[..common]);
-            key.extend_from_slice(suffix);
-            previous_key.clear();
-            previous_key.extend_from_slice(&key);
-            self.pending.push_back(GroupSpillRecord {
-                key: Arc::from(key),
-                partial: decode_group_spill_partial(tag, payload)?,
-            });
+            previous_key.truncate(common);
+            previous_key.extend_from_slice(input.take(suffix_len)?);
+            let partial = decode_group_spill_partial(tag, input.take(payload_len)?)?;
+            self.pending.push_back(GroupSpillRecord { key: Arc::from(previous_key.as_slice()), partial });
         }
         self.pending
             .pop_front()
@@ -6164,33 +5150,18 @@ fn flush_keyed_run( spill: &SpillEngine, chunk: &mut Vec<KeyedRow>, runs: &mut V
 }
 
 fn encode_keyed_row_into( keyed: &KeyedRow, output: &mut Vec<u8>, row_output: &mut Vec<u8>, ) -> Result<(), ExecutionError> {
-    let key_len = u32::try_from(keyed.key.len())
-        .map_err(|_| ExecutionError::evaluation("blocking key exceeds u32"))?;
     encode_execution_row_into(&keyed.row, row_output)?;
     output.clear();
-    output.reserve(
-        4usize
-            .saturating_add(keyed.key.len())
-            .saturating_add(row_output.len()),
-    );
-    output.extend_from_slice(&key_len.to_le_bytes());
-    output.extend_from_slice(&keyed.key);
+    encode_bytes(output, &keyed.key);
     output.extend_from_slice(row_output);
     Ok(())
 }
 
 fn decode_keyed_row(bytes: &[u8]) -> Result<KeyedRow, ExecutionError> {
-    if bytes.len() < 4 {
-        return Err(ExecutionError::evaluation("truncated keyed spill row"));
-    }
-    let key_len = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes")) as usize;
-    if bytes.len() < 4 + key_len {
-        return Err(ExecutionError::evaluation("truncated keyed spill key"));
-    }
-    Ok(KeyedRow {
-        key: Arc::from(&bytes[4..4 + key_len]),
-        row: decode_execution_row(&bytes[4 + key_len..])?,
-    })
+    let mut input = Decoder::new(bytes);
+    let len = input.len()?;
+    let key = Arc::from(input.take(len)?);
+    Ok(KeyedRow { key, row: decode_execution_row(input.rest())? })
 }
 
 fn read_keyed_row(reader: &mut SpillRunReader) -> Result<Option<KeyedRow>, ExecutionError> {
@@ -6221,76 +5192,42 @@ fn merge_distinct_runs( runs: &[SpillRun], limit: Option<usize>, visitor: &mut d
     Ok(returned)
 }
 
-fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::ExpressionFieldPath], group_budget: usize, runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
-    // Capability-driven runtimes expose an incremental accumulator. In that
-    // mode one group retains only its keys, counters and aggregate states;
-    // source rows are never materialized regardless of group cardinality.
-    if runtime
-        .incremental_group_accumulator(keys)
-        .map_err(EngineError::execution)?
-        .is_some()
+fn merge_group_runs( runtime: &QueryRuntime, keys: &[crate::query::ExpressionFieldPath], runs: &[SpillRun], limit: Option<usize>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<u64> {
+    // One group retains only its keys, counters and aggregate states; source
+    // rows are never materialized regardless of group cardinality.
     {
-        let merge_started = Instant::now();
-        let mut merged_partials = 0u64;
-        let init_started = Instant::now();
         let mut merge = merge_runs(runs, GroupSpillRunReader::new, read_group_spill_record)?;
-        EXTERNAL_GROUP_MERGE_INIT_US
-            .fetch_add(elapsed_micros(init_started), AtomicOrdering::Relaxed);
         let mut current_key: Option<Arc<[u8]>> = None;
         let mut accumulator: Option<Box<dyn crate::query::IncrementalGroupAccumulator>> = None;
         let mut returned = 0u64;
-        let mut merge_samples = 0u64;
-        let mut merge_select_ns = 0u64;
-        let mut merge_partial_ns = 0u64;
-        let mut merge_read_ns = 0u64;
-        let mut merge_finish_ns = 0u64;
 
         loop {
-            let sampled =
-                crate::debug::query_instrumentation_enabled() && merged_partials & 1023 == 0;
-            let select_started = sampled.then(Instant::now);
             let selected = merge
                 .min_index(|left, right| Ok(left.key < right.key))
                 .map_err(EngineError::execution)?;
-            if let Some(started) = select_started {
-                merge_select_ns = merge_select_ns.saturating_add(elapsed_nanos(started));
-            }
             let Some(index) = selected else { break };
             if limit.is_some_and(|limit| returned as usize >= limit) {
                 break;
             }
-            if sampled {
-                merge_samples = merge_samples.saturating_add(1);
-            }
-
-            let read_started = sampled.then(Instant::now);
             let keyed = merge.take(index).map_err(EngineError::execution)?;
-            if let Some(started) = read_started {
-                merge_read_ns = merge_read_ns.saturating_add(elapsed_nanos(started));
-            }
-            merged_partials = merged_partials.saturating_add(1);
             let key_changed = current_key
                 .as_deref()
                 .is_some_and(|key| key != keyed.key.as_ref());
 
             if key_changed {
                 if let Some(state) = accumulator.take() {
-                    let finish_started = sampled.then(Instant::now);
                     let ordinal = returned.saturating_add(1);
                     let synthetic = state.finish(ordinal).map_err(EngineError::execution)?;
                     visitor(ExecutionRow::synthetic(synthetic))?;
-                    if let Some(started) = finish_started {
-                        merge_finish_ns = merge_finish_ns.saturating_add(elapsed_nanos(started));
-                    }
                     returned = returned.saturating_add(1);
                 }
             }
 
             if current_key.as_deref() != Some(keyed.key.as_ref()) {
                 current_key = Some(keyed.key.clone());
-                accumulator = runtime
+                accumulator = Some(runtime
                     .incremental_group_accumulator(keys)
-                    .map_err(EngineError::execution)?;
+                    .map_err(EngineError::execution)?);
                 if let Some(state) = accumulator.as_mut() {
                     // Standard compact partials omit key values; seed them once
                     // from the canonical merge key. Legacy/custom runtimes may
@@ -6301,7 +5238,6 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
                 }
             }
 
-            let partial_started = sampled.then(Instant::now);
             let accumulator = accumulator
                 .as_mut()
                 .expect("incremental group capability was probed above");
@@ -6324,92 +5260,18 @@ fn merge_group_runs( runtime: &dyn ExecutionRuntime, keys: &[crate::query::Expre
                     )));
                 }
             }
-            if let Some(started) = partial_started {
-                merge_partial_ns = merge_partial_ns.saturating_add(elapsed_nanos(started));
-            }
         }
 
         if limit.is_none_or(|limit| (returned as usize) < limit) {
             if let Some(state) = accumulator.take() {
-                let finish_started = Instant::now();
                 let ordinal = returned.saturating_add(1);
                 let synthetic = state.finish(ordinal).map_err(EngineError::execution)?;
                 visitor(ExecutionRow::synthetic(synthetic))?;
-                merge_finish_ns = merge_finish_ns.saturating_add(elapsed_nanos(finish_started));
                 returned = returned.saturating_add(1);
             }
         }
-        EXTERNAL_GROUP_MERGE_SAMPLES.fetch_add(merge_samples, AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_MERGE_SELECT_NS.fetch_add(merge_select_ns, AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_MERGE_PARTIAL_NS.fetch_add(merge_partial_ns, AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_MERGE_READ_NS.fetch_add(merge_read_ns, AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_MERGE_FINISH_NS.fetch_add(merge_finish_ns, AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_PARTIALS_MERGED.fetch_add(merged_partials, AtomicOrdering::Relaxed);
-        EXTERNAL_GROUP_MERGE_US.fetch_add(elapsed_micros(merge_started), AtomicOrdering::Relaxed);
-        return Ok(returned);
+        Ok(returned)
     }
-
-    // Compatibility fallback for custom runtimes that only implement the
-    // legacy whole-group materializer.
-    let mut merge = merge_runs(runs, GroupSpillRunReader::new, read_group_spill_record)?;
-    let mut current_key: Option<Arc<[u8]>> = None;
-    let mut documents = Vec::<Arc<Document>>::new();
-    let mut group_bytes = 0usize;
-    let mut returned = 0u64;
-
-    while let Some(keyed) = merge
-        .pop_min(|left, right| Ok(left.key < right.key))
-        .map_err(EngineError::execution)?
-    {
-        if current_key
-            .as_deref()
-            .is_some_and(|key| key != keyed.key.as_ref())
-        {
-            emit_group_documents(runtime, keys, limit, &mut documents, &mut returned, visitor)?;
-            group_bytes = 0;
-            if limit.is_some_and(|limit| returned as usize >= limit) {
-                break;
-            }
-        }
-        current_key = Some(keyed.key.clone());
-        let row = match keyed.partial {
-            GroupSpillPartial::Document(row) => row,
-            GroupSpillPartial::Compact(_) => {
-                return Err(EngineError::execution(ExecutionError::evaluation(
-                    "legacy group runtime cannot merge compact spilled state",
-                )));
-            }
-        };
-        let row_bytes = execution_row_encoded_len(&row);
-        group_bytes = group_bytes.saturating_add(row_bytes);
-        if group_bytes > group_budget {
-            return Err(EngineError::execution(ExecutionError::evaluation(
-                "one group exceeds the governed query working set; incremental group aggregation is required",
-            )));
-        }
-        documents.push(row.shared_document());
-    }
-    emit_group_documents(runtime, keys, limit, &mut documents, &mut returned, visitor)?;
-    Ok(returned)
-}
-
-fn emit_group_documents( runtime: &dyn ExecutionRuntime, keys: &[crate::query::ExpressionFieldPath], limit: Option<usize>, documents: &mut Vec<Arc<Document>>, returned: &mut u64, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<()> {
-    if documents.is_empty() || limit.is_some_and(|limit| *returned as usize >= limit) {
-        documents.clear();
-        return Ok(());
-    }
-    for synthetic in runtime
-        .group_documents(keys, documents)
-        .map_err(EngineError::execution)?
-    {
-        if limit.is_some_and(|limit| *returned as usize >= limit) {
-            break;
-        }
-        visitor(ExecutionRow::synthetic(synthetic))?;
-        *returned = returned.saturating_add(1);
-    }
-    documents.clear();
-    Ok(())
 }
 
 fn spill_engine_error(error: io::Error) -> ExecutionError {
@@ -6448,6 +5310,12 @@ impl EngineError {
     #[must_use]
     pub const fn execution(error: ExecutionError) -> Self {
         Self::new(EngineErrorKind::Execution(error))
+    }
+}
+
+impl From<ExecutionError> for EngineError {
+    fn from(error: ExecutionError) -> Self {
+        Self::execution(error)
     }
 }
 
@@ -6494,41 +5362,17 @@ pub enum EngineErrorKind {
 mod tests {
     use super::*;
     use crate::{
-        query::{ExecutionResult, PhysicalSource},
+        query::PhysicalSource,
         storage::{memory::MemoryStorage, CollectionId},
-        Document,
     };
 
-    #[derive(Debug, Default)]
-    struct EmptyRuntime;
-
-    impl ExecutionRuntime for EmptyRuntime {
-        fn evaluate_predicate( &self, _expression: &crate::query::Expression, _document: &Document, ) -> ExecutionResult<bool> {
-            panic!("runtime must not be called for an empty collection")
-        }
-
-        fn apply_set( &self, _assignments: &[crate::query::SetAssignment], _document: &Document, ) -> ExecutionResult<Arc<Document>> {
-            panic!("runtime must not be called for an empty collection")
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct SourceOnlyLowerer;
-
-    impl PlanLowerer for SourceOnlyLowerer {
-        fn lower( &self, _logical: &LogicalPlan, physical_planner: &PhysicalPlanner, ) -> Result<PhysicalPlan, PhysicalPlanError> {
-            let collection = CollectionId::parse("users").expect("test collection must be valid");
-            physical_planner.plan_collection(collection).finish()
-        }
-    }
-
-    #[test] fn engine_executes_an_existing_empty_physical_plan() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let engine = Engine::new(storage, runtime, lowerer); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert!(output.is_empty()); assert!(!output.committed()); }
-    #[test] fn governed_streaming_accepts_group_followed_by_sort_and_limit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let engine = Engine::new(storage, runtime, lowerer); let group_field = crate::query::ExpressionFieldPath::new(["Article_Code"]).expect("valid group field"); let sort_field = crate::query::ExpressionFieldPath::new(["CA"]).expect("valid sort field"); let plan = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("data").unwrap()), [ PhysicalOperator::group([group_field]).unwrap(), PhysicalOperator::sort([crate::query::SortKey::descending(sort_field)]).unwrap(), PhysicalOperator::limit(10), ], ) .unwrap(); assert!(engine.supports_governed_blocking_streaming(&plan)); }
-    #[test] fn engine_debug_does_not_require_trait_objects_to_be_debug() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let debug = format!("{:?}", Engine::new(storage, runtime, lowerer)); assert!(debug.starts_with("Engine")); }
-    #[test] fn plan_cached_records_a_miss_then_a_hit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let engine = Engine::new(storage, runtime, lowerer); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 0, misses: 1, evictions: 0, } ); engine.plan_cached(source, &pipeline).expect("cached plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 1, misses: 1, evictions: 0, } ); }
-    #[test] fn invalidating_planner_cache_forces_replanning() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let engine = Engine::new(storage, runtime, lowerer); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); engine.invalidate_planner_cache(); engine.plan_cached(source, &pipeline).expect("replanned"); let stats = engine.planner_cache_stats(); assert_eq!(stats.hits, 0); assert_eq!(stats.misses, 2); }
+    #[test] fn engine_executes_an_existing_empty_physical_plan() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert!(output.is_empty()); assert!(!output.committed()); }
+    #[test] fn governed_streaming_accepts_group_followed_by_sort_and_limit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let group_field = crate::query::ExpressionFieldPath::new(["Article_Code"]).expect("valid group field"); let sort_field = crate::query::ExpressionFieldPath::new(["CA"]).expect("valid sort field"); let plan = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("data").unwrap()), [ PhysicalOperator::group([group_field]).unwrap(), PhysicalOperator::sort([crate::query::SortKey::descending(sort_field)]).unwrap(), PhysicalOperator::limit(10), ], ) .unwrap(); assert!(engine.supports_governed_blocking_streaming(&plan)); }
+    #[test] fn engine_debug_does_not_require_trait_objects_to_be_debug() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let debug = format!("{:?}", Engine::new(storage)); assert!(debug.starts_with("Engine")); }
+    #[test] fn plan_cached_records_a_miss_then_a_hit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 0, misses: 1, evictions: 0, } ); engine.plan_cached(source, &pipeline).expect("cached plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 1, misses: 1, evictions: 0, } ); }
+    #[test] fn invalidating_planner_cache_forces_replanning() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); engine.invalidate_planner_cache(); engine.plan_cached(source, &pipeline).expect("replanned"); let stats = engine.planner_cache_stats(); assert_eq!(stats.hits, 0); assert_eq!(stats.misses, 2); }
     #[test] fn engine_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Engine>(); assert_send_and_sync::<PlannedQuery>(); assert_send_and_sync::<QueryOutput>(); assert_send_and_sync::<EngineError>(); }
-    #[test] fn memory_system_collection_exposes_global_and_class_rows() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let governor = MemoryGovernor::with_limit(1_024); let _held = governor .reserve(crate::memory::MemoryClass::Query, 128) .unwrap(); let engine = Engine::new(storage, runtime, lowerer).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 7); assert!(output.rows().iter().any(|row| { row.document().get("scope") == Some(&Value::from("global")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); assert!(output.rows().iter().any(|row| { row.document().get("class") == Some(&Value::from("query")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); }
-    #[test] fn memory_events_system_collection_exposes_bounded_journal() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let governor = MemoryGovernor::with_limit_and_event_capacity(8 * 1024 * 1024, 8); let reservation = governor .reserve( crate::memory::MemoryClass::Import, crate::memory::MEMORY_EVENT_MIN_BYTES, ) .unwrap(); drop(reservation); let engine = Engine::new(storage, runtime, lowerer).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY_EVENTS).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 2); let kinds = output .rows() .iter() .filter_map(|row| row.document().get("kind")) .cloned() .collect::<Vec<_>>(); assert!(kinds.contains(&Value::from("reserved"))); assert!(kinds.contains(&Value::from("released"))); }
-    #[test] fn sort_distinct_limit_has_a_bounded_streaming_executor() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime: Arc<dyn ExecutionRuntime> = Arc::new(EmptyRuntime); let lowerer: Arc<dyn PlanLowerer> = Arc::new(SourceOnlyLowerer); let engine = Engine::new(storage, runtime, lowerer); let operators = vec![ PhysicalOperator::sort([crate::query::SortKey::ascending( crate::query::ExpressionFieldPath::new(["value"]).unwrap(), )]) .unwrap(), PhysicalOperator::distinct([]).unwrap(), PhysicalOperator::limit(10), ]; let plan = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("data").unwrap()), operators, ) .unwrap(); assert!(engine.supports_governed_blocking_streaming(&plan)); }
+    #[test] fn memory_system_collection_exposes_global_and_class_rows() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit(1_024); let _held = governor .reserve(crate::memory::MemoryClass::Query, 128) .unwrap(); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 7); assert!(output.rows().iter().any(|row| { row.document().get("scope") == Some(&Value::from("global")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); assert!(output.rows().iter().any(|row| { row.document().get("class") == Some(&Value::from("query")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); }
+    #[test] fn memory_events_system_collection_exposes_bounded_journal() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit_and_event_capacity(8 * 1024 * 1024, 8); let reservation = governor .reserve( crate::memory::MemoryClass::Import, crate::memory::MEMORY_EVENT_MIN_BYTES, ) .unwrap(); drop(reservation); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY_EVENTS).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 2); let kinds = output .rows() .iter() .filter_map(|row| row.document().get("kind")) .cloned() .collect::<Vec<_>>(); assert!(kinds.contains(&Value::from("reserved"))); assert!(kinds.contains(&Value::from("released"))); }
+    #[test] fn sort_distinct_limit_has_a_bounded_streaming_executor() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let operators = vec![ PhysicalOperator::sort([crate::query::SortKey::ascending( crate::query::ExpressionFieldPath::new(["value"]).unwrap(), )]) .unwrap(), PhysicalOperator::distinct([]).unwrap(), PhysicalOperator::limit(10), ]; let plan = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("data").unwrap()), operators, ) .unwrap(); assert!(engine.supports_governed_blocking_streaming(&plan)); }
 }

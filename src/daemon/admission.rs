@@ -9,6 +9,7 @@
 //! Connections that cannot be admitted wait in a FIFO queue in which local
 //! connections (the admin CLI) go before Gateway channels, so an operator can
 //! still reach a node that is being flooded through its Gateway.
+#![cfg_attr(rustfmt, rustfmt_skip)]
 use std::{
     collections::VecDeque,
     sync::{Arc, Condvar, Mutex, PoisonError},
@@ -190,84 +191,15 @@ mod tests {
         Arc::new(ConnectionAdmission::new(MemoryGovernor::with_process_limit(limit_bytes)))
     }
 
-    #[test]
-    fn budget_excludes_the_operation_envelope() {
-        let profile = MemoryProfileConfig::for_limit(256 * MIB);
-        let budget = connection_budget_bytes(profile);
-        assert_eq!(
-            budget,
-            profile.managed_budget_bytes.unwrap() - profile.operation_budget_bytes
-        );
-        assert!(budget / CONNECTION_THREAD_FOOTPRINT_BYTES >= 64);
-    }
+    #[test] fn budget_excludes_the_operation_envelope() { let profile = MemoryProfileConfig::for_limit(256 * MIB); let budget = connection_budget_bytes(profile); assert_eq!(budget, profile.managed_budget_bytes.unwrap() - profile.operation_budget_bytes); assert!(budget / CONNECTION_THREAD_FOOTPRINT_BYTES >= 64); }
 
-    #[test]
-    fn permits_reserve_and_release_network_memory() {
-        let admission = admission_with_limit(256 * MIB);
-        let permit = admission.acquire(2, AdmissionPriority::Gateway);
-        assert_eq!(admission.governor.reserved_bytes(), 2 * CONNECTION_THREAD_FOOTPRINT_BYTES);
-        drop(permit);
-        assert_eq!(admission.governor.reserved_bytes(), 0);
-    }
+    #[test] fn permits_reserve_and_release_network_memory() { let admission = admission_with_limit(256 * MIB); let permit = admission.acquire(2, AdmissionPriority::Gateway); assert_eq!(admission.governor.reserved_bytes(), 2 * CONNECTION_THREAD_FOOTPRINT_BYTES); drop(permit); assert_eq!(admission.governor.reserved_bytes(), 0); }
 
-    #[test]
-    fn saturated_admission_times_out_then_recovers() {
-        let admission = admission_with_limit(256 * MIB);
-        let capacity = admission.budget_bytes / CONNECTION_THREAD_FOOTPRINT_BYTES;
-        let held = (0..capacity)
-            .map(|_| admission.acquire(1, AdmissionPriority::Local))
-            .collect::<Vec<_>>();
-        let deadline = Instant::now() + Duration::from_millis(50);
-        assert!(admission
-            .acquire_until(1, AdmissionPriority::Gateway, Some(deadline))
-            .is_none());
-        assert!(lock_unpoisoned(&admission.state).waiting.is_empty());
-        drop(held);
-        assert!(admission
-            .acquire_until(1, AdmissionPriority::Gateway, Some(Instant::now()))
-            .is_some());
-    }
+    #[test] fn saturated_admission_times_out_then_recovers() { let admission = admission_with_limit(256 * MIB); let capacity = admission.budget_bytes / CONNECTION_THREAD_FOOTPRINT_BYTES; let held = (0..capacity).map(|_| admission.acquire(1, AdmissionPriority::Local)).collect::<Vec<_>>(); let deadline = Instant::now() + Duration::from_millis(50); assert!(admission.acquire_until(1, AdmissionPriority::Gateway, Some(deadline)).is_none()); assert!(lock_unpoisoned(&admission.state).waiting.is_empty()); drop(held); assert!(admission.acquire_until(1, AdmissionPriority::Gateway, Some(Instant::now())).is_some()); }
 
-    #[test]
-    fn waiter_is_admitted_when_a_permit_is_released() {
-        let admission = admission_with_limit(256 * MIB);
-        let capacity = admission.budget_bytes / CONNECTION_THREAD_FOOTPRINT_BYTES;
-        let mut held = (0..capacity)
-            .map(|_| admission.acquire(1, AdmissionPriority::Local))
-            .collect::<Vec<_>>();
-        let waiter = {
-            let admission = Arc::clone(&admission);
-            thread::spawn(move || {
-                admission
-                    .acquire_until(1, AdmissionPriority::Gateway, Some(Instant::now() + Duration::from_secs(5)))
-                    .is_some()
-            })
-        };
-        thread::sleep(Duration::from_millis(20));
-        held.pop();
-        assert!(waiter.join().unwrap());
-    }
+    #[test] fn waiter_is_admitted_when_a_permit_is_released() { let admission = admission_with_limit(256 * MIB); let capacity = admission.budget_bytes / CONNECTION_THREAD_FOOTPRINT_BYTES; let mut held = (0..capacity).map(|_| admission.acquire(1, AdmissionPriority::Local)).collect::<Vec<_>>(); let waiter = { let admission = Arc::clone(&admission); thread::spawn(move || { admission.acquire_until(1, AdmissionPriority::Gateway, Some(Instant::now() + Duration::from_secs(5))).is_some() }) }; thread::sleep(Duration::from_millis(20)); held.pop(); assert!(waiter.join().unwrap()); }
 
-    #[test]
-    fn local_waiters_go_before_gateway_waiters() {
-        let mut state = AdmissionState::default();
-        state.waiting.push_back((1, AdmissionPriority::Gateway));
-        state.waiting.push_back((2, AdmissionPriority::Local));
-        assert_eq!(state.head(), Some(2));
-        state.leave(2);
-        assert_eq!(state.head(), Some(1));
-    }
+    #[test] fn local_waiters_go_before_gateway_waiters() { let mut state = AdmissionState::default(); state.waiting.push_back((1, AdmissionPriority::Gateway)); state.waiting.push_back((2, AdmissionPriority::Local)); assert_eq!(state.head(), Some(2)); state.leave(2); assert_eq!(state.head(), Some(1)); }
 
-    #[test]
-    fn idle_node_admits_even_beyond_budget() {
-        let admission = Arc::new(ConnectionAdmission {
-            budget_bytes: 0,
-            ..ConnectionAdmission::new(MemoryGovernor::unlimited())
-        });
-        let first = admission.acquire_until(1, AdmissionPriority::Local, Some(Instant::now()));
-        assert!(first.is_some());
-        assert!(admission
-            .acquire_until(1, AdmissionPriority::Local, Some(Instant::now()))
-            .is_none());
-    }
+    #[test] fn idle_node_admits_even_beyond_budget() { let admission = Arc::new(ConnectionAdmission { budget_bytes: 0,..ConnectionAdmission::new(MemoryGovernor::unlimited()) }); let first = admission.acquire_until(1, AdmissionPriority::Local, Some(Instant::now())); assert!(first.is_some()); assert!(admission.acquire_until(1, AdmissionPriority::Local, Some(Instant::now())).is_none()); }
 }

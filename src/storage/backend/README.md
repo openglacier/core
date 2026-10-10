@@ -90,6 +90,10 @@ flowchart TD
 
 - `.checkpoint` stores the current generation, data length, collection documents, and field metadata.
 - `.primary.<hash>` stores compact ordered entries: document ID, generation, version, record offset, and record length.
+- `.timeline` (only with `OGD_HISTORY=on`) stores the time and author of each commit, appended without sync. It
+  dates `as of "<date>"` reads and fills `_at`/`_by` in `history`; the versions themselves need nothing more,
+  since the store file keeps every committed frame. `as of` reads the in-memory index at the older generation when
+  it covers it (from the checkpoint loaded at open), and otherwise rebuilds the changed documents from the frames.
 - In memory, `GlacierState` tracks generation, clear generations, per-collection indexes, and field metadata.
 
 Source: `glacier.rs` lines 206-290, 668-705, and 5365-5492.

@@ -10,7 +10,9 @@ pub mod glacier;
 mod glacier_mmap;
 pub mod memory;
 
-use super::{ CollectionId, CommitResult, StorageMutation, StorageRead, StorageResult, StorageTransaction, StoredDocument, };
+use std::sync::Arc;
+
+use super::{ CollectionId, CommitResult, StorageError, StorageMutation, StorageRead, StorageResult, StorageTransaction, StoredDocument, Temporal, TemporalCache, };
 
 /// Common contract implemented by physical storage backends.
 ///
@@ -20,6 +22,12 @@ use super::{ CollectionId, CommitResult, StorageMutation, StorageRead, StorageRe
 pub trait StorageBackend: Send + Sync {
     /// Opens a consistent backend read snapshot.
     fn read(&self) -> StorageResult<Box<dyn StorageRead + '_>>;
+
+    /// Opens a temporal read view (see [`crate::storage::history`]). The
+    /// default keeps no history.
+    fn read_temporal(&self, _temporal: &Temporal, _cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + '_>> {
+        Err(StorageError::history_unavailable())
+    }
 
     /// Begins a mutable multi-collection transaction.
     fn begin(&self) -> StorageResult<Box<dyn StorageTransaction + '_>>;

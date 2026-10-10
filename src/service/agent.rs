@@ -21,7 +21,7 @@ use crate::{
     access::authorization::QueryAccess,
     helpers::{unix_time_nanos, JsonFields},
     operation::{AgentRunInput, LlmMessageInput, LlmToolCallInput, LlmToolChoice, LlmToolDefinition},
-    query::{parse as parse_query, LogicalOperator, Planner},
+    query::{parse as parse_query, PhysicalOperator, Planner},
     storage::CollectionId,
 };
 
@@ -1267,15 +1267,15 @@ fn validate_read_only_query(query: &str) -> Result<(), AgentError> {
     let plan = Planner::new()
         .plan_ast(query, &ast)
         .map_err(|error| AgentError::InvalidToolCall(format!("invalid database query: {error}")))?;
-    if !plan.is_read_only() {
+    if plan.is_write() {
         return Err(AgentError::ToolDenied(
             "database.query accepts read-only queries only".to_owned(),
         ));
     }
-    if plan.operators().any(|operator| {
+    if plan.operators().iter().any(|operator| {
         matches!(
             operator,
-            LogicalOperator::Custom { stage, .. } if stage.as_str() == "sample"
+            PhysicalOperator::Custom { stage: Some(crate::query::Stage::Sample), .. }
         )
     }) {
         return Err(AgentError::ToolDenied(

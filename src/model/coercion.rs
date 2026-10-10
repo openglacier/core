@@ -365,7 +365,7 @@ fn parse_float(text: &str) -> CoercionResult<CoercedNumber> {
     if !value.is_finite() {
         return Err(CoercionFailure::OutOfRange);
     }
-    Ok(CoercedNumber::Float(normalize_zero(value)))
+    Ok(CoercedNumber::Float(crate::helpers::normalize_zero(value)))
 }
 
 fn coerce_signed_unsigned(signed: i64, unsigned: u64) -> CoercionResult<CoercedNumberPair> {
@@ -405,14 +405,6 @@ pub(crate) const fn unsigned_to_exact_float(value: u64) -> CoercionResult<f64> {
         Ok(converted)
     } else {
         Err(CoercionFailure::PrecisionLoss)
-    }
-}
-
-fn normalize_zero(value: f64) -> f64 {
-    if value == 0.0 {
-        0.0
-    } else {
-        value
     }
 }
 

@@ -96,7 +96,6 @@ struct DebugConfig {
     protocol: bool,
     timing: bool,
     memory: bool,
-    query_instrumentation: bool,
 }
 
 impl DebugConfig {
@@ -122,7 +121,6 @@ impl DebugConfig {
             timing: env_flag("OGD_DEBUG_TIMING"),
             memory: env_flag("OGD_DEBUG_MEMORY")
                 || normalized.split(',').any(|v| v.trim() == "memory"),
-            query_instrumentation: env_flag("OGD_DEBUG_QUERY"),
         }
     }
 
@@ -164,13 +162,6 @@ pub fn timing_enabled() -> bool {
 #[must_use]
 pub fn memory_enabled() -> bool {
     config().memory
-}
-
-/// Enables expensive per-query profiling. Disabled by default so production
-/// scans keep only low-cost aggregate counters.
-#[must_use]
-pub fn query_instrumentation_enabled() -> bool {
-    config().query_instrumentation
 }
 
 pub fn log(topic: DebugTopic, connection_id: Option<u64>, message: impl AsRef<str>) {

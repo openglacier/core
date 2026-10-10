@@ -98,14 +98,14 @@ impl DateTime {
         }
     }
 
-    /// Epoch milliseconds of these calendar fields.
+    /// Epoch milliseconds of these calendar fields; `None` outside `i64`.
     #[must_use]
-    pub fn to_millis(self) -> i64 {
-        days_from_civil(self.year, self.month, self.day) * MS_PER_DAY
-            + i64::from(self.hour) * MS_PER_HOUR
+    pub fn to_millis(self) -> Option<i64> {
+        let time = i64::from(self.hour) * MS_PER_HOUR
             + i64::from(self.minute) * MS_PER_MINUTE
             + i64::from(self.second) * MS_PER_SECOND
-            + i64::from(self.millisecond)
+            + i64::from(self.millisecond);
+        days_from_civil(self.year, self.month, self.day).checked_mul(MS_PER_DAY)?.checked_add(time)
     }
 
     fn date_only(self) -> Self {
@@ -226,8 +226,8 @@ pub fn parse_iso(text: &str) -> Result<i64, String> {
     if cursor.position != cursor.bytes.len() {
         return Err(invalid());
     }
-    let local = DateTime { year, month, day, hour, minute, second, millisecond }.to_millis();
-    Ok(local - offset)
+    let local = DateTime { year, month, day, hour, minute, second, millisecond }.to_millis().ok_or_else(invalid)?;
+    local.checked_sub(offset).ok_or_else(invalid)
 }
 
 struct Cursor<'a> {
@@ -300,19 +300,18 @@ pub fn to_iso(millis: i64) -> String {
     format(millis, "%FT%T.%LZ").expect("static date format is valid")
 }
 
-/// Truncates to the start of the unit containing `millis` (weeks start on Monday).
-pub fn trunc(millis: i64, unit: DateUnit) -> i64 {
+/// Truncates to the start of the unit containing `millis` (weeks start on
+/// Monday); an error when that start is outside the millisecond range.
+pub fn trunc(millis: i64, unit: DateUnit) -> Result<i64, String> {
     let date = DateTime::from_millis(millis);
     match unit {
         DateUnit::Year => DateTime { month: 1, day: 1, ..date.date_only() }.to_millis(),
         DateUnit::Quarter => DateTime { month: (date.month - 1) / 3 * 3 + 1, day: 1, ..date.date_only() }.to_millis(),
         DateUnit::Month => DateTime { day: 1, ..date.date_only() }.to_millis(),
-        DateUnit::Week => (date.days() - (date.iso_weekday() - 1)) * MS_PER_DAY,
-        fixed => {
-            let length = fixed.fixed_millis().expect("non-calendar unit");
-            millis - millis.rem_euclid(length)
-        }
+        DateUnit::Week => (date.days() - (date.iso_weekday() - 1)).checked_mul(MS_PER_DAY),
+        fixed => millis.checked_sub(millis.rem_euclid(fixed.fixed_millis().expect("non-calendar unit"))),
     }
+    .ok_or_else(|| "date_trunc overflows the supported range".to_owned())
 }
 
 /// Adds `amount` units. Adding months clamps the day to the target month
@@ -326,18 +325,46 @@ pub fn add(millis: i64, amount: i64, unit: DateUnit) -> Result<i64, String> {
     let date = DateTime::from_millis(millis);
     let index = (date.year * 12 + i64::from(date.month) - 1).checked_add(months).ok_or_else(overflow)?;
     let (year, month) = (index.div_euclid(12), index.rem_euclid(12) as u32 + 1);
-    Ok(DateTime { year, month, day: date.day.min(days_in_month(year, month)), ..date }.to_millis())
+    DateTime { year, month, day: date.day.min(days_in_month(year, month)), ..date }.to_millis().ok_or_else(overflow)
 }
 
 /// Number of unit boundaries crossed from `start` to `end` (negative when `end` is earlier).
-pub fn diff(start: i64, end: i64, unit: DateUnit) -> i64 {
+pub fn diff(start: i64, end: i64, unit: DateUnit) -> Result<i64, String> {
     if let Some(months) = unit.months() {
         let (from, to) = (DateTime::from_millis(start), DateTime::from_millis(end));
         let index = |date: DateTime| (date.year * 12 + i64::from(date.month) - 1).div_euclid(months);
-        return index(to) - index(from);
+        return Ok(index(to) - index(from));
     }
     let length = unit.fixed_millis().expect("non-calendar unit");
-    (trunc(end, unit) - trunc(start, unit)) / length
+    trunc(end, unit)?
+        .checked_sub(trunc(start, unit)?)
+        .map(|span| span / length)
+        .ok_or_else(|| "date_diff overflows the supported range".to_owned())
+}
+
+/// The fiscal year holding `millis`, for a year that closes at the end of
+/// month `closing` (1 to 12; 12 is the calendar year), or that opens on the
+/// date `closing` (any other value, epoch milliseconds: the first day of a
+/// month): `[year, month, start, end]`, the year it closes in, the month
+/// within it (1 to 12), and its first and last days.
+pub fn fiscal(millis: i64, closing: i64) -> Result<[i64; 4], String> {
+    let closing = match u32::try_from(closing) {
+        Ok(month @ 1..=12) => month,
+        _ => {
+            let opening = DateTime::from_millis(closing);
+            if opening != opening.date_only() || opening.day != 1 {
+                return Err(format!("expected a closing month (1 to 12) or an opening date on the first day of a month, found {}", to_iso(closing)));
+            }
+            (opening.month + 10) % 12 + 1
+        }
+    };
+    let date = DateTime::from_millis(millis).date_only();
+    let year = date.year + i64::from(date.month > closing);
+    let (first_year, first_month) = if closing == 12 { (year, 1) } else { (year - 1, closing + 1) };
+    let start = DateTime { year: first_year, month: first_month, day: 1, ..date }.to_millis();
+    let end = DateTime { year, month: closing, day: days_in_month(year, closing), ..date }.to_millis();
+    let overflow = || "fiscal year outside the supported range".to_owned();
+    Ok([year, i64::from((date.month + 11 - closing) % 12 + 1), start.ok_or_else(overflow)?, end.ok_or_else(overflow)?])
 }
 
 /// Extracts one calendar field.
@@ -370,6 +397,8 @@ mod tests {
     #[test] fn civil_round_trip_covers_leap_years_and_negative_days() { for days in [-719_468, -1, 0, 1, 10_957, 11_016, 20_000, 2_932_896] { let (year, month, day) = civil_from_days(days); assert_eq!(days_from_civil(year, month, day), days); } assert_eq!(civil_from_days(0), (1970, 1, 1)); assert_eq!(civil_from_days(11_016), (2000, 2, 29)); }
     #[test] fn parses_iso_forms_and_offsets() { assert_eq!(iso("1970-01-01"), 0); assert_eq!(iso("1970-01-01T00:00:01.5Z"), 1_500); assert_eq!(iso("2026-01"), iso("2026-01-01T00:00:00Z")); assert_eq!(iso("2026-03-10T10:00:00+02:00"), iso("2026-03-10T08:00:00Z")); assert_eq!(iso("2026-03-10 08:00"), iso("2026-03-10T08:00:00.000Z")); for bad in ["2026-13-01", "2026-02-30", "2026-01-01T25:00", "20260101", "2026-01-01T10", "x"] { assert!(parse_iso(bad).is_err(), "{bad}"); } }
     #[test] fn formats_directives() { let millis = iso("2026-03-09T07:05:03.042Z"); assert_eq!(to_iso(millis), "2026-03-09T07:05:03.042Z"); assert_eq!(format(millis, "%Y/%m/%d %j %u W%V 100%%").unwrap(), "2026/03/09 068 1 W11 100%"); assert!(format(millis, "%q").is_err()); }
-    #[test] fn truncates_adds_and_diffs_on_calendar_boundaries() { let millis = iso("2026-08-13T15:42:10Z"); assert_eq!(to_iso(trunc(millis, DateUnit::Quarter)), "2026-07-01T00:00:00.000Z"); assert_eq!(to_iso(trunc(millis, DateUnit::Week)), "2026-08-10T00:00:00.000Z"); assert_eq!(to_iso(trunc(millis, DateUnit::Hour)), "2026-08-13T15:00:00.000Z"); assert_eq!(to_iso(add(iso("2026-01-31"), 1, DateUnit::Month).unwrap()), "2026-02-28T00:00:00.000Z"); assert_eq!(to_iso(add(iso("2024-02-29"), -12, DateUnit::Month).unwrap()), "2023-02-28T00:00:00.000Z"); assert_eq!(diff(iso("2025-12-31T23:59:59Z"), iso("2026-01-01"), DateUnit::Year), 1); assert_eq!(diff(iso("2026-01-01"), iso("2026-01-31T23:00:00Z"), DateUnit::Day), 30); assert_eq!(diff(iso("2026-03-01"), iso("2026-01-15"), DateUnit::Month), -2); }
+    #[test] fn truncates_adds_and_diffs_on_calendar_boundaries() { let millis = iso("2026-08-13T15:42:10Z"); assert_eq!(to_iso(trunc(millis, DateUnit::Quarter).unwrap()), "2026-07-01T00:00:00.000Z"); assert_eq!(to_iso(trunc(millis, DateUnit::Week).unwrap()), "2026-08-10T00:00:00.000Z"); assert_eq!(to_iso(trunc(millis, DateUnit::Hour).unwrap()), "2026-08-13T15:00:00.000Z"); assert_eq!(to_iso(add(iso("2026-01-31"), 1, DateUnit::Month).unwrap()), "2026-02-28T00:00:00.000Z"); assert_eq!(to_iso(add(iso("2024-02-29"), -12, DateUnit::Month).unwrap()), "2023-02-28T00:00:00.000Z"); assert_eq!(diff(iso("2025-12-31T23:59:59Z"), iso("2026-01-01"), DateUnit::Year).unwrap(), 1); assert_eq!(diff(iso("2026-01-01"), iso("2026-01-31T23:00:00Z"), DateUnit::Day).unwrap(), 30); assert_eq!(diff(iso("2026-03-01"), iso("2026-01-15"), DateUnit::Month).unwrap(), -2); }
     #[test] fn extracts_parts() { let millis = iso("2021-01-03T10:20:30.400Z"); assert_eq!(part(millis, "week").unwrap(), 53); assert_eq!(part(millis, "day_of_week").unwrap(), 7); assert_eq!(part(millis, "quarter").unwrap(), 1); assert_eq!(part(millis, "millisecond").unwrap(), 400); assert!(part(millis, "century").is_err()); assert_eq!(DateUnit::parse("days").unwrap(), DateUnit::Day); assert!(DateUnit::parse("fortnight").is_err()); }
+    #[test] fn fiscal_years_close_at_the_end_of_their_month() { let fiscal = |text: &str, closing: i64| { let [year, month, start, end] = fiscal(iso(text), closing).unwrap(); (year, month, to_iso(start)[..10].to_owned(), to_iso(end)[..10].to_owned()) }; assert_eq!(fiscal("2026-06-30T23:00:00Z", 6), (2026, 12, "2025-07-01".to_owned(), "2026-06-30".to_owned())); assert_eq!(fiscal("2026-07-01", 6), (2027, 1, "2026-07-01".to_owned(), "2027-06-30".to_owned())); assert_eq!(fiscal("2024-02-10", 2), (2024, 12, "2023-03-01".to_owned(), "2024-02-29".to_owned())); assert_eq!(fiscal("2026-01-15", 12), (2026, 1, "2026-01-01".to_owned(), "2026-12-31".to_owned())); assert_eq!(fiscal("2026-12-31", 1), (2027, 11, "2026-02-01".to_owned(), "2027-01-31".to_owned())); assert_eq!(fiscal("2026-07-01", iso("2019-07-01")), fiscal("2026-07-01", 6)); assert_eq!(fiscal("2026-03-01", 0), fiscal("2026-03-01", 12)); for closing in [13, -1, iso("2026-07-02"), iso("2026-07-01T08:00:00Z")] { assert!(super::fiscal(0, closing).is_err(), "{closing}"); } }
+    #[test] fn calendar_steps_outside_the_millisecond_range_are_errors() { for unit in [DateUnit::Year, DateUnit::Quarter, DateUnit::Month, DateUnit::Week, DateUnit::Hour] { assert!(trunc(i64::MIN, unit).is_err(), "{unit:?}"); } assert!(trunc(i64::MAX, DateUnit::Hour).is_ok()); assert!(add(i64::MAX, 1, DateUnit::Month).is_err()); assert!(diff(i64::MIN, i64::MAX, DateUnit::Hour).is_err()); assert!(diff(0, 86_400_000, DateUnit::Hour).is_ok_and(|hours| hours == 24)); }
 }

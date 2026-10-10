@@ -2,7 +2,7 @@
 //! To not be confused with the memory backend.
 //! It provides a shared governor, RAII reservations and diagnostics that later patches can wire into caches and physical operators.
 #![cfg_attr(rustfmt, rustfmt_skip)]
-use std::{ collections::VecDeque, fmt, sync::{ atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex, Weak, }, };
+use std::{ cell::{Cell, RefCell}, collections::VecDeque, fmt, sync::{ atomic::{AtomicU64, AtomicUsize, Ordering}, Arc, Mutex, Weak, }, };
 
 pub use crate::error::{MemoryReservationError, ProcessMemoryPressureError, QueryAdmissionError};
 
@@ -56,23 +56,12 @@ impl fmt::Display for MemoryClass {
     }
 }
 
-/// Best-effort source of revocable governed memory.
-///
-/// Reclaimers are deliberately backend-agnostic: the governor only asks for
-/// bytes to be surrendered and never knows what data structure is being
-/// evicted. Implementations must not call back into [`MemoryGovernor::reserve`]
-/// while reclaiming.
+/// Revocable governed memory, such as a page cache: the governor asks it for
+/// bytes when another class would exceed the limit. It must not reserve while
+/// reclaiming.
 pub trait MemoryReclaimer: Send + Sync + fmt::Debug {
-    /// Tries to make at least `target_bytes` available and returns the number of
-    /// governed bytes actually released. Reclaim is best-effort and may return
-    /// fewer bytes than requested.
+    /// Releases about `target_bytes` (best effort): the bytes released.
     fn reclaim(&self, target_bytes: usize) -> usize;
-}
-
-#[derive(Debug)]
-struct RegisteredReclaimer {
-    class: MemoryClass,
-    reclaimer: Weak<dyn MemoryReclaimer>,
 }
 
 use crate::helpers::{lock_unpoisoned, u128_to_usize_saturating};
@@ -480,7 +469,7 @@ struct MemoryGovernorInner {
     classes: [ClassCounters; MEMORY_CLASS_COUNT],
     next_event_sequence: AtomicU64,
     events: Mutex<MemoryEventLog>,
-    reclaimers: Mutex<Vec<RegisteredReclaimer>>,
+    reclaimers: Mutex<Vec<Weak<dyn MemoryReclaimer>>>,
 }
 
 /// Shared hard memory budget with lock-free accounting.
@@ -583,45 +572,10 @@ impl MemoryGovernor {
         self.inner.current_bytes.load(Ordering::Acquire)
     }
 
-    /// Registers a weak revocation hook for one governed class.
-    ///
-    /// The caller retains the strong [`Arc`] and therefore controls the hook
-    /// lifetime. Dead registrations are removed lazily during reclaim.
-    pub fn register_reclaimer( &self, class: MemoryClass, reclaimer: &Arc<dyn MemoryReclaimer>, ) {
-        let mut reclaimers = lock_unpoisoned(&self.inner.reclaimers);
-        reclaimers.push(RegisteredReclaimer {
-            class,
-            reclaimer: Arc::downgrade(reclaimer),
-        });
-    }
-
-    fn reclaim_revocable(&self, class: MemoryClass, target_bytes: usize) -> usize {
-        if target_bytes == 0 || class == MemoryClass::PageCache {
-            return 0;
-        }
-
-        // PageCache is intentionally lower priority than execution memory.
-        // Snapshot strong handles under the registry mutex, then drop the lock
-        // before invoking backend code so reclaimers can take their own locks.
-        let candidates = {
-            let mut reclaimers = lock_unpoisoned(&self.inner.reclaimers);
-            reclaimers.retain(|entry| entry.reclaimer.strong_count() > 0);
-            reclaimers
-                .iter()
-                .filter(|entry| entry.class == MemoryClass::PageCache)
-                .filter_map(|entry| entry.reclaimer.upgrade())
-                .collect::<Vec<_>>()
-        };
-
-        let mut reclaimed = 0usize;
-        for reclaimer in candidates {
-            let remaining = target_bytes.saturating_sub(reclaimed);
-            if remaining == 0 {
-                break;
-            }
-            reclaimed = reclaimed.saturating_add(reclaimer.reclaim(remaining));
-        }
-        reclaimed
+    /// Registers a page-cache reclaimer, held weakly: the caller's [`Arc`]
+    /// keeps it registered.
+    pub fn register_reclaimer(&self, reclaimer: &Arc<dyn MemoryReclaimer>) {
+        lock_unpoisoned(&self.inner.reclaimers).push(Arc::downgrade(reclaimer));
     }
 
     /// Attempts to reserve bytes for one logical class.
@@ -632,76 +586,13 @@ impl MemoryGovernor {
         if bytes == 0 {
             return Ok(MemoryReservation::empty(Arc::clone(&self.inner), class));
         }
-
-        let mut current = self.inner.current_bytes.load(Ordering::Acquire);
-        loop {
-            let Some(next) = current.checked_add(bytes) else {
-                return Err(self.reject(class, bytes, current));
-            };
-
-            if let Some(limit) = self.inner.limit_bytes {
-                if next > limit {
-                    let shortfall = next.saturating_sub(limit);
-                    if self.reclaim_revocable(class, shortfall) > 0 {
-                        current = self.inner.current_bytes.load(Ordering::Acquire);
-                        continue;
-                    }
-                    return Err(self.reject(class, bytes, current));
-                }
-            }
-
-            match self.inner.current_bytes.compare_exchange_weak(
-                current,
-                next,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    update_peak(&self.inner.peak_bytes, next);
-                    self.inner
-                        .active_reservations
-                        .fetch_add(1, Ordering::Relaxed);
-
-                    let counters = &self.inner.classes[class.index()];
-                    let class_current =
-                        counters.current_bytes.fetch_add(bytes, Ordering::AcqRel) + bytes;
-                    update_peak(&counters.peak_bytes, class_current);
-                    counters.active_reservations.fetch_add(1, Ordering::Relaxed);
-                    record_event(&self.inner, MemoryEventKind::Reserved, class, bytes, next);
-
-                    return Ok(MemoryReservation {
-                        inner: Arc::clone(&self.inner),
-                        class,
-                        bytes,
-                        released: false,
-                    });
-                }
-                Err(observed) => current = observed,
-            }
-        }
-    }
-
-    fn reject( &self, class: MemoryClass, requested_bytes: usize, current_bytes: usize, ) -> MemoryReservationError {
-        self.inner
-            .failed_reservations
-            .fetch_add(1, Ordering::Relaxed);
-        self.inner.classes[class.index()]
-            .failed_reservations
-            .fetch_add(1, Ordering::Relaxed);
-        record_event(
-            &self.inner,
-            MemoryEventKind::Rejected,
+        acquire(&self.inner, class, bytes, true)?;
+        Ok(MemoryReservation {
+            inner: Arc::clone(&self.inner),
             class,
-            requested_bytes,
-            current_bytes,
-        );
-
-        MemoryReservationError {
-            class,
-            requested_bytes,
-            current_bytes,
-            limit_bytes: self.inner.process_limit_bytes,
-        }
+            bytes,
+            released: false,
+        })
     }
 
     /// Reports best-effort resident bytes owned by a memory class but not
@@ -822,7 +713,9 @@ impl MemoryGovernor {
             .filter(|r| r.class != WorkloadClass::Streaming)
             .count();
         let next = state.active_bytes.saturating_add(budget);
-        if heavy >= profile.max_concurrent_heavy || next > profile.operation_budget_bytes {
+        // Query operators hold reservations beyond their admission bytes.
+        let reserved = self.inner.classes[MemoryClass::Query.index()].current_bytes.load(Ordering::Acquire);
+        if heavy >= profile.max_concurrent_heavy || next.saturating_add(reserved) > profile.operation_budget_bytes {
             state.rejected = state.rejected.saturating_add(1);
             return Err(QueryAdmissionError {
                 class,
@@ -891,6 +784,70 @@ impl Default for MemoryGovernor {
     }
 }
 
+/// Counts `bytes` more in `class`, or rejects them when they would exceed the
+/// governor limit or, for query operators, the profile's operation envelope.
+fn acquire( inner: &Arc<MemoryGovernorInner>, class: MemoryClass, bytes: usize, new_reservation: bool, ) -> Result<(), MemoryReservationError> {
+    let counters = &inner.classes[class.index()];
+    // Query operators reserve as their state grows: together they stay within
+    // the envelope that admission used to split between them upfront.
+    let class_cap = (class == MemoryClass::Query).then_some(inner.profile.operation_budget_bytes);
+    let class_current = add_within(&counters.current_bytes, bytes, class_cap)
+        .map_err(|_| reject(inner, class, bytes, inner.current_bytes.load(Ordering::Acquire)))?;
+    let next = loop {
+        match add_within(&inner.current_bytes, bytes, inner.limit_bytes) {
+            Ok(next) => break next,
+            Err(current) if class != MemoryClass::PageCache && reclaim(inner, (current + bytes).saturating_sub(inner.limit_bytes.unwrap_or(0))) > 0 => {}
+            Err(current) => {
+                counters.current_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                return Err(reject(inner, class, bytes, current));
+            }
+        }
+    };
+    crate::helpers::raise_peak_usize(&inner.peak_bytes, next);
+    crate::helpers::raise_peak_usize(&counters.peak_bytes, class_current);
+    if new_reservation {
+        inner.active_reservations.fetch_add(1, Ordering::Relaxed);
+        counters.active_reservations.fetch_add(1, Ordering::Relaxed);
+    }
+    record_event(inner, MemoryEventKind::Reserved, class, bytes, next);
+    Ok(())
+}
+
+/// Asks the page-cache reclaimers for `target` bytes: the bytes released.
+fn reclaim(inner: &MemoryGovernorInner, target: usize) -> usize {
+    let reclaimers = {
+        let mut reclaimers = lock_unpoisoned(&inner.reclaimers);
+        reclaimers.retain(|reclaimer| reclaimer.strong_count() > 0);
+        reclaimers.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
+    };
+    reclaimers.iter().fold(0, |done: usize, reclaimer| if done >= target { done } else { done + reclaimer.reclaim(target - done) })
+}
+
+/// Adds `bytes` to `counter` unless the sum would exceed `limit`: the new
+/// value, or the current one when refused.
+fn add_within(counter: &AtomicUsize, bytes: usize, limit: Option<usize>) -> Result<usize, usize> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current.checked_add(bytes).filter(|next| limit.is_none_or(|limit| *next <= limit)).ok_or(current)?;
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn reject( inner: &MemoryGovernorInner, class: MemoryClass, requested_bytes: usize, current_bytes: usize, ) -> MemoryReservationError {
+    inner.failed_reservations.fetch_add(1, Ordering::Relaxed);
+    inner.classes[class.index()].failed_reservations.fetch_add(1, Ordering::Relaxed);
+    record_event(inner, MemoryEventKind::Rejected, class, requested_bytes, current_bytes);
+    MemoryReservationError {
+        class,
+        requested_bytes,
+        current_bytes,
+        limit_bytes: inner.process_limit_bytes,
+    }
+}
+
 fn record_event( inner: &MemoryGovernorInner, kind: MemoryEventKind, class: MemoryClass, bytes: usize, current_bytes: usize, ) {
     if kind != MemoryEventKind::Rejected && bytes < MEMORY_EVENT_MIN_BYTES {
         return;
@@ -906,17 +863,6 @@ fn record_event( inner: &MemoryGovernorInner, kind: MemoryEventKind, class: Memo
     };
     lock_unpoisoned(&inner.events)
         .push(event);
-}
-
-fn update_peak(peak: &AtomicUsize, candidate: usize) {
-    let mut observed = peak.load(Ordering::Relaxed);
-    while candidate > observed {
-        match peak.compare_exchange_weak(observed, candidate, Ordering::Relaxed, Ordering::Relaxed)
-        {
-            Ok(_) => break,
-            Err(actual) => observed = actual,
-        }
-    }
 }
 
 /// Current process-memory pressure relative to the configured limit.
@@ -1022,6 +968,22 @@ impl MemoryReservation {
         self.bytes
     }
 
+    /// Reserves `bytes` more for the same class.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rejection when the governor cannot grant them; the
+    /// reservation then keeps its current size.
+    pub fn try_grow(&mut self, bytes: usize) -> Result<(), MemoryReservationError> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        acquire(&self.inner, self.class, bytes, self.released)?;
+        self.bytes += bytes;
+        self.released = false;
+        Ok(())
+    }
+
     /// Releases the reservation before the end of its lexical scope.
     pub fn release(mut self) {
         self.release_inner();
@@ -1070,6 +1032,107 @@ impl MemoryReservation {
 impl Drop for MemoryReservation {
     fn drop(&mut self) {
         self.release_inner();
+    }
+}
+
+/// Envelope bytes a query is admitted with: its operators reserve the rest
+/// as their state grows ([`QueryMemory`]).
+pub const QUERY_ADMISSION_BYTES: usize = 4 * 1024 * 1024;
+
+/// Memory of the blocking stages of one query.
+///
+/// Stages reserve what their state holds, as it grows, instead of the whole
+/// query budget upfront: concurrent queries then share the governed memory
+/// by what they use. Together, the stages of a query never hold more than
+/// the profile's query budget.
+#[derive(Debug)]
+pub struct QueryMemory {
+    governor: MemoryGovernor,
+    limit: usize,
+    held: Cell<usize>,
+}
+
+impl QueryMemory {
+    #[must_use]
+    pub fn new(governor: &MemoryGovernor) -> Self {
+        Self::with_limit(governor, governor.profile().query_budget_bytes)
+    }
+
+    #[must_use]
+    pub fn with_limit(governor: &MemoryGovernor, limit: usize) -> Self {
+        Self { governor: governor.clone(), limit, held: Cell::new(0) }
+    }
+
+    /// Memory of one more stage, holding nothing yet.
+    #[must_use]
+    pub fn stage(&self) -> StageMemory<'_> {
+        StageMemory { query: self, reservation: RefCell::new(MemoryReservation::empty(Arc::clone(&self.governor.inner), MemoryClass::Query)) }
+    }
+
+    /// Bytes reserved by the stages alive.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.held.get()
+    }
+}
+
+/// Memory of one blocking stage of a query, see [`QueryMemory`].
+#[derive(Debug)]
+pub struct StageMemory<'q> {
+    query: &'q QueryMemory,
+    reservation: RefCell<MemoryReservation>,
+}
+
+impl StageMemory<'_> {
+    /// Smallest growth step: a stage reserves at least this much more at once.
+    const STEP_BYTES: usize = 256 * 1024;
+
+    /// Whether the stage may hold `bytes` in all, reserving them when it holds
+    /// less. Growth doubles the reservation (at least [`Self::STEP_BYTES`]),
+    /// or takes only what is needed when the governor cannot grant more.
+    pub fn fits(&self, bytes: usize) -> bool {
+        let held = self.reservation.borrow().bytes();
+        if bytes <= held {
+            return true;
+        }
+        let others = self.query.held.get() - held;
+        let room = self.query.limit.saturating_sub(others);
+        if bytes > room {
+            return false;
+        }
+        let wanted = bytes.max(held.saturating_mul(2)).max(Self::STEP_BYTES).min(room);
+        let mut reservation = self.reservation.borrow_mut();
+        let grown = reservation.try_grow(wanted - held).is_ok() || reservation.try_grow(bytes - held).is_ok();
+        self.query.held.set(others + reservation.bytes());
+        grown
+    }
+
+    /// Most the stage could hold, if the governor grants it.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        let held = self.reservation.borrow().bytes();
+        self.query.limit.saturating_sub(self.query.held.get() - held)
+    }
+
+    /// Bytes reserved by the stage.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.reservation.borrow().bytes()
+    }
+
+    /// Returns what the stage holds, once its state is gone (spilled).
+    pub fn release(&self) {
+        let mut reservation = self.reservation.borrow_mut();
+        let held = reservation.bytes();
+        reservation.shrink_by(held);
+        self.query.held.set(self.query.held.get() - held);
+    }
+}
+
+impl Drop for StageMemory<'_> {
+    fn drop(&mut self) {
+        let held = self.reservation.get_mut().bytes();
+        self.query.held.set(self.query.held.get() - held);
     }
 }
 
@@ -1164,25 +1227,15 @@ const fn classify_process_pressure( limit_bytes: usize, process: ProcessMemorySn
 mod tests {
     use super::*;
     
-    #[derive(Debug)]
-    struct TestReclaimer {
-        reservation: Mutex<Option<MemoryReservation>>,
-    }
-
-    impl MemoryReclaimer for TestReclaimer {
-        fn reclaim(&self, target_bytes: usize) -> usize {
-            let mut reservation = lock_unpoisoned(&self.reservation);
-            let Some(reservation) = reservation.as_mut() else {
-                return 0;
-            };
-            reservation.shrink_by(target_bytes)
-        }
-    }
     
+    #[test] fn stage_memory_grows_on_demand_within_the_query_limit() { let mib = 1024 * 1024; let governor = MemoryGovernor::with_limit(64 * mib); let query = QueryMemory::with_limit(&governor, 10 * mib); let first = query.stage(); assert_eq!(governor.reserved_bytes(), 0); assert!(first.fits(1)); assert_eq!(first.held_bytes(), mib / 4); assert!(first.fits(9 * mib)); assert_eq!(first.held_bytes(), 9 * mib); assert!(!first.fits(11 * mib)); let second = query.stage(); assert!(!second.fits(2 * mib)); assert_eq!(query.held_bytes(), 9 * mib); drop(first); assert!(second.fits(2 * mib)); assert_eq!(governor.reserved_bytes(), 2 * mib); drop(second); assert_eq!((governor.reserved_bytes(), query.held_bytes()), (0, 0)); }
+
+    #[test] fn stage_memory_takes_what_the_governor_has_left() { let mib = 1024 * 1024; let governor = MemoryGovernor::with_limit(6 * mib); let query = QueryMemory::with_limit(&governor, 100 * mib); let stage = query.stage(); assert!(stage.fits(5 * mib)); assert!(stage.fits(5 * mib + 1)); assert_eq!(stage.held_bytes(), 5 * mib + 1); assert!(!stage.fits(7 * mib)); assert_eq!(governor.reserved_bytes(), 5 * mib + 1); }
+
+    #[test] fn query_reservations_stay_within_the_operation_envelope() { let mib = 1024 * 1024; let governor = MemoryGovernor::with_process_limit(256 * mib); let envelope = governor.profile().operation_budget_bytes; let _held = governor.reserve(MemoryClass::Query, envelope - mib).unwrap(); assert!(governor.reserve(MemoryClass::Query, 2 * mib).is_err()); assert!(governor.reserve(MemoryClass::Planner, 2 * mib).is_ok()); let mut grown = governor.reserve(MemoryClass::Query, mib / 2).unwrap(); assert!(grown.try_grow(mib).is_err()); assert_eq!(grown.bytes(), mib / 2); assert!(governor.admit(WorkloadClass::Query, QUERY_ADMISSION_BYTES).is_err()); }
+
     #[test] fn reservation_is_released_on_drop() { let governor = MemoryGovernor::with_limit(128); { let reservation = governor.reserve(MemoryClass::Query, 64).unwrap(); assert_eq!(reservation.bytes(), 64); assert_eq!(governor.snapshot().current_bytes, 64); } let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!(snapshot.active_reservations, 0); assert_eq!(snapshot.peak_bytes, 64); }
     #[test] fn hard_limit_rejects_without_changing_current_usage() { let governor = MemoryGovernor::with_limit(100); let _held = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let error = governor .reserve(MemoryClass::Query, 21) .expect_err("reservation must exceed the limit"); assert_eq!(error.class, MemoryClass::Query); assert_eq!(error.requested_bytes, 21); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 80); assert_eq!(snapshot.failed_reservations, 1); }
-    #[test] fn query_reservation_reclaims_page_cache_before_rejecting() { let governor = MemoryGovernor::with_limit(100); let cache = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(TestReclaimer { reservation: Mutex::new(Some(cache)), }); governor.register_reclaimer(MemoryClass::PageCache, &reclaimer); let query = governor .reserve(MemoryClass::Query, 40) .expect("query should evict revocable page cache"); assert_eq!(query.bytes(), 40); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 100); assert_eq!( snapshot.classes[MemoryClass::PageCache.index()].current_bytes, 60 ); assert_eq!( snapshot.classes[MemoryClass::Query.index()].current_bytes, 40 ); }
-    #[test] fn page_cache_does_not_reclaim_itself() { let governor = MemoryGovernor::with_limit(100); let cache = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let reclaimer: Arc<dyn MemoryReclaimer> = Arc::new(TestReclaimer { reservation: Mutex::new(Some(cache)), }); governor.register_reclaimer(MemoryClass::PageCache, &reclaimer); assert!(governor.reserve(MemoryClass::PageCache, 21).is_err()); }
     #[test] fn classes_are_accounted_independently() { let governor = MemoryGovernor::with_limit(1_000); let _cache = governor.reserve(MemoryClass::PageCache, 300).unwrap(); let _query = governor.reserve(MemoryClass::Query, 200).unwrap(); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 500); assert_eq!( snapshot.classes[MemoryClass::PageCache.index()].current_bytes, 300 ); assert_eq!( snapshot.classes[MemoryClass::Query.index()].current_bytes, 200 ); }
     #[test] fn observed_bytes_are_diagnostic_only() { let governor = MemoryGovernor::with_limit(128); governor.set_observed_bytes(MemoryClass::Indexing, 1_000_000); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!( snapshot.classes[MemoryClass::Indexing.index()].observed_bytes, 1_000_000 ); assert!(governor.reserve(MemoryClass::Query, 64).is_ok()); }
     #[test] fn zero_byte_reservation_has_no_accounting_effect() { let governor = MemoryGovernor::with_limit(0); let reservation = governor.reserve(MemoryClass::Network, 0).unwrap(); assert_eq!(reservation.bytes(), 0); assert_eq!(governor.snapshot().current_bytes, 0); }

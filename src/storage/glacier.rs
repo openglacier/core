@@ -23,6 +23,18 @@ impl BackendStorage<GlacierBackend> {
         self.backend().format_info()
     }
 
+    /// Records commit times and authors (for `as of <date>` and the `_at`/`_by`
+    /// fields of `history`); every version is in the store file already.
+    pub fn record_history(&self) -> StorageResult<()> {
+        self.backend().record_history()
+    }
+
+    /// Whether this store records its timeline.
+    #[must_use]
+    pub fn keeps_history(&self) -> bool {
+        self.backend().keeps_history()
+    }
+
     /// Writes a durable checkpoint and resets the Glacier WAL.
     pub fn checkpoint(&self) -> StorageResult<()> {
         self.backend().checkpoint()

@@ -10,7 +10,7 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-1.0.2-blue)
+![Version](https://img.shields.io/badge/version-1.0.3-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
@@ -173,10 +173,7 @@ AST
 Normalizer
   │
   ▼
-Logical Plan
-  │
-  ▼
-Physical Plan
+Plan
   │
   ▼
 Executor
@@ -191,8 +188,7 @@ Its responsibilities include:
 
 - parsing;
 - expression evaluation;
-- logical planning;
-- physical planning;
+- planning;
 - query execution;
 - filtering;
 - projection;
@@ -258,6 +254,31 @@ on customers
 ```
 
 `from` and `on` are aliases.
+
+A source can also be read at a past point, or as the list of its stored versions (with `OGD_HISTORY=on`):
+
+```text
+on customers as of "2026-09-01T00:00:00Z"
+on customers as of 1842
+on customers history | where _op == "delete"
+```
+
+See [`src/query/README.md` §5.1.1](src/query/README.md) for the fields of history rows (`_doc_id`, `_version`,
+`_op`, `_generation`, `_at`, `_by`) and the rules.
+
+A source can also be a view, a named query saved in the Place with `define view` (see
+[`src/query/README.md` §5.7](src/query/README.md)):
+
+```text
+define view sales.paid | exec | on orders | where status == "paid" and amount >= $min | end | end
+let $min = 100 | on view sales.paid | sort amount desc | limit 10
+```
+
+Or literal rows, read like a collection:
+
+```text
+on orders | lookup values [{code: "FR", rate: 0.2}, {code: "DE", rate: 0.19}] as v on code == country into vat
+```
 
 ---
 
@@ -701,7 +722,6 @@ Memory-sensitive execution paths can:
 
 - reserve memory explicitly;
 - operate within bounded buffers;
-- release reclaimable cache memory;
 - spill intermediate execution state when required.
 
 The goal is predictable failure and bounded resource usage rather than uncontrolled allocation.
@@ -1133,6 +1153,35 @@ isolated venv
 
 This keeps Python-specific transformation logic outside the Rust database kernel.
 
+## Checked imports
+
+`data.import` writes the rows of the file into the App table only once the checks the App declares for that table let it.
+The rows first wait in `<collection>.staged`, in the scope of the target App instance, each with `import_id`; each check
+is a query that reads them (`$import` names the import, usually through a view) and returns what stops the import:
+
+```json
+"model": { "tables": { "ledger": { "collection": "l", "import": {
+  "summary": "on view finance.import.summary",
+  "checks": [{ "id": "imbalance", "message": "Unbalanced months", "query": "on view finance.import.imbalance" },
+             { "id": "rows", "message": "Invalid rows", "query": "on view x.invalid", "blocking": true }],
+  "replace": ["scenario", "version", "entity", "date"],
+  "after": ["on view finance.import.record | into finance_imports"] } } } }
+```
+
+- A check that returns rows stops the import: the answer is `status: "confirm"` with `importId`, the `summary` rows and,
+  for each check, its first 100 rows (`more` when there are others). The caller resumes with `importId` and `accept`
+  (the ids of the checks it accepts), or drops the import with `importId` and `cancel: true`. The checks run again at
+  each resume: a rule added in between counts. A `blocking` check cannot be accepted (`status: "blocked"`).
+- `checkOnly: true` stages and checks without writing (`status: "checked"`): the « import? » question.
+- Once nothing stops it, the stored rows sharing the `replace` fields with a staged row give way (an entity's months
+  imported again), the staged rows are written, then the `after` queries run (in the scope of the target instance) and
+  the staged rows go, all in one transaction (each step reads the rows as they were before the import). An import nobody
+  resumes goes after a week.
+- Checks and summary read as the App reads the Place (scope of the Place, its views and their caches).
+- In Gateway fabric mode, the authority Core authorizes the import and answers its destination and checks (`planOnly`:
+  `collection`, `mode`, `import`); the Gateway gives them (`plan`) with the rows to the database Core of the Place, which
+  stages, checks and writes them under the Gateway's `database` delegation for the target App instance (write role).
+
 ---
 
 # Places and execution context
@@ -1160,6 +1209,12 @@ The effective scope is applied by the execution layer.
 It is not left to arbitrary query text to decide which Place or application instance may be accessed.
 
 This allows the same query engine to execute in different authorized contexts without embedding authorization logic into the query language.
+
+An App can be open to some Place roles only: `access.visibleTo` in its definition, or `config.visibleTo` on one instance
+(which wins), lists the roles (`owner`, `resident`, `member`); none listed means everyone who reads the Place. `ogd` leaves
+the other instances out of `app.instance.list` and refuses their context (`app.instance_forbidden`) to queries, files and App
+operations. The Owner and the App's maintainers always reach it; a public reader without a role does not reach a restricted
+App.
 
 For the broader openglacier model and project vision, see:
 
@@ -1250,6 +1305,7 @@ core.operations
 node.status
 
 query.execute
+query.stages
 collections.list
 storage.stats
 
@@ -1502,10 +1558,9 @@ contains:
 - lexer;
 - parser;
 - AST;
-- normalization/lowering;
+- normalization;
 - expression semantics;
-- logical plans;
-- physical plans;
+- plans;
 - planner;
 - executor;
 - runtime operators;

@@ -1,20 +1,14 @@
 //! Query module exports.
 
 mod ast;
-mod fingerprint;
 mod lexer;
 mod parser;
 mod span;
 mod token;
 
 pub use ast::{
-    EndAst, NameAst, PipelineAst, SourceAliasAst, SourceAst, SourceKeyword, Spanned, StageAst,
-    SubPipelineAst,
-};
-
-pub use fingerprint::{
-    fingerprint_query_shape, fingerprint_query_text, fingerprint_syntax, LogicalPlanFingerprint,
-    QueryShapeFingerprint, QueryTextFingerprint, SyntaxFingerprint,
+    EndAst, NameAst, PipelineAst, SourceAliasAst, SourceAst, SourceKeyword, SourceTemporalAst,
+    Spanned, StageAst, SubPipelineAst,
 };
 
 pub use lexer::{lex, LexError, LexErrorKind, LexResult, Lexer, TokenStream};
@@ -30,11 +24,10 @@ pub use token::{Token, TokenKind};
 mod stage;
 
 pub use stage::{
-    ResolvedStage, StageArgumentPolicy, StageDefinition, StageError, StageErrorKind, StageKind,
-    StageName, StageRegistry, StageResult,
+    Arguments, Placement, Stage, StageEntry, StageName, StageNameError, STAGE_CATALOG,
 };
 
-mod dates;
+pub(crate) mod dates;
 mod eval;
 mod expression;
 mod functions;
@@ -43,10 +36,14 @@ mod params;
 
 pub use eval::{
     apply_assignments, check_call, evaluate, evaluate_document, evaluate_predicate, DocumentFields,
-    ExpressionFieldResolver, Function, LookupFields, SemanticValue,
+    ExpressionFieldResolver, Function, LookupFields, LookupScope, SemanticValue,
 };
 
-pub use params::{bind_parameters, prepare_query, split_explain};
+pub use params::{
+    bind_parameters, prepare_query, prepare_view, reads_place, split_explain, Sources,
+};
+pub(crate) use params::{group_length, stage_ranges};
+pub(crate) use plan_values::value_from_source;
 
 pub use expression::{
     parse_expression, BinaryOperator, Expression, ExpressionError, ExpressionErrorKind,
@@ -54,13 +51,15 @@ pub use expression::{
     Literal, UnaryOperator,
 };
 
-mod logical_plan;
+mod plan_values;
+mod scope;
 
-pub use logical_plan::{
-    CollectionName, FieldListContext, IdentifierContext, InsertDocument, LogicalObject,
-    LogicalObjectField, LogicalOperator, LogicalOperatorKind, LogicalPlan, LogicalPlanBuilder,
-    LogicalPlanError, LogicalPlanErrorKind, LogicalPlanResult, LogicalSource, LogicalValue,
-    PivotAggregate, PivotSpecification, PivotValue, SetAssignment, SortDirection, SortKey,
+pub use scope::{is_scope_restriction, scope_restriction, scoped_read_plan};
+
+pub use plan_values::{
+    CollectionName, FieldListContext, IdentifierContext, InsertDocument, PivotAggregate,
+    PivotSpecification, PivotValue, PlanValueError, PlanValueErrorKind, PlanValueResult,
+    SetAssignment, SortDirection, SortKey,
 };
 
 mod syntax;
@@ -91,26 +90,22 @@ pub use physical_plan::{
     PhysicalSource, PhysicalSubPipeline, StorageAccessMode,
 };
 
+pub(crate) mod codec;
 mod executor;
 
 pub use executor::{
     CustomOperatorResult, DocumentScope, ExecutionError, ExecutionErrorKind, ExecutionOutput,
-    ExecutionResult, ExecutionRow, ExecutionRowOrigin, ExecutionRuntime, ExecutionStatistics,
-    ExecutionStrategies, ExecutionStrategy, Executor, IncrementalGroupAccumulator,
-    IncrementalPivotAccumulator, LookupDocuments, PreparedInsertDocument, Reservoir,
-    StreamingLoadMutation, SyntheticDocument,
+    ExecutionResult, ExecutionRow, ExecutionRowOrigin, ExecutionStatistics, ExecutionStrategies,
+    ExecutionStrategy, IncrementalGroupAccumulator, IncrementalPivotAccumulator,
+    PreparedInsertDocument, Reservoir, StreamingLoadMutation, SyntheticDocument,
 };
 
 pub(crate) use executor::{
-    decode_execution_row, encode_execution_row_into, execution_row_encoded_len,
-    execution_row_working_bytes, projected_row_working_bytes_refs, reserve_query_memory,
-    stable_projected_order, stable_sort, BoundedProjectedTopN, BoundedTopN, ProjectedRowLocator,
-    ProjectedRowSet,
+    decode_execution_row, encode_execution_row_into, execute_insert, execute_streaming_load,
+    execution_row_encoded_len, execution_row_working_bytes, insert_document, into_target,
+    projected_row_working_bytes_refs, sample_seed, stable_sort, streaming_load_specification,
+    BoundedProjectedTopN, BoundedTopN, ProjectedRowLocator,
 };
-
-mod lowerer;
-
-pub use lowerer::ScanPlanLowerer;
 
 mod insert_materializer;
 
@@ -118,22 +113,30 @@ pub use insert_materializer::InsertDocumentMaterializer;
 
 mod projected_values;
 
+mod prune;
+mod pushdown;
 mod totality;
 
 mod batch;
+pub(crate) mod keys;
 
+pub(crate) use batch::keep;
 pub use batch::{Abort, BatchProgram, BatchRunner, Column, Tag, BATCH_ROWS};
 
+pub(crate) use executor::{check_sort_kinds, compare_owned_projected_rows, TopSelection};
+pub use prune::GroupPruning;
 pub use totality::{total_kinds, Kinds};
 
 pub use projected_values::{
-    AccessVector, ProjectedPredicate, ProjectedValueLayout, ProjectedValuePipeline,
-    ProjectedValueRow, SlotProgram, SlotRow,
+    document_of_fields, AccessVector, ProjectedPredicate, ProjectedValueLayout,
+    ProjectedValuePipeline, ProjectedValueRow, SlotProgram, SlotRow,
 };
 
 mod runtime_materializer;
+mod window;
+pub use window::{FillSpec, WindowSpec};
 
-pub(crate) use runtime_materializer::{describe_group_fields, group_field_layout, NearSpec};
+pub(crate) use runtime_materializer::{describe_group_fields, group_field_layout, path_value};
 pub use runtime_materializer::{
     CompiledStage, DenseGroups, QueryRuntime, RuntimeMaterializer, SlotExpansion,
 };

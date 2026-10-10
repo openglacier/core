@@ -93,7 +93,7 @@ impl QueryAccess {
             .find(|stage| {
                 stage
                     .name_text(source)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("into") || name.eq_ignore_ascii_case("out"))
+                    .is_some_and(|name| crate::query::Stage::parse(&name.to_ascii_lowercase()) == Some(crate::query::Stage::Into))
             })
             .and_then(|stage| stage.arguments_text(source))
             .map(|target| target.trim().to_owned());
@@ -101,8 +101,8 @@ impl QueryAccess {
         let mutating = into_target.is_some() || pipeline.stages().iter().any(|stage| {
             stage
                 .name_text(source)
-                .map(str::to_ascii_lowercase)
-                .is_some_and(|name| matches!(name.as_str(), "insert" | "set" | "delete" | "load"))
+                .and_then(|name| crate::query::Stage::parse(&name.to_ascii_lowercase()))
+                .is_some_and(|stage| stage.entry().effect == crate::query::Effect::Write)
         });
         let (collection, source_read) = match into_target {
             Some(target) => (target, Some(collection)),
@@ -125,25 +125,6 @@ impl QueryAccess {
     }
 }
 
-/// Escapes one string for an internal OG query literal.
-#[must_use]
-pub fn quote_query_string(value: &str) -> String {
-    let mut output = String::with_capacity(value.len() + 2);
-    output.push('"');
-    for character in value.chars() {
-        match character {
-            '\\' => output.push_str("\\\\"),
-            '"' => output.push_str("\\\""),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            other => output.push(other),
-        }
-    }
-    output.push('"');
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +135,4 @@ mod tests {
     #[test] fn authenticated_principal_builds_permission_request() { let access = QueryAccess::analyze("on users").unwrap(); let request = access .request_for(&Principal::Identity { identity_id: "identity-a".to_owned(), device_id: "device-a".to_owned(), }) .unwrap(); assert_eq!(request.identity_id, "identity-a"); assert_eq!(request.action, AuthorizationAction::QueryRead); assert_eq!(request.resource, "users"); }
     #[test] fn app_manage_action_is_stable() { assert_eq!(AuthorizationAction::AppManage.as_str(), "app.manage"); }
     #[test] fn fabric_manage_action_is_stable() { assert_eq!(AuthorizationAction::FabricManage.as_str(), "fabric.manage"); }
-    #[test] fn query_string_escaping_is_stable() { assert_eq!(quote_query_string("a\"b\\c"), "\"a\\\"b\\\\c\""); }
 }

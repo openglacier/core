@@ -1,12 +1,9 @@
 //! Bootstrap administrator creation isolated from daemon wiring.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::path::Path;
-use crate::helpers::unix_time_millis;
+use crate::helpers::{insert_query, unix_time_millis};
 
-use super::{
-    authorization::quote_query_string,
-    identity_file::{self, IdentityCredential, IdentityFileError},
-};
+use super::identity_file::{self, IdentityCredential, IdentityFileError};
 
 #[derive(Debug)]
 pub struct BootstrapAdmin {
@@ -24,14 +21,14 @@ impl BootstrapAdmin {
 
     #[must_use]
     pub fn registration_queries(&self) -> [String; 3] {
-        let identity = quote_query_string(&self.credential.identity_id);
-        let device = quote_query_string(&self.credential.device_id);
-        let public = quote_query_string(&self.credential.public_key);
+        let identity = &self.credential.identity_id;
+        let device = &self.credential.device_id;
+        let public = &self.credential.public_key;
         let created = self.created_at;
         [
-            format!("on _identities | insert {{identityId: {identity}, publicKey: {public}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created}}}"),
-            format!("on _devices | insert {{deviceId: {device}, identityId: {identity}, publicKey: {public}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created}}}"),
-            format!("on _permissions | insert {{identityId: {identity}, action: \"*\", resource: \"*\", effect: \"allow\", state: \"active\", createdAt: {created}}}"),
+            insert_query("_identities", serde_json::json!({"identityId": identity, "publicKey": public, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created})),
+            insert_query("_devices", serde_json::json!({"deviceId": device, "identityId": identity, "publicKey": public, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created})),
+            insert_query("_permissions", serde_json::json!({"identityId": identity, "action": "*", "resource": "*", "effect": "allow", "state": "active", "createdAt": created})),
         ]
     }
 

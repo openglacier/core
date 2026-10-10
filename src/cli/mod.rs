@@ -3,7 +3,7 @@
 use std::{
     env,
     error::Error,
-    io::{self, BufRead, IsTerminal, Read, Write},
+    io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Write},
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::ExitCode,
@@ -15,7 +15,7 @@ use std::{
 use crate::{
     access::identity_file::{self, IdentityCredential},
     helpers::decode_base64,
-    operation::{ operation_by_name, OperationRequest, TransportKind, AUTH_BEGIN, AUTH_COMPLETE, QUERY_EXECUTE, },
+    operation::{ operation_by_name, OperationRequest, TransportKind, AUTH_BEGIN, AUTH_COMPLETE, AUTH_ENROLL_BEGIN, AUTH_ENROLL_COMPLETE, QUERY_EXECUTE, },
     protocol::{
         decode_stream_response, encode_message, ensure_payload_size, MessageKind, RequestId,
         StreamResponse, LENGTH_PREFIX_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
@@ -257,7 +257,8 @@ fn parse_operation(input: &str) -> Result<(&str, Value)> {
     Ok((op, if payload.is_empty() { json!({}) } else { serde_json::from_str(payload)? }))
 }
 
-struct Client { stream: TcpStream, next_id: u64, }
+/// Responses are read through a buffer: a result streams many small frames.
+struct Client { stream: BufReader<TcpStream>, next_id: u64, }
 
 impl Client {
     fn connect(config: &Config) -> Result<Self> {
@@ -270,10 +271,18 @@ impl Client {
         stream.set_read_timeout(config.read_timeout)?;
         stream.set_write_timeout(Some(config.write_timeout))?;
         stream.set_nodelay(true)?;
-        let mut client = Self { stream, next_id: 1 };
+        let mut client = Self { stream: BufReader::with_capacity(1 << 16, stream), next_id: 1 };
         if let Some(path) = &config.identity {
             let identity = identity_file::load(path, &config.password()?)?;
-            client.authenticate(&identity)?;
+            match client.authenticate(&identity) {
+                // As og-hub does: an identity or device the node does not
+                // know yet is enrolled, then authenticated.
+                Err(error) if config.enroll && ["auth.device_not_found", "auth.identity_not_found", "authorization.invalid_principal"].iter().any(|code| error.to_string().starts_with(code)) => {
+                    client.enroll(&identity)?;
+                    client.authenticate(&identity)?;
+                }
+                result => result?,
+            }
         }
         Ok(client)
     }
@@ -286,7 +295,7 @@ impl Client {
             MessageKind::Request,
             MAX_REQUEST_BYTES,
         )?;
-        self.stream.write_all(&message)?;
+        self.stream.get_mut().write_all(&message)?;
         Ok(id)
     }
 
@@ -298,8 +307,10 @@ impl Client {
             ensure_payload_size(MessageKind::Response, len, MAX_RESPONSE_BYTES)?;
             message.resize(len, 0);
             self.stream.read_exact(message)?;
-            let envelope: Value = rmp_serde::from_slice(message)?;
-            if envelope.get("kind").and_then(Value::as_str) != Some("event") {
+            // Only the kind is read: the data is decoded once, by the caller.
+            #[derive(serde::Deserialize)]
+            struct Envelope { #[serde(default)] kind: String }
+            if rmp_serde::from_slice::<Envelope>(message)?.kind != "event" {
                 return Ok(());
             }
         }
@@ -476,6 +487,29 @@ impl Client {
         }
     }
 
+    /// Enrolls `identity` with one device holding the same key, under the
+    /// node's enrollment mode (`OGCLI_ENROLLMENT_TOKEN` for a token).
+    fn enroll(&mut self, identity: &IdentityCredential) -> Result<()> {
+        let mut begin = json!({
+            "identityId": identity.identity_id,
+            "identityPublicKey": identity.public_key,
+            "deviceId": identity.device_id,
+            "devicePublicKey": identity.public_key,
+        });
+        if let Ok(token) = env::var("OGCLI_ENROLLMENT_TOKEN") {
+            begin["token"] = Value::String(token);
+        }
+        let challenge = self.operation(AUTH_ENROLL_BEGIN, begin)?;
+        let (Some(challenge_id), Some(bytes)) = (challenge["challengeId"].as_str(), challenge["challenge"].as_str()) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid enrollment response").into());
+        };
+        self.operation(
+            AUTH_ENROLL_COMPLETE,
+            json!({"challengeId": challenge_id, "signature": identity.sign_base64(&decode_base64(bytes)?)}),
+        )?;
+        Ok(())
+    }
+
     fn authenticate(&mut self, identity: &IdentityCredential) -> Result<()> {
         let begin = self.operation(
             AUTH_BEGIN,
@@ -533,14 +567,13 @@ fn render_json(value: &Value, output: Output) -> Result<String> {
 }
 
 fn print_json(value: &Value, output: Output) -> Result<()> {
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
+    let mut stdout = BufWriter::with_capacity(1 << 16, io::stdout().lock());
     match output {
         Output::Pretty => serde_json::to_writer_pretty(&mut stdout, value)?,
         Output::Compact | Output::Quiet => serde_json::to_writer(&mut stdout, value)?,
     }
     writeln!(stdout)?;
-    Ok(())
+    Ok(stdout.flush()?)
 }
 
 #[derive(Clone)]
@@ -551,6 +584,8 @@ struct Config {
     write_timeout: Duration,
     output: Output,
     identity: Option<PathBuf>,
+    /// Enrolls the identity (identity and device) when the node does not know it.
+    enroll: bool,
     password_file: Option<PathBuf>,
     password: Option<String>,
     /// `$name` query parameters given with `--param name=value`.
@@ -572,6 +607,7 @@ impl Config {
             write_timeout: env_duration("OGCLI_WRITE_TIMEOUT_MS", 30_000, false)?.unwrap(),
             output: Output::Pretty,
             identity,
+            enroll: false,
             password_file: env::var("OGCLI_IDENTITY_PASSWORD_FILE").ok().map(PathBuf::from),
             password: env::var("OGCLI_IDENTITY_PASSWORD").ok(),
             params: Map::new(),
@@ -639,6 +675,7 @@ impl Args {
                 "--identity" => config.identity = Some(value!().into()),
                 "--identity-password-file" => config.password_file = Some(value!().into()),
                 "--identity-password" => config.password = Some(value!()),
+                "--enroll" => config.enroll = true,
                 "--connect-timeout-ms" => config.connect_timeout = duration(&value!(), false)?.unwrap(),
                 "--read-timeout-ms" => config.read_timeout = duration(&value!(), true)?,
                 "--write-timeout-ms" => config.write_timeout = duration(&value!(), false)?.unwrap(),
@@ -727,6 +764,7 @@ OPTIONS:\n\
     --identity FILE           Encrypted identity used to authenticate\n\
     --identity-password-file FILE\n\
     --identity-password PASS\n\
+    --enroll                  Enrolls an unknown identity (OGCLI_ENROLLMENT_TOKEN: token)\n\
     --connect-timeout-ms MS   [default: 5000]\n\
     --read-timeout-ms MS      0 waits indefinitely [default: 0]\n\
     --write-timeout-ms MS     [default: 30000]\n\

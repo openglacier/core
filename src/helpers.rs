@@ -8,6 +8,7 @@ use serde_json::{Map, Value as JsonValue};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,11 +36,6 @@ pub fn elapsed_micros(started: Instant) -> u64 {
 }
 #[inline]
 #[must_use]
-pub fn elapsed_nanos(started: Instant) -> u64 {
-    u128_to_u64_saturating(started.elapsed().as_nanos())
-}
-#[inline]
-#[must_use]
 pub fn elapsed_millis(started: Instant) -> u64 {
     u128_to_u64_saturating(started.elapsed().as_millis())
 }
@@ -51,6 +47,12 @@ pub fn system_time_millis(time: SystemTime) -> Option<u64> {
 #[must_use]
 pub fn unix_time_millis() -> u64 {
     system_time_millis(SystemTime::now()).unwrap_or_default()
+}
+/// Current Unix time in milliseconds as a signed query value (0 before the
+/// epoch).
+#[must_use]
+pub fn now_millis() -> i64 {
+    i64::try_from(unix_time_millis()).unwrap_or(i64::MAX)
 }
 #[must_use]
 pub fn unix_time_nanos() -> u128 {
@@ -258,6 +260,84 @@ pub fn fnv1a64_continue(hash: u64, bytes: &[u8]) -> u64 {
 #[must_use]
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
     fnv1a64_continue(FNV1A64_OFFSET, bytes)
+}
+
+/// Raises `peak` to `value` when `value` is higher; a lower value leaves the
+/// counter untouched without a write.
+#[inline]
+pub fn raise_peak_u64(peak: &AtomicU64, value: u64) {
+    if value > peak.load(Ordering::Relaxed) {
+        peak.fetch_max(value, Ordering::Relaxed);
+    }
+}
+/// [`raise_peak_u64`] for a `usize` counter.
+#[inline]
+pub fn raise_peak_usize(peak: &AtomicUsize, value: usize) {
+    if value > peak.load(Ordering::Relaxed) {
+        peak.fetch_max(value, Ordering::Relaxed);
+    }
+}
+
+/// Length of the longest common prefix of two slices.
+#[must_use]
+pub fn common_prefix_len<T: PartialEq>(left: &[T], right: &[T]) -> usize {
+    left.iter().zip(right).take_while(|(left, right)| left == right).count()
+}
+
+/// Replaces negative zero by positive zero.
+#[inline]
+#[must_use]
+pub fn normalize_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
+}
+
+/// First character of an identifier (collection segment, field, stage).
+#[inline]
+#[must_use]
+pub fn is_identifier_start(character: char) -> bool {
+    character == '_' || character.is_alphabetic()
+}
+/// Any later character of an identifier.
+#[inline]
+#[must_use]
+pub fn is_identifier_continue(character: char) -> bool {
+    character == '_' || character.is_alphabetic() || character.is_ascii_digit()
+}
+
+/// Appends the conjuncts of `expression` (its `and` operands, ungrouped,
+/// left to right) to `output`.
+pub fn collect_conjuncts<'a>(expression: &'a crate::query::Expression, output: &mut Vec<&'a crate::query::Expression>) {
+    let expression = expression.ungrouped();
+    match expression.view() {
+        crate::query::ExpressionView::Binary { left, operator: crate::query::BinaryOperator::And, right } => {
+            collect_conjuncts(left, output);
+            collect_conjuncts(right, output);
+        }
+        _ => output.push(expression),
+    }
+}
+
+/// `value` as a query string literal (JSON-quoted and escaped).
+#[must_use]
+pub fn query_string(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a Rust string to JSON cannot fail")
+}
+
+/// `format!` for a query whose arguments are all strings, each written as a
+/// query string literal ([`query_string`]).
+macro_rules! quoted {
+    ($format:literal $(, $argument:expr)* $(,)?) => {
+        format!($format $(, $crate::helpers::query_string($argument))*)
+    };
+}
+pub(crate) use quoted;
+
+/// `on <collection> | insert <document>`: field values are written as JSON
+/// literals, so strings are quoted and escaped, and objects and arrays keep
+/// their structure.
+#[must_use]
+pub fn insert_query(collection: &str, document: impl std::fmt::Display) -> String {
+    format!("on {collection} | insert {document}")
 }
 
 /// Locks `mutex`, recovering the guard if a previous holder panicked.

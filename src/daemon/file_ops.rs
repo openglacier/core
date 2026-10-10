@@ -623,23 +623,20 @@ pub(super) fn file_version_json( version_id:&str,file:&FileEntry,remote_id:&str,
 
 #[cfg(feature = "files")]
 pub(super) fn list_file_versions( engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str )->Result<Vec<JsonValue>,QueryResponse>{
-    let query=format!( "on _file_versions | where _place == {} and _app_instance == {} and fileId == {} | sort createdAt desc", query_string(place_id),query_string(instance_id),query_string(file_id) );
-    match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{documents,..}=>Ok(documents),error@QueryResponse::Error{..}=>Err(error)}
+    let query=quoted!("on _file_versions | where _place == {} and _app_instance == {} and fileId == {} | sort createdAt desc", place_id, instance_id, file_id);
+    query_documents(engine, id, query)
 }
 
 #[cfg(feature = "files")]
 pub(super) fn load_file_version( engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str )->Result<JsonValue,QueryResponse>{
-    let query=format!( "on _file_versions | where _place == {} and _app_instance == {} and fileId == {} and versionId == {} | limit 1", query_string(place_id),query_string(instance_id),query_string(file_id),query_string(version_id) );
-    match execute_request(engine,QueryRequest::new(id,query)){
-        QueryResponse::Ok{documents,..}=>documents.into_iter().next().ok_or_else(||QueryResponse::request_error(id,"file.version_not_found","File version was not found")),
-        error@QueryResponse::Error{..}=>Err(error),
-    }
+    let query=quoted!("on _file_versions | where _place == {} and _app_instance == {} and fileId == {} and versionId == {} | limit 1", place_id, instance_id, file_id, version_id);
+    query_first(engine, id, query)?.ok_or_else(||QueryResponse::request_error(id,"file.version_not_found","File version was not found"))
 }
 
 #[cfg(feature = "files")]
 pub(super) fn delete_file_version_metadata( engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,version_id:&str )->Result<(),QueryResponse>{
-    let query=format!( "on _file_versions | where _place == {} and _app_instance == {} and fileId == {} and versionId == {} | delete", query_string(place_id),query_string(instance_id),query_string(file_id),query_string(version_id) );
-    match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(()),error@QueryResponse::Error{..}=>Err(error)}
+    let query=quoted!("on _file_versions | where _place == {} and _app_instance == {} and fileId == {} and versionId == {} | delete", place_id, instance_id, file_id, version_id);
+    query_run(engine, id, query)
 }
 
 pub(super) fn archive_current_file( engine:&Engine,settings:&ConnectionSettings,id:RequestId,file:&FileEntry )->Result<JsonValue,QueryResponse>{
@@ -656,11 +653,8 @@ pub(super) fn archive_current_file( engine:&Engine,settings:&ConnectionSettings,
     ).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
     stored.metadata.content_type=file.metadata.content_type.clone();
     let json=file_version_json(&version_id,file,&stored.remote_id,&stored.metadata,created_at);
-    let query=format!("on _file_versions | insert {}",serde_json::to_string(&json).expect("file version serializes"));
-    match execute_request(engine,QueryRequest::new(id,query)){
-        QueryResponse::Ok{..}=>Ok(json),
-        error@QueryResponse::Error{..}=>{let _=versions.delete(&stored.remote_id);Err(error)}
-    }
+    let query=insert_query("_file_versions",&json);
+    query_run(engine,id,query).map(|()|json).inspect_err(|_|{let _=versions.delete(&stored.remote_id);})
 }
 
 pub(super) static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
@@ -704,11 +698,8 @@ pub(super) fn json_to_file_entry(value:&JsonValue)->Result<FileEntry,&'static st
 }
 
 pub(super) fn load_file_entry_json(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<JsonValue,QueryResponse>{
-    let query=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | limit 1",query_string(place_id),query_string(instance_id),query_string(file_id));
-    match execute_request(engine,QueryRequest::new(id,query)){
-        QueryResponse::Ok{documents,..}=>documents.into_iter().next().ok_or_else(||QueryResponse::request_error(id,"file.not_found","File entry was not found")),
-        error@QueryResponse::Error{..}=>Err(error),
-    }
+    let query=quoted!("on _files | where _place == {} and _app_instance == {} and fileId == {} | limit 1", place_id, instance_id, file_id);
+    query_first(engine, id, query)?.ok_or_else(||QueryResponse::request_error(id,"file.not_found","File entry was not found"))
 }
 pub(super) fn load_file_entry(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<FileEntry,QueryResponse>{
     let json=load_file_entry_json(engine,id,place_id,instance_id,file_id)?;
@@ -716,8 +707,8 @@ pub(super) fn load_file_entry(engine:&Engine,id:RequestId,place_id:&str,instance
 }
 pub(super) fn list_file_children_raw(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:Option<&str>)->Result<Vec<JsonValue>,QueryResponse>{
     let parent=parent_id.map_or_else(||"parentId == null".to_owned(),|value|format!("parentId == {}",query_string(value)));
-    let query=format!("on _files | where _place == {} and _app_instance == {} and {parent} | sort name",query_string(place_id),query_string(instance_id));
-    match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{documents,..}=>Ok(documents),error@QueryResponse::Error{..}=>Err(error)}
+    let query=quoted!("on _files | where _place == {} and _app_instance == {} and {parent} | sort name", place_id, instance_id);
+    query_documents(engine, id, query)
 }
 
 pub(super) fn list_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:Option<&str>)->Result<Vec<JsonValue>,QueryResponse>{
@@ -729,28 +720,24 @@ pub(super) fn list_file_entries(engine:&Engine,id:RequestId,place_id:&str,instan
 
 #[cfg(feature = "files")]
 pub(super) fn list_trashed_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str)->Result<Vec<JsonValue>,QueryResponse>{
-    let query=format!("on _files | where _place == {} and _app_instance == {}",query_string(place_id),query_string(instance_id));
-    match execute_request(engine,QueryRequest::new(id,query)){
-        QueryResponse::Ok{documents,..}=>{
-            let trashed_ids=documents.iter()
-                .filter(|document|document.bool_field("trashed")==Some(true))
-                .filter_map(|document|document.str_field("fileId"))
-                .map(str::to_owned)
-                .collect::<std::collections::BTreeSet<_>>();
-            let mut entries=documents.into_iter()
-                .filter(|document|{
-                    if document.bool_field("trashed")!=Some(true){return false;}
-                    match document.str_field("parentId"){
-                        Some(parent)=>!trashed_ids.contains(parent),
-                        None=>true,
-                    }
-                })
-                .collect::<Vec<_>>();
-            entries.sort_by_key(|document|std::cmp::Reverse(document.u64_field("trashedAt").unwrap_or(0)));
-            Ok(entries)
-        }
-        error@QueryResponse::Error{..}=>Err(error),
-    }
+    let query=quoted!("on _files | where _place == {} and _app_instance == {}", place_id, instance_id);
+    let documents=query_documents(engine,id,query)?;
+    let trashed_ids=documents.iter()
+        .filter(|document|document.bool_field("trashed")==Some(true))
+        .filter_map(|document|document.str_field("fileId"))
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut entries=documents.into_iter()
+        .filter(|document|{
+            if document.bool_field("trashed")!=Some(true){return false;}
+            match document.str_field("parentId"){
+                Some(parent)=>!trashed_ids.contains(parent),
+                None=>true,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|document|std::cmp::Reverse(document.u64_field("trashedAt").unwrap_or(0)));
+    Ok(entries)
 }
 pub(super) fn file_entry_from_store(place_id:&str,instance_id:&str,parent_id:Option<&str>,stored:FileStoreEntry)->FileEntry{
     let sequence=NEXT_FILE_ID.fetch_add(1,Ordering::Relaxed);
@@ -758,28 +745,23 @@ pub(super) fn file_entry_from_store(place_id:&str,instance_id:&str,parent_id:Opt
 }
 pub(super) fn persist_file_entry(engine:&Engine,id:RequestId,entry:&FileEntry)->Result<JsonValue,QueryResponse>{
     let json=file_entry_json(entry);
-    let query=format!("on _files | insert {}",serde_json::to_string(&json).expect("file metadata serializes"));
-    match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(json),error@QueryResponse::Error{..}=>Err(error)}
+    let query=insert_query("_files",&json);
+    query_run(engine, id, query).map(|()| json)
 }
 pub(super) fn replace_file_entry(engine:&Engine,id:RequestId,entry:&FileEntry)->Result<JsonValue,QueryResponse>{
-    let delete=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete",query_string(&entry.place_id),query_string(&entry.app_instance_id),query_string(entry.file_id.as_str()));
-    match execute_request(engine,QueryRequest::new(id,delete)){QueryResponse::Ok{..}=>persist_file_entry(engine,id,entry),error@QueryResponse::Error{..}=>Err(error)}
+    let delete=quoted!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete", &entry.place_id, &entry.app_instance_id, entry.file_id.as_str());
+    query_run(engine, id, delete).and_then(|()| persist_file_entry(engine,id,entry))
 }
 #[cfg(feature = "files")]
 pub(super) fn delete_file_metadata(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<(),QueryResponse>{
-    let query=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete",query_string(place_id),query_string(instance_id),query_string(file_id));
-    match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(()),error@QueryResponse::Error{..}=>Err(error)}
+    let query=quoted!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete", place_id, instance_id, file_id);
+    query_run(engine, id, query)
 }
 
 pub(super) fn replace_file_json(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str,json:&JsonValue)->Result<JsonValue,QueryResponse>{
-    let delete=format!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete",query_string(place_id),query_string(instance_id),query_string(file_id));
-    match execute_request(engine,QueryRequest::new(id,delete)){
-        QueryResponse::Ok{..}=>{
-            let query=format!("on _files | insert {}",serde_json::to_string(json).expect("file metadata serializes"));
-            match execute_request(engine,QueryRequest::new(id,query)){QueryResponse::Ok{..}=>Ok(json.clone()),error@QueryResponse::Error{..}=>Err(error)}
-        }
-        error@QueryResponse::Error{..}=>Err(error),
-    }
+    let delete=quoted!("on _files | where _place == {} and _app_instance == {} and fileId == {} | delete", place_id, instance_id, file_id);
+    query_run(engine,id,delete)?;
+    query_run(engine,id,insert_query("_files",json)).map(|()|json.clone())
 }
 
 pub(super) const INTERNAL_TRASH_DIR: &str = ".og-trash";

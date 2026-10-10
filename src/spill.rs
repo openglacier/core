@@ -64,16 +64,6 @@ pub fn stats_snapshot() -> SpillStatsSnapshot {
     }
 }
 
-fn update_peak(target: &AtomicU64, value: u64) {
-    let mut current = target.load(Ordering::Relaxed);
-    while value > current {
-        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => break,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SpillEngine { directory: PathBuf, }
 
@@ -147,14 +137,14 @@ impl SpillRunWriter {
         let active = SPILL_RUNS_ACTIVE
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        update_peak(&SPILL_RUNS_PEAK_ACTIVE, active);
+        crate::helpers::raise_peak_u64(&SPILL_RUNS_PEAK_ACTIVE, active);
         SPILL_RECORDS_WRITTEN.fetch_add(self.records, Ordering::Relaxed);
         SPILL_PAYLOAD_BYTES_WRITTEN.fetch_add(self.payload_bytes, Ordering::Relaxed);
         SPILL_FRAMING_BYTES_WRITTEN.fetch_add(framing_bytes, Ordering::Relaxed);
         let live = SPILL_LIVE_BYTES
             .fetch_add(bytes, Ordering::Relaxed)
             .saturating_add(bytes);
-        update_peak(&SPILL_PEAK_LIVE_BYTES, live);
+        crate::helpers::raise_peak_u64(&SPILL_PEAK_LIVE_BYTES, live);
         Ok(SpillRun {
             path: self.path.clone(),
             records: self.records,

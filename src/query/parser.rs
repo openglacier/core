@@ -4,7 +4,7 @@
 use std::fmt;
 
 use super::{
-    lex, EndAst, LexError, NameAst, PipelineAst, SourceAliasAst, SourceAst, SourceKeyword, Span,
+    lex, EndAst, LexError, NameAst, PipelineAst, SourceAliasAst, SourceAst, SourceKeyword, SourceTemporalAst, Span,
     Spanned, StageAst, SubPipelineAst, Token, TokenKind, TokenStream,
 };
 
@@ -39,6 +39,9 @@ pub enum ParseErrorKind {
 
     /// Le mot-clé `as` doit être suivi d'un identifiant.
     ExpectedAliasName { found: TokenKind },
+
+    /// `as of` doit être suivi d'une date (chaîne) ou d'une génération (nombre).
+    ExpectedAsOfValue { found: TokenKind },
 
     /// Un point d'un nom qualifié doit être suivi d'un identifiant.
     ExpectedNameAfterDot { found: TokenKind },
@@ -134,6 +137,10 @@ impl fmt::Display for ParseErrorKind {
 
             Self::ExpectedAliasName { found } => {
                 write!(formatter, "expected alias name after `as`, found {found}")
+            }
+
+            Self::ExpectedAsOfValue { found } => {
+                write!(formatter, "expected a date string or a generation number after `as of`, found {found}")
             }
 
             Self::ExpectedNameAfterDot { found } => {
@@ -297,7 +304,7 @@ impl From<ParseError> for QueryParseError {
 /// semantics: the planner decides what the nested stages mean.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SubPipelinePolicy {
-    /// The stage is always compound (`union`, `pivot`).
+    /// The stage is always compound (`union`, `pivot`, `window`).
     Always,
     /// The stage is compound unless its header holds `into` (`lookup`, `join`):
     /// `lookup orders on user == name into orders` is the one-line equality form.
@@ -315,7 +322,7 @@ impl SubPipelinePolicy {
     pub fn of_stage(name: &str) -> Self {
         match name {
             "lookup" | "join" => Self::UnlessHeaderHasInto,
-            "union" | "pivot" => Self::Always,
+            "union" | "pivot" | "window" => Self::Always,
             "load" | "group" => Self::WhenHeaderEmpty,
             _ => Self::Never,
         }
@@ -644,7 +651,52 @@ impl<'stream, 'source> Parser<'stream, 'source> {
         self.advance();
 
         let collection = self.parse_qualified_collection_name()?;
+        let temporal = self.parse_source_temporal()?;
+        let source = self.parse_source_alias(keyword, keyword_token, collection)?;
+        Ok(match temporal {
+            Some(temporal) => {
+                let span = source.span().join(temporal.span());
+                let rebuilt = match source.alias() {
+                    Some(alias) => SourceAst::with_alias(keyword, keyword_token.span(), collection, alias, span),
+                    None => SourceAst::new(keyword, keyword_token.span(), collection, span),
+                };
+                rebuilt.with_temporal(temporal)
+            }
+            None => source,
+        })
+    }
 
+    /// `history`, or `as of <string|number>` (a following `as of` without a
+    /// value stays an alias named `of`).
+    fn parse_source_temporal(&mut self) -> ParseResult<Option<SourceTemporalAst>> {
+        let source = self.stream.source();
+        let current = self.current();
+        if current.kind() == TokenKind::Identifier && current.lexeme(source) == Some("history") {
+            self.advance();
+            return Ok(Some(SourceTemporalAst::History { span: current.span() }));
+        }
+        let of = self.next_token();
+        if !(current.kind() == TokenKind::As && of.kind() == TokenKind::Identifier && of.lexeme(source) == Some("of")) {
+            return Ok(None);
+        }
+        let value = self.stream.get(self.cursor.saturating_add(2)).unwrap_or_else(|| Token::end(source.len()));
+        match value.kind() {
+            TokenKind::String | TokenKind::Number => {
+                self.advance();
+                self.advance();
+                self.advance();
+                Ok(Some(SourceTemporalAst::AsOf { value: value.span(), number: value.kind() == TokenKind::Number, span: current.span().join(value.span()) }))
+            }
+            TokenKind::End | TokenKind::Pipe => Ok(None),
+            found => {
+                self.advance();
+                self.advance();
+                Err(self.error_current(ParseErrorKind::ExpectedAsOfValue { found }))
+            }
+        }
+    }
+
+    fn parse_source_alias(&mut self, keyword: SourceKeyword, keyword_token: Token, collection: NameAst) -> ParseResult<SourceAst> {
         if self.check(TokenKind::As) {
             let as_token = self.advance();
             let alias_token = self.current();
@@ -1013,14 +1065,7 @@ mod tests {
     #[test] fn parses_empty_structured_values() { let array = parse_value_ok("[]"); let object = parse_value_ok("{}"); assert!(matches!(array, ValueAst::Array(ref value) if value.is_empty())); assert!(matches!(object, ValueAst::Object(ref value) if value.is_empty())); }
     #[test] fn parses_array_with_trailing_comma() { let source = r#"["rust", 42, true, null,]"#; let ValueAst::Array(array) = parse_value_ok(source) else { panic!("expected array"); }; assert_eq!(array.len(), 4); assert_eq!(array.span().slice(source), Some(source)); assert!(matches!(array.value(0), Some(ValueAst::String(_)))); assert!(matches!(array.value(1), Some(ValueAst::Number(_)))); assert!(matches!(array.value(2), Some(ValueAst::Boolean(_)))); assert!(matches!(array.value(3), Some(ValueAst::Null(_)))); }
     #[test] fn parses_object_with_identifier_and_string_keys() { let source = r#"{name: "John", "display-name": "Johnny",}"#; let ValueAst::Object(object) = parse_value_ok(source) else { panic!("expected object"); }; assert_eq!(object.len(), 2); assert_eq!( object.field(0).and_then(|field| field.key_text(source)), Some("name"), ); assert_eq!( object.field(1).and_then(|field| field.key_text(source)), Some(r#""display-name""#), ); }
-    #[test] fn parses_nested_object_and_array() { let source = r#"{
-            user: {
-                name: "John",
-                tags: ["rust", "database"],
-                address: {city: "Paris"},
-            },
-            active: true,
-        }"#; let value = parse_value_ok(source); assert!(value.is_object()); assert_eq!(value.text(source), Some(source)); }
+    #[test] fn parses_nested_object_and_array() { let source = "{\n            user: {\n                name: \"John\",\n                tags: [\"rust\", \"database\"],\n                address: {city: \"Paris\"},\n            },\n            active: true,\n        }"; let value = parse_value_ok(source); assert!(value.is_object()); assert_eq!(value.text(source), Some(source)); }
     #[test] fn rejects_missing_object_colon() { let error = parse_value_error(r#"{name "John"}"#); assert!(matches!( error.kind(), ParseErrorKind::ExpectedColonAfterObjectKey { found: TokenKind::String } )); }
     #[test] fn rejects_missing_array_comma() { let error = parse_value_error("[1 2]"); assert!(matches!( error.kind(), ParseErrorKind::ExpectedCommaOrArrayEnd { found: TokenKind::Number } )); }
     #[test] fn rejects_missing_object_comma() { let error = parse_value_error("{a: 1 b: 2}"); assert!(matches!( error.kind(), ParseErrorKind::ExpectedCommaOrObjectEnd { found: TokenKind::Identifier } )); }
@@ -1050,15 +1095,7 @@ mod tests {
     #[test] fn pipe_inside_parentheses_does_not_end_stage() { let source = "from users | custom (left | right) | inspect"; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some("(left | right)"), ); assert_eq!( pipeline.stage(1).unwrap().name_text(source), Some("inspect"), ); }
     #[test] fn handles_nested_parentheses() { let source = "from users | where (active and (age > 18))"; let pipeline = parse_ok(source); let stage = pipeline.stage(0).unwrap(); assert_eq!( stage.arguments_text(source), Some("(active and (age > 18))"), ); }
     #[test] fn pipe_in_string_does_not_end_stage() { let source = r#"from users | where value == "left | right" | inspect"#; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some(r#"value == "left | right""#), ); }
-    #[test] fn parses_insert_document_as_complete_stage_arguments() { let source = r#"from users | insert {
-            _id: "u1",
-            name: "John",
-            tags: ["rust", "database"],
-        } | inspect"#; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!(pipeline.stage(0).unwrap().name_text(source), Some("insert")); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some( r#"{
-            _id: "u1",
-            name: "John",
-            tags: ["rust", "database"],
-        }"#, ), ); assert_eq!( pipeline.stage(1).unwrap().name_text(source), Some("inspect") ); }
+    #[test] fn parses_insert_document_as_complete_stage_arguments() { let source = "from users | insert {\n            _id: \"u1\",\n            name: \"John\",\n            tags: [\"rust\", \"database\"],\n        } | inspect"; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!(pipeline.stage(0).unwrap().name_text(source), Some("insert")); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some( "{\n            _id: \"u1\",\n            name: \"John\",\n            tags: [\"rust\", \"database\"],\n        }", ), ); assert_eq!( pipeline.stage(1).unwrap().name_text(source), Some("inspect") ); }
     #[test] fn balances_braces_and_brackets_in_stage_arguments() { let source = r#"from users | custom {items: [{value: 1}, {value: 2}]} | inspect"#; let pipeline = parse_ok(source); assert_eq!(pipeline.stage_count(), 2); assert_eq!( pipeline.stage(0).unwrap().arguments_text(source), Some("{items: [{value: 1}, {value: 2}]}"), ); }
     #[test] fn rejects_unclosed_brace_in_stage_arguments() { let source = "from users | insert {name: \"John\""; let error = parse_error(source); assert!(matches!(error.kind(), ParseErrorKind::UnclosedBrace { .. })); }
     #[test] fn rejects_unclosed_bracket_in_stage_arguments() { let source = "from users | custom [1, 2"; let error = parse_error(source); assert!(matches!( error.kind(), ParseErrorKind::UnclosedBracket { .. } )); }
@@ -1087,20 +1124,9 @@ mod tests {
     #[test] fn parse_error_display_is_compact() { let error = ParseError::new( ParseErrorKind::ExpectedPipe { found: TokenKind::Where, }, Span::new(11, 16), ); assert_eq!( error.to_string(), "expected `|` before next stage, found `where` at 11..16", ); }
     #[test] fn unclosed_subpipeline_error_mentions_opening_stage() { let error = ParseError::new( ParseErrorKind::UnclosedSubPipeline { stage_span: Span::new(9, 27), }, Span::at(42), ); assert_eq!( error.to_string(), "sub-pipeline opened by stage at 9..27 is missing `| end` at 42..42", ); }
     #[test] fn query_parse_error_display_distinguishes_layer() { let error = parse("users").unwrap_err(); assert_eq!( error.to_string(), "parse error: expected `from` or `on`, found identifier at 0..5", ); }
-    #[test] fn parses_pivot_subpipeline() { let source = r#"on sales
-| pivot
-    | rows region
-    | columns month
-    | values revenue
-    | aggregate sum
-| end"#; let pipeline = parse(source).unwrap(); let pivot = pipeline.stage(0).expect("pivot stage"); assert_eq!(pivot.name_text(source), Some("pivot")); assert!(pivot.is_composite()); let subpipeline = pivot.subpipeline().expect("pivot sub-pipeline"); assert_eq!(subpipeline.stage_count(), 4); assert_eq!( subpipeline .stage(0) .and_then(|stage| stage.name_text(source)), Some("rows"), ); assert_eq!( subpipeline .stage(1) .and_then(|stage| stage.name_text(source)), Some("columns"), ); assert_eq!( subpipeline .stage(2) .and_then(|stage| stage.name_text(source)), Some("values"), ); assert_eq!( subpipeline .stage(3) .and_then(|stage| stage.name_text(source)), Some("aggregate"), ); }
+    #[test] fn parses_pivot_subpipeline() { let source = "on sales\n| pivot\n    | rows region\n    | columns month\n    | values revenue\n    | aggregate sum\n| end"; let pipeline = parse(source).unwrap(); let pivot = pipeline.stage(0).expect("pivot stage"); assert_eq!(pivot.name_text(source), Some("pivot")); assert!(pivot.is_composite()); let subpipeline = pivot.subpipeline().expect("pivot sub-pipeline"); assert_eq!(subpipeline.stage_count(), 4); assert_eq!( subpipeline .stage(0) .and_then(|stage| stage.name_text(source)), Some("rows"), ); assert_eq!( subpipeline .stage(1) .and_then(|stage| stage.name_text(source)), Some("columns"), ); assert_eq!( subpipeline .stage(2) .and_then(|stage| stage.name_text(source)), Some("values"), ); assert_eq!( subpipeline .stage(3) .and_then(|stage| stage.name_text(source)), Some("aggregate"), ); }
 
-    #[test] fn rejects_unclosed_pivot_subpipeline() { let source = r#"on sales
-| pivot
-    | rows region
-    | columns month
-    | values revenue
-    | aggregate sum"#; let error = parse(source).unwrap_err(); assert!(matches!( error.as_parse_error().map(ParseError::kind), Some(ParseErrorKind::UnclosedSubPipeline { .. }), )); }
+    #[test] fn rejects_unclosed_pivot_subpipeline() { let source = "on sales\n| pivot\n    | rows region\n    | columns month\n    | values revenue\n    | aggregate sum"; let error = parse(source).unwrap_err(); assert!(matches!( error.as_parse_error().map(ParseError::kind), Some(ParseErrorKind::UnclosedSubPipeline { .. }), )); }
     #[test] fn subpipeline_policy_is_a_stage_property() { assert_eq!(SubPipelinePolicy::of_stage("lookup"), SubPipelinePolicy::UnlessHeaderHasInto); assert!(parse_ok("on users | lookup orders on user == name into orders | limit 1").stage(0).unwrap().subpipeline().is_none()); assert!(parse_ok("on users | lookup orders | into orders | end").stage(0).unwrap().is_composite()); assert_eq!(SubPipelinePolicy::of_stage("pivot"), SubPipelinePolicy::Always); assert_eq!(SubPipelinePolicy::of_stage("group"), SubPipelinePolicy::WhenHeaderEmpty); assert_eq!(SubPipelinePolicy::of_stage("load"), SubPipelinePolicy::WhenHeaderEmpty); assert_eq!(SubPipelinePolicy::of_stage("where"), SubPipelinePolicy::Never); assert!(SubPipelinePolicy::WhenHeaderEmpty.opens(Span::at(3))); assert!(!SubPipelinePolicy::WhenHeaderEmpty.opens(Span::new(3, 5))); }
     #[test] fn group_without_header_opens_a_subpipeline() { let compound = parse_ok("on orders | group | by region | sum qty | sum price | end | sort qty"); assert_eq!(compound.stage_count(), 2); let group = compound.stage(0).unwrap(); assert_eq!(group.subpipeline().map(SubPipelineAst::stage_count), Some(3)); let compact = parse_ok("on orders | group region, qty"); assert!(compact.stage(0).unwrap().subpipeline().is_none()); }
     #[test] fn symbolic_operators_are_not_stage_names() { let error = parse_error("on users | + x"); assert!(matches!(error.kind(), ParseErrorKind::ExpectedStageName { found: TokenKind::Operator })); }

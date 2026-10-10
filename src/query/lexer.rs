@@ -138,12 +138,6 @@ impl<'source> TokenStream<'source> {
         &self.tokens
     }
 
-    /// Consomme le flux et retourne les tokens.
-    #[must_use]
-    pub fn into_tokens(self) -> Vec<Token> {
-        self.tokens
-    }
-
     /// Retourne le nombre total de tokens, token terminal inclus.
     #[must_use]
     #[inline]
@@ -356,7 +350,7 @@ impl<'source> Lexer<'source> {
 
             character if character.is_ascii_digit() => self.lex_number(start),
 
-            character if is_identifier_start(character) => {
+            character if crate::helpers::is_identifier_start(character) => {
                 Ok(self.lex_identifier_or_keyword(start))
             }
 
@@ -420,7 +414,7 @@ impl<'source> Lexer<'source> {
 
     fn lex_identifier_or_keyword(&mut self, start: usize) -> Token {
         self.advance_char();
-        while self.peek_char().is_some_and(is_identifier_continue) {
+        while self.peek_char().is_some_and(crate::helpers::is_identifier_continue) {
             self.advance_char();
         }
         let span = Span::new(start, self.cursor);
@@ -522,8 +516,8 @@ impl<'source> Lexer<'source> {
                 ));
             }
         }
-        if self.peek_char().is_some_and(is_identifier_start) {
-            while self.peek_char().is_some_and(is_identifier_continue) {
+        if self.peek_char().is_some_and(crate::helpers::is_identifier_start) {
+            while self.peek_char().is_some_and(crate::helpers::is_identifier_continue) {
                 self.advance_char();
             }
 
@@ -617,14 +611,6 @@ pub fn lex(source: &str) -> LexResult<TokenStream<'_>> {
     Lexer::new(source).tokenize()
 }
 
-fn is_identifier_start(character: char) -> bool {
-    character == '_' || character.is_alphabetic()
-}
-
-fn is_identifier_continue(character: char) -> bool {
-    character == '_' || character.is_alphabetic() || character.is_ascii_digit()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,30 +635,16 @@ mod tests {
     #[test] fn lexes_set_pipeline() { assert_eq!( kinds("from users | set active = true"), vec![ TokenKind::From, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Set, TokenKind::Identifier, TokenKind::Equal, TokenKind::True, TokenKind::End, ], ); }
     #[test] fn lexes_load_pipeline() { assert_eq!( kinds("from users | load profile"), vec![ TokenKind::From, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Load, TokenKind::Identifier, TokenKind::End, ], ); }
     #[test] fn lexes_join_as_compound_stage_keyword() { assert_eq!( kinds("on users | join workspace | into public | end"), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Join, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Into, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
-    #[test] fn lexes_lookup_pipeline() { assert_eq!( kinds( "on users as u \
-                 | lookup workspace as w \
-                 | where w.public == true \
-                 | into public \
-                 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Lookup, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::Dot, TokenKind::Identifier, TokenKind::EqualEqual, TokenKind::True, TokenKind::Pipe, TokenKind::Into, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
+    #[test] fn lexes_lookup_pipeline() { assert_eq!( kinds( "on users as u | lookup workspace as w | where w.public == true | into public | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Lookup, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::Dot, TokenKind::Identifier, TokenKind::EqualEqual, TokenKind::True, TokenKind::Pipe, TokenKind::Into, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
 
-    #[test] fn lexes_union_pipeline() { assert_eq!( kinds( "on users \
-                 | union \
-                 | on archived_users \
-                 | where active == true \
-                 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Union, TokenKind::Pipe, TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::EqualEqual, TokenKind::True, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
+    #[test] fn lexes_union_pipeline() { assert_eq!( kinds( "on users | union | on archived_users | where active == true | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Union, TokenKind::Pipe, TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Where, TokenKind::Identifier, TokenKind::EqualEqual, TokenKind::True, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
 
-    #[test] fn lexes_streaming_load_pipeline() { assert_eq!( kinds( "on users \
-                 | load \
-                 | with replace \
-                 | chunk batch1 \
-                 | chunk batch2 \
-                 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Load, TokenKind::Pipe, TokenKind::With, TokenKind::Replace, TokenKind::Pipe, TokenKind::Chunk, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Chunk, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
+    #[test] fn lexes_streaming_load_pipeline() { assert_eq!( kinds( "on users | load | with replace | chunk batch1 | chunk batch2 | end" ), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Load, TokenKind::Pipe, TokenKind::With, TokenKind::Replace, TokenKind::Pipe, TokenKind::Chunk, TokenKind::Identifier, TokenKind::Pipe, TokenKind::Chunk, TokenKind::Identifier, TokenKind::Pipe, TokenKind::EndKeyword, TokenKind::End, ], ); }
     #[test] fn lexes_compact_load_modes() { assert_eq!( kinds("load x with replace load y with update load z with merge"), vec![ TokenKind::Load, TokenKind::Identifier, TokenKind::With, TokenKind::Replace, TokenKind::Load, TokenKind::Identifier, TokenKind::With, TokenKind::Update, TokenKind::Load, TokenKind::Identifier, TokenKind::With, TokenKind::Merge, TokenKind::End, ], ); }
     #[test] fn distinguishes_end_keyword_from_end_of_input() { let stream = lex("| end").unwrap(); assert_eq!( stream.tokens(), &[ Token::new(TokenKind::Pipe, Span::new(0, 1)), Token::new(TokenKind::EndKeyword, Span::new(2, 5)), Token::end(5), ], ); assert!(stream.get(1).is_some_and(Token::is_end_keyword)); assert!(stream.get(2).is_some_and(Token::is_end)); }
     #[test] fn lexes_on_source() { assert_eq!( kinds("on users"), vec![TokenKind::On, TokenKind::Identifier, TokenKind::End], ); }
     #[test] fn lexes_source_alias() { assert_eq!( kinds("on users as u"), vec![ TokenKind::On, TokenKind::Identifier, TokenKind::As, TokenKind::Identifier, TokenKind::End, ], ); assert_eq!(lexemes("on users as u"), vec!["on", "users", "as", "u"]); }
-    #[test] fn lexes_all_reserved_words() { assert_eq!( kinds( "from on as where set lookup join union load into with chunk \
-                 replace update merge end true false null and or not" ), vec![ TokenKind::From, TokenKind::On, TokenKind::As, TokenKind::Where, TokenKind::Set, TokenKind::Lookup, TokenKind::Join, TokenKind::Union, TokenKind::Load, TokenKind::Into, TokenKind::With, TokenKind::Chunk, TokenKind::Replace, TokenKind::Update, TokenKind::Merge, TokenKind::EndKeyword, TokenKind::True, TokenKind::False, TokenKind::Null, TokenKind::And, TokenKind::Or, TokenKind::Not, TokenKind::End, ], ); }
+    #[test] fn lexes_all_reserved_words() { assert_eq!( kinds( "from on as where set lookup join union load into with chunk replace update merge end true false null and or not" ), vec![ TokenKind::From, TokenKind::On, TokenKind::As, TokenKind::Where, TokenKind::Set, TokenKind::Lookup, TokenKind::Join, TokenKind::Union, TokenKind::Load, TokenKind::Into, TokenKind::With, TokenKind::Chunk, TokenKind::Replace, TokenKind::Update, TokenKind::Merge, TokenKind::EndKeyword, TokenKind::True, TokenKind::False, TokenKind::Null, TokenKind::And, TokenKind::Or, TokenKind::Not, TokenKind::End, ], ); }
     #[test] fn keywords_are_case_sensitive() { assert_eq!( kinds("FROM From from"), vec![ TokenKind::Identifier, TokenKind::Identifier, TokenKind::From, TokenKind::End, ], ); }
     #[test] fn lexes_ascii_identifiers() { assert_eq!( lexemes("users _private user2 first_name"), vec!["users", "_private", "user2", "first_name",], ); }
     #[test] fn lexes_unicode_identifiers() { assert_eq!( lexemes("employés âge résumé"), vec!["employés", "âge", "résumé"], ); }
@@ -682,26 +654,8 @@ mod tests {
     #[test] fn lexes_object_literal_shape() { let source = r#"{ _id: "u1", name: "John", age: 42, active: true }"#; assert_eq!( kinds(source), vec![ TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::Number, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::True, TokenKind::RightBrace, TokenKind::End, ], ); }
     #[test] fn lexes_quoted_object_keys() { let source = r#"{ "_id": "u1", "display-name": "John" }"#; assert_eq!( kinds(source), vec![ TokenKind::LeftBrace, TokenKind::String, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::Colon, TokenKind::String, TokenKind::RightBrace, TokenKind::End, ], ); }
     #[test] fn lexes_array_literal_shape() { let source = r#"["rust", "database", 42, true, false, null]"#; assert_eq!( kinds(source), vec![ TokenKind::LeftBracket, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::Comma, TokenKind::Number, TokenKind::Comma, TokenKind::True, TokenKind::Comma, TokenKind::False, TokenKind::Comma, TokenKind::Null, TokenKind::RightBracket, TokenKind::End, ], ); }
-    #[test] fn lexes_nested_structured_values() { let source = r#"
-            {
-                user: {
-                    name: "John",
-                    address: {
-                        city: "Paris"
-                    }
-                },
-                tags: ["rust", "database"],
-                scores: [1, 2.5, -3e2]
-            }
-        "#; let stream = lex(source).unwrap(); assert_eq!( stream.kinds().collect::<Vec<_>>(), vec![ TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::RightBrace, TokenKind::RightBrace, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBracket, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::RightBracket, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBracket, TokenKind::Number, TokenKind::Comma, TokenKind::Number, TokenKind::Comma, TokenKind::Number, TokenKind::RightBracket, TokenKind::RightBrace, TokenKind::End, ], ); }
-    #[test] fn lexes_insert_with_document_literal() { let source = r#"
-            from users
-            | insert {
-                _id: "u1",
-                name: "John",
-                age: 42
-            }
-        "#; let stream = lex(source).unwrap(); let kinds = stream.kinds().collect::<Vec<_>>(); assert_eq!(kinds[0], TokenKind::From); assert_eq!(kinds[1], TokenKind::Identifier); assert_eq!(kinds[2], TokenKind::Pipe); assert_eq!(kinds[3], TokenKind::Identifier); assert_eq!(kinds[4], TokenKind::LeftBrace); assert_eq!(kinds.last(), Some(&TokenKind::End)); assert!(kinds.contains(&TokenKind::Colon)); assert!(kinds.contains(&TokenKind::RightBrace)); }
+    #[test] fn lexes_nested_structured_values() { let source = "\n            {\n                user: {\n                    name: \"John\",\n                    address: {\n                        city: \"Paris\"\n                    }\n                },\n                tags: [\"rust\", \"database\"],\n                scores: [1, 2.5, -3e2]\n            }\n        "; let stream = lex(source).unwrap(); assert_eq!( stream.kinds().collect::<Vec<_>>(), vec![ TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBrace, TokenKind::Identifier, TokenKind::Colon, TokenKind::String, TokenKind::RightBrace, TokenKind::RightBrace, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBracket, TokenKind::String, TokenKind::Comma, TokenKind::String, TokenKind::RightBracket, TokenKind::Comma, TokenKind::Identifier, TokenKind::Colon, TokenKind::LeftBracket, TokenKind::Number, TokenKind::Comma, TokenKind::Number, TokenKind::Comma, TokenKind::Number, TokenKind::RightBracket, TokenKind::RightBrace, TokenKind::End, ], ); }
+    #[test] fn lexes_insert_with_document_literal() { let source = "\n            from users\n            | insert {\n                _id: \"u1\",\n                name: \"John\",\n                age: 42\n            }\n        "; let stream = lex(source).unwrap(); let kinds = stream.kinds().collect::<Vec<_>>(); assert_eq!(kinds[0], TokenKind::From); assert_eq!(kinds[1], TokenKind::Identifier); assert_eq!(kinds[2], TokenKind::Pipe); assert_eq!(kinds[3], TokenKind::Identifier); assert_eq!(kinds[4], TokenKind::LeftBrace); assert_eq!(kinds.last(), Some(&TokenKind::End)); assert!(kinds.contains(&TokenKind::Colon)); assert!(kinds.contains(&TokenKind::RightBrace)); }
     #[test] fn lexes_assignment_and_comparison_operators() { assert_eq!( kinds("= == != < <= > >="), vec![ TokenKind::Equal, TokenKind::EqualEqual, TokenKind::NotEqual, TokenKind::Less, TokenKind::LessEqual, TokenKind::Greater, TokenKind::GreaterEqual, TokenKind::End, ], ); }
     #[test] fn lexes_integer_numbers() { assert_eq!( lexemes("0 18 +18 -18 0018"), vec!["0", "18", "+18", "-18", "0018"], ); }
     #[test] fn lexes_decimal_numbers() { assert_eq!(lexemes("18.5 -0.25 +42.0"), vec!["18.5", "-0.25", "+42.0"],); }

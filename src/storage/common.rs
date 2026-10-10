@@ -27,7 +27,7 @@ pub fn validate_collection_id(value: &str) -> StorageResult<()> {
             ));
         };
 
-        if !is_identifier_start(first) {
+        if !crate::helpers::is_identifier_start(first) {
             return Err(StorageError::invalid_collection_id(
                 value,
                 format!("segment {segment_index} must start with an alphabetic character or '_'"),
@@ -35,7 +35,7 @@ pub fn validate_collection_id(value: &str) -> StorageResult<()> {
         }
 
         for (byte_index, character) in characters {
-            if !is_identifier_continue(character) {
+            if !crate::helpers::is_identifier_continue(character) {
                 return Err(StorageError::invalid_collection_id(
                     value,
                     format!(
@@ -72,16 +72,6 @@ pub fn next_generation(generation: u64) -> StorageResult<u64> {
     generation
         .checked_add(1)
         .ok_or_else(|| StorageError::backend("storage generation overflow"))
-}
-
-#[inline]
-fn is_identifier_start(character: char) -> bool {
-    character == '_' || character.is_alphabetic()
-}
-
-#[inline]
-fn is_identifier_continue(character: char) -> bool {
-    character == '_' || character.is_alphabetic() || character.is_ascii_digit()
 }
 
 #[cfg(test)]

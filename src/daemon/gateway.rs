@@ -352,22 +352,13 @@ pub(super) fn node_identity_proof(challenge: &str, node_id: &str, identity_id: &
 
 pub(super) fn registered_device_matches(engine: &Engine, identity_id: &str, device_id: &str, public_key: &str) -> bool {
     if identity_id.is_empty() || device_id.is_empty() || public_key.is_empty() { return false; }
-    let query = format!(
-        "on _devices | where identityId == {} and deviceId == {} and publicKey == {} and state == \"active\" | limit 1",
-        query_string(identity_id),
-        query_string(device_id),
-        query_string(public_key),
-    );
+    let query = quoted!("on _devices | where identityId == {} and deviceId == {} and publicKey == {} and state == \"active\" | limit 1", identity_id, device_id, public_key);
     query_has_rows(engine, 0, query)
 }
 
 pub(super) fn registered_identity_matches(engine: &Engine, identity_id: &str, public_key: &str) -> bool {
     if identity_id.is_empty() || public_key.is_empty() { return false; }
-    let query = format!(
-        "on _identities | where identityId == {} and publicKey == {} and state == \"active\" | limit 1",
-        query_string(identity_id),
-        query_string(public_key),
-    );
+    let query = quoted!("on _identities | where identityId == {} and publicKey == {} and state == \"active\" | limit 1", identity_id, public_key);
     query_has_rows(engine, 0, query)
 }
 
@@ -423,30 +414,24 @@ pub(super) fn ensure_gateway_device_registration(engine: &Engine, identity_id: &
         return Ok(());
     }
 
-    let identity_lookup = format!("on _identities | where identityId == {} | limit 1", query_string(identity_id));
+    let identity_lookup = quoted!("on _identities | where identityId == {} | limit 1", identity_id);
     if query_has_rows(engine, 0, identity_lookup) {
         return Err(format!("Gateway identity {identity_id} conflicts with an existing identity"));
     }
-    let device_lookup = format!("on _devices | where deviceId == {} | limit 1", query_string(device_id));
+    let device_lookup = quoted!("on _devices | where deviceId == {} | limit 1", device_id);
     if query_has_rows(engine, 0, device_lookup) {
         return Err(format!("Gateway device {device_id} conflicts with an existing Device"));
     }
 
     let created_at = unix_time_millis();
-    let identity_insert = format!(
-        "on _identities | insert {{identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}, kind: \"gateway\"}}",
-        query_string(identity_id), query_string(public_key),
-    );
-    if !execute_request(engine, QueryRequest::new(0, identity_insert)).is_ok() {
+    let identity_insert = insert_query("_identities", serde_json::json!({"identityId": identity_id, "publicKey": public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at, "kind": "gateway"}));
+    if !query_run(engine, 0, identity_insert).is_ok() {
         return Err("unable to persist Gateway identity".to_owned());
     }
-    let device_insert = format!(
-        "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}, kind: \"gateway\"}}",
-        query_string(device_id), query_string(identity_id), query_string(public_key),
-    );
-    if !execute_request(engine, QueryRequest::new(0, device_insert)).is_ok() {
-        let rollback = format!("on _identities | where identityId == {} | delete", query_string(identity_id));
-        let _ = execute_request(engine, QueryRequest::new(0, rollback));
+    let device_insert = insert_query("_devices", serde_json::json!({"deviceId": device_id, "identityId": identity_id, "publicKey": public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at, "kind": "gateway"}));
+    if !query_run(engine, 0, device_insert).is_ok() {
+        let rollback = quoted!("on _identities | where identityId == {} | delete", identity_id);
+        let _ = query_run(engine, 0, rollback);
         return Err("unable to persist Gateway Device".to_owned());
     }
     Ok(())

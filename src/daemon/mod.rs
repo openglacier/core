@@ -3,6 +3,7 @@
 #![allow(unused)]
 
 mod admission;
+mod frames;
 
 /// Answers the request with an error and stops its handler.
 macro_rules! reject {
@@ -39,7 +40,7 @@ use crate::access::{
     bootstrap::BootstrapAdmin,
     identity_file::{self, IdentityCredential},
     authorization::{
-        quote_query_string as quote_authorization_string, AuthorizationAction, AuthorizationMode,
+        AuthorizationAction, AuthorizationMode,
         AuthorizationRequest, QueryAccess,
     },
     place::{
@@ -50,7 +51,7 @@ use crate::access::{
 use crate::{
     build as build_profile,
     debug::{self, DebugTopic},
-    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, fnv1a64_continue, JsonFields, lock_unpoisoned, system_time_millis, unix_time_millis, write_file_atomic, APP_INSTANCE_SCOPE_FIELD, FNV1A64_OFFSET, PLACE_SCOPE_FIELD},
+    helpers::{decode_base64, document_to_json, elapsed_micros, encode_base64, fnv1a64_continue, insert_query, query_string, quoted, JsonFields, lock_unpoisoned, system_time_millis, unix_time_millis, write_file_atomic, APP_INSTANCE_SCOPE_FIELD, FNV1A64_OFFSET, PLACE_SCOPE_FIELD},
     engine::Engine, files::{FileEntry, FileId, FileStore, FileStoreEntry, FileStoreError, FileSyncConfig, FileSyncEntryState, FileSyncIndex, FileSyncIndexEntry, FileSyncSelectionMode, FileWrite, NativeFileStore, StoreId, APP_FILES_DIRECTORY, PRIMARY_APPS_COLLISION_NAME, file_sync_projection_component, file_sync_projection_suffix}, Principal, backup,
     event_engine::{EventEngine, EventSubscription},
     memory::{MemoryClass, MemoryGovernor, MemoryProfileConfig, WorkloadClass},
@@ -70,7 +71,6 @@ use crate::{
     },
     query::{
         parse as parse_query, vcollections, DocumentScope, PlannerPipeline,
-        QueryRuntime, ScanPlanLowerer,
     },
     storage::{GlacierStorage, MemoryStorage, ScanOptions, StorageEngine, StorageError, StorageRead, UuidV7Generator},
     Document, Number, Value,
@@ -528,10 +528,7 @@ fn load_node_identity_credential(configuration: &Configuration) -> Result<Identi
 /// records are never rewritten: an unexpected identity/key/state collision is treated as an
 /// inconsistent local store and fails startup.
 fn ensure_node_device_credential(engine: &Engine, credential: &IdentityCredential) -> Result<(), DaemonError> {
-    let lookup = format!(
-        "on _devices | where deviceId == {} | limit 1",
-        query_string(&credential.device_id),
-    );
+    let lookup = quoted!("on _devices | where deviceId == {} | limit 1", &credential.device_id);
     // A fresh client store may not have `_devices` yet. Reads against a missing
     // collection are therefore equivalent to "credential absent" here. The insert
     // below creates/populates the collection through the normal Core query path. If
@@ -549,13 +546,8 @@ fn ensure_node_device_credential(engine: &Engine, credential: &IdentityCredentia
     }
 
     let created_at = unix_time_millis();
-    let insert = format!(
-        "on _devices | insert {{deviceId: {}, identityId: {}, publicKey: {}, algorithm: \"ed25519\", encoding: \"spki-der\", state: \"active\", createdAt: {created_at}}}",
-        query_string(&credential.device_id),
-        query_string(&credential.identity_id),
-        query_string(&credential.public_key),
-    );
-    if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
+    let insert = insert_query("_devices", serde_json::json!({"deviceId": &credential.device_id, "identityId": &credential.identity_id, "publicKey": &credential.public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at}));
+    if !query_run(engine, 0, insert).is_ok() {
         return Err(DaemonError::NodeDeviceCredentialState);
     }
     debug::log( DebugTopic::Auth, None, format!( "registered local node device credential identity={} device={}", credential.identity_id, credential.device_id, ), );
@@ -572,7 +564,7 @@ fn ensure_node_events_permission(engine: &Engine, credential: &IdentityCredentia
     }
 
     let query = enrollment_events_permission_query(&credential.identity_id, unix_time_millis());
-    if execute_request(engine, QueryRequest::new(0, query)).is_ok() {
+    if query_run(engine, 0, query).is_ok() {
         debug::log( DebugTopic::Auth, None, format!( "grant local node identity={} action=events.subscribe resource=* source=node-bootstrap", credential.identity_id ), );
     } else {
         debug::log( DebugTopic::Auth, None, format!( "cannot grant local node identity={} action=events.subscribe resource=*", credential.identity_id ), );
@@ -582,10 +574,7 @@ fn ensure_node_events_permission(engine: &Engine, credential: &IdentityCredentia
 const FABRIC_DEFAULTS_ID: &str = "defaults";
 
 fn bootstrap_fabric_defaults_if_needed( engine: &Engine, credential: &crate::access::identity_file::IdentityCredential, published: ServiceCapabilities, ) -> Result<(), DaemonError> {
-    let query = format!(
-        "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
-        query_string(FABRIC_DEFAULTS_ID),
-    );
+    let query = quoted!("on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1", FABRIC_DEFAULTS_ID);
     if query_has_rows(engine, 0, query) {
         return Ok(());
     }
@@ -619,12 +608,8 @@ fn bootstrap_fabric_defaults_if_needed( engine: &Engine, credential: &crate::acc
             }
         })
         .collect();
-    let encoded = serde_json::to_string(&assignments).expect("fabric defaults serialize");
-    let insert = format!(
-        "on _fabric_resources | insert {{fabricId: {}, resourceAssignments: {encoded}, state: \"active\", createdAt: {now}, updatedAt: {now}}}",
-        query_string(FABRIC_DEFAULTS_ID),
-    );
-    if !execute_request(engine, QueryRequest::new(0, insert)).is_ok() {
+    let insert = insert_query("_fabric_resources", serde_json::json!({"fabricId": FABRIC_DEFAULTS_ID, "resourceAssignments": assignments, "state": "active", "createdAt": now, "updatedAt": now}));
+    if !query_run(engine, 0, insert).is_ok() {
         return Err(DaemonError::BootstrapFabricResourcesState);
     }
     debug::log( DebugTopic::Gateway, None, format!( "seed fabric defaults device={} capabilities={}", credential.device_id, assignments .iter() .filter_map(|assignment| assignment.str_field("capability")) .collect::<Vec<_>>() .join(",") ), );
@@ -640,7 +625,7 @@ fn bootstrap_admin_if_needed( engine: &Engine, configuration: &Configuration, ) 
     let staged = admin.stage(&configuration.bootstrap_admin_path, &password)
         .map_err(DaemonError::BootstrapIdentity)?;
     for query in admin.registration_queries() {
-        if !execute_request(engine, QueryRequest::new(0, query)).is_ok() {
+        if !query_run(engine, 0, query).is_ok() {
             return Err(DaemonError::BootstrapAdminState);
         }
     }
@@ -738,17 +723,16 @@ fn bootstrap_apps(engine: &Engine, apps: &[BuiltinApp]) -> Result<(), DaemonErro
             Err(_) => return Err(DaemonError::BootstrapAppsState),
         };
         let query = if exists {
-            format!(
-                "on _apps | where appId == {app_id} | set name = {}, version = {}, definition = {definition}, state = \"active\", updatedBy = \"system\", updatedAt = {now}",
-                query_string(&app.name), query_string(&app.version),
-            )
+            quoted!("on _apps | where appId == {app_id} | set name = {}, version = {}, definition = {definition}, state = \"active\", updatedBy = \"system\", updatedAt = {now}", &app.name, &app.version)
         } else {
-            format!(
-                "on _apps | insert {{appId: {app_id}, name: {}, version: {}, definition: {definition}, createdBy: \"system\", state: \"active\", createdAt: {now}}}",
-                query_string(&app.name), query_string(&app.version),
-            )
+            insert_query("_apps", serde_json::json!({"appId": &app.app_id, "name": &app.name, "version": &app.version, "definition": &app.definition, "createdBy": "system", "state": "active", "createdAt": now}))
         };
-        if !execute_request(engine, QueryRequest::new(0, query)).is_ok() {
+        if !query_run(engine, 0, query).is_ok() {
+            return Err(DaemonError::BootstrapAppsState);
+        }
+        let views = app.definition.get("queryViews").and_then(JsonValue::as_array).map_or(&[][..], Vec::as_slice);
+        if let Err(message) = crate::view::deliver(engine, &app.app_id, views) {
+            eprintln!("openglacier: invalid built-in App {}: {message}", app.app_id);
             return Err(DaemonError::BootstrapAppsState);
         }
     }
@@ -761,21 +745,25 @@ fn build_engine( configuration: &Configuration, ) -> Result<(Engine, Option<Arc<
         MemoryGovernor::with_process_limit,
     );
     let (storage, glacier_storage) = build_storage(configuration, governor.clone())?;
-    let runtime = Arc::new(QueryRuntime::new());
-    let lowerer = Arc::new(ScanPlanLowerer::new());
-
     Ok((
-        Engine::new(storage, runtime, lowerer).with_memory_governor(governor),
+        Engine::new(storage).with_memory_governor(governor),
         glacier_storage,
     ))
 }
 
 fn build_storage( configuration: &Configuration, governor: MemoryGovernor, ) -> Result<(Arc<dyn StorageEngine>, Option<Arc<GlacierStorage>>), DaemonError> {
     match configuration.storage_backend {
+        StorageBackend::Memory if configuration.storage_history => Ok((Arc::new(MemoryStorage::with_history()), None)),
         StorageBackend::Memory => Ok((Arc::new(MemoryStorage::new()), None)),
         StorageBackend::Glacier => {
             prepare_storage_directory(&configuration.storage_path)?;
             GlacierStorage::open_governed(&configuration.storage_path, governor)
+                .and_then(|storage| {
+                    if configuration.storage_history {
+                        storage.record_history()?;
+                    }
+                    Ok(storage)
+                })
                 .map(|storage| {
                     let storage = Arc::new(storage);
                     let engine_storage: Arc<dyn StorageEngine> = storage.clone();
@@ -910,7 +898,7 @@ fn pending_auth_subject(authentication: &ConnectionAuth) -> Option<(String, Stri
 }
 
 fn try_load_device_credential( engine: &Engine, request_id: RequestId, identity_id: &str, device_id: &str, ) -> Result<Option<DeviceCredential>, QueryResponse> {
-    let query = format!( "on _devices | where deviceId == {} and identityId == {} | limit 1", query_string(device_id), query_string(identity_id), );
+    let query = quoted!("on _devices | where deviceId == {} and identityId == {} | limit 1", device_id, identity_id);
     let Some(document) = query_first(engine, request_id, query)? else {
         return Ok(None);
     };
@@ -1081,10 +1069,7 @@ fn remove_resource_assignment( mut assignments: Vec<JsonValue>, identity_id: &st
 }
 
 fn load_fabric_defaults(engine: &Engine, request_id: RequestId) -> Result<Vec<JsonValue>, QueryResponse> {
-    let query = format!(
-        "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
-        query_string(FABRIC_DEFAULTS_ID),
-    );
+    let query = quoted!("on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1", FABRIC_DEFAULTS_ID);
     // Older stores legitimately do not have this collection yet. Treat that
     // as "no defaults"; the first fabric.resource.set will create the record.
     let document = query_first(engine, request_id, query).ok().flatten();
@@ -1094,20 +1079,11 @@ fn load_fabric_defaults(engine: &Engine, request_id: RequestId) -> Result<Vec<Js
 fn save_fabric_defaults(engine: &Engine, request_id: RequestId, assignments: &[JsonValue]) -> Result<(), QueryResponse> {
     let encoded = serde_json::to_string(assignments).expect("fabric resource assignments serialize");
     let now = unix_time_millis();
-    let lookup = format!(
-        "on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1",
-        query_string(FABRIC_DEFAULTS_ID),
-    );
+    let lookup = quoted!("on _fabric_resources | where fabricId == {} and state == \"active\" | limit 1", FABRIC_DEFAULTS_ID);
     let query = if query_has_rows(engine, request_id, lookup) {
-        format!(
-            "on _fabric_resources | where fabricId == {} and state == \"active\" | set resourceAssignments = {encoded}, updatedAt = {now}",
-            query_string(FABRIC_DEFAULTS_ID),
-        )
+        quoted!("on _fabric_resources | where fabricId == {} and state == \"active\" | set resourceAssignments = {encoded}, updatedAt = {now}", FABRIC_DEFAULTS_ID)
     } else {
-        format!(
-            "on _fabric_resources | insert {{fabricId: {}, resourceAssignments: {encoded}, state: \"active\", createdAt: {now}, updatedAt: {now}}}",
-            query_string(FABRIC_DEFAULTS_ID),
-        )
+        insert_query("_fabric_resources", serde_json::json!({"fabricId": FABRIC_DEFAULTS_ID, "resourceAssignments": assignments, "state": "active", "createdAt": now, "updatedAt": now}))
     };
     query_documents(engine, request_id, query).map(drop)
 }
@@ -1119,10 +1095,7 @@ fn active_devices_for_assignments(engine: &Engine, request_id: RequestId, assign
         let Some(identity_id) = assignment.get("identityId").or_else(|| assignment.get("nodeIdentityId")).and_then(JsonValue::as_str) else { continue; };
         let Some(device_id) = assignment.get("deviceId").or_else(|| assignment.get("nodeDeviceId")).or_else(|| assignment.get("nodeId")).and_then(JsonValue::as_str) else { continue; };
         if !seen.insert((identity_id.to_owned(), device_id.to_owned())) { continue; }
-        let query = format!(
-            "on _devices | where identityId == {} and deviceId == {} and state == \"active\" | select identityId, deviceId, publicKey | limit 1",
-            query_string(identity_id), query_string(device_id),
-        );
+        let query = quoted!("on _devices | where identityId == {} and deviceId == {} and state == \"active\" | select identityId, deviceId, publicKey | limit 1", identity_id, device_id);
         devices.extend(query_documents(engine, request_id, query).unwrap_or_default());
     }
     devices
@@ -1166,6 +1139,7 @@ impl PlaceRecord {
 #[derive(Debug, Clone)]
 struct AppInstanceRecord {
     place_id: String,
+    document: JsonValue,
 }
 
 /// Stable attribution for records written by a principal (`anonymous` without identity).
@@ -1181,7 +1155,7 @@ fn principal_identity_id(principal: &Principal) -> Option<&str> {
 }
 
 fn load_place( engine: &Engine, request_id: RequestId, place_id: &str, ) -> Result<PlaceRecord, QueryResponse> {
-    let query = format!( "on _places | where placeId == {} and state == \"active\" | limit 1", query_string(place_id), );
+    let query = quoted!("on _places | where placeId == {} and state == \"active\" | limit 1", place_id);
     let Some(document) = query_first(engine, request_id, query)? else {
         return Err(QueryResponse::request_error(
             request_id,
@@ -1234,7 +1208,7 @@ fn load_place( engine: &Engine, request_id: RequestId, place_id: &str, ) -> Resu
 }
 
 fn app_record_exists( engine: &Engine, request_id: RequestId, app_id: &str, ) -> Result<bool, QueryResponse> {
-    let query = format!( "on _apps | where appId == {} | limit 1", query_string(app_id), );
+    let query = quoted!("on _apps | where appId == {} | limit 1", app_id);
     query_documents(engine, request_id, query).map(|documents| !documents.is_empty())
 }
 
@@ -1252,7 +1226,7 @@ fn app_identity_is_maintainer(app: &JsonValue, identity_id: &str) -> bool {
 }
 
 fn load_app_definition( engine: &Engine, request_id: RequestId, app_id: &str, ) -> Result<JsonValue, QueryResponse> {
-    let query = format!( "on _apps | where appId == {} and state == \"active\" | limit 1", query_string(app_id), );
+    let query = quoted!("on _apps | where appId == {} and state == \"active\" | limit 1", app_id);
     let Some(document) = query_first(engine, request_id, query)? else {
         return Err(QueryResponse::request_error(
             request_id,
@@ -1264,7 +1238,7 @@ fn load_app_definition( engine: &Engine, request_id: RequestId, app_id: &str, ) 
 }
 
 fn load_app_instance( engine: &Engine, request_id: RequestId, instance_id: &str, ) -> Result<AppInstanceRecord, QueryResponse> {
-    let query = format!( "on _app_instances | where instanceId == {} and state == \"active\" | limit 1", query_string(instance_id), );
+    let query = quoted!("on _app_instances | where instanceId == {} and state == \"active\" | limit 1", instance_id);
     let Some(document) = query_first(engine, request_id, query)? else {
         return Err(QueryResponse::request_error(
             request_id,
@@ -1280,7 +1254,24 @@ fn load_app_instance( engine: &Engine, request_id: RequestId, instance_id: &str,
             "App instance has no valid Place",
         ));
     }
-    Ok(AppInstanceRecord { place_id })
+    Ok(AppInstanceRecord { place_id, document })
+}
+
+/// Whether `principal`, with `access` to its Place, sees the App instance
+/// `instance` (C12): the roles of its `config.visibleTo`, else of its App's
+/// `access.visibleTo`; none listed, everyone who reads the Place. The Owner
+/// and the App's maintainers always see it; a public reader without a role
+/// does not see a restricted App.
+fn app_instance_visible( engine: &Engine, request_id: RequestId, principal: &Principal, access: &PlaceAccess, instance: &JsonValue, ) -> Result<bool, QueryResponse> {
+    let roles = |value: Option<&JsonValue>| value.and_then(JsonValue::as_array).map(|roles| roles.iter().filter_map(JsonValue::as_str).filter_map(PlaceRole::parse).collect::<Vec<_>>());
+    let app = match instance.str_field("appId") {
+        Some(app_id) => load_app_definition(engine, request_id, app_id).ok(),
+        None => None,
+    };
+    let visible_to = roles(instance.pointer("/config/visibleTo")).or_else(|| roles(app.as_ref().and_then(|app| app.pointer("/definition/access/visibleTo")))).unwrap_or_default();
+    Ok(visible_to.is_empty()
+        || access.role().is_some_and(|role| role == PlaceRole::Owner || visible_to.contains(&role))
+        || app.as_ref().zip(principal_identity_id(principal)).is_some_and(|(app, identity_id)| app_identity_is_maintainer(app, identity_id)))
 }
 
 fn place_access_sharing_id(place_id: &str, identity_id: &str) -> String {
@@ -1288,7 +1279,7 @@ fn place_access_sharing_id(place_id: &str, identity_id: &str) -> String {
 }
 
 fn list_place_access( engine: &Engine, request_id: RequestId, place: &PlaceRecord, ) -> Result<Vec<serde_json::Value>, QueryResponse> {
-    let query = format!( "on _sharings | where owner == {} | select sharingId, target, permissions, placeRole, state | sort target", query_string(&place.owner_identity_id), );
+    let query = quoted!("on _sharings | where owner == {} | select sharingId, target, permissions, placeRole, state | sort target", &place.owner_identity_id);
     let documents = query_documents(engine, request_id, query)?;
     use std::collections::BTreeMap;
     let mut entries: BTreeMap<String, PlaceRole> = BTreeMap::new();
@@ -1363,7 +1354,7 @@ fn resolve_place_role( engine: &Engine, request_id: RequestId, identity_id: &str
     if place.owner_identity_id == identity_id {
         return Ok(Some(PlaceRole::Owner));
     }
-    let query = format!( "on _sharings | where owner == {} and target == {} | select sharingId, permissions, placeRole, state", query_string(&place.owner_identity_id), query_string(identity_id), );
+    let query = quoted!("on _sharings | where owner == {} and target == {} | select sharingId, permissions, placeRole, state", &place.owner_identity_id, identity_id);
     let documents = query_documents(engine, request_id, query)?;
     let mut role = None;
     for document in documents {
@@ -1441,7 +1432,7 @@ fn public_place_app_ids(engine: &Engine, request_id: RequestId) -> Result<std::c
     let mut app_ids = std::collections::BTreeSet::new();
     for place in list_public_places(engine, request_id)? {
         let Some(place_id) = place.str_field("placeId") else { continue; };
-        let query = format!("on _app_instances | where placeId == {} and state == \"active\" | select appId", query_string(place_id));
+        let query = quoted!("on _app_instances | where placeId == {} and state == \"active\" | select appId", place_id);
         let documents = query_documents(engine, request_id, query)?;
         app_ids.extend(documents.iter().filter_map(|document| document.str_field("appId").map(str::to_owned)));
     }
@@ -1531,6 +1522,9 @@ fn resolve_query_execution_context( engine: &Engine, request_id: RequestId, prin
 
     if let Some(app_instance_id) = requested.app_instance_id.as_deref() {
         let instance = load_app_instance(engine, request_id, app_instance_id)?;
+        if !app_instance_visible(engine, request_id, principal, &access, &instance.document)? {
+            return Err(QueryResponse::request_error(request_id, "app.instance_forbidden", "this App is not open to your role in this Place"));
+        }
         if instance.place_id != requested.place_id {
             return Err(QueryResponse::request_error(
                 request_id,
@@ -1575,7 +1569,7 @@ struct SharingRecord {
 }
 
 fn load_sharing( engine: &Engine, request_id: RequestId, sharing_id: &str, ) -> Result<SharingRecord, QueryResponse> {
-    let query = format!( "on _sharings | where sharingId == {} | limit 1", query_string(sharing_id), );
+    let query = quoted!("on _sharings | where sharingId == {} | limit 1", sharing_id);
     let Some(document) = query_first(engine, request_id, query)? else {
         return Err(QueryResponse::request_error(
             request_id,
@@ -1595,10 +1589,6 @@ fn load_sharing( engine: &Engine, request_id: RequestId, sharing_id: &str, ) -> 
     Ok(SharingRecord { owner, target })
 }
 
-fn query_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a Rust string to JSON cannot fail")
-}
-
 fn read_message( reader: &mut BufReader<TcpStream>, payload: &mut Vec<u8>, ) -> Result<usize, ConnectionError> {
     let mut header = [0_u8; LENGTH_PREFIX_BYTES];
     match reader.read_exact(&mut header) {
@@ -1616,7 +1606,11 @@ fn read_message( reader: &mut BufReader<TcpStream>, payload: &mut Vec<u8>, ) -> 
     Ok(length)
 }
 
-fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request: &QueryRequest, ) -> Result<bool, ConnectionError> {
+/// Streams a query's rows when its plan allows it; `Ok(false)` leaves the
+/// request to a whole response ([`Engine::execute_physical`]): writes and
+/// system collections. Under a Place/App `scope`, the plan reads only the rows
+/// of that scope ([`Engine::plan_scoped`]).
+fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request: &QueryRequest, scope: Option<(&str, Option<&str>)>, ) -> Result<bool, ConnectionError> {
     let started = Instant::now();
     let parse_started = Instant::now();
     let pipeline = match parse_pipeline(&request.query) {
@@ -1625,7 +1619,15 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
     };
     let parse_us = elapsed_micros(parse_started);
     let plan_started = Instant::now();
-    let planned = match engine.plan_cached(&request.query, &pipeline) {
+    let planned = match scope {
+        None => engine.plan_cached(&request.query, &pipeline),
+        Some((place, app_instance)) => match engine.plan_scoped(&pipeline, place, app_instance) {
+            Ok(Some(planned)) => Ok(planned),
+            Ok(None) => return Ok(false),
+            Err(error) => Err(error),
+        },
+    };
+    let planned = match planned {
         Ok(planned) => planned,
         Err(_) => return Ok(false),
     };
@@ -1648,7 +1650,7 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
         .is_some();
     let governed_blocking = engine.supports_governed_blocking_streaming(planned.physical());
     if !memory_streaming && !governed_blocking {
-        if matches!(
+        if scope.is_none() && matches!(
             planned.physical().memory_execution_mode(),
             crate::query::MemoryExecutionMode::GovernedBlocking
         ) {
@@ -1667,11 +1669,8 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
     } else {
         WorkloadClass::Streaming
     };
-    let requested_budget = if governed_blocking {
-        engine.memory_governor().profile().query_budget_bytes
-    } else {
-        0
-    };
+    // Stages reserve their memory as it grows, see `QueryMemory`.
+    let requested_budget = if governed_blocking { crate::memory::QUERY_ADMISSION_BYTES } else { 0 };
     let _operation_permit = match engine.memory_governor().admit(workload, requested_budget) {
         Ok(permit) => permit,
         Err(error) => {
@@ -1686,7 +1685,7 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
     };
     let _network_reservation = match engine
         .memory_governor()
-        .reserve(MemoryClass::Network, MAX_RESPONSE_BYTES)
+        .reserve(MemoryClass::Network, MAX_RESPONSE_BYTES + frames::FLUSH_BYTES)
     {
         Ok(reservation) => reservation,
         Err(error) => {
@@ -1699,7 +1698,7 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
             return Ok(true);
         }
     };
-    let mut response_buffer = Vec::with_capacity(MAX_RESPONSE_BYTES + 1);
+    let mut frames = frames::FrameWriter::new(writer);
     let execute_started = Instant::now();
     let mut materialize_us = 0_u64;
     let mut streamed_documents = 0_u64;
@@ -1713,7 +1712,7 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
                 id: request.id,
                 data: BorrowedDocument(document),
             };
-            write_message_buffered(writer, &response, &mut response_buffer)
+            frames.push(&response)
         } else {
             let response = BorrowedDocumentResponse {
                 kind: "response",
@@ -1722,7 +1721,7 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
                 id: request.id,
                 data: BorrowedDocumentWithId { id, document },
             };
-            write_message_buffered(writer, &response, &mut response_buffer)
+            frames.push(&response)
         }
         .map_err(|error| {
             crate::engine::EngineError::execution(crate::query::ExecutionError::evaluation(
@@ -1746,68 +1745,49 @@ fn try_write_streaming_request( engine: &Engine, writer: &mut TcpStream, request
     let statistics = match streamed {
         Ok(Some(statistics)) => statistics,
         Ok(None) => {
-            write_streaming_error(
-                writer,
-                request.id,
-                "query.execution_failed",
-                "streaming plan unexpectedly fell back to materialized execution",
-            )?;
+            let error = WireError::new("query.execution_failed", "streaming plan unexpectedly fell back to materialized execution");
+            frames.finish(&StreamResponse::error(Some(request.id), error))?;
+            writer.flush().map_err(ConnectionError::Write)?;
             return Ok(true);
         }
         Err(error) => {
-            write_streaming_error(
-                writer,
-                request.id,
-                "query.execution_failed",
-                error.to_string(),
-            )?;
+            frames.finish(&StreamResponse::error(Some(request.id), WireError::new("query.execution_failed", error.to_string())))?;
+            writer.flush().map_err(ConnectionError::Write)?;
             return Ok(true);
         }
     };
     let execute_us = elapsed_micros(execute_started);
-    write_stream_response_buffered(
-        writer,
-        &StreamResponse::complete(
-            request.id,
-            Some(serde_json::json!({
-                "scanned": statistics.scanned(),
-                "filtered": statistics.filtered(),
-                "returned": statistics.returned(),
-                "inserted": statistics.inserted(),
-                "replaced": statistics.replaced(),
-                "deleted": statistics.deleted(),
-                "strategies": statistics.strategies().iter().map(|strategy| strategy.as_str()).collect::<Vec<_>>(),
-                "committed": false,
-                "compact": false,
-                "streamed": true,
-                "timings_us": {
-                    "parse": parse_us, "plan": plan_us, "execute": execute_us,
-                    "materialize_response": materialize_us,
-                    "total_before_wire_encode": elapsed_micros(started),
-                }
-            })),
-        ),
-        &mut response_buffer,
-    )?;
+    frames.finish(&StreamResponse::complete(
+        request.id,
+        Some(serde_json::json!({
+            "scanned": statistics.scanned(),
+            "filtered": statistics.filtered(),
+            "returned": statistics.returned(),
+            "inserted": statistics.inserted(),
+            "replaced": statistics.replaced(),
+            "deleted": statistics.deleted(),
+            "strategies": statistics.strategies().iter().map(|strategy| strategy.as_str()).collect::<Vec<_>>(),
+            "committed": false,
+            "compact": false,
+            "streamed": true,
+            "timings_us": {
+                "parse": parse_us, "plan": plan_us, "execute": execute_us,
+                "materialize_response": materialize_us,
+                "total_before_wire_encode": elapsed_micros(started),
+            }
+        })),
+    ))?;
     writer.flush().map_err(ConnectionError::Write)?;
     Ok(true)
 }
 
 fn write_streaming_error( writer: &mut TcpStream, request_id: RequestId, code: impl Into<String>, message: impl Into<String>, ) -> Result<(), ConnectionError> {
-    let mut buffer = Vec::with_capacity(512);
-    write_stream_response_buffered(
-        writer,
-        &StreamResponse::error(Some(request_id), WireError::new(code, message)),
-        &mut buffer,
-    )?;
+    write_stream_response(writer, &StreamResponse::error(Some(request_id), WireError::new(code, message)))?;
     writer.flush().map_err(ConnectionError::Write)
 }
 
 fn enrollment_events_permission_query(identity_id: &str, created_at: u64) -> String {
-    format!(
-        r#"on _permissions | insert {{identityId: {}, action: "events.subscribe", resource: "*", effect: "allow", state: "active", createdAt: {created_at}}}"#,
-        query_string(identity_id)
-    )
+    insert_query("_permissions", serde_json::json!({"identityId": identity_id, "action": "events.subscribe", "resource": "*", "effect": "allow", "state": "active", "createdAt": created_at}))
 }
 
 
@@ -1819,9 +1799,9 @@ fn authorize_connection( engine: &Engine, principal: &crate::access::auth::Princ
 }
 
 fn permission_exists(engine: &Engine, request: &AuthorizationRequest) -> bool {
-    let identity = quote_authorization_string(&request.identity_id);
-    let action = quote_authorization_string(request.action.as_str());
-    let resource = quote_authorization_string(&request.resource);
+    let identity = query_string(&request.identity_id);
+    let action = query_string(request.action.as_str());
+    let resource = query_string(&request.resource);
     let query = format!( "on _permissions | where identityId == {identity} and state == \"active\" and effect == \"allow\" and (action == {action} or action == \"*\") and (resource == {resource} or resource == \"*\") | limit 1" );
     query_has_rows(engine, 0, query)
 }
@@ -1832,15 +1812,8 @@ fn publish_durable_event( engine: &Engine, audience: Audience, event_type: &str,
         .get_or_init(UuidV7Generator::new)
         .next_id()
         .to_string();
-    let audience_json = serde_json::to_string(&audience).expect("audience serializes");
-    let payload_json = serde_json::to_string(&payload).expect("payload serializes");
-    let query = format!(
-        "on _event_outbox | insert {{_id: {}, eventId: {}, type: {}, audience: {audience_json}, payload: {payload_json}, state: \"pending\", attempts: 0, availableAt: {created_at}, createdAt: {created_at}}}",
-        query_string(&event_id),
-        query_string(&event_id),
-        query_string(event_type),
-    );
-    let stored = execute_request(engine, QueryRequest::new(0, query)).is_ok();
+    let query = insert_query("_event_outbox", serde_json::json!({"_id": &event_id, "eventId": &event_id, "type": event_type, "audience": &audience, "payload": &payload, "state": "pending", "attempts": 0, "availableAt": created_at, "createdAt": created_at}));
+    let stored = query_run(engine, 0, query).is_ok();
     if stored {
         event_outbox_wake().notify();
     }
@@ -1854,10 +1827,7 @@ fn start_event_outbox_worker(engine: Arc<Engine>, events: Arc<EventEngine>) {
         .spawn(move || {
             // Old versions retained delivered rows forever. New deliveries are
             // deleted immediately; this one-time sweep bounds legacy growth.
-            let _ = execute_request(
-                &engine,
-                QueryRequest::new(0, "on _event_outbox | where state == \"delivered\" | delete"),
-            );
+            let _ = query_run(&engine, 0, "on _event_outbox | where state == \"delivered\" | delete");
 
             let wake = event_outbox_wake();
             let mut observed_generation = *wake
@@ -1877,14 +1847,7 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
     loop {
         // Event-driven: query on startup, insertion, or retry deadline instead
         // of polling the database every 100 ms while idle.
-        let response = execute_request(
-            engine,
-            QueryRequest::new(
-                0,
-                "on _event_outbox | where state == \"pending\" | sort availableAt | limit 16",
-            ),
-        );
-        let QueryResponse::Ok { documents, .. } = response else {
+        let Ok(documents) = query_documents(engine, 0, "on _event_outbox | where state == \"pending\" | sort availableAt | limit 16") else {
             return Some(EVENT_OUTBOX_MAX_IDLE_RECOVERY);
         };
         if documents.is_empty() {
@@ -1909,11 +1872,8 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
             };
             let event_id = document.str_field("eventId").unwrap_or(row_id);
             let Some(event_type) = document.str_field("type") else {
-                let discard = format!(
-                    "on _event_outbox | where _id == {} | delete",
-                    query_string(row_id),
-                );
-                let _ = execute_request(engine, QueryRequest::new(0, discard));
+                let discard = quoted!("on _event_outbox | where _id == {} | delete", row_id);
+                let _ = query_run(engine, 0, discard);
                 processed += 1;
                 continue;
             };
@@ -1940,11 +1900,8 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
 
             if events.publish(event) {
                 debug::log( DebugTopic::Events, None, format!("publish type={event_type} event_id={event_id}"), );
-                let delivered = format!(
-                    "on _event_outbox | where _id == {} | delete",
-                    query_string(row_id),
-                );
-                if !execute_request(engine, QueryRequest::new(0, delivered)).is_ok() {
+                let delivered = quoted!("on _event_outbox | where _id == {} | delete", row_id);
+                if !query_run(engine, 0, delivered).is_ok() {
                     // A transient delete failure can expose this row again; the
                     // EventEngine suppresses a second delivery of the same id.
                     return Some(EVENT_OUTBOX_RETRY_DELAY);
@@ -1959,7 +1916,7 @@ fn drain_event_outbox(engine: &Engine, events: &EventEngine) -> Option<Duration>
                     query_string(row_id),
                     retry_at,
                 );
-                let _ = execute_request(engine, QueryRequest::new(0, retry));
+                let _ = query_run(engine, 0, retry);
                 next_retry = Some(EVENT_OUTBOX_RETRY_DELAY);
             }
             processed += 1;
@@ -2018,6 +1975,11 @@ fn query_first(engine: &Engine, request_id: impl Into<RequestId>, query: impl In
     query_documents(engine, request_id, query).map(|documents| documents.into_iter().next())
 }
 
+/// Runs `query`, keeping only whether it succeeded.
+fn query_run(engine: &Engine, request_id: impl Into<RequestId>, query: impl Into<String>) -> Result<(), QueryResponse> {
+    query_documents(engine, request_id, query).map(drop)
+}
+
 /// True when `query` succeeds and returns at least one document.
 fn query_has_rows(engine: &Engine, request_id: impl Into<RequestId>, query: impl Into<String>) -> bool {
     query_documents(engine, request_id, query).is_ok_and(|documents| !documents.is_empty())
@@ -2065,7 +2027,7 @@ fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Opti
     } else if compact {
         engine.memory_governor().profile().import_budget_bytes
     } else {
-        engine.memory_governor().profile().query_budget_bytes
+        crate::memory::QUERY_ADMISSION_BYTES
     };
     let _operation_permit = match engine.memory_governor().admit(workload, requested_budget) {
         Ok(permit) => permit,
@@ -2222,7 +2184,7 @@ impl Serialize for BorrowedDocumentId<'_> {
     where
         S: Serializer,
     {
-        serializer.collect_str(self.0)
+        serializer.serialize_str(std::str::from_utf8(&self.0.hyphenated()).map_err(serde::ser::Error::custom)?)
     }
 }
 
@@ -2312,34 +2274,6 @@ fn write_stream_response( writer: &mut TcpStream, response: &StreamResponse, ) -
     let encoded =
         crate::protocol::encode_stream_response(response).map_err(ConnectionError::Encode)?;
     writer.write_all(&encoded).map_err(ConnectionError::Write)
-}
-
-fn write_stream_response_buffered( writer: &mut TcpStream, response: &StreamResponse, buffer: &mut Vec<u8>, ) -> Result<(), ConnectionError> {
-    let encoded =
-        crate::protocol::encode_stream_response(response).map_err(ConnectionError::Encode)?;
-    buffer.clear();
-    buffer.extend_from_slice(&encoded);
-    writer.write_all(buffer).map_err(ConnectionError::Write)
-}
-
-fn write_message_buffered<T: Serialize>( writer: &mut TcpStream, value: &T, buffer: &mut Vec<u8>, ) -> Result<(), ConnectionError> {
-    let payload = rmp_serde::to_vec_named(value)
-        .map_err(|error| ConnectionError::Encode(ProtocolError::InvalidMessagePackEncode(error)))?;
-    buffer.clear();
-    buffer.resize(LENGTH_PREFIX_BYTES, 0);
-    buffer.extend_from_slice(&payload);
-    let payload_len = payload.len();
-    ensure_payload_size(MessageKind::Response, payload_len, MAX_RESPONSE_BYTES)
-        .map_err(ConnectionError::Encode)?;
-    let length = u32::try_from(payload_len).map_err(|_| {
-        ConnectionError::Encode(ProtocolError::MessageTooLarge {
-            kind: MessageKind::Response,
-            actual: payload_len,
-            maximum: MAX_RESPONSE_BYTES,
-        })
-    })?;
-    buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&length.to_be_bytes());
-    writer.write_all(buffer).map_err(ConnectionError::Write)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2439,6 +2373,8 @@ struct Configuration {
     agent_provider_read_timeout: Duration,
     storage_backend: StorageBackend,
     storage_path: PathBuf,
+    /// `OGD_HISTORY=on`: keep history (`as of`, `history`) and record commit times and authors.
+    storage_history: bool,
     files_path: PathBuf,
     files_sync_root: Option<PathBuf>,
     files_sync_config_path: PathBuf,
@@ -2481,6 +2417,7 @@ impl Configuration {
             StorageBackend::Memory
         };
         let storage_path = PathBuf::from( env::var("OGD_STORAGE_PATH").unwrap_or_else(|_| DEFAULT_STORAGE_PATH.to_owned()), );
+        let storage_history = env::var("OGD_HISTORY").is_ok_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"));
         let gateway_endpoints = match env::var("OGD_GATEWAYS") {
             Ok(raw) => {
                 let mut endpoints = Vec::new();
@@ -2612,6 +2549,7 @@ impl Configuration {
             agent_provider_read_timeout,
             storage_backend,
             storage_path,
+            storage_history,
             files_path,
             files_sync_root,
             files_sync_config_path,
@@ -2974,55 +2912,21 @@ mod tests {
         Principal::Identity { identity_id: identity_id.to_owned(), device_id: format!("{identity_id}-device") }
     }
 
-    #[test] fn public_policy_grants_access_without_translating_it_into_a_role() {
-        let engine = public_places_test_engine();
-        let access = |principal: &Principal, place_id: &str| {
-            let place = load_place(&engine, RequestId::Number(1), place_id).expect("place loads");
-            resolve_place_access_for_principal(&engine, RequestId::Number(1), principal, &place)
-        };
-        assert_eq!(access(&Principal::Anonymous, "public-ro").ok(), Some(PlaceAccess::Public(PublicAccess::Readonly)));
-        assert_eq!(access(&Principal::Anonymous, "public-rw").ok(), Some(PlaceAccess::Public(PublicAccess::Readwrite)));
-        assert!(access(&Principal::Anonymous, "private").is_err());
-        assert_eq!(access(&identity("stranger"), "public-rw").ok(), Some(PlaceAccess::Public(PublicAccess::Readwrite)));
-        assert!(access(&identity("stranger"), "private").is_err());
-        assert_eq!(access(&identity("owner"), "public-ro").ok(), Some(PlaceAccess::Role(PlaceRole::Owner)));
-    }
+    #[test] fn public_policy_grants_access_without_translating_it_into_a_role() { let engine = public_places_test_engine(); let access = |principal: &Principal, place_id: &str| { let place = load_place(&engine, RequestId::Number(1), place_id).expect("place loads"); resolve_place_access_for_principal(&engine, RequestId::Number(1), principal, &place) }; assert_eq!(access(&Principal::Anonymous, "public-ro").ok(), Some(PlaceAccess::Public(PublicAccess::Readonly))); assert_eq!(access(&Principal::Anonymous, "public-rw").ok(), Some(PlaceAccess::Public(PublicAccess::Readwrite))); assert!(access(&Principal::Anonymous, "private").is_err()); assert_eq!(access(&identity("stranger"), "public-rw").ok(), Some(PlaceAccess::Public(PublicAccess::Readwrite))); assert!(access(&identity("stranger"), "private").is_err()); assert_eq!(access(&identity("owner"), "public-ro").ok(), Some(PlaceAccess::Role(PlaceRole::Owner))); }
 
-    #[test] fn place_list_returns_scope_plus_public_places() {
-        let engine = public_places_test_engine();
-        let ids = |places: Vec<JsonValue>| places.iter().filter_map(|place| place.str_field("placeId").map(str::to_owned)).collect::<Vec<_>>();
-        assert_eq!(ids(list_public_places(&engine, RequestId::Number(1)).unwrap()), vec!["public-ro", "public-rw"]);
-        let stranger = list_places_for_identity_and_public(&engine, RequestId::Number(1), "stranger").unwrap();
-        assert_eq!(ids(stranger.clone()), vec!["public-ro", "public-rw"]);
-        assert!(stranger.iter().all(|place| place.get("role").is_some_and(JsonValue::is_null)));
-        let owner = list_places_for_identity_and_public(&engine, RequestId::Number(1), "owner").unwrap();
-        assert_eq!(ids(owner.clone()), vec!["private", "public-ro", "public-rw"]);
-        assert!(owner.iter().all(|place| place.str_field("role") == Some("owner")));
-    }
+    #[test] fn apps_are_open_only_to_their_roles() { let engine = public_places_test_engine(); for query in ["on _places | insert {placeId: \"p\", name: \"P\", mood: \"\", ownerIdentityId: \"owner\", state: \"active\", createdAt: 4}", "on _apps | insert {appId: \"app.fin\", state: \"active\", definition: {access: {visibleTo: [\"resident\"]}}, maintainersJson: \"[\\\"maint\\\"]\"}", "on _app_instances | insert {instanceId: \"i-fin\", placeId: \"p\", appId: \"app.fin\", state: \"active\", createdAt: 3}", "on _app_instances | insert {instanceId: \"i-cfg\", placeId: \"p\", appId: \"app.fin\", config: {visibleTo: [\"member\"]}, state: \"active\", createdAt: 4}", "on _app_instances | insert {instanceId: \"i-open\", placeId: \"p\", appId: \"app.open\", state: \"active\", createdAt: 5}"].map(str::to_owned).into_iter().chain([("res", "resident"), ("mem", "member"), ("maint", "member")].map(|(target, role)| format!("on _sharings | insert {{sharingId: \"place-access:p:{target}\", owner: \"owner\", target: \"{target}\", placeRole: \"{role}\", state: \"active\"}}"))) { assert!(execute_request(&engine, QueryRequest::new(RequestId::Number(1), query.clone())).is_ok(), "{query}"); } let open = |identity_id: &str, instance: &str| resolve_query_execution_context(&engine, RequestId::Number(1), &identity(identity_id), RequestedExecutionContext { place_id: "p".to_owned(), app_instance_id: Some(instance.to_owned()) }).is_ok(); assert_eq!(["owner", "res", "mem", "maint"].map(|who| (open(who, "i-fin"), open(who, "i-cfg"), open(who, "i-open"))), [(true, true, true), (true, false, true), (false, true, true), (true, true, true)]); }
+    #[test] fn place_list_returns_scope_plus_public_places() { let engine = public_places_test_engine(); let ids = |places: Vec<JsonValue>| places.iter().filter_map(|place| place.str_field("placeId").map(str::to_owned)).collect::<Vec<_>>(); assert_eq!(ids(list_public_places(&engine, RequestId::Number(1)).unwrap()), vec!["public-ro", "public-rw"]); let stranger = list_places_for_identity_and_public(&engine, RequestId::Number(1), "stranger").unwrap(); assert_eq!(ids(stranger.clone()), vec!["public-ro", "public-rw"]); assert!(stranger.iter().all(|place| place.get("role").is_some_and(JsonValue::is_null))); let owner = list_places_for_identity_and_public(&engine, RequestId::Number(1), "owner").unwrap(); assert_eq!(ids(owner.clone()), vec!["private", "public-ro", "public-rw"]); assert!(owner.iter().all(|place| place.str_field("role") == Some("owner"))); }
 
-    #[test] fn public_app_definitions_are_limited_to_public_places() {
-        let engine = public_places_test_engine();
-        let app_ids = public_place_app_ids(&engine, RequestId::Number(1)).unwrap();
-        assert!(app_ids.contains("app.public"));
-        assert!(!app_ids.contains("app.private"));
-    }
+    #[test] fn public_app_definitions_are_limited_to_public_places() { let engine = public_places_test_engine(); let app_ids = public_place_app_ids(&engine, RequestId::Number(1)).unwrap(); assert!(app_ids.contains("app.public")); assert!(!app_ids.contains("app.private")); }
 
-    #[test] fn files_context_keeps_public_read_only_places_read_only() {
-        let engine = public_places_test_engine();
-        {
-            let (place_id, instance_id) = ("public-ro", "i-public");
-            assert!(resolve_file_context(&engine, RequestId::Number(1), &Principal::Anonymous, place_id, instance_id, false).is_ok());
-            assert!(resolve_file_context(&engine, RequestId::Number(1), &Principal::Anonymous, place_id, instance_id, true).is_err());
-        }
-    }
+    #[test] fn files_context_keeps_public_read_only_places_read_only() { let engine = public_places_test_engine(); { let (place_id, instance_id) = ("public-ro", "i-public"); assert!(resolve_file_context(&engine, RequestId::Number(1), &Principal::Anonymous, place_id, instance_id, false).is_ok()); assert!(resolve_file_context(&engine, RequestId::Number(1), &Principal::Anonymous, place_id, instance_id, true).is_err()); } }
 
     fn app_bootstrap_test_engine() -> Engine {
         let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
-        let runtime = Arc::new(QueryRuntime::new());
-        let lowerer = Arc::new(ScanPlanLowerer::new());
-        Engine::new(storage, runtime, lowerer)
+        Engine::new(storage)
     }
 
+    #[test] fn builtin_finance_views_are_delivered_once_and_compute_fiscal_windows() { let engine = app_bootstrap_test_engine(); for _ in 0..2 { bootstrap_apps_if_needed(&engine).expect("built-in Apps bootstrap"); } let views = query_documents(&engine, 1, "on _views | where name in [\"finance.period\", \"finance.statement\"] | select version, parameters").unwrap(); assert_eq!(views.len(), 2); assert!(views.iter().all(|view| view["version"] == 1)); query_run(&engine, 2, "on finance_settings | insert {opening: {day: 1, month: 7}}").unwrap(); for (month, date) in [(6, 1_748_736_000_000_i64), (7, 1_751_328_000_000), (8, 1_754_006_400_000), (9, 1_756_684_800_000)] { query_run(&engine, 3, format!("on finance | insert {{scenario: \"actual\", entity: \"E1\", account: \"707000\", date: {date}, balance: {}, movement: -100}}", -100 * ((month + 5) % 12 + 1))).unwrap(); } let read = |text: &str| query_documents(&engine, 4, crate::view::literals(&engine, &crate::view::prepare(&engine, None, None, text, &serde_json::Map::new()).unwrap()).unwrap()).unwrap(); assert_eq!(read("let $end = \"2025-09\", $format = \"sig\" | on view finance.statement | where node == \"VentesMarchandises\" | select reading")[0]["reading"], 300); assert_eq!(read("let $end = \"2025-09\", $gran = \"month\", $shifts = [0, -3] | on view finance.period | sort shift | select shift, value").iter().map(|row| (row["shift"].as_i64().unwrap(), row["value"].as_i64().unwrap())).collect::<Vec<_>>(), [(-3, -100), (0, -100)]); assert_eq!(read("let $end = \"2025-09\" | on view finance.indicators | select ca, rt")[0], serde_json::json!({"ca": 300, "rt": 300})); query_run(&engine, 5, "on finance | insert {scenario: \"actual\", entity: \"E2\", account: \"707000\", date: 1754006400000, balance: -50, movement: -50}").unwrap(); assert_eq!(read("let $end = \"2025-09\", $format = \"sig\", $consolidate = true | on view finance.statement | where node == \"VentesMarchandises\" | select entity, reading, window_to, latest"), [serde_json::json!({"entity": null, "reading": 350, "window_to": 1_756_684_800_000_i64, "latest": 1_754_006_400_000_i64})]); assert_eq!(read("let $end = \"2025-09\", $consolidate = true, $entities = [\"E2\"] | on view finance.indicators | select ca")[0]["ca"], 50); assert_eq!(read("let $end = \"2025-09\", $gran = \"month\", $shifts = [0, -1] | on view finance.indicators | where entity == \"E1\" | select shift, ca, latest"), [serde_json::json!({"shift": -1, "ca": 100, "latest": 1_754_006_400_000_i64}), serde_json::json!({"shift": 0, "ca": 100, "latest": 1_756_684_800_000_i64})]); let days = |text: &str| read(text).iter().map(|row| row["dso_ref"].clone()).collect::<Vec<_>>(); let before = days("let $end = \"2025-09\" | on view finance.indicators | where entity == \"E1\" | select dso_ref"); query_run(&engine, 6, "on finance_settings | set params = {\"dsoRef\": 90, \"future\": \"x\"}").unwrap(); let place = days("let $end = \"2025-09\" | on view finance.indicators | where entity == \"E1\" | select dso_ref"); assert_eq!((before[0].as_f64(), place[0].as_f64()), (Some(-60.0), Some(-90.0))); assert_eq!(days("let $end = \"2025-09\", $dsoRef = 60 | on view finance.indicators | where entity == \"E1\" | select dso_ref"), before); query_run(&engine, 7, "on finance | insert {scenario: \"actual\", entity: \"E1\", account: \"601000\", date: 1756684800000, balance: 40, movement: 40}").unwrap(); query_run(&engine, 8, r#"on finance_formats | insert {"id": "mgmt", "categories": [{"id": "Chiffre", "label": {"fr": "Chiffre d'affaires"}, "sens": -1}]}"#).unwrap(); query_run(&engine, 9, r#"on finance_rules | insert {"format": "mgmt", "prefix": "707", "category": "Chiffre"}"#).unwrap(); let statement = |format: &str| read(&format!("let $end = \"2025-09\", $format = \"{format}\" | on view finance.statement | where entity == \"E1\" and !total | select node, label_fr, reading | sort node")); assert_eq!(statement("mgmt"), [serde_json::json!({"node": "AchatApprovisionnements", "label_fr": "Achats de matières et d'approvisionnements", "reading": 40}), serde_json::json!({"node": "Chiffre", "label_fr": "Chiffre d'affaires", "reading": 300})]); assert!(statement("sig").iter().any(|row| row["node"] == "VentesMarchandises" && row["reading"] == 300)); }
     #[cfg(feature = "fabric")] #[test] fn gateway_endpoint_normalization_supports_seeds_and_discovery_hints() { assert_eq!( normalize_gateway_node_endpoint("gw+insecure://127.0.0.1:3000").as_deref(), Some("ws://127.0.0.1:3000/node") ); assert_eq!( normalize_gateway_node_endpoint("gw://example.test").as_deref(), Some("wss://example.test/node") ); assert_eq!( normalize_gateway_node_endpoint("ws://127.0.0.1:3001").as_deref(), Some("ws://127.0.0.1:3001/node") ); assert_eq!( normalize_gateway_node_endpoint("ws://127.0.0.1:3002/peer").as_deref(), Some("ws://127.0.0.1:3002/node") ); assert_eq!( gateway_client_endpoint_from_node("ws://127.0.0.1:3000/node").as_deref(), Some("ws://127.0.0.1:3000/ws") ); }
     #[test] fn node_identity_proof_is_bound_to_gateway_challenge_and_device() { let proof = node_identity_proof("nonce-a", "device-a", "identity-a", "device-a"); assert_eq!(proof, "og.node.challenge.v1\nnonce-a\ndevice-a\nidentity-a\ndevice-a"); assert_ne!(proof, node_identity_proof("nonce-b", "device-a", "identity-a", "device-a")); assert_ne!(proof, node_identity_proof("nonce-a", "device-b", "identity-a", "device-b")); }
     #[test] fn fabric_device_verification_requires_known_active_exact_key() { let engine = app_bootstrap_test_engine(); let inserted = execute_request(&engine, QueryRequest::new(1, r#"on _devices | insert {identityId: "identity-a", deviceId: "device-a", publicKey: "key-a", state: "active"}"#)); assert!(inserted.is_ok()); assert!(registered_device_matches(&engine, "identity-a", "device-a", "key-a")); assert!(!registered_device_matches(&engine, "identity-a", "device-a", "key-b")); assert!(!registered_device_matches(&engine, "identity-a", "device-unknown", "key-a")); let revoked = execute_request(&engine, QueryRequest::new(2, r#"on _devices | where deviceId == "device-a" | set state = "revoked""#)); assert!(revoked.is_ok()); assert!(!registered_device_matches(&engine, "identity-a", "device-a", "key-a")); }
@@ -3030,18 +2934,20 @@ mod tests {
     #[cfg(feature = "fabric")] #[test] fn gateway_enrollment_hmac_matches_sha256_reference_vector() { assert_eq!( hmac_sha256_base64(b"key", b"The quick brown fox jumps over the lazy dog"), "97yD9DBThCSxMpjmqm+xQ+9NWaFJRhdZl0edvC0aPNg=" ); }
     #[test] fn app_bootstrap_with_empty_manifest_is_a_noop() { let engine = app_bootstrap_test_engine(); bootstrap_apps(&engine, &[]).expect("empty App manifest bootstraps"); assert!(!app_record_exists(&engine, RequestId::Number(1), "system.files") .expect("App lookup succeeds")); }
     #[test] fn app_bootstrap_reconciles_managed_apps_without_touching_unmanaged_apps() { let engine = app_bootstrap_test_engine(); let v1 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test".to_owned(), version: "1.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test", "version": "1.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v1)).expect("initial App bootstrap succeeds"); let drifted = execute_request( &engine, QueryRequest::new( 2, r#"on _apps | where appId == "system.test" | set name = "Drifted", version = "0.9.0", state = "deleted""#, ), ); assert!(drifted.is_ok()); let custom = execute_request( &engine, QueryRequest::new( 3, r#"on _apps | insert {appId: "custom.test", name: "Custom", version: "7.0.0", definition: {id: "custom.test", name: "Custom", version: "7.0.0"}, createdBy: "user", state: "active", createdAt: 1}"#, ), ); assert!(custom.is_ok()); let v2 = BuiltinApp { app_id: "system.test".to_owned(), name: "System test v2".to_owned(), version: "2.0.0".to_owned(), definition: serde_json::json!({ "id": "system.test", "name": "System test v2", "version": "2.0.0" }), }; bootstrap_apps(&engine, std::slice::from_ref(&v2)).expect("App reconciliation succeeds"); let response = execute_request( &engine, QueryRequest::new(4, r#"on _apps | where appId == "system.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("managed App lookup must succeed"); }; let managed = documents.first().expect("managed App exists"); assert_eq!(managed.str_field("state"), Some("active")); assert_eq!(managed.str_field("name"), Some("System test v2")); assert_eq!(managed.str_field("version"), Some("2.0.0")); assert_eq!(managed.str_field("updatedBy"), Some("system")); assert_eq!(managed.get("definition"), Some(&v2.definition)); let response = execute_request( &engine, QueryRequest::new(5, r#"on _apps | where appId == "custom.test" | limit 1"#), ); let QueryResponse::Ok { documents, .. } = response else { panic!("custom App lookup must succeed"); }; let unmanaged = documents.first().expect("custom App exists"); assert_eq!(unmanaged.str_field("state"), Some("active")); assert_eq!(unmanaged.str_field("name"), Some("Custom")); assert_eq!(unmanaged.str_field("version"), Some("7.0.0")); assert_eq!(unmanaged.str_field("createdBy"), Some("user")); assert!(unmanaged.get("updatedBy").is_none()); }
-    #[test] fn place_scoped_collection_listing_filters_and_counts_by_place() { let engine = app_bootstrap_test_engine(); for (id, collection, place_id) in [ (20, "shared_items", "place-a"), (21, "shared_items", "place-a"), (22, "shared_items", "place-b"), (23, "other_items", "place-b"), ] { let response = execute_request( &engine, QueryRequest::new( id, format!("on {collection} | insert {{_place: {}, name: \"item\"}}", query_string(place_id)), ), ); assert!(response.is_ok()); } let snapshot = engine.storage().read().expect("snapshot opens"); let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"), None) .expect("Place collections list succeeds"); assert_eq!(collections.len(), 1); assert_eq!(collections[0].str_field("name"), Some("shared_items")); assert_eq!(collections[0].u64_field("documents"), Some(2)); }
-    #[test] fn place_only_query_scope_spans_instances_without_leaking_other_places() { let engine = app_bootstrap_test_engine(); let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext { principal: Principal::Anonymous, place_id: place_id.to_owned(), app_instance_id: app_instance_id.map(str::to_owned), access: PlaceAccess::Role(PlaceRole::Owner), }; for (id, place_id, app_instance_id, name) in [ (10, "place-a", "app-1", "one"), (11, "place-a", "app-2", "two"), (12, "place-b", "app-3", "other"), ] { let response = execute_request_scoped( &engine, QueryRequest::new(id, format!("on studio_scope_test | insert {{name: {}}}", query_string(name))), Some(&context(place_id, Some(app_instance_id))), ); assert!(response.is_ok()); } let place_response = execute_request_scoped( &engine, QueryRequest::new(13, "on studio_scope_test | sort name"), Some(&context("place-a", None)), ); let QueryResponse::Ok { documents, .. } = place_response else { panic!("Place scoped query must succeed"); }; assert_eq!(documents.len(), 2); assert_eq!(documents[0].str_field("name"), Some("one")); assert_eq!(documents[1].str_field("name"), Some("two")); assert!(documents.iter().all(|document| document.str_field("_place") == Some("place-a"))); let app_response = execute_request_scoped( &engine, QueryRequest::new(14, "on studio_scope_test | sort name"), Some(&context("place-a", Some("app-1"))), ); let QueryResponse::Ok { documents, .. } = app_response else { panic!("AppInstance scoped query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!(documents[0].str_field("name"), Some("one")); }
+    #[test] fn place_scoped_collection_listing_filters_and_counts_by_place() { let engine = app_bootstrap_test_engine(); for (id, collection, place_id) in [ (20, "shared_items", "place-a"), (21, "shared_items", "place-a"), (22, "shared_items", "place-b"), (23, "other_items", "place-b"), ] { let response = execute_request( &engine, QueryRequest::new( id, quoted!("on {collection} | insert {{_place: {}, name: \"item\"}}", place_id), ), ); assert!(response.is_ok()); } let snapshot = engine.storage().read().expect("snapshot opens"); let collections = list_storage_collections(snapshot.as_ref(), true, Some("place-a"), None) .expect("Place collections list succeeds"); assert_eq!(collections.len(), 1); assert_eq!(collections[0].str_field("name"), Some("shared_items")); assert_eq!(collections[0].u64_field("documents"), Some(2)); }
+    #[test] fn fabric_imports_run_on_the_database_core_under_the_gateway_delegation() { let engine = app_bootstrap_test_engine(); bootstrap_apps_if_needed(&engine).expect("built-in Apps bootstrap"); let declared = serde_json::json!({"checks": [{"id": "big", "message": "big", "query": "on l.staged | where import_id == $import and v > 5"}], "replace": ["k"], "after": ["on l.staged | where import_id == $import | select k | into l_log"]}); for query in ["on _places | insert {placeId: \"p\", name: \"P\", mood: \"\", ownerIdentityId: \"owner\", state: \"active\", createdAt: 1}".to_owned(), insert_query("_apps", serde_json::json!({"appId": "app.l", "state": "active", "definition": {"model": {"tables": {"t": {"collection": "l", "import": declared}}, "collections": {"l": "l"}}}})), "on _app_instances | insert {instanceId: \"i\", placeId: \"p\", appId: \"app.l\", state: \"active\", createdAt: 2}".to_owned(), "on l | insert {_place: \"p\", _app_instance: \"i\", k: 1, v: 0}".to_owned()] { query_run(&engine, 1, query).unwrap(); } let rows = serde_json::json!({"documents": [{"k": 1, "v": 9}, {"k": 2, "v": 1}]}); let call = |delegation: Option<&GatewayDelegation>, mut input: serde_json::Value| { for (key, value) in [("placeId", "p"), ("targetInstanceId", "i"), ("table", "t")] { input[key] = value.into(); } super::place_ops::data_import(&engine, &identity("owner"), delegation, RequestId::Number(2), serde_json::from_value(input).unwrap(), || unreachable!()).map_err(|stop| match stop { super::serve::Stop::Reply(response) => format!("{response:?}"), super::serve::Stop::Connection(_) => String::new() }) }; let plan = call(None, serde_json::json!({"workerResult": rows, "planOnly": true})).unwrap(); assert_eq!((plan["status"].clone(), plan["collection"].clone(), plan["rows"].clone(), plan["import"].clone()), (serde_json::json!("planned"), serde_json::json!("l"), serde_json::json!(2), declared)); let planned = serde_json::json!({"workerResult": rows, "plan": plan}); assert!(call(None, planned.clone()).unwrap_err().contains("authorization.denied")); let delegation = |capability: &str, role| GatewayDelegation { principal: identity("gateway"), place_id: Some("p".into()), capability: capability.into(), app_instance_id: Some("i".into()), place_role: Some(role), public_access: None, token: None }; for refused in [delegation("files", PlaceRole::Owner), delegation("database", PlaceRole::Member)] { assert!(call(Some(&refused), planned.clone()).unwrap_err().contains("authorization.denied")); } let gateway = delegation("database", PlaceRole::Owner); let first = call(Some(&gateway), planned).unwrap(); assert_eq!((first["status"].clone(), first["checks"][0]["rows"].as_array().unwrap().len()), (serde_json::json!("confirm"), 1)); let done = call(Some(&gateway), serde_json::json!({"importId": first["importId"], "accept": ["big"], "plan": plan})).unwrap(); let rows = |query: &str| query_documents(&engine, 3, query).unwrap(); assert_eq!((done["status"].clone(), rows("on l | sort k | select k, v"), rows("on l_log | sort k | select k"), rows("on l.staged | count as n")), (serde_json::json!("completed"), vec![serde_json::json!({"k": 1, "v": 9}), serde_json::json!({"k": 2, "v": 1})], vec![serde_json::json!({"k": 1}), serde_json::json!({"k": 2})], vec![serde_json::json!({"n": 0})])); }
+    #[test] fn imports_wait_for_their_checks_then_replace_the_months_they_bring() { let engine = app_bootstrap_test_engine(); bootstrap_apps_if_needed(&engine).expect("built-in Apps bootstrap"); let checks = ["imbalance", "gaps", "accounts.new", "accounts.unclassified"].map(|check| serde_json::json!({"id": check, "message": check, "query": format!("on view finance.import.{check}")})); let table = serde_json::json!({"collection": "l", "import": {"summary": "on view finance.import.summary", "checks": checks, "replace": ["scenario", "version", "entity", "date"], "after": ["on view finance.import.record | into finance_imports"]}}); for query in ["on _places | insert {placeId: \"p\", name: \"P\", mood: \"\", ownerIdentityId: \"owner\", state: \"active\", createdAt: 1}".to_owned(), insert_query("_apps", serde_json::json!({"appId": "app.fin", "state": "active", "definition": {"model": {"tables": {"ledger": table}, "collections": {"l": "finance"}}}})), "on _app_instances | insert {instanceId: \"i\", placeId: \"p\", appId: \"app.fin\", state: \"active\", createdAt: 2}".to_owned(), "on finance | insert {_place: \"p\", _app_instance: \"i\", scenario: \"actual\", entity: \"E1\", account: \"707000\", date: 1751328000000, balance: -100}".to_owned()] { query_run(&engine, 1, query).unwrap(); } let row = |account: &str, balance: i64| serde_json::json!({"scenario": "actual", "entity": "E1", "account": account, "account_label": account, "date": 1_756_684_800_000_i64, "balance": balance, "source": "bg"}); let import = |mut input: serde_json::Value| { for (key, value) in [("placeId", "p"), ("targetInstanceId", "i"), ("table", "ledger")] { input[key] = value.into(); } super::place_ops::data_import(&engine, &identity("owner"), None, RequestId::Number(2), serde_json::from_value(input).unwrap(), || unreachable!()).unwrap_or_else(|stop| panic!("{:?}", match stop { super::serve::Stop::Reply(response) => format!("{response:?}"), super::serve::Stop::Connection(_) => String::new() })) }; let found = |response: &serde_json::Value| (response["status"].as_str().unwrap().to_owned(), response["checks"].as_array().unwrap().iter().map(|check| (check["id"].as_str().unwrap().to_owned(), check["rows"].as_array().unwrap().len())).collect::<Vec<_>>()); let count = |query: &str| query_documents(&engine, 3, format!("{query} | count as n")).unwrap().first().map_or(0, |row| row["n"].as_i64().unwrap()); let first = import(serde_json::json!({"workerResult": {"documents": [row("707000", -300), row("601000", 200), row("ZZZ1", 90)]}})); assert_eq!(found(&first), ("confirm".to_owned(), [("imbalance", 1), ("gaps", 1), ("accounts.new", 2), ("accounts.unclassified", 1)].map(|(id, rows)| (id.to_owned(), rows)).to_vec())); assert_eq!((first["summary"][0]["rows"].clone(), first["checks"][1]["rows"][0]["missing"].clone(), count("on finance")), (serde_json::json!(3), serde_json::json!(1), 1)); let id = first["importId"].clone(); assert_eq!(import(serde_json::json!({"importId": id, "accept": ["gaps", "accounts.new", "accounts.unclassified"]}))["status"], "confirm"); let done = import(serde_json::json!({"importId": id, "accept": ["imbalance", "gaps", "accounts.new", "accounts.unclassified"]})); assert_eq!((done["status"].clone(), done["rows"].clone(), count("on finance"), count("on finance.staged")), (serde_json::json!("completed"), serde_json::json!(3), 4, 0)); assert_eq!(query_documents(&engine, 4, "on finance_imports | select import_id, rows, from").unwrap(), [serde_json::json!({"import_id": id, "rows": 3, "from": 1_756_684_800_000_i64})]); let again = import(serde_json::json!({"workerResult": {"documents": [row("707000", -400), row("601000", 400)]}, "accept": ["gaps"]})); assert_eq!((found(&again).0, count("on finance | where date == 1756684800000"), count("on finance | where _place == \"p\" and _app_instance == \"i\"")), ("completed".to_owned(), 2, 3)); let checked = import(serde_json::json!({"workerResult": {"documents": [row("707000", -1), row("601000", 1)]}, "accept": ["gaps"], "checkOnly": true})); assert_eq!((checked["status"].clone(), count("on finance.staged")), (serde_json::json!("checked"), 2)); assert_eq!(import(serde_json::json!({"importId": checked["importId"], "cancel": true}))["status"], "cancelled"); assert_eq!((count("on finance.staged"), count("on finance")), (0, 3)); for instance in [None, Some("i")] { let sig = crate::view::query(&engine, "p", instance, "let $end = \"2025-09\", $format = \"sig\" | on view finance.statement | where node == \"VentesMarchandises\" | select reading", &serde_json::Map::new()).unwrap(); assert_eq!(sig, [serde_json::json!({"reading": 400})], "{instance:?}"); } }
+    #[test] fn place_only_query_scope_spans_instances_without_leaking_other_places() { let engine = app_bootstrap_test_engine(); let context = |place_id: &str, app_instance_id: Option<&str>| ExecutionContext { principal: Principal::Anonymous, place_id: place_id.to_owned(), app_instance_id: app_instance_id.map(str::to_owned), access: PlaceAccess::Role(PlaceRole::Owner), }; for (id, place_id, app_instance_id, name) in [ (10, "place-a", "app-1", "one"), (11, "place-a", "app-2", "two"), (12, "place-b", "app-3", "other"), ] { let response = execute_request_scoped( &engine, QueryRequest::new(id, quoted!("on studio_scope_test | insert {{name: {}}}", name)), Some(&context(place_id, Some(app_instance_id))), ); assert!(response.is_ok()); } let place_response = execute_request_scoped( &engine, QueryRequest::new(13, "on studio_scope_test | sort name"), Some(&context("place-a", None)), ); let QueryResponse::Ok { documents, .. } = place_response else { panic!("Place scoped query must succeed"); }; assert_eq!(documents.len(), 2); assert_eq!(documents[0].str_field("name"), Some("one")); assert_eq!(documents[1].str_field("name"), Some("two")); assert!(documents.iter().all(|document| document.str_field("_place") == Some("place-a"))); let app_response = execute_request_scoped( &engine, QueryRequest::new(14, "on studio_scope_test | sort name"), Some(&context("place-a", Some("app-1"))), ); let QueryResponse::Ok { documents, .. } = app_response else { panic!("AppInstance scoped query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!(documents[0].str_field("name"), Some("one")); }
     #[test] fn file_sync_place_root_projection_is_definition_driven() { let declared = serde_json::json!({ "appId": "custom.files", "definition": { "id": "custom.files", "kind": "custom.anything", "files": {"projection": "place-root"} } }); assert!(file_sync_app_place_root_projection(&declared)); let serialized = serde_json::json!({ "definition": r#"{"files":{"projection":"place-root"}}"# }); assert!(file_sync_app_place_root_projection(&serialized)); let legacy_identity_only = serde_json::json!({ "appId": "system.files", "definition": {"kind": "system.files"} }); assert!(!file_sync_app_place_root_projection(&legacy_identity_only)); assert!(!file_sync_app_place_root_projection(&serde_json::json!({ "definition": {"files": {"projection": "app"}} }))); }
     #[test] fn borrowed_partial_document_encodes_large_js_safe_integers_as_numbers() { let document = Document::from_fields([ ("created_at", Value::from(1_785_680_802_608_u64)), ("small", Value::from(42_u64)), ("negative", Value::from(-5_000_000_000_i64)), ]); let response = BorrowedPlainDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id: RequestId::string("query-1").unwrap(), data: BorrowedDocument(&document), }; let payload = rmp_serde::to_vec_named(&response).unwrap(); let decoded: JsonValue = rmp_serde::from_slice(&payload).unwrap(); assert!(decoded["data"]["created_at"].is_f64()); assert!(decoded["data"]["negative"].is_f64()); assert!(decoded["data"]["small"].is_u64()); }
-    #[test] fn enrollment_grants_event_subscription_permission() { let query = enrollment_events_permission_query("identity-a", 42); assert_eq!( query, r#"on _permissions | insert {identityId: "identity-a", action: "events.subscribe", resource: "*", effect: "allow", state: "active", createdAt: 42}"# ); }
-    #[test] fn wildcard_permission_authorizes_events_subscribe() { let storage = MemoryStorage::new(); let storage: Arc<dyn StorageEngine> = Arc::new(storage); let runtime = Arc::new(QueryRuntime::new()); let lowerer = Arc::new(ScanPlanLowerer::new()); let engine = Engine::new(storage, runtime, lowerer); let insert = execute_request( &engine, QueryRequest::new( 1, r#"on _permissions | insert {identityId: "identity-a", action: "*", resource: "*", effect: "allow", state: "active"}"#, ), ); assert!(insert.is_ok()); let request = AuthorizationRequest { identity_id: "identity-a".to_owned(), action: AuthorizationAction::EventsSubscribe, resource: "*".to_owned(), }; assert!(permission_exists(&engine, &request)); }
-    #[test] fn execute_request_uses_the_planner_cache() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let runtime = Arc::new(QueryRuntime::new()); let lowerer = Arc::new(ScanPlanLowerer::new()); let engine = Engine::new(storage, runtime, lowerer); let query = "from users"; let first = execute_request(&engine, QueryRequest::new(1, query)); assert!(matches!(first, QueryResponse::Ok { .. })); assert_eq!(engine.planner_cache_stats().misses, 1); assert_eq!(engine.planner_cache_stats().hits, 0); let second = execute_request(&engine, QueryRequest::new(2, query)); assert!(matches!(second, QueryResponse::Ok { .. })); assert_eq!(engine.planner_cache_stats().misses, 1); assert_eq!(engine.planner_cache_stats().hits, 1); }
-    #[test] fn raw_query_results_include_document_id() { let storage = MemoryStorage::new(); let collection = CollectionId::parse("users").unwrap(); let id = crate::storage::UuidV7Generator::new().next_id(); let document = Arc::new(Document::from_fields([("name", Value::string("Alice"))])); let mut transaction = storage.begin().unwrap(); transaction.insert(&collection, id, document).unwrap(); transaction.commit().unwrap(); let storage: Arc<dyn StorageEngine> = Arc::new(storage); let runtime = Arc::new(QueryRuntime::new()); let lowerer = Arc::new(ScanPlanLowerer::new()); let engine = Engine::new(storage, runtime, lowerer); let response = execute_request(&engine, QueryRequest::new(1, "from users")); let QueryResponse::Ok { documents, .. } = response else { panic!("query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!( documents[0].get("_id"), Some(&JsonValue::String(id.to_string())) ); assert_eq!( documents[0].get("name"), Some(&JsonValue::String("Alice".to_owned())) ); }
+    #[test] fn enrollment_grants_event_subscription_permission() { let query = enrollment_events_permission_query("identity-a", 42); let document: JsonValue = serde_json::from_str(query.strip_prefix("on _permissions | insert ").expect("an insert into _permissions")).unwrap(); assert_eq!( document, serde_json::json!({"identityId": "identity-a", "action": "events.subscribe", "resource": "*", "effect": "allow", "state": "active", "createdAt": 42}) ); }
+    #[test] fn wildcard_permission_authorizes_events_subscribe() { let storage = MemoryStorage::new(); let storage: Arc<dyn StorageEngine> = Arc::new(storage); let engine = Engine::new(storage); let insert = execute_request( &engine, QueryRequest::new( 1, r#"on _permissions | insert {identityId: "identity-a", action: "*", resource: "*", effect: "allow", state: "active"}"#, ), ); assert!(insert.is_ok()); let request = AuthorizationRequest { identity_id: "identity-a".to_owned(), action: AuthorizationAction::EventsSubscribe, resource: "*".to_owned(), }; assert!(permission_exists(&engine, &request)); }
+    #[test] fn execute_request_uses_the_planner_cache() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let query = "from users"; let first = execute_request(&engine, QueryRequest::new(1, query)); assert!(matches!(first, QueryResponse::Ok { .. })); assert_eq!(engine.planner_cache_stats().misses, 1); assert_eq!(engine.planner_cache_stats().hits, 0); let second = execute_request(&engine, QueryRequest::new(2, query)); assert!(matches!(second, QueryResponse::Ok { .. })); assert_eq!(engine.planner_cache_stats().misses, 1); assert_eq!(engine.planner_cache_stats().hits, 1); }
+    #[test] fn raw_query_results_include_document_id() { let storage = MemoryStorage::new(); let collection = CollectionId::parse("users").unwrap(); let id = crate::storage::UuidV7Generator::new().next_id(); let document = Arc::new(Document::from_fields([("name", Value::string("Alice"))])); let mut transaction = storage.begin().unwrap(); transaction.insert(&collection, id, document).unwrap(); transaction.commit().unwrap(); let storage: Arc<dyn StorageEngine> = Arc::new(storage); let engine = Engine::new(storage); let response = execute_request(&engine, QueryRequest::new(1, "from users")); let QueryResponse::Ok { documents, .. } = response else { panic!("query must succeed"); }; assert_eq!(documents.len(), 1); assert_eq!( documents[0].get("_id"), Some(&JsonValue::String(id.to_string())) ); assert_eq!( documents[0].get("name"), Some(&JsonValue::String("Alice".to_owned())) ); }
     #[test] fn transformed_plans_do_not_expose_document_id() { let source = crate::query::PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()); let plan = crate::query::PhysicalPlan::new( source, [crate::query::PhysicalOperator::select([ crate::query::ExpressionFieldPath::new(["name"]).unwrap(), ]) .unwrap()], ) .unwrap(); assert!(!exposes_document_id(&plan)); }
     #[test] fn parses_flexible_memory_limit_values() { let mib = 1024 * 1024; let gib = 1024 * mib; assert_eq!(parse_byte_size("TEST", "512M").unwrap(), 512 * mib); assert_eq!(parse_byte_size("TEST", "850m").unwrap(), 850 * mib); assert_eq!(parse_byte_size("TEST", "1G").unwrap(), gib); assert_eq!(parse_byte_size("TEST", "2GiB").unwrap(), 2 * gib); assert_eq!(parse_byte_size("TEST", "1.5G").unwrap(), 1536 * mib); assert_eq!(parse_byte_size("TEST", "512").unwrap(), 512 * mib); assert_eq!(parse_byte_size("TEST", "0.5G").unwrap(), 512 * mib); assert_eq!(parse_byte_size("TEST", "1024KiB").unwrap(), mib); }
     #[test] fn rejects_invalid_memory_limit_values() { for value in ["", "0", ".", "1.2.3G", "12T", "-1G"] { assert!(parse_byte_size("TEST", value).is_err(), "{value}"); } }
-    #[test] fn parses_supported_storage_backends() { assert_eq!( StorageBackend::parse("memory").expect("memory"), StorageBackend::Memory ); assert_eq!( StorageBackend::parse("glacier").expect("glacier"), StorageBackend::Glacier ); assert_eq!( StorageBackend::parse(" GLACIER ").expect("normalized glacier"), StorageBackend::Glacier ); assert_eq!(StorageBackend::Memory.as_str(), "memory"); assert_eq!(StorageBackend::Glacier.as_str(), "glacier"); assert!(StorageBackend::parse("redb").is_err()); }
+    #[test] fn parses_supported_storage_backends() { assert_eq!( StorageBackend::parse("memory").expect("memory"), StorageBackend::Memory ); assert_eq!( StorageBackend::parse("glacier").expect("glacier"), StorageBackend::Glacier ); assert_eq!( StorageBackend::parse(" GLACIER ").expect("normalized glacier"), StorageBackend::Glacier ); assert_eq!(StorageBackend::Memory.as_str(), "memory"); assert_eq!(StorageBackend::Glacier.as_str(), "glacier"); assert!(StorageBackend::parse("glacier6").is_err()); assert!(StorageBackend::parse("redb").is_err()); }
     #[test] fn rejects_unknown_storage_backend() { let error = StorageBackend::parse("sqlite").expect_err("must reject unknown backend"); assert!(matches!( error, DaemonError::InvalidStorageBackend { value } if value == "sqlite" )); }
     #[test] fn adapts_official_ast_to_planner_pipeline() { let source = "from users | where active == true | inspect verbose"; let pipeline = parse_pipeline(source).expect("pipeline parses"); assert_eq!(pipeline.source(), "users"); assert_eq!(pipeline.len(), 2); assert_eq!(pipeline.stages()[0].name().as_str(), "where"); assert_eq!(pipeline.stages()[0].arguments(), "active == true"); assert_eq!(pipeline.stages()[1].name().as_str(), "inspect"); assert_eq!(pipeline.stages()[1].arguments(), "verbose"); }
     #[test] fn preserves_qualified_collection_name() { let pipeline = parse_pipeline("from tenant.analytics.events | where active == true") .expect("pipeline parses"); assert_eq!(pipeline.source(), "tenant.analytics.events"); }

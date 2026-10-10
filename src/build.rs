@@ -50,16 +50,6 @@ pub const fn has_fabric() -> bool {
     cfg!(feature = "fabric")
 }
 
-#[must_use]
-pub const fn has_identity() -> bool {
-    cfg!(feature = "identity")
-}
-
-#[must_use]
-pub const fn has_files_watch() -> bool {
-    cfg!(feature = "files-watch")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

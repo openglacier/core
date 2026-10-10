@@ -53,6 +53,10 @@ impl ExpressionFieldResolver<Value> for DocumentFields<'_> {
     }
 }
 
+/// The outer row of a `lookup` and both aliases, as its sub-pipeline's
+/// stages read them.
+pub type LookupScope<'a> = (&'a Document, Option<&'a str>, Option<&'a str>);
+
 /// Field scope of a `lookup` sub-pipeline.
 ///
 /// `<inner alias>.path` reads the joined document, `<outer alias>.path` reads
@@ -376,6 +380,21 @@ functions! {
     // Dates.
     Now = "now", 0, Some(0); ParseDate = "parse_date", 1, Some(1); DateTrunc = "date_trunc", 2, Some(2); DateAdd = "date_add", 3, Some(3);
     DateDiff = "date_diff", 3, Some(3); DatePart = "date_part", 2, Some(2); DateFormat = "date_format", 1, Some(2);
+    FiscalYear = "fiscal_year", 2, Some(2); FiscalMonth = "fiscal_month", 2, Some(2); FiscalStart = "fiscal_start", 2, Some(2);
+    FiscalEnd = "fiscal_end", 2, Some(2);
+}
+
+impl Function {
+    /// Position of a fiscal function's field in [`super::dates::fiscal`].
+    pub(crate) const fn fiscal_field(self) -> Option<usize> {
+        match self {
+            Self::FiscalYear => Some(0),
+            Self::FiscalMonth => Some(1),
+            Self::FiscalStart => Some(2),
+            Self::FiscalEnd => Some(3),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for Function {

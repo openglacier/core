@@ -300,10 +300,13 @@ pub struct DataAnalyzeInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DataImportInput {
     pub place_id: String,
+    #[serde(default)]
     pub files_instance_id: String,
+    #[serde(default)]
     pub file_id: String,
     pub target_instance_id: String,
     pub table: String,
+    #[serde(default)]
     pub mapping: serde_json::Value,
     #[serde(default)]
     pub mode: Option<String>,
@@ -316,6 +319,24 @@ pub struct DataImportInput {
     /// the Place database provider is a remote Core.
     #[serde(default)]
     pub plan_only: bool,
+    /// The staged import to resume (after its checks asked for a
+    /// confirmation) or to cancel; absent, the file is read and staged.
+    #[serde(default)]
+    pub import_id: Option<String>,
+    /// The checks the caller accepts: their rows no longer stop the import.
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// Stage and check only, write nothing (the « import? » question).
+    #[serde(default)]
+    pub check_only: bool,
+    /// Drop the staged import `importId`.
+    #[serde(default)]
+    pub cancel: bool,
+    /// The destination the authority Core resolved (`planOnly`: `collection`,
+    /// `mode`, `import`), given by the Gateway to the database Core of the
+    /// Place, which stages, checks and writes the rows under its delegation.
+    #[serde(default)]
+    pub plan: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -391,7 +412,8 @@ pub struct QueryExecuteInput {
     pub read_only: bool,
     /// Values for the `$name` parameters of `query`. They are bound as escaped
     /// literals during validation (with the query's `let` variables), before
-    /// authorization and planning see the query.
+    /// authorization and planning see the query; for a query reading views,
+    /// once the Place's views are read.
     #[serde(default)]
     pub params: Option<serde_json::Map<String, serde_json::Value>>,
 }
@@ -1095,10 +1117,15 @@ impl OperationPayload for QueryExecuteInput {
             return Err(invalid_payload(operation, "query must not be empty"));
         }
         // Evaluate `let` variables and bind `$name` values before authorization
-        // and planning ever see the query.
+        // and planning ever see the query; a query reading its Place (views,
+        // `let` queries) keeps its parameters until the Place is known.
         let parameters = self.params.take().unwrap_or_default();
-        self.query = crate::query::prepare_query(&self.query, &parameters)
-            .map_err(|message| invalid_payload(operation, message))?;
+        if crate::query::reads_place(&self.query) {
+            self.params = Some(parameters);
+        } else {
+            self.query = crate::query::prepare_query(&self.query, &parameters)
+                .map_err(|message| invalid_payload(operation, message))?;
+        }
         if let Some(context) = self.context.as_ref() {
             non_empty(operation, "context.placeId", &context.place_id)?;
             if let Some(app_instance_id) = context.app_instance_id.as_ref() {
@@ -1218,11 +1245,13 @@ impl OperationPayload for DataAnalyzeInput {
 impl OperationPayload for DataImportInput {
     fn validate(&mut self, operation: &str) -> Result<()> {
         non_empty(operation, "placeId", &self.place_id)?;
-        non_empty(operation, "filesInstanceId", &self.files_instance_id)?;
-        non_empty(operation, "fileId", &self.file_id)?;
+        if self.import_id.is_none() {
+            non_empty(operation, "filesInstanceId", &self.files_instance_id)?;
+            non_empty(operation, "fileId", &self.file_id)?;
+        }
         non_empty(operation, "targetInstanceId", &self.target_instance_id)?;
         non_empty(operation, "table", &self.table)?;
-        if !self.mapping.is_object() {
+        if self.import_id.is_none() && !self.mapping.is_object() {
             return Err(invalid_payload(operation, "mapping must be an object"));
         }
         if self

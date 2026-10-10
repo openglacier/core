@@ -164,10 +164,6 @@ pub enum ObjectKeyAst {
 }
 
 impl ObjectKeyAst {
-    #[must_use]
-    pub const fn is_identifier(self) -> bool {
-        matches!(self, Self::Identifier(_))
-    }
 
     #[must_use]
     pub const fn is_string(self) -> bool {
@@ -556,10 +552,6 @@ impl ObjectAst {
         self.fields.iter()
     }
 
-    #[must_use]
-    pub fn into_fields(self) -> Vec<ObjectFieldAst> {
-        self.fields
-    }
 }
 
 impl Spanned for ObjectAst {
@@ -652,6 +644,31 @@ impl Spanned for SourceAliasAst {
     }
 }
 
+/// Lecture temporelle d'une source.
+///
+/// ```text
+/// on orders as of "2026-09-01T00:00:00Z"
+///           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/// on orders history
+///           ^^^^^^^
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SourceTemporalAst {
+    /// `as of <valeur>` : une chaîne (date ISO 8601) ou un nombre (génération).
+    AsOf { value: Span, number: bool, span: Span },
+    /// `history` : toutes les versions stockées de la collection.
+    History { span: Span },
+}
+
+impl Spanned for SourceTemporalAst {
+    #[inline]
+    fn span(&self) -> Span {
+        match self {
+            Self::AsOf { span, .. } | Self::History { span } => *span,
+        }
+    }
+}
+
 /// Source syntaxique d'un pipeline.
 ///
 /// Exemples :
@@ -667,6 +684,7 @@ pub struct SourceAst {
     keyword_span: Span,
     collection: NameAst,
     alias: Option<SourceAliasAst>,
+    temporal: Option<SourceTemporalAst>,
     span: Span,
 }
 
@@ -718,8 +736,30 @@ impl SourceAst {
             keyword_span,
             collection,
             alias,
+            temporal: None,
             span,
         }
+    }
+
+    /// Ajoute une lecture temporelle (`as of …`, `history`) placée entre la
+    /// collection et l'alias éventuel.
+    ///
+    /// # Panics
+    ///
+    /// Panique lorsque la lecture temporelle sort du span de la source.
+    #[must_use]
+    pub fn with_temporal(mut self, temporal: SourceTemporalAst) -> Self {
+        assert!(
+            self.span.contains_span(temporal.span()),
+            "source span must contain temporal span",
+        );
+        self.temporal = Some(temporal);
+        self
+    }
+
+    #[must_use]
+    pub const fn temporal(self) -> Option<SourceTemporalAst> {
+        self.temporal
     }
 
     #[must_use]

@@ -350,12 +350,16 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
         }
 
         // Dates.
-        F::Now => Value::signed(now_millis()),
+        F::Now => Value::signed(crate::helpers::now_millis()),
         F::ParseDate => Value::signed(timestamp(name, argument(0))?),
-        F::DateTrunc => Value::signed(dates::trunc(timestamp(name, argument(0))?, unit(name, argument(1))?)),
+        F::DateTrunc => Value::signed(dates::trunc(timestamp(name, argument(0))?, unit(name, argument(1))?).map_err(error)?),
         F::DateAdd => Value::signed(dates::add(timestamp(name, argument(0))?, integer(name, argument(1))?, unit(name, argument(2))?).map_err(error)?),
-        F::DateDiff => Value::signed(dates::diff(timestamp(name, argument(0))?, timestamp(name, argument(1))?, unit(name, argument(2))?)),
+        F::DateDiff => Value::signed(dates::diff(timestamp(name, argument(0))?, timestamp(name, argument(1))?, unit(name, argument(2))?).map_err(error)?),
         F::DatePart => Value::signed(dates::part(timestamp(name, argument(0))?, text(name, argument(1))?).map_err(error)?),
+        F::FiscalYear | F::FiscalMonth | F::FiscalStart | F::FiscalEnd => {
+            let fields = dates::fiscal(timestamp(name, argument(0))?, timestamp(name, argument(1))?).map_err(|message| error(format!("`{name}`: {message}")))?;
+            Value::signed(fields[function.fiscal_field().expect("a fiscal function")])
+        }
         F::DateFormat => {
             let millis = timestamp(name, argument(0))?;
             Value::string(match optional(1) {
@@ -494,8 +498,3 @@ fn unit(name: &str, value: &Value) -> ExecutionResult<DateUnit> {
     DateUnit::parse(text(name, value)?).map_err(|message| error(format!("`{name}`: {message}")))
 }
 
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-}

@@ -73,8 +73,68 @@ impl Expression {
         };
         if children_constant {
             self.constant = super::eval::evaluate_constant(self);
+        } else if let Some(chosen) = self.chosen_branch() {
+            *self = chosen;
         }
         self.constant.is_some()
+    }
+
+    /// The part of a conditional its constant conditions leave: `if(false, a, b)`
+    /// is `b`, `true or x` is `true`, `coalesce(null, x)` is `x`, `case(false, a, c, b)`
+    /// is `case(c, b)`. Folded at planning, so that `derive f = if($p, null, f)`
+    /// becomes `f = f` once `$p` is bound.
+    fn chosen_branch(&self) -> Option<Self> {
+        use super::Function::{Case, Coalesce, If};
+        let flag = |item: &Self| item.constant.as_ref().and_then(crate::Value::as_bool);
+        let call = |function, rest: &[Self]| Self::new(ExpressionKind::Call { function, arguments: rest.to_vec() }, self.span);
+        match &self.kind {
+            ExpressionKind::Binary { left, operator: operator @ (BinaryOperator::And | BinaryOperator::Or), .. } => (flag(left)? == (*operator == BinaryOperator::Or)).then(|| left.as_ref().clone()),
+            ExpressionKind::Call { function: If, arguments } => Some(arguments[if flag(&arguments[0])? { 1 } else { 2 }].clone()),
+            ExpressionKind::Call { function: Case, arguments } => {
+                let skip = arguments.chunks(2).take_while(|pair| pair.len() == 2 && flag(&pair[0]) == Some(false)).count();
+                match &arguments[2 * skip..] {
+                    [default] => Some(default.clone()),
+                    [condition, value, ..] if flag(condition) == Some(true) => Some(value.clone()),
+                    rest if skip > 0 && !rest.is_empty() => Some(call(Case, rest)),
+                    _ => None,
+                }
+            }
+            ExpressionKind::Call { function: Coalesce, arguments } => {
+                let skip = arguments.iter().take_while(|item| item.constant.as_ref().is_some_and(crate::Value::is_null)).count();
+                match &arguments[skip..] {
+                    [first, ..] if first.constant.is_some() => Some(first.clone()),
+                    [only] => Some(only.clone()),
+                    rest if skip > 0 && !rest.is_empty() => Some(call(Coalesce, rest)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// This expression with every field it reads made optional (`a` reads
+    /// as `a?`): a missing field reads as `null` instead of failing.
+    #[must_use]
+    pub(crate) fn with_optional_fields(&self) -> Self {
+        let mut copy = self.clone();
+        copy.make_fields_optional();
+        copy
+    }
+
+    fn make_fields_optional(&mut self) {
+        match &mut self.kind {
+            ExpressionKind::Field(_) => {
+                let field = std::mem::replace(self, Self::new(ExpressionKind::Array(Vec::new()), self.span));
+                *self = Self::new(ExpressionKind::Call { function: super::Function::Optional, arguments: vec![field] }, self.span);
+            }
+            ExpressionKind::Call { function: super::Function::Optional, .. } | ExpressionKind::Literal(_) => {}
+            ExpressionKind::Unary { operand, .. } | ExpressionKind::Group(operand) => operand.make_fields_optional(),
+            ExpressionKind::Binary { left, right, .. } => {
+                left.make_fields_optional();
+                right.make_fields_optional();
+            }
+            ExpressionKind::Array(items) | ExpressionKind::Call { arguments: items, .. } => items.iter_mut().for_each(Self::make_fields_optional),
+        }
     }
 
     /// Creates a literal expression.
@@ -141,12 +201,6 @@ impl Expression {
         self.span
     }
 
-    /// Consumes the expression and returns its kind.
-    #[must_use]
-    pub fn into_kind(self) -> ExpressionKind {
-        self.kind
-    }
-
     /// Returns the expression as a literal when applicable.
     #[must_use]
     pub const fn as_literal(&self) -> Option<&Literal> {
@@ -161,6 +215,16 @@ impl Expression {
     pub const fn as_field(&self) -> Option<&ExpressionFieldPath> {
         match &self.kind {
             ExpressionKind::Field(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The field this node reads, and whether it reads it optionally (`a?`: missing reads as `null`).
+    #[must_use]
+    pub fn as_read_field(&self) -> Option<(&ExpressionFieldPath, bool)> {
+        match &self.kind {
+            ExpressionKind::Field(path) => Some((path, false)),
+            ExpressionKind::Call { function: super::Function::Optional, arguments } if arguments.len() == 1 => arguments[0].as_field().map(|path| (path, true)),
             _ => None,
         }
     }
@@ -730,12 +794,6 @@ impl BinaryOperator {
         )
     }
 
-    /// Returns whether this is a membership operator (`in`, `not in`).
-    #[must_use]
-    pub const fn is_membership(self) -> bool {
-        matches!(self, Self::In | Self::NotIn)
-    }
-
     /// Returns whether this is an arithmetic operator.
     #[must_use]
     pub const fn is_arithmetic(self) -> bool {
@@ -786,7 +844,9 @@ pub fn parse_expression(source: &str) -> ExpressionResult<Expression> {
 #[derive(Clone, Debug)]
 pub struct ExpressionParser<'source> {
     source: &'source str,
-    lexer: ExpressionLexer<'source>,
+    tokens: Vec<ExpressionToken>,
+    /// Index of the token after `current`.
+    next: usize,
     current: ExpressionToken,
 }
 
@@ -797,7 +857,8 @@ impl<'source> ExpressionParser<'source> {
     pub const fn new(source: &'source str) -> Self {
         Self {
             source,
-            lexer: ExpressionLexer::new(source),
+            tokens: Vec::new(),
+            next: 0,
             current: ExpressionToken::end(0),
         }
     }
@@ -808,6 +869,7 @@ impl<'source> ExpressionParser<'source> {
     ///
     /// Returns an expression syntax error.
     pub fn parse(mut self) -> ExpressionResult<Expression> {
+        self.tokens = expression_tokens(self.source)?;
         self.advance()?;
 
         if self.current.kind == ExpressionTokenKind::End {
@@ -1169,7 +1231,7 @@ impl<'source> ExpressionParser<'source> {
     }
 
     fn next_is(&self, kind: ExpressionTokenKind) -> bool {
-        self.lexer.clone().next_token().is_ok_and(|token| token.kind == kind)
+        self.tokens.get(self.next).is_some_and(|token| token.kind == kind)
     }
 
     fn current_is_word(&self, word: &str) -> bool {
@@ -1177,13 +1239,14 @@ impl<'source> ExpressionParser<'source> {
     }
 
     fn next_is_word(&self, word: &str) -> bool {
-        self.lexer.clone().next_token().is_ok_and(|token| {
+        self.tokens.get(self.next).is_some_and(|token| {
             token.kind == ExpressionTokenKind::Identifier && token.text(self.source) == word
         })
     }
 
     fn advance(&mut self) -> ExpressionResult<()> {
-        self.current = self.lexer.next_token()?;
+        self.current = self.tokens.get(self.next).copied().unwrap_or_else(|| ExpressionToken::end(self.source.len()));
+        self.next += 1;
         Ok(())
     }
 }
@@ -1292,399 +1355,113 @@ impl ExpressionToken {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ExpressionLexer<'source> {
-    source: &'source str,
-    offset: usize,
-}
-
-impl<'source> ExpressionLexer<'source> {
-    #[inline]
-    const fn new(source: &'source str) -> Self {
-        Self { source, offset: 0 }
-    }
-
-    fn next_token(&mut self) -> ExpressionResult<ExpressionToken> {
-        self.skip_whitespace();
-
-        let start = self.offset;
-
-        let Some(character) = self.peek() else {
-            return Ok(ExpressionToken::end(self.offset));
-        };
-
-        if is_identifier_start(character) {
-            return Ok(self.lex_identifier());
+/// The tokens of an expression, read by the query lexer: signs and leading
+/// dots of numbers, word operators and `{…}` objects are recombined into
+/// the expression's own kinds.
+fn expression_tokens(source: &str) -> ExpressionResult<Vec<ExpressionToken>> {
+    use super::TokenKind as T;
+    use ExpressionTokenKind as E;
+    let stream = super::lex(source).map_err(|error| {
+        let span = error.span();
+        match *error.kind() {
+            super::LexErrorKind::UnexpectedCharacter { character: '&' } => ExpressionError::single_ampersand(span),
+            super::LexErrorKind::UnexpectedCharacter { character } => ExpressionError::invalid_character(character, span),
+            super::LexErrorKind::UnterminatedString | super::LexErrorKind::UnterminatedEscape => ExpressionError::unterminated_string(span),
+            super::LexErrorKind::InvalidEscape { character } => ExpressionError::invalid_escape(character, span),
+            super::LexErrorKind::ExpectedEqualsAfterBang => ExpressionError::unexpected_end(Span::at(source.len()), "an operand"),
+            _ => ExpressionError::invalid_number(span),
         }
-
-        if character.is_ascii_digit()
-            || (character == '.' && self.peek_next().is_some_and(|next| next.is_ascii_digit()))
-        {
-            return self.lex_number();
-        }
-
-        match character {
-            '"' => self.lex_string(),
-
-            '{' => self.lex_object(),
-
-            '(' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::LeftParen,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            ')' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::RightParen,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '.' => {
-                self.advance();
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Dot,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '?' => {
-                self.advance();
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Question,
-                    Span::new(start, self.offset),
-                ))
-            }
-            '[' | ']' | ',' => {
-                self.advance();
-                let kind = match character {
-                    '[' => ExpressionTokenKind::LeftBracket,
-                    ']' => ExpressionTokenKind::RightBracket,
-                    _ => ExpressionTokenKind::Comma,
-                };
-                Ok(ExpressionToken::new(kind, Span::new(start, self.offset)))
-            }
-
-            '+' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Plus,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '-' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Minus,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '*' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Star,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '/' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Slash,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '%' => {
-                self.advance();
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::Percent,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '!' => {
-                self.advance();
-
-                let kind = if self.consume('=') {
-                    ExpressionTokenKind::BangEqual
-                } else {
-                    ExpressionTokenKind::Bang
-                };
-
-                Ok(ExpressionToken::new(kind, Span::new(start, self.offset)))
-            }
-
-            '=' => {
-                self.advance();
-
-                if !self.consume('=') {
-                    return Err(ExpressionError::single_equal(Span::new(start, self.offset)));
+    })?;
+    let tokens = stream.tokens();
+    let mut out = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+    while let Some(&token) = tokens.get(index) {
+        index += 1;
+        let span = token.span();
+        let text = span.slice(source).unwrap_or("");
+        let kind = match token.kind() {
+            T::End => E::End,
+            T::String => E::String,
+            T::True => E::True,
+            T::False => E::False,
+            T::Null => E::Null,
+            T::And => E::AndAnd,
+            T::Or => E::OrOr,
+            T::Not => E::Bang,
+            T::Identifier if text == "in" => E::In,
+            kind if kind == T::Identifier || kind.is_keyword() => E::Identifier,
+            T::Number => {
+                if let Some(sign) = text.strip_prefix(['+', '-']).map(|_| if text.starts_with('-') { E::Minus } else { E::Plus }) {
+                    out.push(ExpressionToken::new(sign, Span::new(span.start(), span.start() + 1)));
+                    out.push(ExpressionToken::new(E::Number, Span::new(span.start() + 1, span.end())));
+                    continue;
                 }
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::EqualEqual,
-                    Span::new(start, self.offset),
-                ))
+                E::Number
             }
-
-            '<' => {
-                self.advance();
-
-                let kind = if self.consume('=') {
-                    ExpressionTokenKind::LessEqual
-                } else {
-                    ExpressionTokenKind::Less
-                };
-
-                Ok(ExpressionToken::new(kind, Span::new(start, self.offset)))
-            }
-
-            '>' => {
-                self.advance();
-
-                let kind = if self.consume('=') {
-                    ExpressionTokenKind::GreaterEqual
-                } else {
-                    ExpressionTokenKind::Greater
-                };
-
-                Ok(ExpressionToken::new(kind, Span::new(start, self.offset)))
-            }
-
-            '&' => {
-                self.advance();
-
-                if !self.consume('&') {
-                    return Err(ExpressionError::single_ampersand(Span::new(
-                        start,
-                        self.offset,
-                    )));
+            // `.5`: a dot right before digits starts a number.
+            T::Dot => match tokens.get(index) {
+                Some(number) if number.kind() == T::Number && number.span().start() == span.end() && span.slice(source).is_some() && !number.span().slice(source).unwrap_or("").starts_with(['+', '-']) => {
+                    index += 1;
+                    out.push(ExpressionToken::new(E::Number, Span::new(span.start(), number.span().end())));
+                    continue;
                 }
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::AndAnd,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            '|' => {
-                self.advance();
-
-                if !self.consume('|') {
-                    return Err(ExpressionError::single_pipe(Span::new(start, self.offset)));
-                }
-
-                Ok(ExpressionToken::new(
-                    ExpressionTokenKind::OrOr,
-                    Span::new(start, self.offset),
-                ))
-            }
-
-            _ => {
-                self.advance();
-
-                Err(ExpressionError::invalid_character(
-                    character,
-                    Span::new(start, self.offset),
-                ))
-            }
-        }
-    }
-
-    fn lex_identifier(&mut self) -> ExpressionToken {
-        let start = self.offset;
-
-        self.advance();
-
-        while self.peek().is_some_and(is_identifier_continue) {
-            self.advance();
-        }
-
-        let span = Span::new(start, self.offset);
-        let text = self
-            .source
-            .get(start..self.offset)
-            .expect("lexer offsets must remain valid");
-
-        let kind = match text {
-            "true" => ExpressionTokenKind::True,
-            "false" => ExpressionTokenKind::False,
-            "null" => ExpressionTokenKind::Null,
-            "and" => ExpressionTokenKind::AndAnd,
-            "or" => ExpressionTokenKind::OrOr,
-            "not" => ExpressionTokenKind::Bang,
-            "in" => ExpressionTokenKind::In,
-            _ => ExpressionTokenKind::Identifier,
-        };
-
-        ExpressionToken::new(kind, span)
-    }
-
-    fn lex_number(&mut self) -> ExpressionResult<ExpressionToken> {
-        let start = self.offset;
-        let mut saw_digit = false;
-
-        while self.peek().is_some_and(|value| value.is_ascii_digit()) {
-            saw_digit = true;
-            self.advance();
-        }
-
-        if self.peek() == Some('.') {
-            self.advance();
-
-            while self.peek().is_some_and(|value| value.is_ascii_digit()) {
-                saw_digit = true;
-                self.advance();
-            }
-        }
-
-        if !saw_digit {
-            return Err(ExpressionError::invalid_number(Span::new(
-                start,
-                self.offset,
-            )));
-        }
-
-        if matches!(self.peek(), Some('e' | 'E')) {
-            let exponent_start = self.offset;
-
-            self.advance();
-
-            if matches!(self.peek(), Some('+' | '-')) {
-                self.advance();
-            }
-
-            let digits_start = self.offset;
-
-            while self.peek().is_some_and(|value| value.is_ascii_digit()) {
-                self.advance();
-            }
-
-            if self.offset == digits_start {
-                return Err(ExpressionError::invalid_number(Span::new(
-                    exponent_start,
-                    self.offset,
-                )));
-            }
-        }
-
-        Ok(ExpressionToken::new(
-            ExpressionTokenKind::Number,
-            Span::new(start, self.offset),
-        ))
-    }
-
-    /// Lexes a balanced `{…}` as one token; strings may contain braces.
-    fn lex_object(&mut self) -> ExpressionResult<ExpressionToken> {
-        let start = self.offset;
-        let mut depth = 0_usize;
-        let mut in_string = false;
-        while let Some(character) = self.advance() {
-            match character {
-                '\\' if in_string => {
-                    self.advance();
-                }
-                '"' => in_string = !in_string,
-                '{' if !in_string => depth += 1,
-                '}' if !in_string => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Ok(ExpressionToken::new(ExpressionTokenKind::Object, Span::new(start, self.offset)));
+                _ => E::Dot,
+            },
+            T::Comma => E::Comma,
+            T::LeftParen => E::LeftParen,
+            T::RightParen => E::RightParen,
+            T::LeftBracket => E::LeftBracket,
+            T::RightBracket => E::RightBracket,
+            // A balanced `{…}` is one object literal.
+            T::LeftBrace => {
+                let mut depth = 1_usize;
+                let end = loop {
+                    let Some(&inner) = tokens.get(index) else {
+                        return Err(ExpressionError::unexpected_end(Span::new(span.start(), source.len()), "'}'"));
+                    };
+                    index += 1;
+                    match inner.kind() {
+                        T::LeftBrace => depth += 1,
+                        T::RightBrace => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break inner.span().end();
+                            }
+                        }
+                        T::End => return Err(ExpressionError::unexpected_end(Span::new(span.start(), source.len()), "'}'")),
+                        _ => {}
                     }
-                }
-                _ => {}
+                };
+                out.push(ExpressionToken::new(E::Object, Span::new(span.start(), end)));
+                continue;
             }
-        }
-        Err(ExpressionError::unexpected_end(Span::new(start, self.offset), "'}'"))
+            T::RightBrace => return Err(ExpressionError::invalid_character('}', span)),
+            T::Colon => return Err(ExpressionError::invalid_character(':', span)),
+            T::Equal => return Err(ExpressionError::single_equal(span)),
+            T::Pipe => return Err(ExpressionError::single_pipe(span)),
+            T::EqualEqual => E::EqualEqual,
+            T::NotEqual => E::BangEqual,
+            T::Less => E::Less,
+            T::LessEqual => E::LessEqual,
+            T::Greater => E::Greater,
+            T::GreaterEqual => E::GreaterEqual,
+            T::Operator => match text {
+                "+" => E::Plus,
+                "-" => E::Minus,
+                "*" => E::Star,
+                "/" => E::Slash,
+                "%" => E::Percent,
+                "?" => E::Question,
+                "&&" => E::AndAnd,
+                "||" => E::OrOr,
+                "!" => E::Bang,
+                _ => return Err(ExpressionError::invalid_character(text.chars().next().unwrap_or(' '), span)),
+            },
+            _ => return Err(ExpressionError::invalid_character(text.chars().next().unwrap_or(' '), span)),
+        };
+        out.push(ExpressionToken::new(kind, span));
     }
-
-    fn lex_string(&mut self) -> ExpressionResult<ExpressionToken> {
-        let start = self.offset;
-
-        self.advance();
-
-        while let Some(character) = self.peek() {
-            match character {
-                '"' => {
-                    self.advance();
-
-                    return Ok(ExpressionToken::new(
-                        ExpressionTokenKind::String,
-                        Span::new(start, self.offset),
-                    ));
-                }
-
-                '\\' => {
-                    self.advance();
-
-                    if self.peek().is_none() {
-                        break;
-                    }
-
-                    self.advance();
-                }
-
-                _ => {
-                    self.advance();
-                }
-            }
-        }
-
-        Err(ExpressionError::unterminated_string(Span::new(
-            start,
-            self.offset,
-        )))
-    }
-
-    fn skip_whitespace(&mut self) {
-        while self.peek().is_some_and(char::is_whitespace) {
-            self.advance();
-        }
-    }
-
-    fn consume(&mut self, expected: char) -> bool {
-        if self.peek() != Some(expected) {
-            return false;
-        }
-
-        self.advance();
-        true
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.source
-            .get(self.offset..)
-            .and_then(|remaining| remaining.chars().next())
-    }
-
-    fn peek_next(&self) -> Option<char> {
-        let mut characters = self.source.get(self.offset..)?.chars();
-
-        characters.next()?;
-        characters.next()
-    }
-
-    fn advance(&mut self) -> Option<char> {
-        let character = self.peek()?;
-
-        self.offset += character.len_utf8();
-
-        Some(character)
-    }
+    Ok(out)
 }
 
 fn decode_string_literal(source: &str, span: Span) -> ExpressionResult<String> {
@@ -1693,14 +1470,6 @@ fn decode_string_literal(source: &str, span: Span) -> ExpressionResult<String> {
         .and_then(|value| value.strip_suffix('"'))
         .ok_or_else(|| ExpressionError::unterminated_string(span))?;
     super::syntax::unescape_string(inner).map_err(|character| ExpressionError::invalid_escape(character, span))
-}
-
-fn is_identifier_start(character: char) -> bool {
-    character == '_' || character.is_alphabetic()
-}
-
-fn is_identifier_continue(character: char) -> bool {
-    character == '_' || character.is_alphabetic() || character.is_ascii_digit()
 }
 
 /// Expression parsing error.
@@ -2042,7 +1811,9 @@ mod tests {
     #[test] fn not_binds_looser_than_comparisons() { let expression = parse_expression("not city == \"Berlin\" and active").unwrap(); let ExpressionView::Binary { left, operator: BinaryOperator::And, .. } = expression.view() else { panic!("expected conjunction"); }; assert!(matches!(left.view(), ExpressionView::Unary { operator: UnaryOperator::Not, operand } if operand.is_binary())); assert!(matches!(parse_expression("!x in tags").unwrap().view(), ExpressionView::Unary { operand, .. } if operand.is_binary())); }
     #[test] fn between_desugars_to_a_call() { let expression = parse_expression("age between 18 and 30 + 1 and active").unwrap(); let ExpressionView::Binary { left, operator: BinaryOperator::And, .. } = expression.view() else { panic!("expected conjunction"); }; assert!(matches!(left.view(), ExpressionView::Call { function: "between", arguments } if arguments.len() == 3 && arguments[2].is_binary())); assert!(matches!(parse_expression("age not between 1 and 2").unwrap().view(), ExpressionView::Unary { operator: UnaryOperator::Not, .. })); assert!(parse_expression("age between 1").is_err()); assert!(parse_expression("between == 1").unwrap().is_binary()); }
     #[test] fn question_mark_makes_a_path_optional() { for source in ["nick?", "profile?.country", "profile.country?"] { let expression = parse_expression(source).unwrap(); assert!(matches!(expression.view(), ExpressionView::Call { function: "optional", arguments } if arguments[0].is_field()), "{source}"); } assert_eq!(parse_expression("profile?.country").unwrap().to_string(), "profile.country?"); assert!(parse_expression("f(x)?").is_err()); }
+    #[test] fn constant_conditions_choose_their_branch() { for (text, folded) in [("if(false, null, f)", "f"), ("if(1 > 0, f, g)", "f"), ("true or f", "true"), ("false and f", "false"), ("true and f", "true and f"), ("coalesce(null, f, 1)", "coalesce(f, 1)"), ("coalesce(null, 2, f)", "2"), ("case(false, 1, g, 2, 3)", "case(g, 2, 3)"), ("case(false, 1, true, f, 3)", "f"), ("if(g, 1, 2)", "if(g, 1, 2)")] { assert_eq!(parse_expression(text).unwrap().to_string(), parse_expression(folded).unwrap().to_string(), "{text}"); } }
     #[test] fn constant_subtrees_are_computed_once() { let expression = parse_expression("price * (2 + 3) > len([1, 2]) and now() > 0").unwrap(); assert!(expression.constant().is_none()); let ExpressionView::Binary { left, right, .. } = expression.view() else { panic!("expected and") }; let ExpressionView::Binary { left: product, right: length, .. } = left.view() else { panic!("expected comparison") }; assert_eq!(length.constant(), Some(&crate::Value::unsigned(2))); let ExpressionView::Binary { right: sum, .. } = product.view() else { panic!("expected product") }; assert_eq!(sum.constant(), Some(&crate::Value::signed(5))); assert!(right.constant().is_none(), "now() is volatile"); assert!(parse_expression("1 / 0").unwrap().constant().is_none(), "failing constants stay lazy"); assert_eq!(parse_expression("{\"a\": [1]}").unwrap().constant().and_then(crate::Value::as_object).map(crate::Document::len), Some(1)); }
     #[test] fn display_round_trips_through_the_parser() { for source in ["a.b >= -2 and not (c or d)", "round(price * qty, 2) not in [1, \"x\"]", "not x == 1", "-(a + b)", "nick? == \"Z\""] { let expression = parse_expression(source).unwrap(); let reparsed = parse_expression(&expression.to_string()).unwrap(); assert_eq!(reparsed.to_string(), expression.to_string(), "{source}"); } }
     #[test] fn parses_calls_arrays_and_membership() { let expression = parse_expression("round(price * qty, 2) not in [1, a.b]").unwrap(); let ExpressionKind::Binary { left, operator, right } = expression.kind() else { panic!("expected membership"); }; assert_eq!(*operator, BinaryOperator::NotIn); assert!(matches!(left.view(), ExpressionView::Call { function: "round", arguments } if arguments.len() == 2)); assert!(matches!(right.view(), ExpressionView::Array(items) if items.len() == 2)); let mut fields = Vec::new(); expression.for_each_field(&mut |field| fields.push(field.to_string())); assert_eq!(fields, ["price", "qty", "a.b"]); assert!(matches!(parse_expression("x in tags").unwrap().kind(), ExpressionKind::Binary { operator: BinaryOperator::In, .. })); assert!(parse_expression("f(").is_err()); assert!(parse_expression("[1, ").is_err()); }
 }
+

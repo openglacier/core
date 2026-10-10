@@ -135,8 +135,6 @@ on data | group Receptionnaire_Code as Client, CAFacture as CA | sort CA desc
 on data | group Article_Code | select Article_Code, count | limit 10
 ```
 
-> **Note:** the last line (`group … | select … | limit 10`) is valid, but `ogd` currently rejects it under its memory contract: after a `group`, only `sort` and/or `limit` may follow. See [Execution shapes accepted by `ogd`](#7-pipeline-composition-rules).
-
 ```text
 on data
 | group
@@ -172,6 +170,8 @@ Every stage has a single responsibility.
 | load | Load documents or chunks | :white_check_mark: | | Streaming form `with replace\|update\|merge` + `chunk` |
 | into | Insert the result into another collection | :white_check_mark: | :white_check_mark: | Alias : out. Terminal: `on users \| where active \| into archive`. One atomic insert with fresh `_id`s; target must differ from the source and cannot be a system collection. Needs write access on the target and read access on the source |
 | pivot | Pivot data | :white_check_mark: | :white_check_mark: | Expect rows, columns, values and aggregate function. Keeps one aggregate cell per row key and column, never the rows |
+| fill | Add the rows a grid misses | :white_check_mark: | :white_check_mark: | `fill month from "2026-01" to "2026-12" step "month" by entity with balance = 0` |
+| window | Values over ordered partitions | :white_check_mark: | :white_check_mark: | `\| partition by … \| order by … \| lag\|lead\|cumsum\|first\|last\|row_number … \| end`; keeps every row |
 | aggregate | Compute aggregates | not working | | Not a stage: use `group`, `count` or `pivot` |
 | select | Project fields | :white_check_mark: | | Alias : project. Accepts `expression as alias` |
 | rename | Rename fields | :white_check_mark: | | |
@@ -188,6 +188,7 @@ Every stage has a single responsibility.
 | union | Append another pipeline | :white_check_mark: | | `\| union \| on <collection> … \| end` |
 | explain | Describe the plan instead of running the query | :white_check_mark: | :white_check_mark: | Query prefix, not a stage: `explain on users \| where …` |
 | let | Declare reusable variables | :white_check_mark: | :white_check_mark: | Header before `on`: `let $min = 18 \| on users \| where age >= $min`. Evaluated once per query |
+| define view | Save a named read query in the Place, read by `on view <name>` | :white_check_mark: | | Statement, not a stage: `define view <name> \| description "…" \| [materialized \|] exec \| <query> \| end \| end`; `undefine view <name>`. See [5.7](#57-views-define-view-on-view) |
 | .collections | Show a list of collections | :white_check_mark: | | ogcli operation `.collections.list`, option `{"stats": true}` |
 | .backup | Create backup | :white_check_mark: | | ogcli operation `.backup.create {"name": …}`; `.backup.inspect` reads metadata |
 | .restore | Restore backup | :white_check_mark: | | ogcli operation `.backup.restore {"name": …, "replace": true}` |
@@ -825,6 +826,9 @@ invalid expression "abs(age, 2) > 1" for stage "where": function `abs` expects 1
 | `date_diff(start, end, unit)` | Unit boundaries crossed from `start` to `end` | `date_diff("2025-12-31", "2026-01-01", "year")` → `1` |
 | `date_part(t, part)` | `year`, `quarter`, `month`, `week` (ISO), `day`, `day_of_week` (1 = Monday), `day_of_year`, `hour`, `minute`, `second`, `millisecond` | `date_part(at, "day_of_week")` |
 | `date_format(t [, pattern])` | Text; default ISO-8601. Directives `%Y %m %d %H %M %S %L` (ms) `%j %u %V %F %T %%` | `date_format(at, "%Y-%m")` → `"2026-03"` |
+| `fiscal_year(t, closing)` | Fiscal year holding `t`, named after the year it closes in, for a year closing at the end of month `closing` (1 to 12; 12 is the calendar year), or opening on the date `closing` (a timestamp on the first day of a month, repeated every year) | `fiscal_year("2026-07-01", 6)` → `2027`, as `fiscal_year("2026-07-01", "2019-07-01")` |
+| `fiscal_month(t, closing)` | Month within the fiscal year, 1 to 12 | `fiscal_month("2026-07-01", 6)` → `1` |
+| `fiscal_start(t, closing)`, `fiscal_end(t, closing)` | First and last day of the fiscal year, epoch milliseconds | `fiscal_end("2026-07-01", 6)` → 2027-06-30 |
 
 ```text
 on users | select name, upper(concat(name, "@", lower(city))) as handle, coalesce(nick, name) as display, if(age >= 18, "adult", "minor") as bracket
@@ -854,8 +858,8 @@ on orders | select order_id, div(price, qty - 1, 0) as per_extra, round(sqrt(pow
 ### 5.1 Source
 
 ```text
-on <collection> [as <alias>]
-from <collection> [as <alias>]
+on <collection> [as of <date|generation> | history] [as <alias>]
+from <collection> [as of <date|generation> | history] [as <alias>]
 ```
 
 - `on` and `from` are synonyms.
@@ -863,6 +867,47 @@ from <collection> [as <alias>]
 - Collections are created implicitly by the first write. Reading a collection that does not exist returns nothing.
 - A query may consist of the source alone: `on users` returns every document.
 - The alias names the source. At the top level `u.age` and `age` are the same field (`on users as u | where u.age > 30`); the qualifier is dropped before planning, outside string literals, so an alias shadows a document field of the same name. In `lookup`/`union` sub-pipelines the alias names the outer document.
+- `on values [{…}, …]` reads literal rows, objects with bare or quoted keys: `on values [{code: "FR", rate: 0.2}, {code: "DE", rate: 0.19}] | where rate > 0.19`. It works wherever a collection is read (`lookup values […] as r | … | end`, `union | on values […] | end`). The rows are written once in a constant collection named after their content (`_values.v<hash>`), so they are read like any collection (indexes of `lookup`, streaming), by every Place, and can never be written.
+- `on view <name> [version <n>] [as <alias>]` reads a view ([5.7](#57-views-define-view-on-view)).
+
+#### 5.1.1 Past states and history (`as of`, `history`)
+
+```text
+on orders as of "2026-09-01T12:00:00Z" | where status == "paid" | count
+on orders as of 1842 | sort total desc | limit 10
+on orders history | where _doc_id == "0190f3c2-…" | sort _generation
+on orders as of "2026-09-01" | into orders_restored
+```
+
+- `as of <string>` reads the store as it was at that time (ISO 8601, the date alone meaning midnight UTC):
+  the state after the last commit made at or before it. `as of <number>` reads it at that commit generation.
+  Every collection of the query is read at that point, `lookup` and `union` collections included.
+- `history` returns one row per stored write of the collection, in commit order: each row holds the document
+  of the version plus the system fields below. Other collections of the query (`lookup`, `union`) are read
+  in their current state.
+
+  | Field | Meaning |
+  |---|---|
+  | `_id` | Identifier of the history row (commit generation, position in the commit): distinct and ordered. |
+  | `_doc_id` | Identifier of the document (string). |
+  | `_version` | Version of the document written, or deleted for a `delete` row. |
+  | `_op` | `insert` (version 1), `replace`, `delete` (the row holds the document as it was deleted), `baseline` (present when history recording started, written earlier). |
+  | `_generation` | Commit generation. |
+  | `_at` | Commit time (ISO 8601), `null` when not recorded. |
+  | `_by`, `_by_device` | Identity and device that made the commit, `null` when unknown (anonymous, or a write made outside a query). |
+
+  These names replace document fields of the same name in history rows.
+- Both are read-only: a stage that writes is rejected, except a terminal `into`, which copies the rows into
+  another collection (a restore).
+- A Place or App Instance scope applies to every version, through its `_place`/`_app_instance` fields.
+- `as of` a generation after the current one, or before the start of the kept history, is an error. A date
+  after the last commit reads the current state; a date before the first recorded commit time is an error.
+- History needs the store to keep it: `OGD_HISTORY=on` (memory and glacier). Without it, `as of` and `history`
+  fail with `this store does not keep history`.
+- Cost: `as of` reads the current state minus the documents changed since the requested point, plus the versions
+  those documents had then; a collection not changed since is read at full speed. `history` reads every stored
+  version of the collection.
+- `as of` without a value keeps its old meaning: an alias named `of` (`on users as of | where of.age > 3`).
 
 ### 5.2 Simple stages
 
@@ -878,7 +923,7 @@ Whether a stage opens a **sub-pipeline** is a syntactic property of its name (`S
 
 | Policy | Stages | Meaning |
 |---|---|---|
-| `Always` | `union`, `pivot` | Always compound |
+| `Always` | `union`, `pivot`, `window` | Always compound |
 | `UnlessHeaderHasInto` | `lookup`/`join` | Compound, except the one-line form whose header contains `into` |
 | `WhenHeaderEmpty` | `load`, `group` | Compound when written without arguments; compact single-line form otherwise |
 | `Never` | every other stage | Always simple |
@@ -940,7 +985,9 @@ let $threshold = 50, $since = parse_date("2026-02-01")
 - Each expression is evaluated **once per query**, before planning, then used wherever `$name` appears: `where`, `derive`, `set`, `select`, `sort`, `limit`, sub-pipelines. `let $now = now()` therefore gives every row the same instant.
 - An expression may use any function, request parameters and variables declared before it (`let $max = $min * 2`, or a later `let` header). It cannot read document fields: `let $x = qty` is rejected.
 - A name is bound once: redeclaring a variable, or declaring a name also passed in `params`, is an error.
+- `let $name ?= <expression>` gives a default: it binds the name only when it is not bound already (by `params`, an earlier variable, or the query reading the view): `let $gran ?= "ytd" | …`.
 - Variables are bound like parameters (as escaped literals), so the plan, `explain` and authorization see the resulting values: `explain let $n = 2 | on orders | limit $n` shows `limit 2`.
+- A value written as a query in parentheses is the array of its rows, read once in the scope of the request (its Place and App instance), before the query is planned: `let $settings = (on settings | limit 1) | let $opening = get(at($settings, 0), "opening") | on ledger | where month >= $opening`. The query may use the variables declared before it and read views; it must not write and returns at most 1,000 rows. Like `on view`, it is read through `query.execute`.
 
 ### 5.6 `explain`
 
@@ -959,6 +1006,44 @@ explain on orders | where qty > 1 | sort price * qty desc | limit 3
 | `executor` | `streaming`, `governed_blocking`, `transactional` (writes), or `rejected` when the shape has no bounded executor ([7.2](#72-execution-shapes-accepted-by-ogd-memory-contract)) |
 | `mode` | Memory contract of the plan |
 | `operators` | Physical operators in order, with shorthand forms expanded |
+
+### 5.7 Views (`define view`, `on view`)
+
+A view is a named read query kept in the Place, in the `_views` collection, one document per version. Like `explain`, these are statements, not stages:
+
+```text
+define view finance.cube
+| description "Monthly cube by account"
+| exec
+  | on ledger | where scenario == $scenario and month <= $to
+  | group | by account, month | sum amount as amount | end
+  | end
+| end
+```
+```json
+{"name":"finance.cube","version":1,"state":"active","description":"Monthly cube by account","query":"on ledger | where scenario == $scenario and month <= $to\n  | group | by account, month | sum amount as amount | end","parameters":["scenario","to"],"reads":["ledger"],"createdBy":"…","createdAt":…}
+```
+
+- `exec` is the last clause; the body runs from `exec` to the two final `end` (its own `end` stay in it). Each `define` writes a new version and marks the previous one `superseded`; without `description`, the description is kept.
+- The body's parameters are the `$name` it reads without declaring them with `let`; they are not bound when the view is defined, and are listed in `parameters`.
+- The body is checked when defined: planned with its parameters read as `1`, and refused when it writes (`view.invalid`).
+- `define view <name> | description "…" | end` writes a new version with another description; `define view <name> | version <n> | end` restores version `n` as a new version; `undefine view <name>` marks the active version `deleted`. History is never rewritten.
+- `explain define view …` checks without writing. In a Place, views are defined by its Owner; a view defined outside a Place is a standard view and needs the right to write `_views`.
+- `on _views` lists and reads them back; in a Place it reads only that Place's views, and only `define` / `undefine` write them: `on _views | where state == "active" | select name, version, parameters`.
+- `| materialized |` (before `exec`) keeps the view's rows: the first read in a scope (Place, App instance) computes them into a cache collection (`_cache.v<key>s<0|1>`, rows scoped like any write), and later reads in that scope read it, until a collection the view reads changes for that Place: a write of the Place, or a write og-core cannot attribute to one Place (unscoped, `load`), which counts for every Place (the storage tells the generation of each collection's last change, og-core the Place of each scoped write; a restart computes the caches again). The rows are then computed again into the scope's other cache collection. A materialized view takes no parameter (its `let` bind them); filters after it reach the cache like any source. `on _cache` lists the caches (scope, view version, collection, `computedAt`); only og-core writes them. A view defined over a materialized view lists the collections it reads among its own `reads`.
+
+A view is read as a source, with `on view <name> [version <n>] [as <alias>]`, in the main pipeline or a `union` branch, and as the joined collection of `lookup view <name> [version <n>] as <alias> | … | end` (or the one-line `lookup view <name> as <alias> on <field> == <field> into <field>`):
+
+```text
+let $scenario = "actual", $to = "2026-06" | on view finance.cube | where account == "601"
+on view finance.cube version 1 | union | on view finance.cube | end
+```
+
+- The view's query replaces the source before the query is planned: the plan, `explain` and authorization see the collections it reads, and the stages that follow are optimized with it.
+- Its parameters are bound from the reading query: request `params` and its `let` variables. The view's own `let` stay local: they may shadow a variable of the reading query, which cannot read them.
+- In a Place, the Place's view is read, else the standard view of that name; its active version, or `version <n>`.
+- A view can read other views, 8 deep at most; a cycle is refused when the view is defined. `lookup view` needs a view whose source is a bare `on <collection>` or `on values […]`; `as <alias>` names the view's source, which must not have one already.
+- A built-in App delivers standard views in its definition, `"queryViews": [{"name": …, "description": …, "query": …, "materialized": true}]`, in order (a view may read the ones before it). They are defined when `ogd` starts: a changed query or description writes a new version, a view the App no longer lists is undefined. `system.finance` delivers the standard finance views (`finance.classified` and `finance.cube` from `$from` to `$to`, the latter reading the materialized `finance.cube.all` (the union of `finance.cube.standard` and `finance.cube.custom`, the Place's own formats of `finance_formats`), which classify through the materialized `finance.accounts` (each account's category for a debit and a credit balance, in each format), `finance.period` for `$end`, `$gran`, `$shifts` (with `$offsets`, `$grans`), `$landing`, `$entities` and `$consolidate`, `finance.unclassified`, `finance.indicators` (the 188 indicators of `system.finance.json`, translated into `derive`) and `finance.indicators.definitions`, `finance.statement` with `$format` = `sig`, `pcg` or a format of the Place, and the reference tables they read as `values`), generated by `og-360/tools/finance_views.py`; dates are epoch milliseconds.
 
 ---
 
@@ -1309,15 +1394,16 @@ on orders | group product | sort count desc | limit 2
 -- {"count":2,"product":"P2"}
 ```
 
-Groups are emitted in group-key order. `group | limit N` is bounded: only the N smallest live keys are kept (see the execution rule in Part I). A sum stays an integer while every term is an integer and the total fits in 64 bits; otherwise it is a float. Non-numeric values are ignored by sums. Grouping keys are field paths: to group or aggregate a computed value, `derive` it first, as in the tour.
+Groups are emitted in group-key order. `group | limit N` is bounded: only the N smallest live keys are kept (see the execution rule in Part I). A sum stays an integer while every term is an integer and the total fits in 64 bits; otherwise it is a float. Non-numeric values are ignored by sums. Grouping keys are field paths: to group by a computed value, `derive` it first, as in the tour; the compound form below measures expressions directly.
 
 **Compound form**, for several measures:
 
 ```text
 group
 | by <key> [as <alias>], ...
-| sum|avg|min|max|first|last <field> [as <alias>]
-| count [<field>] [as <alias>]
+| sum|avg|min|max|first|last|list <value> [where <predicate>] [as <alias>]
+| first|last <value> by <order> [where <predicate>] [as <alias>]
+| count [<value>] [where <predicate>] [as <alias>]
 | ...
 | end
 ```
@@ -1330,10 +1416,25 @@ group
 | `avg <field>` | Mean of the numeric values, `null` when there are none | `avg_<field>` |
 | `min <field>`, `max <field>` | Smallest / largest non-null value; values must be comparable (numbers, strings or booleans) | `min_<field>`, `max_<field>` |
 | `first <field>`, `last <field>` | Value on the first / last row of the group, in input order (`null` when missing) | `first_<field>`, `last_<field>` |
+| `first <value> by <order>`, `last <value> by <order>` | Value on the row of smallest / largest `<order>`, whatever the input order; rows whose order is `null` or missing are skipped, equal orders keep the first / last row read; `null` when no row has an order | `first_<field>`, `last_<field>` |
 | `count` | Number of rows | `count` |
+| `list <field>` | Array of the values neither missing nor null, in input order (`unwind` gives the rows back) | `list_<field>` |
 | `count <field>` | Number of rows where the field is present and not `null` | `count_<field>` |
 
 With no measure, the group emits `count`. Every measure runs on the same bounded, spillable executor as the compact form.
+
+A measure's `<value>` (and a `by` order) may be any expression; an expression needs `as <alias>`. `where <predicate>` measures only the rows the predicate keeps: the value counts as `null` on the others, which every measure ignores (`count where <predicate>` counts the kept rows). `first`/`last` with `where` need `by <order>`. An expression, or a value under `where`, is a `derive` of a hidden field before the `group`, as for `pivot` values; `first`/`last … by` read their value and order fields directly.
+
+```text
+on ledger
+| group
+    | by entity, account
+    | last balance by month as closing
+    | sum amount where category in ["Sales", "Services"] as revenue
+    | count where amount < 0 as credits
+    | sum amount * rate as converted
+| end
+```
 
 ```text
 on orders
@@ -1391,7 +1492,61 @@ pivot
 
 `values` takes one or more measures, written like `select` items: a field, or any expression with an alias (`CAFacture - COGS as marge`). With one measure, each cell is named after its column; with several, `<column>.<name>`, where the name is the alias or the field's last segment, and names must be unique. An expression value is computed by a hidden `derive` before the pivot, so it runs on the same streamed prefix.
 
-Each directive appears exactly once. `pivot` is a terminal stage. Cells use the same aggregates as the compound `group`: sums stay integers when exact (a cell with no number is `0`), non-numeric values are ignored by `sum`/`avg`, missing values are skipped by every aggregate except `count`, which counts rows. It runs in `ogd` on a bounded executor of the `group` family: the prefix streams and only the aggregate cells are retained (one per row key and column). The state is charged to the query working set; a pivot with too many distinct rows × columns fails with `pivot cells exceed the governed query working set` (it does not spill, unlike `group`).
+Each directive appears exactly once. Stages may follow `pivot`, which emits one row per row key once its input is read: `| pivot | … | end | derive marge = coalesce(sales?, 0) - coalesce(costs?, 0)`; a cell with no row is absent (read it with `?`). Cells use the same aggregates as the compound `group`: sums stay integers when exact (a cell with no number is `0`), non-numeric values are ignored by `sum`/`avg`, missing values are skipped by every aggregate except `count`, which counts rows. It runs in `ogd` on a bounded executor of the `group` family: the prefix streams and only the aggregate cells are retained (one per row key and column). The state is charged to the query working set; a pivot with too many distinct rows × columns fails with `pivot cells exceed the governed query working set` (it does not spill, unlike `group`).
+
+#### `window`
+
+```text
+window
+| partition by <field>, ...
+| order by <field> [asc|desc], ...
+| lag|lead <field> [<rows>] [as <alias>]
+| cumsum|first|last <field> [as <alias>]
+| row_number [as <alias>]
+| ...
+| end
+```
+
+Adds to every row values computed over its **partition** (the rows whose `partition by` fields compare equal as `sort` compares them, so `1` and `1.0` share one; the whole input without it), taken in `order by` order. `order by` is required and appears once; `partition by` is optional; at least one function is required. Rows come out sorted by partition, then order, and keep all their fields.
+
+| Function | Value on each row | Default alias |
+|---|---|---|
+| `lag <field> [<rows>]` | The field `<rows>` rows earlier in the partition (default 1); `null` before the first | `lag_<field>` |
+| `lead <field> [<rows>]` | The field `<rows>` rows later; `null` after the last | `lead_<field>` |
+| `cumsum <field>` | Running sum up to this row, as `group`'s `sum` (integer while exact, non-numbers ignored); `null` before the first number | `cumsum_<field>` |
+| `first <field>`, `last <field>` | The field on the partition's first / last row | `first_<field>`, `last_<field>` |
+| `row_number` | 1, 2, 3… within the partition | `row_number` |
+
+Functions run in order, so one may read a field an earlier one added. `window` is a `sort` by the partition and order fields (stable: equal orders keep their input order; it spills like any sort), then a pass that holds one partition at a time in the query working set: a partition larger than it fails with `a window partition exceeds the governed query working set`.
+
+```text
+on ledger
+| window
+    | partition by entity, account, fiscal_year
+    | order by month
+    | lag balance as previous
+    | cumsum movement as ytd
+| end
+| derive variation = balance - coalesce(previous, 0)
+```
+
+#### `fill`
+
+```text
+fill <field> from <start> to <end> step <step> [by <field>, ...] [with <field> = <value>, ...]
+```
+
+Adds, in each partition (the rows whose `by` fields compare equal, as `sort` compares them; the whole input without `by`), a row for every value of the grid `start`, `start + step`, … up to `end` that no row of the partition holds in `<field>`. A new row holds the partition's `by` fields, the grid value and the `with` values; every other field is missing. Rows already there pass unchanged, values off the grid included; rows come out sorted by the `by` fields, then `<field>`.
+
+The grid steps by a positive number (`from 0 to 100 step 10`), or by a date unit for date bounds (`step "month"`, units as in `date_add`), written as `start` is: `"2026-01"` gives `"2026-02"`, `"2026-03"`…, a full date gives full dates, epoch milliseconds give milliseconds. A grid holds at most 100,000 values. Bounds may be parameters (`from $start to $end`). An empty input stays empty: a partition exists only through its rows.
+
+```text
+on ledger
+| fill month from $opening to $closing step "month" by entity, account with balance = 0, movement = 0
+| window | partition by entity, account | order by month | lag balance 12 as last_year | end
+```
+
+`fill` is a `sort` by the `by` fields and `<field>` (it spills like any sort), then a pass that holds nothing but the current partition's last row: the added rows stream out as the grid reaches them.
 
 ### Combining collections
 
@@ -1461,11 +1616,21 @@ on users as u | lookup orders as o on o.user == u.name into orders
 
 The left side reads the joined collection and the right side the document being enriched; unqualified names are qualified accordingly. Rows where either field is missing do not match. It expands to `lookup <collection> | where exists(…) and exists(…) and <joined> == <outer> | into <field> | end`.
 
-The correlation is not a special case: the sub-pipeline's filters are evaluated by the common evaluator over a *lookup field scope*, a field resolver that routes each alias to its document.
+The correlation is not a special case: every stage of the sub-pipeline (`where`, `derive`, `select`…) reads fields through a *lookup field scope*, a field resolver that routes each alias to its document; `select o.region` writes `region`, as the source alias does at the top level. The sub-pipeline may hold blocking stages (`sort | first`, `group`, `distinct`…), which run on the rows joined to each outer row; the row-local stages after them still read the outer row (`lookup windows as w | group | by from, to | list w as ws | end | where from <= o.date | into hit | end`), and stages may follow the `end`.
 
-`ogd` limitations:
-- `lookup` must be the **last** stage.
-- Its sub-pipeline may only contain filter, projection, skip, limit and row-bound stages (`first`).
+**Execution.** When the sub-pipeline's first `where` begins (after `exists(…)` guards) with `joined == outer` or `starts_with(outer, joined)`, the joined collection is indexed once on the joined field: an equality probes one key, a prefix probes the outer text's prefixes of every key length present, so the longest-prefix rule reads only the matching rules. Several leading equalities make one composite key (`where s.entity == t.entity and s.date == t.date and s.version? == t.version? and …`), and a side read with `?` keys a missing field as `null`:
+
+```text
+on ledger as a
+| lookup rules as r
+    | where starts_with(a.account, r.prefix)
+    | derive length = len(prefix) | sort length desc | first
+    | select category
+    | into rule
+| end
+```
+
+When the sub-pipeline reads nothing of the outer row but known fields and is deterministic (no `sample`, no `now()`), its result is kept per value of those fields: outer rows sharing them (the same account on many months) share one run. Both the index and these results are held within the query working set; past it, rows are joined by scan, and results stop being kept. The joined documents are shared with the outer row, not copied.
 
 #### `union`
 
@@ -1482,11 +1647,13 @@ Emits the main stream, then the documents of the sub-pipeline. The first sub-sta
 on users | select name | union | on products | select label | end
 ```
 
-In `ogd`, only streaming stages (`where`, `select`, `skip`, `limit`, `count`, …) may follow a `union`.
+A branch takes any read pipeline (`sort`, `group`, `lookup`, another `union`…): it then runs as a query of its own, governed like the main one, and any stage may follow the `end`: `on actual | group | by month | sum amount as a | end | union | on forecast | group | by month | sum amount as a | end | end | group | by month | sum a as a | end`.
 
 ### Writes
 
 Every write runs in **one transaction**: all mutations commit, or none do. Write stages are **terminal**: nothing can follow them. The response contains the written documents and the mutation counters (`inserted`, `replaced`, `deleted`).
+
+A write (`set`, `delete`, `into`) streams its rows into the transaction and charges what it holds to the query memory budget. Past it, the write fails. Only the documents a `set` returns stay in memory. og-core also runs several writes in one transaction (`Engine::execute_together`, used by checked imports): each reads the rows as they were before it.
 
 #### `insert`
 
@@ -1500,7 +1667,7 @@ Inserts **one** document and returns it with its generated `_id`. Keys may be un
 insert [ { <key>: <value>, ... }, ... ]
 ```
 
-With an array, `insert` writes every object in one transaction. It runs as a streaming `load` in `merge` mode: rows without `_id` get a fresh one, and a row carrying the `_id` of an existing document is merged into it.
+With an array, `insert` writes every object in one transaction. It runs as a streaming `load` in `merge` mode: rows without `_id` get a fresh one, and a row carrying the `_id` of an existing document is merged into it. In a Place or App instance scope, each row gets the scope fields, and a row may not merge into a stored document.
 
 ```text
 on users | insert {name: "Frank", age: 52, tags: ["new"], profile: {country: "IT"}, active: true}
@@ -1549,7 +1716,7 @@ Terminal. Inserts every row that reaches it into another collection, in one tran
 
 - The target must differ from the source and cannot be a system collection (`_…`).
 - Authorization requires write access on the target and read access on the source.
-- The rows are materialized before the write and charged to the query memory budget.
+- The rows stream into the transaction; past the query memory budget, Glacier moves them to disk (see [Writes](#writes)).
 
 ```text
 on users | where active | into archive
@@ -1600,32 +1767,63 @@ The compact form `load <target>` (with arguments and no sub-pipeline) is a runti
 
 ### 7.1 Planner rules (all hosts)
 
+Each stage is declared once in the stage catalogue (`src/query/stage.rs`): name and aliases, accepted forms and
+arguments, placement, effect and flow. The planner, plan validation and execution read it, and
+`.query.stages` lists it. The rules below follow from it.
+
 | Rule | Error |
 |---|---|
-| `select`, `sort`, `limit`, `skip`, `distinct`, `count`, `group`, `pivot`, `load`, `delete`, `insert` appear at most once | `logical <op> operator is duplicated` |
-| Nothing may follow a terminal stage: `set`, `delete`, `insert`, `load`, `count`, `pivot` | `appears after a terminal operator` |
+| Nothing may follow a terminal stage: `set`, `delete`, `insert`, `load`, `count` | `follows a terminal operator` |
 | `insert` must be the only stage (a batch `insert [...]` too, planned as `load`) | `insert … must be the only operator` |
-| `load` must be the first stage | `logical load operator at index N must be first` |
+| `load` must be the first stage | `load operator at index N must be first` |
 | Unknown stage names are rejected | `unknown stage "frobnicate"` |
 | Stage arguments are validated before any storage access | `invalid limit syntax … expected a non-negative integer` |
+
+**Filters move towards the source.** The planner splits a `where a and b` into `where a | where b` (same result, same
+errors, same order) and moves each filter before the stages that leave the fields it reads and the set of rows alone:
+`derive`, `select`, `rename`, `drop` and `unwind` that do not write those fields, `lookup` that does not fill one of them,
+`sort`; `group` and `pivot` when it reads only their keys (it then reads them as optional: a group key of a row without the
+field is `null`), `window` when it reads only partition fields, and `union`, where it is also copied at the end of the
+branch (and moves on there; not when it reads the branch's alias). It stops at any other stage (`limit`, `skip`, `first`,
+`distinct`, `fill`…) and after another filter, whose order it keeps; a **guard** then goes on alone, past filters
+too: for each comparison of a field with a constant, `type(f?) != "string" or f? == "x"`, which cannot fail and drops only
+rows the filter drops without failing; it is kept when it passes a filter written apart. The filter itself stays where it
+stopped, so no row reaches it that did not before, and no error is lost. Conjuncts of one filter that end side by side are
+joined back, so a plan where nothing moves is the plan as written. A conditional whose condition is constant once the
+parameters are bound is replaced by the branch it takes (`if(false, a, b)` is `b`, `true or x` is `true`, `coalesce(null, x)`
+is `x`, `case` drops its false conditions), and `derive f = f` writes nothing: `derive entity = if($consolidate, null, entity)`
+lets a filter on `entity` pass when `$consolidate` is `false`. `explain` shows the result. A filter written after a view therefore reaches its source:
+
+```text
+let $end = "2026-03", $format = "sig" | on view finance.statement | where entity == "E1"
+```
+
+reads `finance` with `type(entity?) != "string" or entity? == "E1"` right after its date filter (10.2 s → 0.25 s on 1.8 M
+rows).
 
 ### 7.2 Execution shapes accepted by `ogd` (memory contract)
 
 `ogd` never falls back to "load everything into RAM". Read queries must fit one of the shapes it can execute with bounded memory:
 
 1. **Pure streaming.** Any mix of `where`, `select`/`project`, `derive`, `rename`, `drop`, `root`, `near`, `skip`, `limit`, `first`, `single`, followed optionally by `count`. Documents flow one by one, and any stage that declares a row bound (`limit`, `first`) stops the scan early.
-2. **Streaming prefix + blocking core + streaming tail.** The core is one of:
-   - `sort`, `distinct`, `group` or `pivot` (terminal, bounded by its cell count);
-   - `group | sort`;
-   - `sort | distinct` (only when the tail bounds the rows);
-   - `sample N` (retains at most N rows);
-   - `lookup` or `union` whose sub-pipeline is made only of filter, projection, skip, limit and row-bound stages.
+2. **Streaming prefix, then blocking stages.** The blocking stages are `sort`, `distinct`, `group`, `pivot`, `sample N`,
+   `lookup`, and `union` (a branch holding blocking stages runs as a query of its own). Any number of
+   them may follow one another, each followed by row-local stages (`where`, `select`, `derive`, `skip`, `limit`, `first`, `single`,
+   `unwind`, …), and the query may end with `count`.
+   - The first blocking stage reads the streaming prefix. `group | sort` and `sort | distinct` (when the rows after it are bounded)
+     run there as one stage.
+   - Each later blocking stage takes the rows of the stages before it, once they have all been produced, and hands its own rows to
+     the stages after it.
+   - A leading `skip k` / `limit n` (or `first`) after a blocking stage bounds that stage, even when stages that turn each row into
+     exactly one row (`select`, `derive`, `rename`, `drop`, `root`) sit in between; stages that can drop rows (`where`, `near`) stop
+     the push: `sort k | skip 10 | limit 5` runs as a bounded Top-15, `sort k | first name` as a Top-1 followed by the projection.
+   - `sort` and `group` spill sorted runs to disk when their state outgrows the memory they can get; `distinct` after another
+     blocking stage keeps only the keys it has seen and emits the first row of each key as it comes.
+   - Examples: `… | sort k | skip 10 | limit 5`, `… | group … | where count > 2 | sort count desc`, `… | sort CA desc | limit 100 |
+     group client`, `… | distinct code | sort code`, `… | lookup … | end | group …`, `… | group … | sample 3 | count`.
 
-   The tail is any run of row-local stages applied one row at a time to the core's output: `where`, `select`, `derive`, `skip`, `limit`, `first`, `single`, `unwind`, …, optionally ending with `count`. A leading `skip k` / `limit n` (or `first`) of the tail is pushed into the core, even when stages that turn each row into exactly one row (`select`, `derive`, `rename`, `drop`, `root`) sit in between; stages that can drop rows (`where`, `near`) stop the push: `sort k | skip 10 | limit 5` runs as a bounded Top-15, `sort k | first name` as a Top-1 followed by the projection.
-   - `… | sort k | skip 10 | limit 5`, `… | sort k | first name`
-   - `… | group … | select …`, `… | group … | count`
-   - `… | sample N | select …`, `… | sample N | count`
-   - `… | lookup … | end | where …`, `… | union | on … | end | limit N`
+   Every blocking stage of a query reserves memory as its state grows, and all of them together stay within the query budget of the
+   memory profile. A query is admitted with a small reservation, so concurrent queries share the memory by what they use.
 
 Any other shape is rejected before execution:
 
@@ -1633,14 +1831,6 @@ Any other shape is rejected before execution:
 query plan contains a blocking stage sequence without a bounded executor;
 materialized fallback is forbidden by the memory contract
 ```
-
-Examples that are rejected, with the equivalent query that is accepted:
-
-| Rejected | Accepted equivalent |
-|---|---|
-| `sort price desc \| limit 1 \| select order_id` | `select order_id, price \| sort price desc \| first` |
-| `sort order_id \| skip 2` | `skip 2` (the natural order is the `_id` order) |
-| `sort price \| count` | `count` |
 
 Writes (`set`, `delete`, `load`, `insert`) and system collections (`_…`) use the transactional path and are not restricted by these shapes.
 
@@ -1715,6 +1905,7 @@ A line starting with `.` sends a raw protocol operation (`.OPERATION [JSON paylo
 | `.backup.inspect {"name": "nightly"}` | Reads backup metadata (format, version, counts, source host) |
 | `.backup.restore {"name": "nightly", "replace": true}` | Restores; `replace` drops existing data first |
 | `.core.operations` | Lists every operation the node exposes |
+| `.query.stages` | Lists every query stage with its forms, arguments, placement and properties |
 
 ---
 
@@ -1726,7 +1917,7 @@ Errors come from four layers, and each message carries a byte span or a stage lo
 |---|---|---|
 | Lexer | Unknown character, bad string/number | `lex error: unexpected character '$' at 27..28` |
 | Parser | Pipeline structure | `parse error: expected stage name, found operator at 11..12` (from `\| + x`), `unexpected 'end' outside a sub-pipeline` |
-| Planner | Stage arguments, expressions, ordering | `unknown stage "aggregate"`, `unknown function \`nope\``, `function \`abs\` expects 1 argument(s), got 2`, `logical limit operator is duplicated` |
+| Planner | Stage arguments, expressions, ordering | `unknown stage "aggregate"`, `unknown function \`nope\``, `function \`abs\` expects 1 argument(s), got 2`, `limit operator is duplicated` |
 | Execution | Data-dependent | `field path "nickname" is missing`, `operation "==" is incompatible with values …`, `division by zero; use div(a, b, fallback) …`, `single expected exactly 1 row(s), found 0`, `streaming-load update target … does not exist` |
 
 Planning errors are raised before any storage access. Write errors roll back the whole transaction.
@@ -1822,10 +2013,11 @@ This list is kept honest on purpose. Every item was observed on a live `ogd` bui
 |---|---|---|
 | Parameters and `let` (`$name`) | Bound as literals before planning: each distinct set of values is planned (and cached) separately | None needed |
 | Missing fields | A missing field fails the query, except in `exists`, `coalesce` and optional paths | `x?`, `exists(x) and …`, `coalesce(x, default)` |
-| `lookup`, `union` | Only a streaming tail (`where`, `select`, `limit`, `count`, …) may follow; a blocking stage after them is rejected | Put `sort`, `group`, `distinct` before them |
 | `pivot` | Aggregate cells must fit the query working set (no spill) | Filter or `select` before it to cut row/column cardinality |
-| Blocking stages | Only the shapes listed in [7.2](#72-execution-shapes-accepted-by-ogd-memory-contract) are accepted | Reorder as shown there |
+| `fill` | Top level only; `<field>` and `by` are field paths; at most 100,000 grid values | `derive` computed fields first |
+| `window` | Each partition must fit the query working set (the sort before it spills); top level only; partition and order keys are field paths | Partition more finely; `derive` computed keys first |
 | `group` keys | Field paths only | `derive` the computed key first |
+| `sort` | A key's values other than `null` must all be numbers, all texts or all booleans (values of different kinds do not order) | `to_string(…)` or `to_float(…)` in a `derive` first |
 | `aggregate` | Not a stage | `group`, `count`, `pivot` |
 | Date/Time | No native type; date functions read epoch milliseconds or ISO-8601 strings, in UTC | `date_*` functions |
 

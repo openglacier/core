@@ -67,16 +67,10 @@ impl Value {
     pub fn as_str(&self) -> Option<&str> { match self { Self::String(v) => Some(v), _ => None } }
 
     #[must_use]
-    pub const fn as_string_arc(&self) -> Option<&Arc<str>> { match self { Self::String(v) => Some(v), _ => None } }
-
-    #[must_use]
     pub fn into_string(self) -> Option<Arc<str>> { match self { Self::String(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn as_array(&self) -> Option<&[Self]> { match self { Self::Array(v) => Some(v), _ => None } }
-
-    #[must_use]
-    pub const fn as_array_arc(&self) -> Option<&Arc<[Self]>> { match self { Self::Array(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn into_array(self) -> Option<Arc<[Self]>> { match self { Self::Array(v) => Some(v), _ => None } }
@@ -86,9 +80,6 @@ impl Value {
 
     #[must_use]
     pub fn as_object(&self) -> Option<&Document> { match self { Self::Object(v) => Some(v.as_ref()), _ => None } }
-
-    #[must_use]
-    pub const fn as_object_arc(&self) -> Option<&Arc<Document>> { match self { Self::Object(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn into_object(self) -> Option<Arc<Document>> { match self { Self::Object(v) => Some(v), _ => None } }
@@ -125,7 +116,7 @@ impl Number {
     pub const fn unsigned(value: u64) -> Self { Self::Unsigned(value) }
 
     pub fn float(value: f64) -> Result<Self> {
-        if value.is_finite() { Ok(Self::Float(normalize_zero(value))) }
+        if value.is_finite() { Ok(Self::Float(crate::helpers::normalize_zero(value))) }
         else { Err(Error::NonFiniteNumber { value }) }
     }
 
@@ -215,8 +206,6 @@ impl NumberKind {
 impl fmt::Display for NumberKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.as_str()) }
 }
-
-fn normalize_zero(value: f64) -> f64 { if value == 0.0 { 0.0 } else { value } }
 
 impl From<i8> for Number { fn from(v: i8) -> Self { Self::Signed(i64::from(v)) } }
 impl From<i16> for Number { fn from(v: i16) -> Self { Self::Signed(i64::from(v)) } }

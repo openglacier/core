@@ -30,7 +30,6 @@ pub enum Bound {
 pub enum Shape {
     Linear,
     Scalar,
-    Matrix,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

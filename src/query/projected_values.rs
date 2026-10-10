@@ -3,16 +3,11 @@
 
 use std::sync::Arc;
 
-use crate::{
-    equals, greater_than, greater_than_or_equal, less_than, less_than_or_equal, model::not_equals,
-    model::parse_number_value, model::CoercionPolicy, model::FieldPath, model::Value,
-    storage::ProjectedValueRef,
-};
+use crate::{model::FieldPath, model::Value};
 
 use super::{
-    BinaryOperator, ExecutionError, ExecutionResult, Expression, ExpressionFieldPath,
-    ExpressionFieldResolver, ExpressionView, Literal, PhysicalOperator, SemanticValue,
-    UnaryOperator, Fields, ProjectionReuse, SlotExpansion
+    ExecutionError, ExecutionResult, Expression, ExpressionFieldPath, ExpressionFieldResolver,
+    PhysicalOperator, SemanticValue, Fields, ProjectionReuse, SlotExpansion
 };
 
 /// Row representation used by stages that can consume projected field values
@@ -71,13 +66,6 @@ impl ProjectedValueLayout {
     #[must_use]
     pub fn storage_fields(&self) -> &[FieldPath] {
         &self.storage_fields
-    }
-
-    /// Returns whether every requested field is compatible with the storage
-    /// top-level projected-value cursor contract.
-    #[must_use]
-    pub fn is_top_level(&self) -> bool {
-        self.storage_fields.iter().all(|field| field.len() == 1)
     }
 
     /// Returns the slot occupied by one query field.
@@ -198,9 +186,6 @@ impl ProjectedValuePipeline {
         }
 
         let layout = ProjectedValueLayout::new(source_fields)?;
-        if !layout.is_top_level() {
-            return Ok(None);
-        }
 
         let mut stages = Vec::with_capacity(operators.len());
         let mut hydration_projection = None;
@@ -282,40 +267,6 @@ impl ProjectedValuePipeline {
         Ok(true)
     }
 
-    /// Applies the same projected stage prefix to borrowed storage values.
-    ///
-    /// Scalar ownership is acquired only when the language evaluator resolves a
-    /// field, keeping access-vector composition independent from materialization.
-    pub fn accepts_refs_with<F>(
-        &self,
-        values: &[Option<ProjectedValueRef<'_>>],
-        mut evaluate: F,
-    ) -> ExecutionResult<bool>
-    where
-        F: FnMut(&Expression, &dyn ExpressionFieldResolver<crate::Value>) -> ExecutionResult<bool>,
-    {
-        if values.len() != self.layout.fields().len() {
-            return Err(ExecutionError::evaluation(
-                "borrowed projected-value row does not match its field layout",
-            ));
-        }
-        let mut fallback_row = None;
-        for stage in self.stages.iter() {
-            if let ProjectedValueStage::Filter(predicate) = stage {
-                let accepted = if let Some(accepted) = predicate.accepts_refs(values) { accepted } else {
-                    let row = fallback_row.get_or_insert_with(|| {
-                        ProjectedValueRefRow::new(&self.layout, values)
-                            .expect("projected row length checked above")
-                    });
-                    evaluate(predicate.expression(), row)?
-                };
-                if !accepted {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
-    }
 }
 
 /// One predicate compiled against a [`ProjectedValueLayout`].
@@ -326,25 +277,6 @@ impl ProjectedValuePipeline {
 #[derive(Clone, Debug)]
 pub struct ProjectedPredicate {
     expression: Expression,
-    fast: Option<CompiledPredicate>,
-}
-
-#[derive(Clone, Debug)]
-enum CompiledPredicate {
-    And(Box<Self>, Box<Self>),
-    Or(Box<Self>, Box<Self>),
-    Not(Box<Self>),
-    Compare {
-        left: CompiledScalar,
-        operator: BinaryOperator,
-        right: CompiledScalar,
-    },
-}
-
-#[derive(Clone, Debug)]
-enum CompiledScalar {
-    Slot(usize),
-    Literal(Value),
 }
 
 impl ProjectedPredicate {
@@ -363,10 +295,7 @@ impl ProjectedPredicate {
                 )));
             }
         }
-        Ok(Self {
-            expression: expression.clone(),
-            fast: CompiledPredicate::compile(expression, layout),
-        })
+        Ok(Self { expression: expression.clone() })
     }
 
     /// Original expression evaluated by the normal query runtime.
@@ -375,165 +304,6 @@ impl ProjectedPredicate {
         &self.expression
     }
 
-    fn accepts_refs(&self, values: &[Option<ProjectedValueRef<'_>>]) -> Option<bool> {
-        self.fast.as_ref()?.evaluate(values)
-    }
-}
-
-impl CompiledPredicate {
-    fn compile(expression: &Expression, layout: &ProjectedValueLayout) -> Option<Self> {
-        let expression = expression.ungrouped();
-        match expression.view() {
-            ExpressionView::Binary {
-                left,
-                operator: BinaryOperator::And,
-                right,
-            } => Some(Self::And(
-                Box::new(Self::compile(left, layout)?),
-                Box::new(Self::compile(right, layout)?),
-            )),
-            ExpressionView::Binary {
-                left,
-                operator: BinaryOperator::Or,
-                right,
-            } => Some(Self::Or(
-                Box::new(Self::compile(left, layout)?),
-                Box::new(Self::compile(right, layout)?),
-            )),
-            ExpressionView::Unary {
-                operator: UnaryOperator::Not,
-                operand,
-            } => Some(Self::Not(Box::new(Self::compile(operand, layout)?))),
-            ExpressionView::Binary {
-                left,
-                operator,
-                right,
-            } if operator.is_comparison() => Some(Self::Compare {
-                left: CompiledScalar::compile(left, layout)?,
-                operator,
-                right: CompiledScalar::compile(right, layout)?,
-            }),
-            _ => None,
-        }
-    }
-
-    fn evaluate(&self, values: &[Option<ProjectedValueRef<'_>>]) -> Option<bool> {
-        match self {
-            Self::And(left, right) => {
-                let left = left.evaluate(values)?;
-                if left {
-                    right.evaluate(values)
-                } else {
-                    Some(false)
-                }
-            }
-            Self::Or(left, right) => {
-                let left = left.evaluate(values)?;
-                if left {
-                    Some(true)
-                } else {
-                    right.evaluate(values)
-                }
-            }
-            Self::Not(inner) => inner.evaluate(values).map(|value| !value),
-            Self::Compare {
-                left,
-                operator,
-                right,
-            } => compare_fast_scalars(left.resolve(values)?, right.resolve(values)?, *operator),
-        }
-    }
-}
-
-impl CompiledScalar {
-    fn compile(expression: &Expression, layout: &ProjectedValueLayout) -> Option<Self> {
-        let expression = expression.ungrouped();
-        if let Some(field) = expression.as_field() {
-            return layout.slot(field).map(Self::Slot);
-        }
-        let value = match expression.as_literal()? {
-            Literal::Null => Value::null(),
-            Literal::Bool(value) => Value::bool(*value),
-            Literal::String(value) => Value::string(Arc::clone(value)),
-            Literal::Number(text) => Value::Number(parse_number_value(text).ok()?),
-            Literal::Json(_) => return None,
-        };
-        Some(Self::Literal(value))
-    }
-
-    fn resolve<'a>(
-        &'a self,
-        values: &'a [Option<ProjectedValueRef<'a>>],
-    ) -> Option<FastScalar<'a>> {
-        match self {
-            Self::Slot(slot) => match values.get(*slot)?.as_ref()? {
-                ProjectedValueRef::Null => Some(FastScalar::Null),
-                ProjectedValueRef::Bool(value) => Some(FastScalar::Bool(*value)),
-                ProjectedValueRef::Signed(value) => Some(FastScalar::Signed(*value)),
-                ProjectedValueRef::Unsigned(value) => Some(FastScalar::Unsigned(*value)),
-                ProjectedValueRef::Float(value) => Some(FastScalar::Float(*value)),
-                ProjectedValueRef::String(value) => Some(FastScalar::String(value)),
-                ProjectedValueRef::Owned(_) => None,
-            },
-            Self::Literal(value) => Some(FastScalar::Literal(value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum FastScalar<'a> {
-    Null,
-    Bool(bool),
-    Signed(i64),
-    Unsigned(u64),
-    Float(f64),
-    String(&'a str),
-    Literal(&'a Value),
-}
-
-fn compare_fast_scalars( left: FastScalar<'_>, right: FastScalar<'_>, operator: BinaryOperator, ) -> Option<bool> {
-    if let (Some(left), Some(right)) = (fast_str(left), fast_str(right)) {
-        return Some(match operator {
-            BinaryOperator::Equal => left == right,
-            BinaryOperator::NotEqual => left != right,
-            BinaryOperator::LessThan => left < right,
-            BinaryOperator::LessThanOrEqual => left <= right,
-            BinaryOperator::GreaterThan => left > right,
-            BinaryOperator::GreaterThanOrEqual => left >= right,
-            _ => return None,
-        });
-    }
-    let (left, right) = (fast_value(left)?, fast_value(right)?);
-    let policy = CoercionPolicy::Numeric;
-    match operator {
-        BinaryOperator::Equal => equals(&left, &right, policy).ok(),
-        BinaryOperator::NotEqual => not_equals(&left, &right, policy).ok(),
-        BinaryOperator::LessThan => less_than(&left, &right, policy).ok(),
-        BinaryOperator::LessThanOrEqual => less_than_or_equal(&left, &right, policy).ok(),
-        BinaryOperator::GreaterThan => greater_than(&left, &right, policy).ok(),
-        BinaryOperator::GreaterThanOrEqual => greater_than_or_equal(&left, &right, policy).ok(),
-        _ => None,
-    }
-}
-
-fn fast_str(value: FastScalar<'_>) -> Option<&str> {
-    match value {
-        FastScalar::String(value) => Some(value),
-        FastScalar::Literal(value) => value.as_str(),
-        _ => None,
-    }
-}
-
-fn fast_value(value: FastScalar<'_>) -> Option<Value> {
-    match value {
-        FastScalar::Null => Some(Value::null()),
-        FastScalar::Bool(value) => Some(Value::bool(value)),
-        FastScalar::Signed(value) => Some(Value::signed(value)),
-        FastScalar::Unsigned(value) => Some(Value::unsigned(value)),
-        FastScalar::Float(value) => Value::float(value).ok(),
-        FastScalar::Literal(value) => Some(value.clone()),
-        FastScalar::String(_) => None,
-    }
 }
 
 fn collect_expression_fields(expression: &Expression, fields: &mut Vec<ExpressionFieldPath>) {
@@ -608,30 +378,36 @@ impl<'a> SlotRow<'a> {
     }
 
     fn slot(&self, name: &str) -> Option<usize> {
-        self.fields.iter().position(|field| field.first() == name)
+        self.fields.iter().position(|field| field.len() == 1 && field.first() == name)
     }
 
-    /// Value at a (possibly nested) path.
+    /// Value at a (possibly nested) path ([`slot_value`]).
     #[must_use]
     pub fn get(&self, field: &ExpressionFieldPath) -> Option<&Value> {
-        let mut segments = field.iter();
-        let mut current = self.values[self.slot(segments.next()?)?].as_ref()?;
-        for segment in segments {
-            current = current.as_object()?.get(segment)?;
-        }
-        Some(current)
+        slot_value(self.fields, self.values, field)
     }
 
     /// Writes (or with `None` removes) a top-level field of the program layout.
     pub fn set(&mut self, field: &ExpressionFieldPath, value: Option<Value>) {
         let slot = self.slot(field.first()).expect("slot program layout holds every written field");
+        self.refresh_nested(field.first(), value.as_ref());
         self.values[slot] = value;
     }
 
     /// Removes a top-level field and returns its value.
     pub fn take(&mut self, field: &ExpressionFieldPath) -> Option<Value> {
         let slot = self.slot(field.first())?;
+        self.refresh_nested(field.first(), None);
         self.values[slot].take()
+    }
+
+    /// Nested slots under top-level field `name` read its new `value`.
+    fn refresh_nested(&mut self, name: &str, value: Option<&Value>) {
+        for (field, slot) in self.fields.iter().zip(self.values.iter_mut()) {
+            if field.len() > 1 && field.first() == name {
+                *slot = value.and_then(|value| field.iter().skip(1).try_fold(value, |value, segment| value.as_object()?.get(segment))).cloned();
+            }
+        }
     }
 
     /// Removes every field.
@@ -681,7 +457,7 @@ impl SlotProgram {
     }
 
     fn compile_with(operators: &[PhysicalOperator], source_fields: &[ExpressionFieldPath], expanding: bool) -> Option<Self> {
-        if source_fields.iter().any(|field| field.len() != 1 || field.first() == "_id") {
+        if source_fields.iter().any(|field| field.first() == "_id") {
             return None;
         }
         let mut fields = source_fields.to_vec();
@@ -743,7 +519,11 @@ impl SlotProgram {
                         return Ok(false);
                     }
                 }
-                SlotStage::Stage(stage) => stage.apply_slots(&mut row)?,
+                SlotStage::Stage(stage) => {
+                    if !stage.apply_slots(&mut row)? {
+                        return Ok(false);
+                    }
+                }
             }
         }
         Ok(true)
@@ -797,7 +577,11 @@ impl SlotProgram {
                         return Ok(emitted);
                     }
                 },
-                SlotStage::Stage(stage) => stage.apply_slots(&mut row)?,
+                SlotStage::Stage(stage) => {
+                    if !stage.apply_slots(&mut row)? {
+                        return Ok(0);
+                    }
+                }
             }
         }
         emit(row.values)?;
@@ -807,53 +591,48 @@ impl SlotProgram {
     /// Document holding the present slots of a row.
     #[must_use]
     pub fn document(&self, values: &[Option<Value>]) -> crate::Document {
-        let mut document = crate::Document::new();
-        for (field, value) in self.fields.iter().zip(values) {
-            if let Some(value) = value {
-                document.insert(field.first(), value.clone());
-            }
+        document_of_fields(&self.fields, values)
+    }
+}
+
+/// Value at `path` of a row holding `values` at `fields`: a nested path read
+/// as its own slot, or a path into a top-level slot.
+#[must_use]
+pub fn slot_value<'a>(fields: &[ExpressionFieldPath], values: &'a [Option<Value>], path: &ExpressionFieldPath) -> Option<&'a Value> {
+    if path.len() > 1 {
+        if let Some(slot) = fields.iter().position(|slot| slot == path) {
+            return values[slot].as_ref();
         }
-        document
     }
+    let mut segments = path.iter();
+    let first = segments.next()?;
+    let slot = fields.iter().position(|field| field.len() == 1 && field.first() == first)?;
+    segments.try_fold(values[slot].as_ref()?, |value, segment| value.as_object()?.get(segment))
 }
 
-/// Borrowed storage scalar row using the same stable projected-value layout.
-#[derive(Clone, Copy, Debug)]
-struct ProjectedValueRefRow<'layout, 'row, 'value> {
-    layout: &'layout ProjectedValueLayout,
-    values: &'row [Option<ProjectedValueRef<'value>>],
-}
-
-impl<'layout, 'row, 'value> ProjectedValueRefRow<'layout, 'row, 'value> {
-    fn new(
-        layout: &'layout ProjectedValueLayout,
-        values: &'row [Option<ProjectedValueRef<'value>>],
-    ) -> ExecutionResult<Self> {
-        if values.len() != layout.fields().len() {
-            return Err(ExecutionError::evaluation(
-                "borrowed projected-value row does not match its field layout",
-            ));
+/// The document holding `values` at `fields`: a nested path goes into its
+/// object, unless its top-level field is present (it holds the path then).
+#[must_use]
+pub fn document_of_fields(fields: &[ExpressionFieldPath], values: &[Option<Value>]) -> crate::Document {
+    let mut document = crate::Document::new();
+    for (field, value) in fields.iter().zip(values) {
+        if let (1, Some(value)) = (field.len(), value) {
+            document.insert(field.first(), value.clone());
         }
-        Ok(Self { layout, values })
     }
-}
-
-impl ExpressionFieldResolver<crate::Value> for ProjectedValueRefRow<'_, '_, '_> {
-    fn resolve_field(&self, field: &ExpressionFieldPath) -> SemanticValue<crate::Value> {
-        self.layout
-            .slot(field)
-            .and_then(|slot| self.values.get(slot))
-            .and_then(Option::as_ref)
-            .map(ProjectedValueRef::to_value)
-            .map_or(SemanticValue::Missing, SemanticValue::Present)
+    for (field, value) in fields.iter().zip(values) {
+        if let Some(value) = value.as_ref().filter(|_| field.len() > 1 && !fields.iter().any(|top| top.len() == 1 && top.first() == field.first())) {
+            super::runtime_materializer::insert_path(&mut document, field.segments(), value.clone());
+        }
     }
+    document
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test] fn layout_deduplicates_fields_and_resolves_slots() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone(), revenue.clone(), period.clone()]).unwrap(); assert_eq!(layout.fields(), &[period.clone(), revenue.clone()]); assert_eq!(layout.slot(&period), Some(0)); assert_eq!(layout.slot(&revenue), Some(1)); assert!(layout.is_top_level()); }
+    #[test] fn layout_deduplicates_fields_and_resolves_slots() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone(), revenue.clone(), period.clone()]).unwrap(); assert_eq!(layout.fields(), &[period.clone(), revenue.clone()]); assert_eq!(layout.slot(&period), Some(0)); assert_eq!(layout.slot(&revenue), Some(1)); }
     #[test] fn projected_row_reads_values_by_field() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let layout = ProjectedValueLayout::new([period.clone()]).unwrap(); let values = [Some(crate::Value::string("12-2025"))]; let row = ProjectedValueRow::new(&layout, &values).unwrap(); assert_eq!(row.get(&period), Some(&crate::Value::string("12-2025"))); }
     #[test] fn projected_pipeline_unions_filter_and_downstream_fields() { let period = ExpressionFieldPath::new(["tPeriode"]).unwrap(); let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let predicate = crate::query::parse_expression(r#"tPeriode == "12-2025""#).unwrap(); let operators = [PhysicalOperator::Filter { predicate }]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert_eq!(pipeline.layout().slot(&period), Some(0)); assert_eq!(pipeline.layout().slot(&revenue), Some(1)); assert_eq!(pipeline.projection_reuse(), ProjectionReuse::Reusable); }
     #[test] fn projected_pipeline_accepts_select_as_slot_visibility_boundary() { let revenue = ExpressionFieldPath::new(["CAFacture"]).unwrap(); let operators = [PhysicalOperator::Select { fields: Arc::from([revenue.clone()]), }]; let pipeline = ProjectedValuePipeline::compile(&operators, [revenue.clone()]) .unwrap() .unwrap(); assert_eq!(pipeline.layout().slot(&revenue), Some(0)); }

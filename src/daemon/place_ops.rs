@@ -10,19 +10,17 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
     match operation {
         RoutedOperation::PermissionGrant(Routed { id, input: PermissionGrantInput { identity_id, action, resource, created_at }, }) => {
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _permissions | insert {{identityId: {}, action: {}, resource: {}, effect: \"allow\", state: \"active\", createdAt: {created_at}}}", query_string(&identity_id), query_string(&action), query_string(&resource), );
+            let query = insert_query("_permissions", serde_json::json!({"identityId": &identity_id, "action": &action, "resource": &resource, "effect": "allow", "state": "active", "createdAt": created_at}));
             write_query_then_publish(writer, engine, id, query, Audience::identities([identity_id.clone()]), "permission.granted", serde_json::json!({"identityId": identity_id, "action": action, "resource": resource, "createdAt": created_at}))
         }
         RoutedOperation::PermissionRevoke(Routed { id, input: PermissionRevokeInput { identity_id, action, resource, revoked_at }, }) => {
             let revoked_at = revoked_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _permissions | where identityId == {} and action == {} and resource == {} and state == \"active\" | set state = \"revoked\", revokedAt = {revoked_at}", query_string(&identity_id), query_string(&action), query_string(&resource), );
+            let query = quoted!("on _permissions | where identityId == {} and action == {} and resource == {} and state == \"active\" | set state = \"revoked\", revokedAt = {revoked_at}", &identity_id, &action, &resource);
             write_query_then_publish(writer, engine, id, query, Audience::identities([identity_id.clone()]), "permission.revoked", serde_json::json!({"identityId": identity_id, "action": action, "resource": resource, "revokedAt": revoked_at}))
         }
         RoutedOperation::SharingCreate(Routed { id, input: SharingCreateInput { sharing_id, owner, target, permissions, state, created_at }, }) => {
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let permissions_json = serde_json::to_string(&permissions)
-                .expect("sharing permissions serialize");
-            let query = format!( "on _sharings | insert {{sharingId: {}, owner: {}, target: {}, permissions: {permissions_json}, state: {}, createdAt: {created_at}}}", query_string(&sharing_id), query_string(&owner), query_string(&target), query_string(&state), );
+            let query = insert_query("_sharings", serde_json::json!({"sharingId": &sharing_id, "owner": &owner, "target": &target, "permissions": &permissions, "state": &state, "createdAt": created_at}));
             write_query_then_publish(writer, engine, id, query, Audience::identities([owner.clone(), target.clone()]), "sharing.created", serde_json::json!({ "sharing": { "sharingId": sharing_id, "owner": owner, "target": target, "permissions": permissions, "state": state, "createdAt": created_at, } }))
         }
         RoutedOperation::SharingUpdate(Routed { id, input: SharingUpdateInput { sharing_id, permissions, state, updated_at }, }) => {
@@ -46,15 +44,18 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
         RoutedOperation::SharingDelete(Routed { id, input: SharingDeleteInput { sharing_id, deleted_at }, }) => {
             let sharing = load_sharing(engine, id, &sharing_id)?;
             let deleted_at = deleted_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _sharings | where sharingId == {} | delete", query_string(&sharing_id), );
+            let query = quoted!("on _sharings | where sharingId == {} | delete", &sharing_id);
             write_query_then_publish(writer, engine, id, query, Audience::identities([ sharing.owner.clone(), sharing.target.clone(), ]), "sharing.deleted", serde_json::json!({ "sharingId": sharing_id, "owner": sharing.owner, "target": sharing.target, "deletedAt": deleted_at, }))
         }
         RoutedOperation::PlaceCreate(Routed { id, input: PlaceCreateInput { name, mood, public_access, created_at }, }) => {
             let owner_identity_id = require_identity(principal, id, "an authenticated identity is required to create a Place")?;
             let place_id = UuidV7Generator::new().next_id().to_string();
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let public_access_field = public_access.map(|access| format!(", publicAccess: {}", query_string(access.as_str()))).unwrap_or_default();
-            let query = format!( "on _places | insert {{placeId: {}, name: {}, mood: {}, ownerIdentityId: {}, state: \"active\", createdAt: {created_at}{public_access_field}}}", query_string(&place_id), query_string(&name), query_string(&mood), query_string(owner_identity_id), );
+            let mut document = serde_json::json!({"placeId": &place_id, "name": &name, "mood": &mood, "ownerIdentityId": owner_identity_id, "state": "active", "createdAt": created_at});
+            if let Some(access) = public_access {
+                document["publicAccess"] = access.as_str().into();
+            }
+            let query = insert_query("_places", document);
             query_documents(engine, id, query)?;
             Ok(reply(writer, id, serde_json::json!({ "placeId": place_id, "name": name, "mood": mood, "ownerIdentityId": owner_identity_id, "role": PlaceRole::Owner.as_str(), "publicAccess": public_access.map(PublicAccess::as_str), "state": "active", "createdAt": created_at, }))?)
         }
@@ -107,8 +108,8 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
             require_place_owner(engine, id, identity_id, &place, "only the Place Owner may delete it")?;
             let deleted_at = deleted_at.unwrap_or_else(unix_time_millis);
             let audience = place_audience(engine, id, &place_id)?;
-            query_documents(engine, id, format!( "on _app_instances | where placeId == {} and state == \"active\" | set state = \"removed\", removedAt = {deleted_at}", query_string(&place_id), ))?;
-            query_documents(engine, id, format!( "on _places | where placeId == {} and state == \"active\" | set state = \"deleted\", deletedAt = {deleted_at}", query_string(&place_id), ))?;
+            query_documents(engine, id, quoted!("on _app_instances | where placeId == {} and state == \"active\" | set state = \"removed\", removedAt = {deleted_at}", &place_id))?;
+            query_documents(engine, id, quoted!("on _places | where placeId == {} and state == \"active\" | set state = \"deleted\", deletedAt = {deleted_at}", &place_id))?;
             publish_durable_event(engine, audience, "place.deleted", serde_json::json!({ "placeId": place_id, "deletedAt": deleted_at }));
             Ok(reply(writer, id, serde_json::json!({ "placeId": place_id, "state": "deleted", "deletedAt": deleted_at, }))?)
         }
@@ -144,15 +145,7 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
                 )
             } else {
                 let created_at = unix_time_millis();
-                format!(
-                    "on _sharings | insert {{sharingId: {}, owner: {}, target: {}, permissions: {}, placeRole: {}, state: \"active\", createdAt: {created_at}}}",
-                    query_string(&sharing_id),
-                    query_string(&place.owner_identity_id),
-                    query_string(&target_identity_id),
-                    serde_json::to_string(&vec![permission.clone()])
-                        .expect("Place sharing permissions serialize"),
-                    query_string(role.as_str()),
-                )
+                insert_query("_sharings", serde_json::json!({"sharingId": &sharing_id, "owner": &place.owner_identity_id, "target": &target_identity_id, "permissions": [&permission], "placeRole": role.as_str(), "state": "active", "createdAt": created_at}))
             };
 
             query_documents(engine, id, query)?;
@@ -174,7 +167,7 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
             }
 
             let audience = place_audience(engine, id, &place_id)?;
-            query_documents(engine, id, format!( "on _sharings | where sharingId == {} | delete", query_string(&sharing_id), ))?;
+            query_documents(engine, id, quoted!("on _sharings | where sharingId == {} | delete", &sharing_id))?;
             publish_durable_event(engine, audience, "place.access.removed", serde_json::json!({ "placeId": place_id, "identityId": target_identity_id, }));
             Ok(reply(writer, id, serde_json::json!({ "placeId": place_id, "identityId": target_identity_id, "state": "removed", }))?)
         }
@@ -183,7 +176,7 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
             let place = load_place(engine, id, &place_id)?;
             require_place_owner(engine, id, identity_id, &place, "only the Place Owner may change public access")?;
             let value = public_access.map(|access| query_string(access.as_str())).unwrap_or_else(|| "null".to_owned());
-            let query = format!("on _places | where placeId == {} and state == \"active\" | set publicAccess = {value}", query_string(&place_id));
+            let query = quoted!("on _places | where placeId == {} and state == \"active\" | set publicAccess = {value}", &place_id);
             let audience = place_audience(engine, id, &place_id)?;
             query_documents(engine, id, query)?;
             let updated = serde_json::json!({"placeId": place_id, "publicAccess": public_access.map(PublicAccess::as_str)});
@@ -220,7 +213,7 @@ pub(super) fn handle_place_operation(writer: &mut TcpStream, settings: &Connecti
             }
             let mut eligible_devices = Vec::new();
             for identity in &eligible_identity_ids {
-                let query = format!("on _devices | where identityId == {} and state == \"active\" | select identityId, deviceId, publicKey | sort deviceId", query_string(identity));
+                let query = quoted!("on _devices | where identityId == {} and state == \"active\" | select identityId, deviceId, publicKey | sort deviceId", identity);
                 eligible_devices.extend(query_documents(engine, id, query).unwrap_or_default());
             }
             let fabric_can_manage = !settings.authorization_mode.is_enforced()
@@ -292,6 +285,12 @@ fn writable_place(engine: &Engine, id: RequestId, principal: &Principal, place_i
     Ok(access)
 }
 
+/// How long an import waits for its confirmation, and how many rows of a failed check it shows.
+#[cfg(feature = "database")]
+const STAGED_FOR: u64 = 7 * 24 * 3600 * 1000;
+#[cfg(feature = "database")]
+const CHECK_ROWS: usize = 100;
+
 /// The analysis or import result given by the caller, or computed by the local data worker.
 #[cfg(feature = "database")]
 fn data_worker_result(settings: &ConnectionSettings, engine: &Engine, id: RequestId, worker_result: Option<JsonValue>, place_id: &str, files_instance_id: &str, file_id: &str, operation: &str, mapping: Option<&JsonValue>, unavailable: &str) -> Result<JsonValue, super::serve::Stop> {
@@ -305,7 +304,7 @@ fn data_worker_result(settings: &ConnectionSettings, engine: &Engine, id: Reques
 }
 
 #[cfg(feature = "database")]
-pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, authentication: &ConnectionAuth, operation: RoutedOperation) -> Handled {
+pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, authentication: &ConnectionAuth, delegation: Option<&super::GatewayDelegation>, operation: RoutedOperation) -> Handled {
     let principal = authentication.principal();
     match operation {
         RoutedOperation::QueryContextResolve(Routed { id, input: QueryContextResolveInput { place_id, app_instance_id } }) => {
@@ -332,14 +331,17 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
                 reject!(id, "app.already_exists", "an App with this id already exists");
             }
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let definition_json = serde_json::to_string(&definition).expect("App definition serializes");
-            let ownership_fields = place_id.as_ref().map(|owner_place_id| format!(", ownerPlaceId: {}, maintainersJson: {}", query_string(owner_place_id), query_string("[]"))).unwrap_or_default();
-            let query = format!( "on _apps | insert {{appId: {}, name: {}, version: {}, definition: {definition_json}, createdBy: {}, state: \"active\", createdAt: {created_at}{ownership_fields}}}", query_string(&app_id), query_string(&name), query_string(&version), query_string(identity_id), );
+            let mut document = serde_json::json!({"appId": &app_id, "name": &name, "version": &version, "definition": &definition, "createdBy": identity_id, "state": "active", "createdAt": created_at});
+            if let Some(owner_place_id) = place_id.as_ref() {
+                document["ownerPlaceId"] = owner_place_id.as_str().into();
+                document["maintainersJson"] = "[]".into();
+            }
+            let query = insert_query("_apps", document);
             query_documents(engine, id, query)?;
 
             let instance_id = if let Some(ref place_id) = place_id {
                 let instance_id = UuidV7Generator::new().next_id().to_string();
-                let query = format!( "on _app_instances | insert {{instanceId: {}, placeId: {}, appId: {}, name: {}, config: {{}}, state: \"active\", createdAt: {created_at}}}", query_string(&instance_id), query_string(place_id), query_string(&app_id), query_string(&name), );
+                let query = insert_query("_app_instances", serde_json::json!({"instanceId": &instance_id, "placeId": place_id, "appId": &app_id, "name": &name, "config": {}, "state": "active", "createdAt": created_at}));
                 query_documents(engine, id, query)?;
                 Some(instance_id)
             } else { None };
@@ -370,10 +372,7 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
                 let place = load_place(engine, id, place_id)?;
                 let role = place_role(engine, id, identity_id, &place)?;
                 let app = load_app_definition(engine, id, &app_id)?;
-                let links = query_documents(engine, id, format!(
-                    "on _app_instances | where placeId == {} and appId == {} and state == \"active\" | limit 1",
-                    query_string(place_id), query_string(&app_id),
-                ))?;
+                let links = query_documents(engine, id, quoted!("on _app_instances | where placeId == {} and appId == {} and state == \"active\" | limit 1", place_id, &app_id))?;
                 if links.is_empty() {
                     reject!(id, "app.not_in_place", "the App is not attached to this Place");
                 }
@@ -385,7 +384,7 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
                     reject!(id, "app.update_forbidden", "App management requires a Place Owner or App Maintainer");
                 }
                 if owner_place_id.is_none() && role.can_manage() {
-                    let claim = format!("on _apps | where appId == {} and state == \"active\" | set ownerPlaceId = {}, maintainersJson = {}", query_string(&app_id), query_string(place_id), query_string("[]"));
+                    let claim = quoted!("on _apps | where appId == {} and state == \"active\" | set ownerPlaceId = {}, maintainersJson = {}", &app_id, place_id, "[]");
                     query_documents(engine, id, claim)?;
                 }
             } else {
@@ -405,7 +404,7 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
                         reject!(id, "app.maintainers_forbidden", "only a Place Owner may change App maintainers");
                     }
                     let serialized = serde_json::to_string(&normalized).expect("maintainers serialize");
-                    let maintainers_query = format!("on _apps | where appId == {} and state == \"active\" | set maintainersJson = {}", query_string(&app_id), query_string(&serialized));
+                    let maintainers_query = quoted!("on _apps | where appId == {} and state == \"active\" | set maintainersJson = {}", &app_id, &serialized);
                     query_documents(engine, id, maintainers_query)?;
                 }
             }
@@ -416,7 +415,7 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
             let updated_at = updated_at.unwrap_or_else(unix_time_millis);
             let definition_json =
                 serde_json::to_string(&definition).expect("App definition serializes");
-            let query = format!( "on _apps | where appId == {} and state == \"active\" | set name = {}, version = {}, definition = {definition_json}, updatedBy = {}, updatedAt = {updated_at}", query_string(&app_id), query_string(&name), query_string(&version), query_string(identity_id), );
+            let query = quoted!("on _apps | where appId == {} and state == \"active\" | set name = {}, version = {}, definition = {definition_json}, updatedBy = {}, updatedAt = {updated_at}", &app_id, &name, &version, identity_id);
             query_documents(engine, id, query)?;
             publish_durable_event(engine, Audience::Global, "app.updated", serde_json::json!({"appId": app_id, "name": name, "version": version, "updatedBy": identity_id, "updatedAt": updated_at}));
             reply(writer, id, serde_json::json!({"appId": app_id, "name": name, "version": version, "definition": definition, "updatedBy": identity_id, "state": "active", "updatedAt": updated_at}))?;
@@ -425,15 +424,12 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
             let identity_id = require_identity(principal, id, "an authenticated identity is required to delete an App")?;
             ensure_operation_resource_authorized(settings, engine, principal, id, OperationKind::AppDelete, &app_id)?;
             load_app_definition(engine, id, &app_id)?;
-            let instances = query_documents(engine, id, format!(
-                "on _app_instances | where appId == {} and state == \"active\" | limit 1",
-                query_string(&app_id),
-            ))?;
+            let instances = query_documents(engine, id, quoted!("on _app_instances | where appId == {} and state == \"active\" | limit 1", &app_id))?;
             if !instances.is_empty() {
                 reject!(id, "app.in_use", "the App still has active instances");
             }
             let deleted_at = deleted_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _apps | where appId == {} and state == \"active\" | set state = \"deleted\", deletedBy = {}, deletedAt = {deleted_at}", query_string(&app_id), query_string(identity_id), );
+            let query = quoted!("on _apps | where appId == {} and state == \"active\" | set state = \"deleted\", deletedBy = {}, deletedAt = {deleted_at}", &app_id, identity_id);
             query_documents(engine, id, query)?;
             publish_durable_event(engine, Audience::Global, "app.deleted", serde_json::json!({"appId": app_id, "deletedBy": identity_id, "deletedAt": deleted_at}));
             reply(writer, id, serde_json::json!({"appId": app_id, "state": "deleted", "deletedBy": identity_id, "deletedAt": deleted_at}))?;
@@ -445,13 +441,11 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
             load_app_definition(engine, id, &app_id)?;
             let instance_id = UuidV7Generator::new().next_id().to_string();
             let created_at = created_at.unwrap_or_else(unix_time_millis);
-            let config_json =
-                serde_json::to_string(&config).expect("App config serializes");
-            let name_field = name
-                .as_deref()
-                .map(|value| format!(", name: {}", query_string(value)))
-                .unwrap_or_default();
-            let query = format!( "on _app_instances | insert {{instanceId: {}, placeId: {}, appId: {}{name_field}, config: {config_json}, state: \"active\", createdAt: {created_at}}}", query_string(&instance_id), query_string(&place_id), query_string(&app_id), );
+            let mut document = serde_json::json!({"instanceId": &instance_id, "placeId": &place_id, "appId": &app_id, "config": &config, "state": "active", "createdAt": created_at});
+            if let Some(name) = name.as_deref() {
+                document["name"] = name.into();
+            }
+            let query = insert_query("_app_instances", document);
             query_documents(engine, id, query)?;
             let audience = place_audience(engine, id, &place_id)?;
             publish_durable_event(engine, audience, "app.instance.created", serde_json::json!({
@@ -462,10 +456,12 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
         RoutedOperation::AppInstanceList(Routed { id, input: PlaceIdInput { place_id } }) => {
             let place = load_place(engine, id, &place_id)?;
             let access = resolve_place_access_for_principal(engine, id, principal, &place)?;
-            let documents = query_documents(engine, id, format!(
-                "on _app_instances | where placeId == {} and state == \"active\" | sort createdAt",
-                query_string(&place_id),
-            ))?;
+            let mut documents = Vec::new();
+            for document in query_documents(engine, id, quoted!("on _app_instances | where placeId == {} and state == \"active\" | sort createdAt", &place_id))? {
+                if app_instance_visible(engine, id, principal, &access, &document)? {
+                    documents.push(document);
+                }
+            }
             reply(writer, id, serde_json::json!({"placeId": place_id, "role": access.role().map(PlaceRole::as_str), "publicAccess": access.public_access().map(PublicAccess::as_str), "instances": documents}))?;
         }
         RoutedOperation::AppInstanceRemove(Routed { id, input: AppInstanceRemoveInput { instance_id, removed_at }, }) => {
@@ -474,7 +470,7 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
             let place = load_place(engine, id, &instance.place_id)?;
             require_place_owner(engine, id, identity_id, &place, "only the Place Owner may remove an App")?;
             let removed_at = removed_at.unwrap_or_else(unix_time_millis);
-            let query = format!( "on _app_instances | where instanceId == {} and state == \"active\" | set state = \"removed\", removedAt = {removed_at}", query_string(&instance_id), );
+            let query = quoted!("on _app_instances | where instanceId == {} and state == \"active\" | set state = \"removed\", removedAt = {removed_at}", &instance_id);
             query_documents(engine, id, query)?;
             let audience = place_audience(engine, id, &instance.place_id)?;
             publish_durable_event(engine, audience, "app.instance.removed", serde_json::json!({
@@ -486,14 +482,14 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
             writable_place(engine, id, principal, &place_id, "data analysis requires write access to the Place")?;
             let mut response = data_worker_result(settings, engine, id, worker_result, &place_id, &files_instance_id, &file_id, "analyze", None, "data.analyze requires a data.import worker result on this database node")?;
             let fingerprint = response.str_field("fingerprint").unwrap_or_default();
-            let mappings = if fingerprint.is_empty() { Vec::new() } else { query_documents(engine, id, format!("on _data_mappings | where placeId == {} and fingerprint == {} and state == \"active\" | limit 5", query_string(&place_id), query_string(fingerprint)))? };
+            let mappings = if fingerprint.is_empty() { Vec::new() } else { query_documents(engine, id, quoted!("on _data_mappings | where placeId == {} and fingerprint == {} and state == \"active\" | limit 5", &place_id, fingerprint))? };
             if let Some(object) = response.as_object_mut() { object.insert("recognized".into(), JsonValue::Bool(!mappings.is_empty())); object.insert("mappings".into(), JsonValue::Array(mappings)); }
             reply(writer, id, response)?;
         }
         RoutedOperation::DataMappingSave(Routed { id, input: DataMappingSaveInput { place_id, fingerprint, name, target_app_id, target_table, definition } }) => {
             writable_place(engine, id, principal, &place_id, "saving a Mapping requires write access to the Place")?;
             let mapping_id = UuidV7Generator::new().next_id().to_string(); let now = unix_time_millis();
-            query_documents(engine, id, format!("on _data_mappings | insert {{mappingId:{},placeId:{},fingerprint:{},name:{},targetAppId:{},targetTable:{},definition:{},createdBy:{},state:\"active\",createdAt:{}}}", query_string(&mapping_id), query_string(&place_id), query_string(&fingerprint), query_string(&name), query_string(&target_app_id), query_string(&target_table), serde_json::to_string(&definition).expect("mapping serializes"), query_string(&principal_actor(principal)), now))?;
+            query_documents(engine, id, insert_query("_data_mappings", serde_json::json!({"mappingId": &mapping_id, "placeId": &place_id, "fingerprint": &fingerprint, "name": &name, "targetAppId": &target_app_id, "targetTable": &target_table, "definition": &definition, "createdBy": &principal_actor(principal), "state": "active", "createdAt": now})))?;
             reply(writer, id, serde_json::json!({"mappingId": mapping_id, "fingerprint": fingerprint, "name": name, "targetAppId": target_app_id, "targetTable": target_table, "definition": definition}))?;
         }
         RoutedOperation::DataMappingList(Routed { id, input: DataMappingListInput { place_id, fingerprint } }) => {
@@ -505,7 +501,7 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
         }
         RoutedOperation::DataMappingUpdate(Routed { id, input: DataMappingUpdateInput { place_id, mapping_id, name, target_app_id, target_table, definition } }) => {
             writable_place(engine, id, principal, &place_id, "updating a Mapping requires write access to the Place")?;
-            let selected = format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\"", query_string(&mapping_id), query_string(&place_id));
+            let selected = quoted!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\"", &mapping_id, &place_id);
             if query_documents(engine, id, format!("{selected} | limit 1"))?.is_empty() { reject!(id, "data.mapping_not_found", "mapping was not found in this Place"); }
             let mut assignments = Vec::new();
             if let Some(value) = name { assignments.push(format!("name = {}", query_string(&value))); }
@@ -519,75 +515,116 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
         }
         RoutedOperation::DataMappingDelete(Routed { id, input: DataMappingDeleteInput { place_id, mapping_id } }) => {
             writable_place(engine, id, principal, &place_id, "deleting a Mapping requires write access to the Place")?;
-            let selected = format!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\"", query_string(&mapping_id), query_string(&place_id));
+            let selected = quoted!("on _data_mappings | where mappingId == {} and placeId == {} and state == \"active\"", &mapping_id, &place_id);
             if query_documents(engine, id, format!("{selected} | limit 1"))?.is_empty() { reject!(id, "data.mapping_not_found", "mapping was not found in this Place"); }
             let deleted_at = unix_time_millis();
             query_documents(engine, id, format!("{selected} | set state = \"deleted\", deletedBy = {}, deletedAt = {}", query_string(&principal_actor(principal)), deleted_at))?;
             reply(writer, id, serde_json::json!({"mappingId": mapping_id, "placeId": place_id, "state": "deleted", "deletedAt": deleted_at}))?;
         }
-        RoutedOperation::DataImport(Routed { id, input: DataImportInput { place_id, files_instance_id, file_id, target_instance_id, table, mapping, mode, worker_result, plan_only } }) => {
-            let access = writable_place(engine, id, principal, &place_id, "data import requires write access to the Place")?;
-            let instance_docs = query_documents(engine, id, format!("on _app_instances | where instanceId == {} and placeId == {} and state == \"active\" | limit 1", query_string(&target_instance_id), query_string(&place_id)))?;
-            let Some(instance_doc) = instance_docs.first() else { reject!(id, "app.instance_not_found", "target App instance was not found in this Place"); };
-            let app_id = instance_doc.str_field("appId").unwrap_or_default(); if app_id.is_empty() { reject!(id, "app.invalid_instance_record", "target App instance has no appId"); }
-            let app = load_app_definition(engine, id, app_id)?;
-            let Some(collection) = resolve_app_table_collection(&app, &table) else { reject!(id, "data.invalid_target", "target table is not declared by the App") };
-            let result = data_worker_result(settings, engine, id, worker_result, &place_id, &files_instance_id, &file_id, "import", Some(&mapping), "data.import requires a data.import worker result on this database node")?;
-            let documents = result.array_field("documents").cloned().unwrap_or_default();
-            if documents.iter().any(|document| !document.is_object()) {
-                reject!(id, "data.invalid_worker_output", "data worker returned a non-object document");
-            }
-            let mode = mode.as_deref().or_else(|| mapping.get("import").and_then(|v| v.get("mode")).and_then(JsonValue::as_str)).unwrap_or("append");
-            let warnings = result.get("warnings").cloned().unwrap_or(JsonValue::Array(vec![]));
-
-            // In Gateway fabric mode the authority Core is the control plane only. It
-            // authorizes Place/AppInstance/table here, but the Gateway executes
-            // the resulting scoped mutations on the selected database provider.
-            if plan_only {
-                return Ok(reply(writer, id, serde_json::json!({
-                    "status": "planned",
-                    "placeId": place_id,
-                    "appInstanceId": target_instance_id,
-                    "placeRole": access.role().map(PlaceRole::as_str),
-                    "publicAccess": access.public_access().map(PublicAccess::as_str),
-                    "collection": collection,
-                    "mode": mode,
-                    "rows": documents.len(),
-                    "warnings": warnings,
-                }))?);
-            }
-
-            // data.import is already authorized against the Place and the target
-            // AppInstance above. Persist through the normal scoped query executor so
-            // DocumentScope remains the single authority for _place/_app_instance.
-            //
-            // Do NOT use the row-local `load` stage here: `on collection | load ...`
-            // transforms rows already present in the source collection and therefore
-            // inserts nothing when the collection is empty. The dedicated streaming
-            // load path is not scoped yet, so V1 deliberately uses scoped inserts.
-            let import_context = ExecutionContext {
-                principal: principal.clone(),
-                place_id: place_id.clone(),
-                app_instance_id: Some(target_instance_id.clone()),
-                access,
-            };
-            let run_scoped = |query: String| -> Handled {
-                let response = execute_request_scoped(engine, QueryRequest::new(id, query), Some(&import_context));
-                if response.is_ok() { Ok(()) } else { Err(response.into()) }
-            };
-            if mode == "replace" || mode == "replace_all" {
-                run_scoped(format!("on {} | delete", collection))?;
-            }
-            for document in &documents {
-                run_scoped(format!("on {} | insert {}", collection, serde_json::to_string(document).expect("worker document serializes")))?;
-            }
-            let audience = place_audience(engine, id, &place_id)?;
-            publish_durable_event(engine, audience, "app.data.changed", serde_json::json!({
-                "placeId": place_id, "appInstanceId": target_instance_id, "table": table, "rows": documents.len()
-            }));
-            reply(writer, id, serde_json::json!({"status": "completed", "rows": documents.len(), "mode": mode, "warnings": warnings}))?;
+        RoutedOperation::DataImport(Routed { id, input }) => {
+            let (place_id, files_instance_id, file_id, mapping) = (input.place_id.clone(), input.files_instance_id.clone(), input.file_id.clone(), input.mapping.clone());
+            let response = data_import(engine, principal, delegation, id, input, || data_worker_result(settings, engine, id, None, &place_id, &files_instance_id, &file_id, "import", Some(&mapping), "data.import requires a data.import worker result on this database node"))?;
+            reply(writer, id, response)?;
         }
         other => return diverged(other.id()),
     }
     Ok(())
+}
+
+/// `data.import`: stages the rows of the file (`worker` reads it, unless the Gateway gave them), runs the checks the App
+/// declares for the table, and writes the rows once none stops them; else answers `confirm` (or `blocked`) with the rows of
+/// each check, and the caller resumes (`importId`, `accept`) or cancels. In Gateway fabric mode the authority Core only
+/// authorizes the import and resolves its destination (`planOnly`); the database Core of the Place runs it (`plan`).
+#[cfg(feature = "database")]
+pub(super) fn data_import(engine: &Engine, principal: &Principal, delegation: Option<&super::GatewayDelegation>, id: RequestId, input: DataImportInput, worker: impl FnOnce() -> Result<JsonValue, super::serve::Stop>) -> Result<JsonValue, super::serve::Stop> {
+    let DataImportInput { place_id, target_instance_id, table, mapping, mode, worker_result, plan_only, import_id, accept, check_only, cancel, plan, .. } = input;
+    let worker = || match worker_result { Some(result) => Ok(result), None => worker() };
+    let (collection, mode, declared) = match plan {
+        Some(plan) => {
+            let delegated = delegation.is_some_and(|delegated| delegated.capability == "database" && delegated.place_id.as_deref() == Some(place_id.as_str()) && delegated.app_instance_id.as_deref() == Some(target_instance_id.as_str()) && delegated.access().is_some_and(PlaceAccess::can_write));
+            if !delegated { reject!(id, "authorization.denied", "a planned data import requires the Gateway's write delegation for its App instance"); }
+            let Some(collection) = plan["collection"].as_str().filter(|collection| crate::view::is_name(collection)) else { reject!(id, "data.invalid_target", "the import plan names no collection") };
+            (collection.to_owned(), plan["mode"].as_str().unwrap_or("append").to_owned(), plan["import"].clone())
+        }
+        None => {
+            let access = writable_place(engine, id, principal, &place_id, "data import requires write access to the Place")?;
+            let instance_docs = query_documents(engine, id, quoted!("on _app_instances | where instanceId == {} and placeId == {} and state == \"active\" | limit 1", &target_instance_id, &place_id))?;
+            let Some(instance_doc) = instance_docs.first() else { reject!(id, "app.instance_not_found", "target App instance was not found in this Place"); };
+            let app_id = instance_doc.str_field("appId").unwrap_or_default(); if app_id.is_empty() { reject!(id, "app.invalid_instance_record", "target App instance has no appId"); }
+            let app = load_app_definition(engine, id, app_id)?;
+            let Some(collection) = resolve_app_table_collection(&app, &table) else { reject!(id, "data.invalid_target", "target table is not declared by the App") };
+            let mode = mode.as_deref().or_else(|| mapping.get("import").and_then(|v| v.get("mode")).and_then(JsonValue::as_str)).unwrap_or("append").to_owned();
+            let declared = app["definition"]["model"]["tables"][&table]["import"].clone();
+            if plan_only {
+                let result = if import_id.is_none() { worker()? } else { JsonValue::Null };
+                let rows = result.array_field("documents").map(Vec::len);
+                return Ok(serde_json::json!({"status": "planned", "placeId": place_id, "appInstanceId": target_instance_id, "placeRole": access.role().map(PlaceRole::as_str), "publicAccess": access.public_access().map(PublicAccess::as_str), "collection": collection, "mode": mode, "import": declared, "rows": rows, "warnings": result.get("warnings").cloned().unwrap_or(JsonValue::Array(vec![]))}));
+            }
+            (collection, mode, declared)
+        }
+    };
+    // The rows wait in `<collection>.staged`, in the scope of the target instance (DocumentScope stays the single
+    // authority for _place/_app_instance), until the checks the App declares for the table pass or are accepted.
+    let staged = format!("{collection}.staged");
+    let scope = crate::view::scope_of(&place_id, Some(&target_instance_id));
+    let failed = |error: String| super::serve::request_error(id, "data.import_failed", error);
+    let run = |query: &str| crate::view::execute(engine, Some(&scope), query, false).map_err(failed);
+    let (import_id, warnings) = match import_id {
+        Some(import_id) => {
+            let this = format!("on {staged} | where import_id == {}", JsonValue::from(import_id.as_str()));
+            if run(&format!("{this} | limit 1"))?.is_empty() { reject!(id, "data.import_not_found", "no import with this importId waits in this App instance"); }
+            if cancel {
+                run(&format!("{this} | delete"))?;
+                return Ok(serde_json::json!({"status": "cancelled", "importId": import_id}));
+            }
+            (import_id, JsonValue::Array(vec![]))
+        }
+        None => {
+            let result = worker()?;
+            let documents = result.array_field("documents").cloned().unwrap_or_default();
+            if documents.iter().any(|document| !document.is_object()) {
+                reject!(id, "data.invalid_worker_output", "data worker returned a non-object document");
+            }
+            let warnings = result.get("warnings").cloned().unwrap_or(JsonValue::Array(vec![]));
+            let (import_id, now) = (UuidV7Generator::new().next_id().to_string(), unix_time_millis());
+            // An import nobody confirmed or cancelled goes after a week.
+            run(&format!("on {staged} | where staged_at < {} | delete", now.saturating_sub(STAGED_FOR)))?;
+            let rows = documents.into_iter().map(|mut document| { let fields = document.as_object_mut().expect("checked above"); fields.insert("import_id".into(), import_id.clone().into()); fields.insert("staged_at".into(), now.into()); document }).collect::<Vec<_>>();
+            if !rows.is_empty() { run(&format!("on {staged} | insert {}", JsonValue::Array(rows)))?; }
+            (import_id, warnings)
+        }
+    };
+    // Each check reads the staged rows (`$import`); its rows stop the import until the caller accepts it, a blocking one for good.
+    let parameters = serde_json::Map::from_iter([("import".to_owned(), JsonValue::from(import_id.as_str()))]);
+    // Read as the App reads the Place (its views, their caches); `after` writes in the scope of the target instance.
+    let read = |query: &str| crate::view::query(engine, &place_id, None, query, &parameters).map_err(failed);
+    let summary = match declared["summary"].as_str() { Some(query) => JsonValue::Array(read(query)?), None => JsonValue::Null };
+    let mut checks = Vec::new();
+    for check in declared["checks"].as_array().into_iter().flatten() {
+        let mut rows = read(&format!("{} | limit {}", check["query"].as_str().unwrap_or_default(), CHECK_ROWS + 1))?;
+        if rows.is_empty() { continue; }
+        let (more, blocking) = (rows.len() > CHECK_ROWS, check["blocking"] == true);
+        rows.truncate(CHECK_ROWS);
+        checks.push(serde_json::json!({"id": check["id"], "message": check["message"], "blocking": blocking, "accepted": !blocking && accept.iter().any(|accepted| check["id"] == accepted.as_str()), "rows": rows, "more": more}));
+    }
+    let status = if checks.iter().any(|check| check["blocking"] == true) { "blocked" } else if checks.iter().any(|check| check["accepted"] == false) { "confirm" } else if check_only { "checked" } else { "completed" };
+    let mut response = serde_json::json!({"status": status, "importId": import_id, "checks": checks, "summary": summary, "mode": mode, "warnings": warnings});
+    if status == "completed" {
+        let this = format!("on {staged} | where import_id == {}", JsonValue::from(import_id.as_str()));
+        let rows = run(&format!("{this} | count as n"))?.first().and_then(|row| row["n"].as_u64()).unwrap_or(0);
+        // `replace`: the stored rows sharing these fields with a staged row (an entity's months) give way to it.
+        let same = declared["replace"].as_array().into_iter().flatten().filter_map(JsonValue::as_str).filter(|field| crate::view::is_name(field)).map(|field| format!("s.{field}? == t.{field}? and ")).collect::<String>();
+        let replace = match mode.as_str() {
+            "replace" | "replace_all" => Some(format!("on {collection} | delete")),
+            _ => (!same.is_empty()).then(|| format!("on {collection} as t | lookup {staged} as s | where {same}s.import_id == {} | first | into same | end | where len(same) > 0 | delete", JsonValue::from(import_id.as_str()))),
+        };
+        let writes = replace.into_iter().chain([format!("{this} | drop staged_at | into {collection}")]).chain(declared["after"].as_array().into_iter().flatten().filter_map(JsonValue::as_str).map(str::to_owned)).chain([format!("{this} | delete")]).collect::<Vec<_>>();
+        // All or nothing: each write reads the rows as they were before the import.
+        crate::view::write_together(engine, &place_id, Some(&target_instance_id), &writes, &parameters).map_err(failed)?;
+        if let Ok(audience) = place_audience(engine, id, &place_id) {
+            publish_durable_event(engine, audience, "app.data.changed", serde_json::json!({"placeId": place_id, "appInstanceId": target_instance_id, "table": table, "rows": rows}));
+        }
+        response["rows"] = rows.into();
+    }
+    Ok(response)
 }
