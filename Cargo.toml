@@ -1,6 +1,6 @@
 [package]
 name = "openglacier-core"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "An event-first, schema-less document database engine and capability runtime"
 repository = "https://github.com/openglacier/core"
