@@ -130,7 +130,7 @@ mod documents {
         let mut out = String::new();
         for at in 0..archive.len() {
             let mut part = archive.by_index(at).ok()?;
-            if !wanted(part.name()) || part.size() > super::MAX_BYTES { continue; }
+            if !part.name().is_ok_and(|name| wanted(&name)) || part.size() > super::MAX_BYTES { continue; }
             let mut xml = String::new();
             if part.read_to_string(&mut xml).is_ok() { out.push_str(&super::markup(&xml)); out.push('\n'); }
         }
