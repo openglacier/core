@@ -1,6 +1,6 @@
 /target/
 *.tar.gz
-*.txt
+/*.txt
 /data/
 /dist-package/
 bootstrap-password
