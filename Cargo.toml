@@ -10,9 +10,16 @@ categories = ["database"]
 license = "MIT"
 publish = true
 build = false
-exclude = [
-    "antaapalaa*", "release-note*",
-    "*.sh", "public-github*", "github-static*"
+# What crates.io receives, and nothing else: the full apps.json (Apps that are not
+# public), llm-bench/, notes and scripts stay out wherever cargo publish runs from.
+# The library builds in apps_public.json only; apps.json is read by tests alone.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+    "/apps_public.json",
 ]
 
 [lints.clippy]
