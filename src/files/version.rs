@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Persistent file-version metadata stored in `_file_versions`.
 
 use super::{FileId, FileMetadata, StoreId};

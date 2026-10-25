@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 pub mod auth;
 pub mod authorization;
 pub mod bootstrap;

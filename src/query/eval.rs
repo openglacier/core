@@ -238,9 +238,9 @@ pub(super) fn unary(operator: UnaryOperator, value: &Value) -> ExecutionResult<V
         UnaryOperator::Positive => number(operator.as_str(), value).map(Value::Number),
         UnaryOperator::Negate => match number(operator.as_str(), value)? {
             Number::Float(value) => float(-value),
-            integer => match integer_of(integer).and_then(i64::checked_neg) {
+            integer => match integer.to_i64().and_then(i64::checked_neg) {
                 Some(value) => Ok(Value::signed(value)),
-                None => float(-float_of(integer)),
+                None => float(-integer.to_f64()),
             },
         },
     }
@@ -273,10 +273,17 @@ pub(super) fn arithmetic_value(operator: BinaryOperator, left: &Value, right: &V
     let (Some(a), Some(b)) = (left.as_number().copied(), right.as_number().copied()) else {
         return Err(error(format!("operator {operator} expects numbers, found {left:?} and {right:?}")));
     };
-    if matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder) && float_of(b) == 0.0 {
+    if matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder) && b.to_f64() == 0.0 {
         return Err(error("division by zero; use div(a, b, fallback) for a safe division"));
     }
-    if let (Some(x), Some(y), false) = (integer_of(a), integer_of(b), operator == BinaryOperator::Divide) {
+    number_arithmetic(operator, a, b).map(Value::Number).or_else(float)
+}
+
+/// [`arithmetic_value`] of two numbers, `Err` holding a non-finite result
+/// (a zero divisor gives one).
+#[inline]
+pub(super) fn number_arithmetic(operator: BinaryOperator, a: Number, b: Number) -> Result<Number, f64> {
+    if let (Some(x), Some(y), false) = (a.to_i64(), b.to_i64(), operator == BinaryOperator::Divide) {
         let result = match operator {
             BinaryOperator::Add => x.checked_add(y),
             BinaryOperator::Subtract => x.checked_sub(y),
@@ -284,17 +291,18 @@ pub(super) fn arithmetic_value(operator: BinaryOperator, left: &Value, right: &V
             _ => x.checked_rem(y),
         };
         if let Some(result) = result {
-            return Ok(Value::signed(result));
+            return Ok(Number::Signed(result));
         }
     }
-    let (x, y) = (float_of(a), float_of(b));
-    float(match operator {
+    let (x, y) = (a.to_f64(), b.to_f64());
+    let value = match operator {
         BinaryOperator::Add => x + y,
         BinaryOperator::Subtract => x - y,
         BinaryOperator::Multiply => x * y,
         BinaryOperator::Divide => x / y,
         _ => x % y,
-    })
+    };
+    Number::float(value).map_err(|_| value)
 }
 
 pub(super) fn number(context: &str, value: &Value) -> ExecutionResult<Number> {
@@ -303,22 +311,6 @@ pub(super) fn number(context: &str, value: &Value) -> ExecutionResult<Number> {
 
 pub(super) fn text<'a>(context: &str, value: &'a Value) -> ExecutionResult<&'a str> {
     value.as_str().ok_or_else(|| error(format!("`{context}` expects a string, found {value:?}")))
-}
-
-pub(super) fn integer_of(number: Number) -> Option<i64> {
-    match number {
-        Number::Signed(value) => Some(value),
-        Number::Unsigned(value) => i64::try_from(value).ok(),
-        Number::Float(_) => None,
-    }
-}
-
-pub(super) fn float_of(number: Number) -> f64 {
-    match number {
-        Number::Signed(value) => value as f64,
-        Number::Unsigned(value) => value as f64,
-        Number::Float(value) => value,
-    }
 }
 
 pub(super) fn float(value: f64) -> ExecutionResult<Value> {
@@ -358,9 +350,10 @@ macro_rules! functions {
 functions! {
     // Mathematics.
     Abs = "abs", 1, Some(1); Sqrt = "sqrt", 1, Some(1); Floor = "floor", 1, Some(1); Ceil = "ceil", 1, Some(1);
-    Round = "round", 1, Some(2); Trunc = "trunc", 1, Some(2); Pow = "pow", 2, Some(2); Min = "min", 1, None; Max = "max", 1, None;
+    Round = "round", 1, Some(3); Trunc = "trunc", 1, Some(2); Pow = "pow", 2, Some(2); Min = "min", 1, None; Max = "max", 1, None;
     Sum = "sum", 1, None; Avg = "avg", 1, None; Div = "div", 2, Some(3); Ln = "ln", 1, Some(1); Log10 = "log10", 1, Some(1);
-    Log = "log", 2, Some(2); Exp = "exp", 1, Some(1); Sign = "sign", 1, Some(1);
+    Log = "log", 2, Some(2); Exp = "exp", 1, Some(1); Sign = "sign", 1, Some(1); Median = "median", 1, None;
+    Percentile = "percentile", 2, Some(2); Stddev = "stddev", 1, None;
     // Logic and missing values.
     Coalesce = "coalesce", 1, None; If = "if", 3, Some(3); Case = "case", 2, None; Exists = "exists", 1, Some(1);
     Optional = "optional", 1, Some(1); Nullif = "nullif", 2, Some(2); Between = "between", 3, Some(3); Bucket = "bucket", 2, Some(3);
@@ -381,7 +374,7 @@ functions! {
     Now = "now", 0, Some(0); ParseDate = "parse_date", 1, Some(1); DateTrunc = "date_trunc", 2, Some(2); DateAdd = "date_add", 3, Some(3);
     DateDiff = "date_diff", 3, Some(3); DatePart = "date_part", 2, Some(2); DateFormat = "date_format", 1, Some(2);
     FiscalYear = "fiscal_year", 2, Some(2); FiscalMonth = "fiscal_month", 2, Some(2); FiscalStart = "fiscal_start", 2, Some(2);
-    FiscalEnd = "fiscal_end", 2, Some(2);
+    FiscalEnd = "fiscal_end", 2, Some(2); MonthEnd = "month_end", 1, Some(1); DaysIn = "days_in", 2, Some(2);
 }
 
 impl Function {
@@ -457,7 +450,7 @@ fn call(function: Function, arguments: &[Expression], fields: &dyn ExpressionFie
         }
         Function::Div => {
             let (dividend, divisor) = (evaluate(&arguments[0], fields)?, evaluate(&arguments[1], fields)?);
-            if number("div", &divisor).is_ok_and(|divisor| float_of(divisor) == 0.0) {
+            if number("div", &divisor).is_ok_and(|divisor| divisor.to_f64() == 0.0) {
                 return match arguments.get(2) {
                     Some(fallback) => eval(fallback, fields),
                     None => Ok(Some(Value::null())),
@@ -503,6 +496,7 @@ mod tests {
     #[test] fn arithmetic_keeps_integers_and_divides_to_float() { assert_eq!(value("qty * 2 + 1"), Value::signed(7)); assert_eq!(value("qty / 2"), Value::float(1.5).unwrap()); assert_eq!(value("price * qty"), Value::float(37.5).unwrap()); assert_eq!(value("-qty % 2"), Value::signed(-1)); assert!(eval_text("qty / zero").is_err()); }
     #[test] fn comparisons_and_boolean_logic_share_one_evaluator() { assert_eq!(value("qty * 2 > 5 and not (price < 1)"), Value::bool(true)); assert_eq!(value("qty == 3.0 || missing_field"), Value::bool(true)); assert!(eval_text("qty == \"3\"").is_err()); }
     #[test] fn membership_accepts_literal_and_field_arrays() { assert_eq!(value("qty in [1, 2, 3]"), Value::bool(true)); assert_eq!(value("\"b\" in tags"), Value::bool(true)); assert_eq!(value("\"z\" not in tags"), Value::bool(true)); assert_eq!(value("qty + 1 in [qty, qty * 2]"), Value::bool(false)); }
+    #[test] fn statistics_reduce_numbers_or_an_array() { assert_eq!(value("median([3, 1, 2])"), Value::float(2.0).unwrap()); assert_eq!(value("median(1, 2, 3, 4, null)"), Value::float(2.5).unwrap()); assert_eq!(value("percentile([4, 1, 3, 2], 0.5)"), Value::float(2.5).unwrap()); assert_eq!(value("percentile([4, 1, 3, 2], 1)"), Value::float(4.0).unwrap()); assert_eq!(value("stddev([2, 4, 4, 4, 5, 5, 7, 9])"), Value::float((32.0_f64 / 7.0).sqrt()).unwrap()); assert_eq!((value("median([])"), value("stddev([1])")), (Value::null(), Value::null())); assert!(eval_text("percentile([1], 2)").unwrap_err().to_string().contains("fraction")); }
     #[test] fn functions_are_chainable() { assert_eq!(value("round(price * qty / 7, 2)"), Value::float(5.36).unwrap()); assert_eq!(value("abs(-qty)"), Value::signed(3)); assert_eq!(value("sqrt(pow(qty, 2) + 16)"), Value::float(5.0).unwrap()); assert_eq!(value("max(scores)"), Value::signed(9)); assert_eq!(value("min(qty, 1, price)"), Value::signed(1)); assert_eq!(value("upper(trim(name))"), Value::string("ADA")); assert_eq!(value("len(concat(tags, [\"c\"]))"), Value::unsigned(3)); assert_eq!(value("if(qty > 2, \"many\", \"few\")"), Value::string("many")); assert_eq!(value("floor(price)"), Value::signed(12)); assert_eq!(value("concat(\"n=\", qty)"), Value::string("n=3")); }
     #[test] fn safe_division_and_missing_fields() { assert_eq!(value("div(qty, zero, 0)"), Value::signed(0)); assert_eq!(value("div(qty, zero)"), Value::null()); assert_eq!(value("div(qty, 2, 0)"), Value::float(1.5).unwrap()); assert_eq!(value("coalesce(missing, nothing, qty)"), Value::signed(3)); assert_eq!(value("exists(missing)"), Value::bool(false)); assert_eq!(value("if(exists(missing), missing, 0)"), Value::signed(0)); let failure = eval_text("missing + 1").unwrap_err(); assert!(failure.to_string().contains("\"missing\" is missing"), "{failure}"); }
     #[test] fn calls_are_validated_at_parse_time() { assert!(parse_expression("nope(1)").unwrap_err().to_string().contains("unknown function")); assert!(parse_expression("abs(1, 2)").unwrap_err().to_string().contains("expects 1 argument")); assert!(check_call("coalesce", 5).is_ok()); }
@@ -513,6 +507,8 @@ mod tests {
     #[test] fn math_and_logic_helpers() { assert_eq!(value("ln(exp(2))"), Value::float(2.0).unwrap()); assert_eq!(value("log10(1000)"), Value::float(3.0).unwrap()); assert_eq!(value("log(8, 2)"), Value::float(3.0).unwrap()); assert_eq!(value("trunc(-price)"), Value::signed(-12)); assert_eq!(value("trunc(1.2399, 2)"), Value::float(1.23).unwrap()); assert_eq!(value("sign(-qty)"), Value::signed(-1)); assert!(eval_text("ln(0)").is_err()); assert_eq!(value("case(qty > 5, \"big\", qty > 1, \"mid\", \"small\")"), Value::string("mid")); assert_eq!(value("case(qty > 5, \"big\")"), Value::null()); assert_eq!(value("case(false, missing, \"safe\")"), Value::string("safe")); assert_eq!(value("nullif(qty, 3)"), Value::null()); assert_eq!(value("nullif(qty, 4)"), Value::signed(3)); assert_eq!(value("qty between 1 and 3"), Value::bool(true)); assert_eq!(value("qty not between 1 and 2"), Value::bool(true)); assert_eq!(value("bucket(qty, [0, 3, 10])"), Value::signed(3)); assert_eq!(value("bucket(price, [0, 10])"), Value::null()); assert_eq!(value("bucket(price, [0, 10], \"other\")"), Value::string("other")); assert!(eval_text("bucket(qty, [3, 1])").is_err()); }
     #[test] fn bucket_finds_the_range_holding_the_value() { for (source, expected) in [("bucket(qty, [0, 3, 10])", Value::signed(3)), ("bucket(qty, [3, 10])", Value::signed(3)), ("bucket(qty, [0, 3])", Value::null()), ("bucket(qty, [4, 10], -1)", Value::signed(-1)), ("bucket(price, [0, 1.5, 12.5, 13])", Value::float(12.5).unwrap()), ("bucket(name, [\" A\", \"Z\"])", Value::string(" A")), ("bucket(name, [0, 10], \"x\")", Value::string("x"))] { assert_eq!(value(source), expected, "{source}"); } assert_eq!(value("bucket(price, [0, 10, 9007199254740993], \"none\")"), Value::string("none"), "a bound not exactly comparable closes no range"); assert_eq!(value("bucket(price, [0, 9007199254740993, 9007199254740995], \"none\")"), Value::string("none")); }
     #[test] fn optional_paths_read_missing_as_null() { assert_eq!(value("missing?"), Value::null()); assert_eq!(value("missing?.deep == \"x\""), Value::bool(false)); assert_eq!(value("coalesce(missing?, qty)"), Value::signed(3)); assert_eq!(value("qty?"), Value::signed(3)); assert!(eval_text("missing.deep == 1").is_err()); }
+    #[test] fn rounding_takes_decimal_halves_and_a_mode() { assert_eq!(value("round(2.675, 2)"), Value::float(2.68).unwrap()); assert_eq!(value("round(1.005, 2)"), Value::float(1.01).unwrap()); assert_eq!(value("round(0.125, 2, \"half_even\")"), Value::float(0.12).unwrap()); assert_eq!(value("round(0.135, 2, \"half_even\")"), Value::float(0.14).unwrap()); assert_eq!(value("round(-2.5)"), Value::signed(-3)); assert_eq!(value("round(-2.5, 0, \"half_even\")"), Value::signed(-2)); assert_eq!(value("round(2.4999)"), Value::signed(2)); assert!(eval_text("round(1.5, 0, \"up\")").unwrap_err().to_string().contains("mode")); }
+    #[test] fn month_end_and_days_in_follow_the_calendar() { assert_eq!(value("date_format(month_end(\"2024-02-10T08:00:00Z\"))"), Value::string("2024-02-29T00:00:00.000Z")); assert_eq!(value("days_in(\"2023-02-10\", \"month\")"), Value::signed(28)); assert_eq!(value("days_in(\"2024-05-01\", \"year\")"), Value::signed(366)); assert_eq!(value("days_in(\"2024-05-01\", \"quarter\")"), Value::signed(91)); }
     #[test] fn date_functions_accept_epoch_millis_and_iso_strings() { assert_eq!(value("parse_date(\"2026-03-09T07:05:03Z\")"), Value::signed(1_773_039_903_000)); assert_eq!(value("date_format(1773039903042)"), Value::string("2026-03-09T07:05:03.042Z")); assert_eq!(value("date_format(date_trunc(\"2026-03-09T07:05:03Z\", \"month\"), \"%F\")"), Value::string("2026-03-01")); assert_eq!(value("date_part(\"2026-03-09\", \"day_of_week\")"), Value::signed(1)); assert_eq!(value("date_format(date_add(\"2026-01-31\", 1, \"month\"), \"%F\")"), Value::string("2026-02-28")); assert_eq!(value("date_diff(\"2026-01-01\", \"2026-03-15\", \"months\")"), Value::signed(2)); assert!(matches!(value("now()"), Value::Number(Number::Signed(millis)) if millis > 1_700_000_000_000)); assert!(eval_text("date_part(1, \"eon\")").is_err()); assert!(eval_text("parse_date(\"not a date\")").is_err()); }
     #[test] fn lookup_scope_routes_aliases() { let inner = Document::from_fields([("user", Value::string("Ada"))]); let outer = Document::from_fields([("name", Value::string("Ada"))]); let fields = LookupFields { inner: &inner, inner_alias: Some("o"), outer: &outer, outer_alias: Some("u") }; assert!(evaluate_predicate(&parse_expression("o.user == u.name").unwrap(), &fields).unwrap()); assert!(evaluate_predicate(&parse_expression("user == u.name").unwrap(), &fields).unwrap()); }
 }

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 fn main() -> std::process::ExitCode {
     match og_core::cli::run() {
         Ok(code) => code,

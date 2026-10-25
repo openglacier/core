@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Query module exports.
 
 mod ast;
@@ -33,6 +34,7 @@ mod expression;
 mod functions;
 mod json_value;
 mod params;
+mod separators;
 
 pub use eval::{
     apply_assignments, check_call, evaluate, evaluate_document, evaluate_predicate, DocumentFields,
@@ -43,6 +45,7 @@ pub use params::{
     bind_parameters, prepare_query, prepare_view, reads_place, split_explain, Sources,
 };
 pub(crate) use params::{group_length, stage_ranges};
+pub use separators::{normalize, separated_by_lines};
 pub(crate) use plan_values::value_from_source;
 
 pub use expression::{
@@ -96,7 +99,7 @@ mod executor;
 pub use executor::{
     CustomOperatorResult, DocumentScope, ExecutionError, ExecutionErrorKind, ExecutionOutput,
     ExecutionResult, ExecutionRow, ExecutionRowOrigin, ExecutionStatistics, ExecutionStrategies,
-    ExecutionStrategy, IncrementalGroupAccumulator, IncrementalPivotAccumulator,
+    ExecutionStrategy, IncrementalGroupAccumulator, IncrementalPivotAccumulator, PivotRun,
     PreparedInsertDocument, Reservoir, StreamingLoadMutation, SyntheticDocument,
 };
 
@@ -121,11 +124,11 @@ mod batch;
 pub(crate) mod keys;
 
 pub(crate) use batch::keep;
-pub use batch::{Abort, BatchProgram, BatchRunner, Column, Tag, BATCH_ROWS};
+pub use batch::{Abort, BatchProgram, BatchRunner, BlockKernel, Column, KernelColumn, Tag, BATCH_ROWS};
 
-pub(crate) use executor::{check_sort_kinds, compare_owned_projected_rows, TopSelection};
+pub(crate) use executor::{compare_owned_projected_rows, TopSelection};
 pub use prune::GroupPruning;
-pub use totality::{total_kinds, Kinds};
+pub use totality::{summable, total_kinds, Kinds};
 
 pub use projected_values::{
     document_of_fields, AccessVector, ProjectedPredicate, ProjectedValueLayout,
@@ -136,7 +139,8 @@ mod runtime_materializer;
 mod window;
 pub use window::{FillSpec, WindowSpec};
 
-pub(crate) use runtime_materializer::{describe_group_fields, group_field_layout, path_value};
+pub(crate) use runtime_materializer::{compact_group_item, describe_group_fields, group_field_layout, path_value, split_derive_assignments};
+pub(crate) use planner::{group_key_marker, group_measure_marker};
 pub use runtime_materializer::{
     CompiledStage, DenseGroups, QueryRuntime, RuntimeMaterializer, SlotExpansion,
 };

@@ -1,0 +1,29 @@
+{
+  "note": "Business concepts a request may name that a Place does not always hold (wip/APP_MODELE_SEMANTIQUE.md, step 7). A request naming one of the phrases (normalised words, a trailing s dropped) of a concept none of whose `catalog` phrases appears in the catalog of the Place (labels and vocabulary) is routed to « absent »: the answer says what is missing and what to import. The phrases name the concept as an object of analysis (« chaque équipe », not « mon équipe »).",
+  "concepts": [
+    {"id": "commercial", "label": {"fr": "commerciaux", "en": "sales representatives"},
+     "phrases": ["commerciaux", "chaque commercial", "par commercial", "mon commercial", "un commercial", "le commercial", "vendeur", "vendeuse", "representant", "force de vente", "attache commercial", "sales rep", "salesperson", "account manager"],
+     "catalog": ["commercial", "commerciaux", "vendeur", "representant", "salesperson", "sales rep"]},
+    {"id": "equipe", "label": {"fr": "équipes", "en": "teams"},
+     "phrases": ["chaque equipe", "par equipe", "entre equipes", "each team", "by team", "per team"],
+     "catalog": ["equipe", "team"]},
+    {"id": "commande", "label": {"fr": "commandes", "en": "orders"},
+     "phrases": ["commande", "carnet de commande", "bon de commande", "purchase order", "sales order", "order book", "backlog"],
+     "catalog": ["commande", "order"]},
+    {"id": "devis", "label": {"fr": "devis", "en": "quotes"},
+     "phrases": ["devi", "offre commerciale", "quote", "quotation"],
+     "catalog": ["devi", "quote"]},
+    {"id": "prospect", "label": {"fr": "prospects", "en": "prospects"},
+     "phrases": ["prospect", "lead", "pipeline commercial", "opportunite commerciale"],
+     "catalog": ["prospect", "lead", "opportunite"]},
+    {"id": "campagne", "label": {"fr": "campagnes marketing", "en": "marketing campaigns"},
+     "phrases": ["campagne marketing", "campagne publicitaire", "marketing campaign"],
+     "catalog": ["campagne", "campaign"]},
+    {"id": "satisfaction", "label": {"fr": "satisfaction client", "en": "customer satisfaction"},
+     "phrases": ["satisfaction client", "nps", "reclamation", "customer satisfaction", "complaint"],
+     "catalog": ["satisfaction", "nps", "reclamation", "complaint"]},
+    {"id": "livraison", "label": {"fr": "livraisons", "en": "deliveries"},
+     "phrases": ["livraison", "delai de livraison", "delivery"],
+     "catalog": ["livraison", "delivery"]}
+  ]
+}

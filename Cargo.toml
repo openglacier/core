@@ -1,6 +1,6 @@
 [package]
 name = "openglacier-core"
-version = "1.0.5"
+version = "2.0.0"
 edition = "2021"
 description = "An event-first, schema-less document database engine and capability runtime"
 repository = "https://github.com/openglacier/core"
@@ -48,11 +48,11 @@ path = "src/lib.rs"
 [features]
 # The default build is a local database node with authentication and the admin CLI.
 # Additional service families remain explicit compile-time opt-ins.
-default = ["database", "auth", "cli"]
+default = ["database", "auth", "cli", "search", "search-documents"]
 
 # Internal implementation features. These are not published OG capabilities.
 db-engine = []
-identity = ["dep:argon2", "dep:chacha20poly1305", "dep:ed25519-dalek"]
+identity = ["dep:argon2", "dep:chacha20poly1305", "dep:ed25519-dalek", "dep:sha2"]
 
 # Service capabilities. These control which operation families may be enabled at runtime.
 database = ["db-engine"]
@@ -62,6 +62,15 @@ events = ["db-engine"]
 data-import = []
 llm = ["dep:llama-cpp-2", "dep:encoding_rs", "dep:og-llama-common-chat"]
 agent = []
+# Search through all a Place holds (place.search, src/search/).
+search = ["db-engine"]
+# The text of PDF, spreadsheets and office documents in the search (src/search/extract.rs).
+search-documents = ["search", "dep:pdf-extract", "dep:calamine", "dep:zip"]
+# The native data worker (`ogd data-worker`, src/import/): reads CSV, text and Excel files for data.import without
+# Python. When compiled, it is the worker; OG_DATA_WORKER=python asks for the Python one instead.
+native-import = ["dep:calamine", "dep:encoding_rs", "dep:regex", "dep:unicode-normalization", "dep:sha1"]
+# SMTP/SMTPS submission through a remote server (mail.send), routed like any Place provider.
+mailsend = ["dep:rustls", "dep:webpki-roots"]
 
 # Optional llama.cpp GPU backends. The runtime defaults to OGD_LLM_DEVICE=auto,
 # but a CUDA-capable binary still has to be built explicitly.
@@ -70,22 +79,26 @@ cuda-no-vmm = ["cuda", "llama-cpp-2/cuda-no-vmm", "og-llama-common-chat/cuda-no-
 full-cuda = ["full", "cuda"]
 
 # Infrastructure capabilities.
-fabric = ["identity", "dep:tungstenite", "dep:sha2"]
+fabric = ["identity", "dep:tungstenite", "dep:sha2", "dep:rustix"]
 files-watch = ["files", "dep:notify"]
 cli = ["identity", "dep:rustyline", "dep:rpassword"]
 cli-tui = ["cli", "dep:ratatui", "dep:crossterm"]
 
-# Historical/full daemon build plus optional extension providers.
-# data-import, llm and agent are compiled but remain disabled by default unless
+# Everything a server node can serve, with the native data worker.
+# data-import, llm, agent and mailsend are compiled but remain disabled by default unless
 # OGD_NODE_CAPABILITIES explicitly requests them.
 full = [
     "database",
+    "search",
+    "search-documents",
     "auth",
     "files",
     "events",
     "data-import",
+    "native-import",
     "llm",
     "agent",
+    "mailsend",
     "fabric",
     "files-watch",
 ]
@@ -93,6 +106,10 @@ full = [
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
+zstd = { version = "0.13", default-features = false }
+pdf-extract = { version = "0.7", optional = true }
+calamine = { version = "0.36", optional = true, default-features = false }
+zip = { version = "8.6", optional = true, default-features = false, features = ["deflate"] }
 serde_json = "1"
 rustyline = { version = "15", optional = true }
 ratatui = { version = "0.30", optional = true }
@@ -104,8 +121,13 @@ rpassword = { version = "7", optional = true }
 notify = { version = "8", optional = true }
 tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"], optional = true }
 sha2 = { version = "0.10.9", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = { version = "1", optional = true }
 llama-cpp-2 = { version = "=0.1.156", optional = true }
 encoding_rs = { version = "0.8.35", optional = true }
+regex = { version = "1.13", optional = true }
+unicode-normalization = { version = "0.1.26", optional = true }
+sha1 = { version = "0.10", optional = true }
 getrandom = "0.4"
 og-llama-common-chat = {
     package = "openglacier-llama-common-chat",
@@ -115,6 +137,10 @@ og-llama-common-chat = {
 
 [target.'cfg(all(target_pointer_width = "64", target_family = "unix"))'.dependencies]
 mmap-guard = "=0.2.2"
+
+# poll(2) for the node channel bridge (fabric).
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", optional = true, default-features = false, features = ["std", "event"] }
 
 [dev-dependencies]
 proptest = "1"

@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! File metadata and storage-provider contracts.
 //!
 //! `_files` is an App-scoped metadata collection. File contents are never

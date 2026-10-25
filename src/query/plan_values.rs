@@ -187,7 +187,7 @@ pub struct InsertDocument {
 
 impl InsertDocument {
     pub fn parse(source: impl AsRef<str>) -> PlanValueResult<Self> {
-        let source = non_empty_text(
+        let source = crate::helpers::non_empty_text(
             source.as_ref(),
             PlanValueError::empty_insert_specification,
         )?;
@@ -208,7 +208,7 @@ impl InsertDocument {
 /// The value a literal (`[…]`, `{…}` with bare or quoted keys, scalars)
 /// denotes, numbers read as by a value coercion.
 pub(crate) fn value_from_source(source: &str) -> PlanValueResult<Value> {
-    let source = non_empty_text(source, PlanValueError::empty_value_source)?;
+    let source = crate::helpers::non_empty_text(source, PlanValueError::empty_value_source)?;
     let value = parse_value_source(source).map_err(|error| PlanValueError::invalid_value(error.to_string()))?;
     value_from_ast(&value, source, |text| {
         crate::model::parse_number_value(text).map(Value::Number).map_err(|error| PlanValueError::invalid_value(format!("invalid number {text:?}: {error}")))
@@ -696,14 +696,6 @@ impl fmt::Display for FieldListContext {
             Self::PivotValues => formatter.write_str("pivot values"),
         }
     }
-}
-
-fn non_empty_text( text: &str, error: fn() -> PlanValueError, ) -> PlanValueResult<&str> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(error());
-    }
-    Ok(text)
 }
 
 fn validate_identifier(identifier: &str, context: IdentifierContext) -> PlanValueResult<()> {

@@ -69,6 +69,7 @@ pub struct CommitAuthor {
 
 thread_local! {
     static COMMIT_AUTHOR: RefCell<Option<CommitAuthor>> = const { RefCell::new(None) };
+    static COMMIT_RECORD: RefCell<Option<CommitRecord>> = const { RefCell::new(None) };
 }
 
 /// Runs `body` with `author` as the author of the commits it makes on this
@@ -102,7 +103,24 @@ pub struct CommitRecord {
 impl CommitRecord {
     /// The record of a commit made now by the current thread's author.
     #[must_use]
-    pub fn now(generation: u64) -> Self { Self { generation, millis: crate::helpers::now_millis(), author: current_commit_author() } }
+    pub fn now(generation: u64) -> Self {
+        match COMMIT_RECORD.with(|record| record.borrow().clone()) {
+            Some(record) => Self { generation, ..record },
+            None => Self { generation, millis: crate::helpers::now_millis(), author: current_commit_author() },
+        }
+    }
+
+    /// Runs `body` with the time and author of `self` given to the commits it
+    /// makes on this thread: a restored commit keeps its own.
+    pub fn apply<R>(self, body: impl FnOnce() -> R) -> R {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) { COMMIT_RECORD.with(|current| *current.borrow_mut() = None); }
+        }
+        COMMIT_RECORD.with(|current| *current.borrow_mut() = Some(self));
+        let _restore = Restore;
+        body()
+    }
 }
 
 /// Point in time of an `as of` read.
@@ -183,6 +201,10 @@ impl Timeline {
 
     #[must_use]
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+
+    /// The records, by generation.
+    #[must_use]
+    pub fn entries(&self) -> &[CommitRecord] { &self.entries }
 
     fn record(&self, generation: u64) -> Option<&CommitRecord> {
         self.entries.binary_search_by_key(&generation, |entry| entry.generation).ok().map(|index| &self.entries[index])
@@ -319,6 +341,13 @@ pub trait HistorySource {
     /// Oldest generation whose state the source can rebuild.
     fn floor(&self) -> u64;
 
+    /// Whether the source holds the state at its floor ([`HistoryOp::Baseline`]
+    /// events) and the commit times: false for a backup journal.
+    fn keeps_baseline(&self) -> bool { true }
+
+    /// Every collection with events, including those no longer live.
+    fn collections(&self) -> StorageResult<Vec<CollectionId>>;
+
     /// Visits the events of `collection` whose generation is in
     /// `(after, upto]`, in generation order (commit order within one
     /// generation); stops when `visitor` returns `false`. With `ids`, events
@@ -336,6 +365,21 @@ pub trait HistorySource {
 
     /// Commit times recorded so far.
     fn timeline(&self) -> StorageResult<Timeline>;
+}
+
+/// Writes recorded history into a store that has none yet (a backup
+/// restored with its history): the documents of the baseline with their
+/// versions, then the start of the history at its floor, then each commit
+/// with its generation, time and author, in generation order.
+pub trait HistoryWriter {
+    /// Puts documents as they were when history started, versions kept.
+    fn baseline(&mut self, collection: &CollectionId, rows: Vec<StoredDocument>) -> StorageResult<()>;
+
+    /// Starts the history at `base.generation`: the baseline is the state then.
+    fn start(&mut self, base: CommitRecord) -> StorageResult<()>;
+
+    /// Commits the events of `record.generation`, above every earlier one.
+    fn commit(&mut self, record: CommitRecord, events: Vec<(CollectionId, HistoryEvent)>) -> StorageResult<()>;
 }
 
 /// Per-query cache shared by the read views of one temporal query: the
@@ -514,12 +558,7 @@ impl StorageRead for Merged<'_, '_> {
     }
 
     fn scan(&self, collection: &CollectionId, options: ScanOptions) -> StorageResult<Vec<StoredDocument>> {
-        let mut rows = Vec::new();
-        self.scan_each(collection, options, &mut |stored| {
-            rows.push(stored);
-            Ok(true)
-        })?;
-        Ok(rows)
+        crate::helpers::collect_scan(|visit| self.scan_each(collection, options, visit))
     }
 
     fn scan_each(&self, collection: &CollectionId, options: ScanOptions, visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>) -> StorageResult<()> {
@@ -821,12 +860,7 @@ impl StorageRead for HistoryRead<'_> {
     }
 
     fn scan(&self, collection: &CollectionId, options: ScanOptions) -> StorageResult<Vec<StoredDocument>> {
-        let mut rows = Vec::new();
-        self.scan_each(collection, options, &mut |stored| {
-            rows.push(stored);
-            Ok(true)
-        })?;
-        Ok(rows)
+        crate::helpers::collect_scan(|visit| self.scan_each(collection, options, visit))
     }
 
     fn scan_each(&self, collection: &CollectionId, options: ScanOptions, visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>) -> StorageResult<()> {

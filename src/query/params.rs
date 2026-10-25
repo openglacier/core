@@ -80,6 +80,8 @@ fn prepare(query: &str, parameters: &Map<String, JsonValue>, mut free: Option<&m
     if crate::view::Statement::is_statement(query) {
         return Ok(query.to_owned());
     }
+    // Stages separated by `;` and lines are read as `|` from here on.
+    let query = super::separators::normalize(query)?;
     let mut variables = parameters.clone();
     let mut declared = Vec::new();
     let mut rest = query.trim_start();
@@ -201,23 +203,10 @@ fn split_first_stage(text: &str) -> Result<(&str, &str), String> {
 }
 
 /// The byte ranges of the top-level stages of `text`, between the `|` that
-/// separate them (`||` is the `or` operator, not a separator).
+/// separate them (`||` is the `or` operator, not a separator), or between its
+/// `;` and line breaks when it holds no `|` ([`super::separators`]).
 pub(crate) fn stage_ranges(text: &str) -> Result<Vec<std::ops::Range<usize>>, String> {
-    let (mut ranges, mut start, mut state) = (Vec::new(), 0, ScanState::default());
-    let mut characters = text.char_indices().peekable();
-    while let Some((index, character)) = characters.next() {
-        state.consume(character)?;
-        if character == '|' && state.is_top_level() {
-            if characters.peek().is_some_and(|(_, next)| *next == '|') {
-                characters.next();
-                continue;
-            }
-            ranges.push(start..index);
-            start = index + 1;
-        }
-    }
-    ranges.push(start..text.len());
-    Ok(ranges)
+    super::separators::layout(text).map(|layout| layout.ranges(text))
 }
 
 /// Evaluates `$name = <expression>` against the variables bound so far.

@@ -11,9 +11,9 @@ use serde::Serialize;
 
 use crate::operation::LlmGenerateInput;
 
-pub use config::{LlmConfig, LlmConfigError, LlmDevice, LlmGpuLayers, LlmThinking};
+pub use config::{LlmConfig, LlmConfigError, LlmDevice, LlmGpuLayers, LlmPooling, LlmThinking};
 use runtime::LlmRuntime;
-pub use runtime::{LlmError, LlmGenerationEvent, LlmGenerationStats};
+pub use runtime::{LlmEmbeddings, LlmError, LlmGenerationEvent, LlmGenerationStats};
 pub use scheduler::ScheduledRun as LlmRun;
 
 pub struct LlmService {
@@ -89,6 +89,10 @@ impl LlmService {
             .generate(run, request, emit)
     }
 
+    pub fn embed(&self, run: &mut LlmRun, texts: &[String], normalize: bool) -> Result<LlmEmbeddings, LlmError> {
+        self.runtime.as_ref().ok_or(LlmError::Unconfigured)?.embed(run, texts, normalize)
+    }
+
     #[must_use]
     pub fn cancel(&self, run_id: u64, owner: &str) -> bool {
         self.runtime
@@ -119,5 +123,5 @@ pub struct LlmStatus {
 mod tests {
     use super::*;
 
-    #[test] fn status_shape_is_stable_for_unconfigured_service() { let service = LlmService { config: LlmConfig { model_path: None, context_size: std::num::NonZeroU32::new(4096).unwrap(), threads: None, max_tokens: 512, seed: 1234, max_parallel: 1, queue_size: 16, chat_template: None, device: LlmDevice::Auto, gpu_layers: LlmGpuLayers::Auto, thinking: LlmThinking::Auto, prefix_cache_max_bytes: 1024 * 1024 * 1024, }, runtime: None, }; let status = service.status(); assert!(!status.ready); assert_eq!(status.state, "unconfigured"); assert_eq!(status.backend, "llama.cpp"); assert_eq!(status.thinking, "auto"); }
+    #[test] fn status_shape_is_stable_for_unconfigured_service() { let service = LlmService { config: LlmConfig { model_path: None, context_size: std::num::NonZeroU32::new(4096).unwrap(), threads: None, max_tokens: 512, seed: 1234, max_parallel: 1, queue_size: 16, chat_template: None, device: LlmDevice::Auto, gpu_layers: LlmGpuLayers::Auto, thinking: LlmThinking::Auto, prefix_cache_max_bytes: 1024 * 1024 * 1024, pooling: None, }, runtime: None, }; let status = service.status(); assert!(!status.ready); assert_eq!(status.state, "unconfigured"); assert_eq!(status.backend, "llama.cpp"); assert_eq!(status.thinking, "auto"); }
 }

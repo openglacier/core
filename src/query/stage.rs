@@ -237,12 +237,12 @@ fn validate_stage_name(name: &str) -> Result<(), StageNameError> {
         return Err(StageNameError::EmptyName);
     };
 
-    if !is_stage_name_start(first) {
+    if !crate::helpers::is_identifier_start(first) {
         return Err(StageNameError::InvalidNameStart { character: first });
     }
 
     for (index, character) in characters {
-        if !is_stage_name_continue(character) {
+        if !crate::helpers::is_identifier_continue(character) {
             return Err(StageNameError::InvalidNameCharacter { index, character });
         }
     }
@@ -250,13 +250,6 @@ fn validate_stage_name(name: &str) -> Result<(), StageNameError> {
     Ok(())
 }
 
-fn is_stage_name_start(character: char) -> bool {
-    character == '_' || character.is_alphabetic()
-}
-
-fn is_stage_name_continue(character: char) -> bool {
-    character == '_' || character.is_alphabetic() || character.is_ascii_digit()
-}
 
 #[cfg(test)]
 mod tests {

@@ -95,71 +95,25 @@ impl Default for AgentConfig {
 
 impl AgentConfig {
     pub fn from_environment() -> Result<Self, AgentError> {
-        let mut config = Self::default();
-        if let Some(value) = env_u32("OGD_AGENT_MAX_STEPS")? {
-            if value == 0 || value > MAX_MAX_STEPS {
-                return Err(AgentError::Configuration(format!(
-                    "OGD_AGENT_MAX_STEPS must be between 1 and {MAX_MAX_STEPS}"
-                )));
-            }
-            config.max_steps = value;
-        }
-        if let Some(value) = env_u32("OGD_AGENT_LLM_MAX_TOKENS")? {
-            if value == 0 {
-                return Err(AgentError::Configuration(
-                    "OGD_AGENT_LLM_MAX_TOKENS must be greater than zero".to_owned(),
-                ));
-            }
-            config.llm_max_tokens = value;
-        }
-        if let Some(value) = env_u32("OGD_AGENT_SYNTHESIS_MAX_TOKENS")? {
-            if value == 0 {
-                return Err(AgentError::Configuration(
-                    "OGD_AGENT_SYNTHESIS_MAX_TOKENS must be greater than zero".to_owned(),
-                ));
-            }
-            config.synthesis_max_tokens = value;
-        }
-        if let Some(value) = env_u32("OGD_AGENT_MAX_DATABASE_QUERIES")? {
-            if value == 0 || value > MAX_MAX_DATABASE_QUERIES {
-                return Err(AgentError::Configuration(format!(
-                    "OGD_AGENT_MAX_DATABASE_QUERIES must be between 1 and {MAX_MAX_DATABASE_QUERIES}"
-                )));
-            }
-            config.max_database_queries = value;
-        }
-        if let Some(value) = env_usize("OGD_AGENT_MAX_TOOL_BYTES")? {
-            if value == 0 || value > MAX_MAX_TOOL_BYTES {
-                return Err(AgentError::Configuration(format!(
-                    "OGD_AGENT_MAX_TOOL_BYTES must be between 1 and {MAX_MAX_TOOL_BYTES}"
-                )));
-            }
-            config.max_tool_bytes = value;
-        }
-        Ok(config)
+        let defaults = Self::default();
+        Ok(Self {
+            max_steps: setting("OGD_AGENT_MAX_STEPS", defaults.max_steps, Some(MAX_MAX_STEPS))?,
+            llm_max_tokens: setting("OGD_AGENT_LLM_MAX_TOKENS", defaults.llm_max_tokens, None)?,
+            synthesis_max_tokens: setting("OGD_AGENT_SYNTHESIS_MAX_TOKENS", defaults.synthesis_max_tokens, None)?,
+            max_database_queries: setting("OGD_AGENT_MAX_DATABASE_QUERIES", defaults.max_database_queries, Some(MAX_MAX_DATABASE_QUERIES))?,
+            max_tool_bytes: setting("OGD_AGENT_MAX_TOOL_BYTES", defaults.max_tool_bytes, Some(MAX_MAX_TOOL_BYTES))?,
+        })
     }
 }
 
-fn env_u32(name: &str) -> Result<Option<u32>, AgentError> {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            value.parse::<u32>().map_err(|error| {
-                AgentError::Configuration(format!("{name} must be an unsigned integer: {error}"))
-            })
-        })
-        .transpose()
-}
-
-fn env_usize(name: &str) -> Result<Option<usize>, AgentError> {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            value.parse::<usize>().map_err(|error| {
-                AgentError::Configuration(format!("{name} must be an unsigned integer: {error}"))
-            })
-        })
-        .transpose()
+/// A count setting from 1 to `max`, `current` when it is unset.
+fn setting<T: std::str::FromStr + PartialOrd + Default + Copy + std::fmt::Display>(name: &str, current: T, max: Option<T>) -> Result<T, AgentError> where T::Err: std::fmt::Display {
+    let Ok(text) = env::var(name) else { return Ok(current) };
+    let value: T = text.parse().map_err(|error| AgentError::Configuration(format!("{name} must be an unsigned integer: {error}")))?;
+    if value <= T::default() || max.is_some_and(|max| value > max) {
+        return Err(AgentError::Configuration(max.map_or_else(|| format!("{name} must be greater than zero"), |max| format!("{name} must be between 1 and {max}"))));
+    }
+    Ok(value)
 }
 
 /// Current state of the local Agent orchestrator.
@@ -1110,7 +1064,7 @@ fn extract_count(response: &AgentCapabilityResponse) -> Option<u64> {
         .find_map(|document| document.u64_field("count"))
 }
 
-fn response_documents(response: &AgentCapabilityResponse) -> Vec<&JsonValue> {
+pub(crate) fn response_documents(response: &AgentCapabilityResponse) -> Vec<&JsonValue> {
     if !response.partials.is_empty() {
         return response.partials.iter().collect();
     }
@@ -1385,6 +1339,7 @@ mod tests {
             context: crate::RequestedExecutionContext {
                 place_id: "place-1".to_owned(),
                 app_instance_id: Some("app-1".to_owned()),
+                as_profile: None,
             },
             max_steps: None,
             max_tokens: None,
@@ -1405,7 +1360,7 @@ mod tests {
     #[test] fn summary_requires_one_successful_query_before_auto_answer() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Fais moi une synthèse de la table data_people".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on data_people | group country | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; service.run(&input, &mut invoker, |_| true).unwrap(); assert_eq!(invoker.llm_requests.len(), 3); assert_eq!(invoker.llm_requests[1].str_field("toolChoice"), Some("required")); let required_names = invoker.llm_requests[1].array_field("tools").unwrap().iter().filter_map(|tool| tool.str_field("name")).collect::<Vec<_>>(); assert_eq!(required_names, vec!["database.query"]); assert_eq!(invoker.llm_requests[2].str_field("toolChoice"), Some("auto")); let auto_names = invoker.llm_requests[2].array_field("tools").unwrap().iter().filter_map(|tool| tool.str_field("name")).collect::<Vec<_>>(); assert_eq!(auto_names, vec!["database.query"]); }
     #[test] fn detailed_statistics_require_two_successful_queries_before_auto_answer() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Quelles données sont présentes dans data_people ? Avec valeurs et statistiques ?".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on data_people | group country | sort count desc | limit 20"} })], vec![json!({ "type":"toolCall", "id":"call-3", "name":"database.query", "arguments":{"query":"on data_people | distinct name | limit 20"} })], vec![json!({"type":"token","text":"Detailed statistics"})], ], llm_requests: Vec::new(), }; service.run(&input, &mut invoker, |_| true).unwrap(); assert_eq!(invoker.llm_requests.len(), 4); for request in &invoker.llm_requests[1..=2] { assert_eq!(request.str_field("toolChoice"), Some("required")); let names = request.array_field("tools").unwrap().iter().filter_map(|tool| tool.str_field("name")).collect::<Vec<_>>(); assert_eq!(names, vec!["database.query"]); } assert_eq!(invoker.llm_requests[3].str_field("toolChoice"), Some("auto")); let final_names = invoker.llm_requests[3].array_field("tools").unwrap().iter().filter_map(|tool| tool.str_field("name")).collect::<Vec<_>>(); assert_eq!(final_names, vec!["database.query"]); }
     #[test] fn prose_during_required_query_phase_is_not_accepted_and_is_retried() { let service = AgentService { config: AgentConfig::default(), }; let mut input = request(); input.messages[0].content = "Fais moi une synthèse de la table data_people".to_owned(); let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.describe", "arguments":{"collection":"data_people"} })], vec![json!({"type":"token","text":"You could run a group query."})], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on data_people | group country | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"Summary from actual evidence"})], ], llm_requests: Vec::new(), }; let mut events = Vec::new(); service.run(&input, &mut invoker, |event| { events.push(event); true }).unwrap(); assert_eq!(invoker.llm_requests.len(), 4); assert_eq!(invoker.llm_requests[1].str_field("toolChoice"), Some("required")); assert_eq!(invoker.llm_requests[2].str_field("toolChoice"), Some("required")); let retry_messages = invoker.llm_requests[2].array_field("messages").unwrap(); assert_eq!(retry_messages.last().and_then(|message| message.get("role")).and_then(JsonValue::as_str), Some("user")); assert_eq!(retry_messages.last().and_then(|message| message.get("content")).and_then(JsonValue::as_str), Some(REQUIRED_DATABASE_QUERY_RETRY_DIRECTIVE)); assert!(!events.iter().any(|event| event.str_field("type") == Some("message") && event.str_field("content") == Some("You could run a group query."))); assert!(events.iter().any(|event| event.str_field("type") == Some("message") && event.str_field("content") == Some("Summary from actual evidence"))); }
-    #[test] fn observed_fields_reports_types_coverage_and_nested_paths() { let documents = vec![ json!({ "_id":"1", "name":"Ada", "active":true, "score":12, "address":{"country":"FR"} }), json!({ "_id":"2", "name":"Grace", "score":null, "address":{"country":"US"} }), ]; let refs = documents.iter().collect::<Vec<_>>(); let (fields, system_fields) = observed_fields(&refs); assert_eq!(system_fields, vec!["_id".to_owned()]); let name = fields .iter() .find(|field| field.str_field("path") == Some("name")) .expect("name field"); assert_eq!(name.get("coverage").and_then(JsonValue::as_f64), Some(1.0)); assert_eq!(name["types"], json!(["string"])); let active = fields .iter() .find(|field| field.str_field("path") == Some("active")) .expect("active field"); assert_eq!(active.get("coverage").and_then(JsonValue::as_f64), Some(0.5)); assert!(fields.iter().any(|field| { field.str_field("path") == Some("address.country") })); let score = fields .iter() .find(|field| field.str_field("path") == Some("score")) .expect("score field"); assert_eq!(score["types"], json!(["null", "number"])); }
+    #[test] fn observed_fields_reports_types_coverage_and_nested_paths() { let documents = [ json!({ "_id":"1", "name":"Ada", "active":true, "score":12, "address":{"country":"FR"} }), json!({ "_id":"2", "name":"Grace", "score":null, "address":{"country":"US"} }), ]; let refs = documents.iter().collect::<Vec<_>>(); let (fields, system_fields) = observed_fields(&refs); assert_eq!(system_fields, vec!["_id".to_owned()]); let name = fields .iter() .find(|field| field.str_field("path") == Some("name")) .expect("name field"); assert_eq!(name.get("coverage").and_then(JsonValue::as_f64), Some(1.0)); assert_eq!(name["types"], json!(["string"])); let active = fields .iter() .find(|field| field.str_field("path") == Some("active")) .expect("active field"); assert_eq!(active.get("coverage").and_then(JsonValue::as_f64), Some(0.5)); assert!(fields.iter().any(|field| { field.str_field("path") == Some("address.country") })); let score = fields .iter() .find(|field| field.str_field("path") == Some("score")) .expect("score field"); assert_eq!(score["types"], json!(["null", "number"])); }
     #[test] fn database_describe_uses_count_and_streaming_observation() { let mut invoker = FakeInvoker::default(); let value = invoke_agent_tool( &mut invoker, "database.describe", json!({"collection":"data_people"}), ) .unwrap(); assert_eq!(invoker.calls, vec!["query.execute", "query.execute"]); assert_eq!(value.str_field("collection"), Some("data_people")); assert_eq!(value.u64_field("documents"), Some(2)); assert_eq!(value.u64_field("observedDocuments"), Some(2)); assert_eq!(value.u64_field("observationLimit"), Some(128)); assert_eq!(value.str_field("observationStrategy"), Some("streaming-prefix")); assert_eq!(value.str_field("schemaKind"), Some("observed")); let fields = value.array_field("fields").unwrap(); assert!(fields.iter().any(|field| { field.str_field("path") == Some("country") })); }
     #[test] fn database_analysis_can_issue_multiple_queries_before_answering() { let service = AgentService { config: AgentConfig::default(), }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | count"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on people | group country | sort count desc | limit 20"} })], vec![json!({"type":"token","text":"There are people in several countries."})], ], llm_requests: Vec::new(), }; let stats = service.run(&request(), &mut invoker, |_| true).unwrap(); assert_eq!(stats.tool_calls, 2); assert_eq!(stats.llm_calls, 3); assert_eq!( invoker.calls, vec![ "llm.generate", "query.execute", "llm.generate", "query.execute", "llm.generate", ] ); for request in &invoker.llm_requests[1..] { assert_eq!( request.str_field("toolChoice"), Some("auto") ); let names = request.array_field("tools") .expect("database tools") .iter() .filter_map(|tool| tool.str_field("name")) .collect::<Vec<_>>(); assert_eq!(names, vec!["database.describe", "database.query"]); } }
     #[test] fn database_query_limit_forces_a_tool_free_synthesis_turn() { let service = AgentService { config: AgentConfig { max_database_queries: 2, ..AgentConfig::default() }, }; let mut invoker = FakeInvoker { calls: Vec::new(), llm_outputs: vec![ vec![json!({ "type":"toolCall", "id":"call-1", "name":"database.query", "arguments":{"query":"on people | count"} })], vec![json!({ "type":"toolCall", "id":"call-2", "name":"database.query", "arguments":{"query":"on people | group country"} })], vec![json!({"type":"token","text":"Summary"})], ], llm_requests: Vec::new(), }; service.run(&request(), &mut invoker, |_| true).unwrap(); let final_request = invoker.llm_requests.last().expect("final request"); assert_eq!( final_request.str_field("toolChoice"), Some("none") ); assert_eq!( final_request.array_field("tools") .map(Vec::len), Some(0) ); assert_eq!( final_request.u64_field("maxTokens"), Some(u64::from(DEFAULT_SYNTHESIS_MAX_TOKENS)) ); }

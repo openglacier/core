@@ -80,13 +80,7 @@ impl<'a> FileSyncSource<'a> {
             let id = self.next_request_id();
             load_place(self.engine, id, place_id).map_err(query_response_message)?.resource_assignments
         };
-        Ok(assignments.iter().any(|entry| {
-            let entry_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str);
-            let entry_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-            let capability = entry.str_field("capability");
-            let storage_role = resource_assignment_storage_role(entry);
-            entry_identity == Some(identity_id) && entry_device == Some(device_id) && capability == Some("files") && storage_role == Some("sync")
-        }))
+        Ok(assignments.iter().any(|entry| syncs_files(entry, identity_id, device_id)))
     }
 
     pub(super) fn sync_place_ids(&mut self, identity_id: &str, device_id: &str) -> Result<Vec<String>, String> {
@@ -100,16 +94,7 @@ impl<'a> FileSyncSource<'a> {
             for place in places {
                 let Some(place_id) = place.get("placeId").or_else(|| place.get("id")).and_then(JsonValue::as_str) else { continue; };
                 let assignments = place.array_field("resourceAssignments");
-                let sync = assignments.is_some_and(|assignments| assignments.iter().any(|entry| {
-                    let entry_identity = entry.get("identityId").or_else(|| entry.get("nodeIdentityId")).and_then(JsonValue::as_str);
-                    let entry_device = entry.get("deviceId").or_else(|| entry.get("nodeDeviceId")).or_else(|| entry.get("nodeId")).and_then(JsonValue::as_str);
-                    let capability = entry.str_field("capability");
-                    let storage_role = resource_assignment_storage_role(entry);
-                    entry_identity == Some(identity_id)
-                        && entry_device == Some(device_id)
-                        && capability == Some("files")
-                        && storage_role == Some("sync")
-                }));
+                let sync = assignments.is_some_and(|assignments| assignments.iter().any(|entry| syncs_files(entry, identity_id, device_id)));
                 if sync { result.push(place_id.to_owned()); }
             }
             return Ok(result);
@@ -193,12 +178,7 @@ impl<'a> FileSyncSource<'a> {
     pub(super) fn read_file_to_path(&mut self, entry: &FileEntry, destination: &Path) -> Result<u64, String> {
         if self.gateway.is_some() {
             let id = self.next_request_id();
-            let request = OperationRequest::new(id, "file.read", serde_json::json!({
-                "placeId": entry.place_id,
-                "instanceId": entry.app_instance_id,
-                "fileId": entry.file_id.as_str(),
-                "offset": 0,
-            }));
+            let request = OperationRequest::new(id, "file.read", about(entry, serde_json::json!({"offset": 0})));
             let websocket = self.gateway.as_mut().expect("checked above");
             return gateway_raw_read_to_path(websocket, &request, destination);
         }
@@ -213,12 +193,7 @@ impl<'a> FileSyncSource<'a> {
         let size = fs::metadata(source_path).map_err(|error| error.to_string())?.len();
         if self.gateway.is_some() {
             let id = self.next_request_id();
-            let request = OperationRequest::new(id, "file.write", serde_json::json!({
-                "placeId": entry.place_id,
-                "instanceId": entry.app_instance_id,
-                "fileId": entry.file_id.as_str(),
-                "size": size,
-            }));
+            let request = OperationRequest::new(id, "file.write", about(entry, serde_json::json!({"size": size})));
             let websocket = self.gateway.as_mut().expect("checked above");
             let data = gateway_raw_write_from_path(websocket, &request, source_path)?;
             let file = data.get("file").ok_or_else(|| "file.write returned no file metadata".to_owned())?;
@@ -321,13 +296,7 @@ impl<'a> FileSyncSource<'a> {
 
     pub(super) fn move_entry(&mut self, entry: &FileEntry, parent_id: Option<&str>, name: &str) -> Result<FileEntry, String> {
         if self.gateway.is_some() {
-            let data = self.gateway_data("file.move", serde_json::json!({
-                "placeId": entry.place_id,
-                "instanceId": entry.app_instance_id,
-                "fileId": entry.file_id.as_str(),
-                "parentId": parent_id,
-                "name": name,
-            }))?;
+            let data = self.gateway_data("file.move", about(entry, serde_json::json!({"parentId": parent_id, "name": name})))?;
             return json_to_file_entry(&data).map_err(str::to_owned);
         }
 
@@ -361,11 +330,7 @@ impl<'a> FileSyncSource<'a> {
 
     pub(super) fn delete_entry(&mut self, entry: &FileEntry) -> Result<(), String> {
         if self.gateway.is_some() {
-            self.gateway_data("file.delete", serde_json::json!({
-                "placeId": entry.place_id,
-                "instanceId": entry.app_instance_id,
-                "fileId": entry.file_id.as_str(),
-            }))?;
+            self.gateway_data("file.delete", about(entry, serde_json::json!({})))?;
             return Ok(());
         }
         let id = self.next_request_id();
@@ -377,12 +342,7 @@ impl<'a> FileSyncSource<'a> {
 
     pub(super) fn publish_file_event(&self, id: RequestId, event_type: &str, entry: &FileEntry) {
         if let Ok(audience) = place_audience(self.engine, id, &entry.place_id) {
-            publish_durable_event(self.engine, audience, event_type, serde_json::json!({
-                "placeId": entry.place_id,
-                "instanceId": entry.app_instance_id,
-                "fileId": entry.file_id.as_str(),
-                "name": entry.name,
-            }));
+            publish_durable_event(self.engine, audience, event_type, about(entry, serde_json::json!({"name": entry.name})));
         }
     }
 }
@@ -459,6 +419,40 @@ pub(super) fn file_sync_local_matches(path: &Path, entry: &FileSyncIndexEntry) -
     // so re-reading hundreds of MiB just to prove a file is unchanged is both
     // unnecessary and disastrous for large-file sync performance.
     size == entry.local_size && modified == entry.local_modified_at
+}
+
+/// A local file is uploaded only once it has been left alone this long. A copy
+/// into the sync root writes in bursts, and each pause longer than the watcher
+/// debounce would otherwise upload, and keep as a version, the prefix landed so far.
+pub(super) const FILE_SYNC_SETTLE_MS: u64 = 3_000;
+
+/// Whether `path` was written less than [`FILE_SYNC_SETTLE_MS`] ago. A modification
+/// time in the future counts as settled, or a skewed clock would hold it back forever.
+pub(super) fn file_sync_settling(path: &Path) -> bool {
+    let now = unix_time_millis();
+    file_sync_local_metadata(path).ok().and_then(|(_, modified)| modified)
+        .is_some_and(|modified| modified <= now && now - modified < FILE_SYNC_SETTLE_MS)
+}
+
+/// The index entry of a file just uploaded: its local size and time are those
+/// read `before` the upload, so a change written meanwhile, which the uploaded
+/// content may lack, still shows on the next pass.
+/// The payload naming `entry` (its Place, instance and file), with the fields of `more`.
+fn about(entry: &FileEntry, mut more: JsonValue) -> JsonValue {
+    if let Some(fields) = more.as_object_mut() { fields.extend([("placeId".to_owned(), entry.place_id.clone().into()), ("instanceId".to_owned(), entry.app_instance_id.clone().into()), ("fileId".to_owned(), entry.file_id.as_str().into())]); }
+    more
+}
+
+pub(super) fn file_sync_uploaded_entry(uploaded: &FileEntry, materialized_path: PathBuf, before: (Option<u64>, Option<u64>)) -> FileSyncIndexEntry {
+    index_entry(uploaded, materialized_path, before, FileSyncEntryState::Synced, None)
+}
+
+/// The index entry of `logical` at `path`: its remote facts, its `local` size and time, its `state` and `error`.
+fn index_entry(logical: &FileEntry, path: PathBuf, local: (Option<u64>, Option<u64>), state: FileSyncEntryState, error: Option<String>) -> FileSyncIndexEntry {
+    FileSyncIndexEntry {
+        place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(), materialized_path: path, kind: Some(logical.kind.as_str().to_owned()),
+        remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at, local_size: local.0, local_modified_at: local.1, local_fingerprint: None, state, last_error: error,
+    }
 }
 
 pub(super) fn file_sync_local_fingerprint(path: &Path) -> Result<String, String> {
@@ -551,6 +545,10 @@ pub(super) struct FileSyncMutationSummary {
     pub(super) created: u64,
     pub(super) moved: u64,
     pub(super) deleted: u64,
+    /// New local files still being written, created on a later pass.
+    pub(super) deferred: u64,
+    /// The index entries of the files created, as [`file_sync_uploaded_entry`] makes them.
+    pub(super) uploaded: Vec<FileSyncIndexEntry>,
     pub(super) conflicts: Vec<FileSyncIndexEntry>,
     pub(super) errors: Vec<JsonValue>,
 }
@@ -715,6 +713,10 @@ pub(super) fn file_sync_reconcile_local_mutations( source: &mut FileSyncSource<'
         let parent_path = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let parent_id = if parent_path == base { None } else { path_to_id.get(&parent_path).map(String::as_str) };
         if parent_path != base && parent_id.is_none() { continue; }
+        if candidate.kind == "file" && file_sync_settling(&root.join(&path)) {
+            summary.deferred = summary.deferred.saturating_add(1);
+            continue;
+        }
         let name = match file_sync_local_name(&path, candidate.kind) {
             Ok(name) => name,
             Err(error) => {
@@ -722,6 +724,7 @@ pub(super) fn file_sync_reconcile_local_mutations( source: &mut FileSyncSource<'
                 continue;
             }
         };
+        let before = file_sync_local_metadata(&root.join(&path)).unwrap_or_default();
         let created = if candidate.kind == "directory" {
             source.mkdir(&selection.place_id, &selection.app_instance_id, parent_id, &name)
         } else {
@@ -730,6 +733,9 @@ pub(super) fn file_sync_reconcile_local_mutations( source: &mut FileSyncSource<'
         match created {
             Ok(entry) => {
                 summary.created = summary.created.saturating_add(1);
+                if candidate.kind == "file" {
+                    summary.uploaded.push(file_sync_uploaded_entry(&entry, path.clone(), before));
+                }
                 path_to_id.insert(path, entry.file_id.as_str().to_owned());
             }
             Err(error) => summary.errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"path":path,"error":error})),
@@ -887,20 +893,11 @@ pub(super) fn file_sync_materialize_entry( source: &mut FileSyncSource<'_>, root
 
     if logical.kind == crate::files::FileKind::Directory {
         if destination.exists() && !destination.is_dir() {
-            return Ok((FileSyncIndexEntry {
-                place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
-                materialized_path: relative_path, kind: Some("directory".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-                local_size: None, local_modified_at: None, local_fingerprint: None, state: FileSyncEntryState::Conflict,
-                last_error: Some("a local file occupies the directory required by OpenGlacier".to_owned()),
-            }, false, false));
+            return Ok((index_entry(logical, relative_path, (None, None), FileSyncEntryState::Conflict, Some("a local file occupies the directory required by OpenGlacier".to_owned())), false, false));
         }
         fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
         let (_, modified) = file_sync_local_metadata(&destination)?;
-        return Ok((FileSyncIndexEntry {
-            place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
-            materialized_path: relative_path, kind: Some("directory".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-            local_size: None, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced, last_error: None,
-        }, false, false));
+        return Ok((index_entry(logical, relative_path, (None, modified), FileSyncEntryState::Synced, None), false, false));
     }
 
     if let Some(previous) = existing.as_ref() {
@@ -909,40 +906,26 @@ pub(super) fn file_sync_materialize_entry( source: &mut FileSyncSource<'_>, root
             let remote_unchanged = previous.remote_etag == logical.metadata.etag
                 && previous.remote_modified_at == logical.metadata.modified_at;
             if remote_unchanged {
+                if file_sync_settling(&tracked_path) {
+                    // Keep the base entry's local size and time, so a later pass still sees the change.
+                    return Ok((FileSyncIndexEntry { state: FileSyncEntryState::PendingUpload, last_error: None, ..previous.clone() }, false, false));
+                }
+                let before = file_sync_local_metadata(&tracked_path)?;
                 let updated = source.write_existing_from_path(logical, &tracked_path)?;
-                let (size, modified) = file_sync_local_metadata(&tracked_path)?;
-                return Ok((FileSyncIndexEntry {
-                    place_id: updated.place_id.clone(), app_instance_id: updated.app_instance_id.clone(), file_id: updated.file_id.as_str().to_owned(),
-                    materialized_path: previous.materialized_path.clone(), kind: Some("file".to_owned()), remote_etag: updated.metadata.etag.clone(), remote_modified_at: updated.metadata.modified_at,
-                    local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced,
-                    last_error: None,
-                }, false, true));
+                return Ok((file_sync_uploaded_entry(&updated, previous.materialized_path.clone(), before), false, true));
             }
-            return Ok((FileSyncIndexEntry {
-                place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
-                materialized_path: previous.materialized_path.clone(), kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-                local_size: previous.local_size, local_modified_at: previous.local_modified_at, local_fingerprint: previous.local_fingerprint.clone(), state: FileSyncEntryState::Conflict,
-                last_error: Some("local and remote content both changed since the last synchronization".to_owned()),
-            }, false, false));
+            let conflict = index_entry(logical, previous.materialized_path.clone(), (previous.local_size, previous.local_modified_at), FileSyncEntryState::Conflict, Some("local and remote content both changed since the last synchronization".to_owned()));
+            return Ok((FileSyncIndexEntry { local_fingerprint: previous.local_fingerprint.clone(), ..conflict }, false, false));
         }
     } else if destination.exists() {
         let (size, modified) = file_sync_local_metadata(&destination)?;
-        return Ok((FileSyncIndexEntry {
-            place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
-            materialized_path: relative_path, kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-            local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Conflict,
-            last_error: Some("an untracked local file already occupies this OpenGlacier path".to_owned()),
-        }, false, false));
+        return Ok((index_entry(logical, relative_path, (size, modified), FileSyncEntryState::Conflict, Some("an untracked local file already occupies this OpenGlacier path".to_owned())), false, false));
     }
 
     let remote_unchanged = existing.as_ref().is_some_and(|previous| previous.remote_etag == logical.metadata.etag && previous.remote_modified_at == logical.metadata.modified_at);
     if remote_unchanged && destination.exists() && existing.as_ref().is_some_and(|previous| file_sync_local_matches(&destination, previous)) {
         let (size, modified) = file_sync_local_metadata(&destination)?;
-        return Ok((FileSyncIndexEntry {
-            place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
-            materialized_path: relative_path, kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-            local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced, last_error: None,
-        }, false, false));
+        return Ok((index_entry(logical, relative_path, (size, modified), FileSyncEntryState::Synced, None), false, false));
     }
 
     let bytes = source.read_file_to_path(logical, &destination)?;
@@ -950,11 +933,7 @@ pub(super) fn file_sync_materialize_entry( source: &mut FileSyncSource<'_>, root
         return Err(format!("downloaded {bytes} bytes for {} but metadata announced {}", logical.file_id, logical.metadata.size.unwrap_or_default()));
     }
     let (size, modified) = file_sync_local_metadata(&destination)?;
-    Ok((FileSyncIndexEntry {
-        place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(),
-        materialized_path: relative_path, kind: Some("file".to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-        local_size: size, local_modified_at: modified, local_fingerprint: None, state: FileSyncEntryState::Synced, last_error: None,
-    }, true, false))
+    Ok((index_entry(logical, relative_path, (size, modified), FileSyncEntryState::Synced, None), true, false))
 }
 
 pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engine: &Engine, config: &FileSyncConfig, index: &mut FileSyncIndex, identity_id: &str, device_id: &str, allow_local_mutations: bool) -> Result<JsonValue, String> {
@@ -1001,6 +980,8 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
 
     let mut claimed = HashMap::<String, String>::new();
     let mut seen = HashSet::<(String, String, String)>::new();
+    // Place and instance scopes this pass could not read (an unreachable provider).
+    let mut unreadable = HashSet::<(String, String)>::new();
     let mut next_entries = Vec::<FileSyncIndexEntry>::new();
     let mut downloaded = 0u64;
     let mut uploaded = 0u64;
@@ -1009,6 +990,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
     let mut deleted = 0u64;
     let mut materialized = 0u64;
     let mut conflicts = 0u64;
+    let mut deferred = 0u64;
     let mut errors = Vec::<JsonValue>::new();
 
     for selection in &effective_selections {
@@ -1055,6 +1037,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
             Ok(tree) => tree,
             Err(error) => {
                 errors.push(serde_json::json!({"placeId": selection.place_id, "instanceId": selection.app_instance_id, "error": error}));
+                unreadable.insert((selection.place_id.clone(), selection.app_instance_id.clone()));
                 continue;
             }
         };
@@ -1062,6 +1045,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
             Ok(value) => value,
             Err(error) => {
                 errors.push(serde_json::json!({"placeId": selection.place_id, "instanceId": selection.app_instance_id, "error": error}));
+                unreadable.insert((selection.place_id.clone(), selection.app_instance_id.clone()));
                 continue;
             }
         };
@@ -1071,6 +1055,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
                 Ok(value) => value,
                 Err(error) => {
                     errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"error":error}));
+                    unreadable.insert((selection.place_id.clone(), selection.app_instance_id.clone()));
                     continue;
                 }
             }
@@ -1080,6 +1065,10 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
         created = created.saturating_add(mutations.created);
         moved = moved.saturating_add(mutations.moved);
         deleted = deleted.saturating_add(mutations.deleted);
+        deferred = deferred.saturating_add(mutations.deferred);
+        // A file created this pass is then materialized as the tracked entry it now is,
+        // not as an untracked local file occupying its path.
+        index.entries.extend(mutations.uploaded);
         errors.extend(mutations.errors);
         let mut blocked_ids = HashSet::<String>::new();
         if !mutations.conflicts.is_empty() {
@@ -1113,6 +1102,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
                 Ok(value) => value,
                 Err(error) => {
                     errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"error":error}));
+                    unreadable.insert((selection.place_id.clone(), selection.app_instance_id.clone()));
                     continue;
                 }
             }
@@ -1121,6 +1111,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
             Ok(value) => value,
             Err(error) => {
                 errors.push(serde_json::json!({"placeId":selection.place_id,"instanceId":selection.app_instance_id,"error":error}));
+                unreadable.insert((selection.place_id.clone(), selection.app_instance_id.clone()));
                 continue;
             }
         };
@@ -1138,17 +1129,22 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
                     if was_downloaded { downloaded = downloaded.saturating_add(1); }
                     if was_uploaded { uploaded = uploaded.saturating_add(1); }
                     if entry.state == FileSyncEntryState::Conflict { conflicts = conflicts.saturating_add(1); }
+                    if entry.state == FileSyncEntryState::PendingUpload { deferred = deferred.saturating_add(1); }
                     next_entries.push(entry);
                 }
                 Err(error) => {
                     errors.push(serde_json::json!({"placeId": logical.place_id, "instanceId": logical.app_instance_id, "fileId": logical.file_id.as_str(), "error": error}));
-                    next_entries.push(FileSyncIndexEntry {
-                        place_id: logical.place_id.clone(), app_instance_id: logical.app_instance_id.clone(), file_id: logical.file_id.as_str().to_owned(), materialized_path: paths.get(logical.file_id.as_str()).cloned().unwrap_or_default(),
-                        kind: Some(logical.kind.as_str().to_owned()), remote_etag: logical.metadata.etag.clone(), remote_modified_at: logical.metadata.modified_at,
-                        local_size: None, local_modified_at: None, local_fingerprint: None, state: FileSyncEntryState::Error, last_error: Some(error),
-                    });
+                    next_entries.push(index_entry(logical, paths.get(logical.file_id.as_str()).cloned().unwrap_or_default(), (None, None), FileSyncEntryState::Error, Some(error)));
                 }
             }
+        }
+    }
+
+    // An unreadable scope keeps its entries as they were: an unreachable provider
+    // is not a deselection, and the local copies below must not be removed.
+    for entry in index.entries.iter().filter(|entry| unreadable.contains(&(entry.place_id.clone(), entry.app_instance_id.clone()))) {
+        if seen.insert((entry.place_id.clone(), entry.app_instance_id.clone(), entry.file_id.clone())) {
+            next_entries.push(entry.clone());
         }
     }
 
@@ -1194,10 +1190,12 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
         if entry.state != FileSyncEntryState::Synced { continue; }
         let path = config.root.join(&entry.materialized_path);
         if !path.exists() { continue; }
-        if let Ok((size, modified_at)) = file_sync_local_metadata(&path) {
-            entry.local_size = size;
-            entry.local_modified_at = modified_at;
-        }
+        let Ok((size, modified_at)) = file_sync_local_metadata(&path) else { continue; };
+        // A file keeps the size and time recorded when it was synchronized: one
+        // that differs now was written since, and the next pass must see it.
+        if entry.kind.as_deref() == Some("file") && (size, modified_at) != (entry.local_size, entry.local_modified_at) { continue; }
+        entry.local_size = size;
+        entry.local_modified_at = modified_at;
         if let Ok(fingerprint) = file_sync_local_fingerprint(&path) {
             entry.local_fingerprint = Some(fingerprint);
         }
@@ -1212,6 +1210,7 @@ pub(super) fn run_file_sync_materialization(settings: &ConnectionSettings, engin
         "moved": moved,
         "deleted": deleted,
         "conflicts": conflicts,
+        "deferred": deferred,
         "errors": errors,
         "projection": {"appsDirectory": APP_FILES_DIRECTORY, "primaryAppsCollisionDirectory": PRIMARY_APPS_COLLISION_NAME},
     }))
@@ -1289,6 +1288,7 @@ pub(super) fn run_file_sync_once( settings: &ConnectionSettings, engine: &Engine
     if let Ok(mut runtime) = settings.file_sync.lock() {
         runtime.last_run_at = Some(run_at);
         runtime.last_run_error = result.as_ref().err().cloned();
+        runtime.last_run_errors = result.as_ref().ok().and_then(|summary| summary.array_field("errors")).cloned().unwrap_or_default();
     }
     result.map(|summary| (run_at, summary))
 }
@@ -1356,7 +1356,18 @@ pub(super) fn start_file_sync_worker( settings: Arc<ConnectionSettings>, engine:
     thread::Builder::new()
         .name("og-file-sync-worker".to_owned())
         .spawn(move || {
-            while let Ok(mut trigger) = trigger_rx.recv() {
+            // A pass that left files settling wakes again once they may have
+            // settled, even when no further filesystem event arrives.
+            let mut settle_wait = None::<Duration>;
+            loop {
+                let next = match settle_wait.take() {
+                    Some(wait) => match trigger_rx.recv_timeout(wait) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok("filesystem.settled".to_owned()),
+                        other => other.map_err(|_| ()),
+                    },
+                    None => trigger_rx.recv().map_err(|_| ()),
+                };
+                let Ok(mut trigger) = next else { break; };
                 if let Ok(mut runtime) = settings.file_sync.lock() {
                     runtime.worker_pending = true;
                     runtime.last_trigger = Some(trigger.clone());
@@ -1405,6 +1416,9 @@ pub(super) fn start_file_sync_worker( settings: Arc<ConnectionSettings>, engine:
                 }
                 match result {
                     Ok((completed_at, summary)) => {
+                        if summary.u64_field("deferred").is_some_and(|count| count > 0) {
+                            settle_wait = Some(Duration::from_millis(FILE_SYNC_SETTLE_MS));
+                        }
                         worker_events.publish_global("file.sync.completed", serde_json::json!({
                             "completedAt": completed_at,
                             "summary": summary,
@@ -1513,6 +1527,9 @@ pub(super) struct FileSyncRuntime {
     pub(super) config: Option<FileSyncConfig>,
     pub(super) last_run_at: Option<u64>,
     pub(super) last_run_error: Option<String>,
+    /// The errors the last completed pass reported for a Place, an instance or
+    /// an entry; some (a Place without a files provider) touch no index entry.
+    pub(super) last_run_errors: Vec<JsonValue>,
     pub(super) worker_running: bool,
     pub(super) worker_pending: bool,
     pub(super) remote_events: String,
@@ -1529,6 +1546,7 @@ impl FileSyncRuntime {
             config: None,
             last_run_at: None,
             last_run_error: None,
+            last_run_errors: Vec::new(),
             worker_running: false,
             worker_pending: false,
             remote_events: "disabled".to_owned(),
@@ -1584,6 +1602,7 @@ pub(super) fn load_file_sync_runtime(configuration: &Configuration) -> Result<Fi
         config,
         last_run_at: None,
         last_run_error: None,
+        last_run_errors: Vec::new(),
         worker_running: false,
         worker_pending: false,
         remote_events: "disabled".to_owned(),

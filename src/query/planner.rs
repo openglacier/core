@@ -505,6 +505,7 @@ impl Planner {
         match native {
             Some(Stage::Sort) => self.check_form(location, stage, Stage::Sort).and_then(|()| self.desugar_sort(location, stage)),
             Some(Stage::Bucket) => self.check_form(location, stage, Stage::Bucket).and_then(|()| self.desugar_bucket(location, stage)),
+            Some(Stage::Group) if !stage.arguments().trim().is_empty() => self.desugar_compact_group(location, stage),
             Some(Stage::Fill) => {
                 self.check_form(location, stage, Stage::Fill)?;
                 let spec = super::FillSpec::parse(stage.arguments()).map_err(|message| self.invalid_syntax(location, stage, message))?;
@@ -554,16 +555,24 @@ impl Planner {
         ])
     }
 
-    /// `pivot | … | values <expression> as <alias>, … | … | end`: every value
-    /// that is not a plain field is computed by a `derive` into a hidden
-    /// field, which the pivot then measures under the alias.
+    /// `pivot | rows … | columns … | values … | end`: every value, row or
+    /// column that is not a plain field is computed by a `derive` into a hidden
+    /// field; values are measured under their alias, rows renamed after.
     fn desugar_pivot( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
         let Some(body) = stage.subpipeline() else {
             return Ok(vec![(stage.clone(), None)]);
         };
-        let mut derived = Vec::new();
+        let (mut derived, mut renamed) = (Vec::new(), Vec::new());
         let mut children = Vec::with_capacity(body.stages().len());
         for (index, child) in body.stages().iter().enumerate() {
+            if matches!(child.name().as_str(), "rows" | "columns") && !child.is_compound() {
+                // A column's values name the cells: its alias is not kept.
+                let mut unused = Vec::new();
+                let sink = if child.name().as_str() == "rows" { &mut renamed } else { &mut unused };
+                let keys = self.hide_expression_items(location.child(index), child, HIDDEN_PIVOT_FIELD_PREFIX, &mut derived, Some(sink))?;
+                children.push(synthetic_stage(child.name().as_str(), &keys, child));
+                continue;
+            }
             if child.name().as_str() != "values" || child.is_compound() {
                 children.push(child.clone());
                 continue;
@@ -592,28 +601,44 @@ impl Planner {
             }
             children.push(synthetic_stage("values", &values.join(", "), child));
         }
-        Ok(with_derived(stage, &derived, children))
+        let mut stages = with_derived(stage, &derived, children);
+        stages.extend(renamed.iter().map(|(hidden, alias)| (synthetic_stage("rename", &format!("{hidden} as {alias}"), stage), None)));
+        Ok(stages)
     }
 
     /// `group | … | <aggregate> <value> [by <order>] [where <predicate>] [as <alias>] | … | end`:
     /// an expression, or the value where a predicate fails (`null`), is a
     /// hidden field computed by a `derive`. `first`/`last … by` measure two
     /// fields, the value and the order (`null` where the predicate fails).
+    /// `median`, `percentile <value> <fraction>` and `stddev` are a `list` of
+    /// the values that a `derive` after the group reduces with the function
+    /// of the same name.
     fn desugar_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
         let Some(body) = stage.subpipeline() else {
             return Ok(vec![(stage.clone(), None)]);
         };
-        let mut derived = Vec::new();
+        let (mut derived, mut reduced) = (Vec::new(), Vec::new());
         let mut children = Vec::with_capacity(body.stages().len());
         for (index, child) in body.stages().iter().enumerate() {
             let aggregate = child.name().as_str();
-            if child.is_compound() || !matches!(aggregate, "sum" | "avg" | "min" | "max" | "first" | "last" | "count" | "list") {
+            if aggregate == "by" && !child.is_compound() {
+                let keys = self.hide_expression_items(location.child(index), child, HIDDEN_GROUP_FIELD_PREFIX, &mut derived, None)?;
+                children.push(synthetic_stage("by", &keys, child));
+                continue;
+            }
+            if child.is_compound() || !matches!(aggregate, "sum" | "avg" | "min" | "max" | "first" | "last" | "count" | "list" | "median" | "percentile" | "stddev") {
                 children.push(child.clone());
                 continue;
             }
             let invalid = |message: String| self.invalid_syntax(location.child(index), child, message);
             let (rest, alias) = split_top_level_word(child.arguments(), "as").map_or((child.arguments().trim(), None), |(rest, alias)| (rest, Some(alias)));
             let (rest, predicate) = split_top_level_word(rest, "where").map_or((rest, None), |(rest, predicate)| (rest, Some(predicate)));
+            let (rest, fraction) = match rest.rsplit_once(char::is_whitespace) {
+                Some((value, fraction)) if aggregate == "percentile" && fraction.parse::<f64>().is_ok() => (value.trim(), Some(fraction)),
+                _ if aggregate == "percentile" => return Err(invalid("expected `percentile <value> <fraction>`, a fraction between 0 and 1".to_owned())),
+                _ => (rest, None),
+            };
+            let reduce = matches!(aggregate, "median" | "percentile" | "stddev");
             let (value, order) = split_top_level_word(rest, "by").map_or((rest, None), |(value, order)| (value, Some(order)));
             let picks = matches!(aggregate, "first" | "last");
             if order.is_some() && !picks {
@@ -623,7 +648,7 @@ impl Planner {
                 return Err(invalid(format!("`{aggregate} … where` needs `by <order>`")));
             }
             let field = |text: &str| parse_field_path(text).is_ok();
-            if predicate.is_none() && order.is_none() && (value.is_empty() || field(value)) {
+            if predicate.is_none() && order.is_none() && !reduce && (value.is_empty() || field(value)) {
                 children.push(child.clone());
                 continue;
             }
@@ -649,10 +674,48 @@ impl Planner {
                     let value = hide(value, false);
                     synthetic_stage(&format!("{aggregate}by"), &format!("{value} {} as {alias}", hide(order, true)), child)
                 }
+                None if reduce => {
+                    reduced.push(format!("{alias} = {aggregate}({alias}{})", fraction.map_or_else(String::new, |fraction| format!(", {fraction}"))));
+                    synthetic_stage("list", &format!("{} as {alias}", hide(value, true)), child)
+                }
                 None => synthetic_stage(aggregate, &format!("{} as {alias}", hide(value, true)), child),
             });
         }
-        Ok(with_derived(stage, &derived, children))
+        let mut stages = with_derived(stage, &derived, children);
+        stages.extend((!reduced.is_empty()).then(|| (synthetic_stage("derive", &reduced.join(", "), stage), None)));
+        Ok(stages)
+    }
+
+    /// Items of a `group`, `by`, `rows` or `columns` list: each `<expression>
+    /// as <alias>` that is not a field becomes a hidden field computed by a
+    /// `derive` (pushed on `derived`), written `<hidden> as <alias>`, or bare
+    /// `<hidden>` with its alias in `renamed` when the stage takes no `as`.
+    fn hide_expression_items( &self, location: StageLocation, stage: &PlannerStage, prefix: &str, derived: &mut Vec<String>, mut renamed: Option<&mut Vec<(String, String)>>, ) -> PlanningResult<String> {
+        let items = split_top_level(stage.arguments().trim(), ',').map_err(|message| self.invalid_syntax(location, stage, message))?;
+        let mut out = Vec::with_capacity(items.len());
+        for (item_index, item) in items.into_iter().enumerate() {
+            let item = item.trim();
+            let (source, alias) = split_top_level_word(item, "as").map_or((item, None), |(source, alias)| (source, Some(alias)));
+            if parse_field_path(source).is_ok() {
+                out.push(item.to_owned());
+                continue;
+            }
+            let invalid = |message: String| self.invalid_list_item(location, stage, item_index, item, message);
+            parse_expression(source).map_err(|error| invalid(format!("invalid expression {source:?}: {error}")))?;
+            let alias = parse_single_identifier(alias.ok_or_else(|| invalid(format!("an expression needs `as <alias>`: `{source} as <alias>`")))?).map_err(invalid)?;
+            let hidden = format!("{prefix}{}", derived.len());
+            derived.push(format!("{hidden} = {source}"));
+            out.push(match renamed.as_deref_mut() { Some(renamed) => { renamed.push((hidden.clone(), alias.to_owned())); hidden } None => format!("{hidden} as {alias}") });
+        }
+        Ok(out.join(", "))
+    }
+
+    /// Compact `group <key>, …, <measure>` whose items may be expressions.
+    fn desugar_compact_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<Vec<(PlannerStage, Option<Arc<str>>)>> {
+        let mut derived = Vec::new();
+        let items = self.hide_expression_items(location, stage, HIDDEN_GROUP_FIELD_PREFIX, &mut derived, None)?;
+        if derived.is_empty() { return Ok(vec![(stage.clone(), None)]) }
+        Ok(vec![(synthetic_stage("derive", &derived.join(", "), stage), None), (synthetic_stage("group", &items, stage), None)])
     }
 
     /// `window | partition by <fields> | order by <keys> | <functions> | end`:
@@ -1137,6 +1200,7 @@ impl Planner {
 
     fn compile_group( &self, location: StageLocation, stage: &PlannerStage, ) -> PlanningResult<PhysicalOperator> {
         let mut fields = Vec::new();
+        let mut compact = false;
         match stage.subpipeline() {
             None => {
                 let arguments = stage.arguments().trim();
@@ -1150,6 +1214,7 @@ impl Planner {
                 // This makes `group x, y, z` mean "group by x and y, sum z" instead
                 // of silently treating y as another measure. Other measures are
                 // available through the explicit `group | by ... | avg ... | end` form.
+                compact = items.len() > 1;
                 let (keys, measure) = match items.split_last() {
                     Some((last, keys)) if !keys.is_empty() => (keys, Some(*last)),
                     _ => (items.as_slice(), None),
@@ -1197,7 +1262,7 @@ impl Planner {
                                 child_location,
                                 stage,
                                 child,
-                                "group accepts one `by <fields>` directive and measures `sum|avg|min|max|first|last|list <value> [by <order>] [where <predicate>] [as <alias>]` or `count [<value>] [where <predicate>] [as <alias>]`",
+                                "group accepts one `by <fields>` directive and measures `sum|avg|min|max|first|last|list|median|stddev <value> [by <order>] [where <predicate>] [as <alias>]`, `percentile <value> <fraction>` or `count [<value>] [where <predicate>] [as <alias>]`",
                             ));
                         }
                     }
@@ -1209,7 +1274,8 @@ impl Planner {
             }
         }
 
-        PhysicalOperator::group(fields).map_err(|error| self.plan_error(location, stage, error))
+        let group = PhysicalOperator::group(fields).map_err(|error| self.plan_error(location, stage, error))?;
+        Ok(if compact { group.with_auto_measures() } else { group })
     }
 
     /// Appends grouping keys (`field` or `field as alias`) to `fields`.
@@ -1437,7 +1503,14 @@ impl Planner {
                 ));
             }
 
-            compiled.push(self.compile_nested_read_stage(location, parent_stage, child, source.alias)?);
+            // A branch with blocking stages runs as a query of its own: its
+            // stages are written as at the top level, `fill` included.
+            for (stage, scope_alias) in self.desugar_stage(location, child, source.alias)? {
+                compiled.push(match Stage::parse(stage.name().as_str()) {
+                    Some(Stage::Fill) => native_stage(Stage::Fill, stage.arguments().trim()).map_err(|error| self.plan_error(location, &stage, error))?,
+                    _ => self.compile_nested_read_stage(location, parent_stage, &stage, scope_alias.as_deref().or(source.alias))?,
+                });
+            }
         }
 
         Ok(CompiledUnion {
@@ -2173,7 +2246,7 @@ fn parse_group_key(text: &str) -> Result<(&str, Option<&str>), String> {
     Ok((source, alias))
 }
 
-fn group_key_marker(source: &str, alias: &str) -> Result<ExpressionFieldPath, String> {
+pub(crate) fn group_key_marker(source: &str, alias: &str) -> Result<ExpressionFieldPath, String> {
     let marker = format!(
         "{GROUP_KEY_MARKER_PREFIX}{}_{}",
         encode_group_marker_text(source),
@@ -2212,7 +2285,7 @@ fn parse_group_measure_directive<'a>(aggregate: &str, text: &'a str) -> Result<(
 
 /// Encodes a measure as `__og_group_<aggregate>_<source hex>_<alias hex>`; an
 /// empty source (row `count`) encodes as an empty hex run.
-fn group_measure_marker(aggregate: &str, source: &str, alias: &str) -> Result<ExpressionFieldPath, String> {
+pub(crate) fn group_measure_marker(aggregate: &str, source: &str, alias: &str) -> Result<ExpressionFieldPath, String> {
     let marker = format!(
         "{GROUP_MEASURE_MARKER_PREFIX}{aggregate}_{}_{}",
         encode_group_marker_text(source),
@@ -2318,12 +2391,12 @@ fn parse_single_identifier(text: &str) -> Result<&str, String> {
         return Err("identifier must not be empty".to_owned());
     };
 
-    if first != '_' && !first.is_alphabetic() {
+    if !crate::helpers::is_identifier_start(first) {
         return Err("identifier must start with an alphabetic character or '_'".to_owned());
     }
 
     for (index, character) in characters {
-        if character != '_' && !character.is_alphabetic() && !character.is_ascii_digit() {
+        if !crate::helpers::is_identifier_continue(character) {
             return Err(format!(
                 "identifier contains invalid character {character:?} at byte index {index}",
             ));

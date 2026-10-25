@@ -108,7 +108,7 @@ const ORDERED: &[(&str, u64)] = &[
     ("on sales | group period | union | on articles | where code < \"A-00100\" | end | sort period, code", 0x7d288a491e04434a),
     ("on sales | where qty == 5 | group period | sort count desc, period | group count | sort count", 0x937b54987cded8f6),
     ("on sales | group period, code, qty", 0xb8c9c02616ec3bcc),
-    ("on sales | group qty, period", 0x20cbf3afa7ec3bad),
+    ("on sales | group qty, period", 0x17d8c0b742a53998),
     ("on sales | where qty > 3 | union | on sales | where qty < 2 | derive t = qty * 2 | end | group period, t | sort period, t", 0xeb5217813c903ebc),
     ("on sales | where n < 100 | union | on articles | where code < \"A-00050\" | end | group code | sort code", 0xab5dc3af10419642),
 ];

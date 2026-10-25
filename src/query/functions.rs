@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::model::{compare, equals, Comparison, Document, Number, Value};
 
 use super::dates::{self, DateUnit};
-use super::eval::{error, float, float_of, integer_of, integral, number, text, POLICY};
+use super::eval::{error, float, integral, number, text, POLICY};
 use super::{ExecutionResult, Function, Function as F};
 
 /// Largest array `range` may build, so a typo cannot allocate unbounded memory.
@@ -25,10 +25,10 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
         // Numeric functions.
         F::Abs => match number(name, argument(0))? {
             Number::Float(value) => float(value.abs())?,
-            integer => integer_of(integer).and_then(i64::checked_abs).map_or_else(|| float(float_of(integer).abs()), |value| Ok(Value::signed(value)))?,
+            integer => integer.to_i64().and_then(i64::checked_abs).map_or_else(|| float(integer.to_f64().abs()), |value| Ok(Value::signed(value)))?,
         },
         F::Sqrt => {
-            let value = float_of(number(name, argument(0))?);
+            let value = number(name, argument(0))?.to_f64();
             if value < 0.0 {
                 return Err(error(format!("`sqrt` expects a non-negative number, found {value}")));
             }
@@ -36,8 +36,13 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
         }
         F::Floor | F::Ceil | F::Round | F::Trunc => {
             let value = number(name, argument(0))?;
+            let even = match optional(2).map(|mode| text(name, mode)).transpose()? {
+                None | Some("half_up") => false,
+                Some("half_even") => true,
+                Some(other) => return Err(error(format!("`{name}` mode must be \"half_up\" or \"half_even\", found {other:?}"))),
+            };
             let digits = match optional(1) {
-                Some(digits) => integer_of(number(name, digits)?)
+                Some(digits) => number(name, digits)?.to_i64()
                     .filter(|digits| (0..=15).contains(digits))
                     .ok_or_else(|| error(format!("`{name}` digits must be an integer between 0 and 15")))?,
                 None => 0,
@@ -46,16 +51,16 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
                 Value::Number(value)
             } else {
                 let scale = 10_f64.powi(digits as i32);
-                let scaled = float_of(value) * scale;
-                let rounded = match function { F::Floor => scaled.floor(), F::Ceil => scaled.ceil(), F::Trunc => scaled.trunc(), _ => scaled.round() };
+                let scaled = value.to_f64() * scale;
+                let rounded = match function { F::Floor => scaled.floor(), F::Ceil => scaled.ceil(), F::Trunc => scaled.trunc(), _ => round_half(scaled, even) };
                 if digits == 0 { integral(rounded)? } else { float(rounded / scale)? }
             }
         }
         F::Pow => {
             let (base, exponent) = (number(name, argument(0))?, number(name, argument(1))?);
-            match (integer_of(base), integer_of(exponent).and_then(|exponent| u32::try_from(exponent).ok())) {
+            match (base.to_i64(), exponent.to_i64().and_then(|exponent| u32::try_from(exponent).ok())) {
                 (Some(base), Some(exponent)) if base.checked_pow(exponent).is_some() => Value::signed(base.pow(exponent)),
-                _ => float(float_of(base).powf(float_of(exponent)))?,
+                _ => float(base.to_f64().powf(exponent.to_f64()))?,
             }
         }
         F::Min | F::Max => {
@@ -131,11 +136,11 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
 
         // Mathematics.
         F::Ln | F::Log10 | F::Log => {
-            let value = float_of(number(name, argument(0))?);
+            let value = number(name, argument(0))?.to_f64();
             let base = match function {
                 F::Ln => std::f64::consts::E,
                 F::Log10 => 10.0,
-                _ => float_of(number(name, argument(1))?),
+                _ => number(name, argument(1))?.to_f64(),
             };
             if value <= 0.0 || base <= 0.0 || base == 1.0 {
                 return Err(error(format!("`{name}` expects a positive number and a positive base other than 1, found {value} and {base}")));
@@ -153,9 +158,9 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
             };
             float(result)?
         }
-        F::Exp => float(float_of(number(name, argument(0))?).exp())?,
+        F::Exp => float(number(name, argument(0))?.to_f64().exp())?,
         F::Sign => {
-            let value = float_of(number(name, argument(0))?);
+            let value = number(name, argument(0))?.to_f64();
             Value::signed(if value > 0.0 { 1 } else if value < 0.0 { -1 } else { 0 })
         }
         F::Sum | F::Avg => {
@@ -165,10 +170,33 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
                 if values.is_empty() {
                     return Ok(Value::null());
                 }
-                let total = values.iter().map(|value| number(name, value).map(float_of)).sum::<ExecutionResult<f64>>()?;
+                let total = values.iter().map(|value| number(name, value).map(Number::to_f64)).sum::<ExecutionResult<f64>>()?;
                 float(total / values.len() as f64)?
             } else {
                 sum(values.into_iter())?
+            }
+        }
+        F::Median | F::Percentile | F::Stddev => {
+            let (values, fraction) = match function { F::Percentile => (&arguments[..1], number(name, &arguments[1])?.to_f64()), F::Median => (arguments, 0.5), _ => (arguments, 0.0) };
+            let mut values = numbers_or_array(values).iter().filter(|value| !value.is_null()).map(|value| number(name, value).map(Number::to_f64)).collect::<ExecutionResult<Vec<_>>>()?;
+            if !(0.0..=1.0).contains(&fraction) {
+                return Err(error(format!("`{name}` expects a fraction between 0 and 1, found {fraction}")));
+            }
+            let count = values.len() as f64;
+            match function {
+                F::Stddev if values.len() < 2 => Value::null(),
+                F::Stddev => {
+                    let mean = values.iter().sum::<f64>() / count;
+                    float((values.iter().map(|value| (value - mean).powi(2)).sum::<f64>() / (count - 1.0)).sqrt())?
+                }
+                _ if values.is_empty() => Value::null(),
+                // Linear between the two closest ranks, as spreadsheets' inclusive percentile.
+                _ => {
+                    values.sort_by(f64::total_cmp);
+                    let rank = fraction * (count - 1.0);
+                    let (low, high) = (values[rank.floor() as usize], values[rank.ceil() as usize]);
+                    float(low + (high - low) * rank.fract())?
+                }
             }
         }
 
@@ -360,6 +388,8 @@ pub(super) fn call(function: Function, arguments: &[Value]) -> ExecutionResult<V
             let fields = dates::fiscal(timestamp(name, argument(0))?, timestamp(name, argument(1))?).map_err(|message| error(format!("`{name}`: {message}")))?;
             Value::signed(fields[function.fiscal_field().expect("a fiscal function")])
         }
+        F::MonthEnd => Value::signed(dates::span(timestamp(name, argument(0))?, DateUnit::Month).map_err(error)?.0),
+        F::DaysIn => Value::signed(dates::span(timestamp(name, argument(0))?, unit(name, argument(1))?).map_err(error)?.1),
         F::DateFormat => {
             let millis = timestamp(name, argument(0))?;
             Value::string(match optional(1) {
@@ -377,10 +407,10 @@ fn to_int(value: &Value) -> ExecutionResult<Value> {
     Ok(match value {
         Value::Null => Value::null(),
         Value::Bool(flag) => Value::signed(i64::from(*flag)),
-        Value::Number(number) => match integer_of(*number) {
+        Value::Number(number) => match number.to_i64() {
             Some(integer) => Value::signed(integer),
             None if number.is_integer() => Value::Number(*number),
-            None => integral(float_of(*number).trunc()).map_err(|_| failure())?,
+            None => integral(number.to_f64().trunc()).map_err(|_| failure())?,
         },
         Value::String(text) => {
             let text = text.trim();
@@ -400,7 +430,7 @@ fn to_float(value: &Value) -> ExecutionResult<Value> {
     match value {
         Value::Null => Ok(Value::null()),
         Value::Bool(flag) => float(if *flag { 1.0 } else { 0.0 }),
-        Value::Number(number) => float(float_of(*number)),
+        Value::Number(number) => float(number.to_f64()),
         Value::String(text) => match text.trim().parse::<f64>() {
             Ok(parsed) if parsed.is_finite() => float(parsed),
             _ => Err(error(format!("`to_float` cannot convert {text:?}"))),
@@ -413,7 +443,7 @@ fn to_bool(value: &Value) -> ExecutionResult<Value> {
     Ok(match value {
         Value::Null => Value::null(),
         Value::Bool(flag) => Value::bool(*flag),
-        Value::Number(number) => Value::bool(float_of(*number) != 0.0),
+        Value::Number(number) => Value::bool(number.to_f64() != 0.0),
         Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" => Value::bool(true),
             "false" | "0" | "no" => Value::bool(false),
@@ -429,8 +459,8 @@ pub(super) fn sum<'a>(values: impl Iterator<Item = &'a Value>) -> ExecutionResul
     let mut float_total = 0.0;
     for value in values {
         let term = number("sum", value)?;
-        integer_total = integer_total.zip(integer_of(term)).and_then(|(total, term)| total.checked_add(term));
-        float_total += float_of(term);
+        integer_total = integer_total.zip(term.to_i64()).and_then(|(total, term)| total.checked_add(term));
+        float_total += term.to_f64();
     }
     match integer_total {
         Some(total) => Ok(Value::signed(total)),
@@ -447,7 +477,7 @@ fn numbers_or_array(arguments: &[Value]) -> Vec<Value> {
 }
 
 fn integer(name: &str, value: &Value) -> ExecutionResult<i64> {
-    integer_of(number(name, value)?).ok_or_else(|| error(format!("`{name}` expects an integer, found {value:?}")))
+    number(name, value)?.to_i64().ok_or_else(|| error(format!("`{name}` expects an integer, found {value:?}")))
 }
 
 fn count(name: &str, value: &Value) -> ExecutionResult<usize> {
@@ -478,10 +508,10 @@ fn window(name: &str, len: usize, start: &Value, length: Option<&Value>) -> Exec
 /// Reads a timestamp: epoch milliseconds (a number) or an ISO-8601 string.
 fn timestamp(name: &str, value: &Value) -> ExecutionResult<i64> {
     match value {
-        Value::Number(number) => match integer_of(*number) {
+        Value::Number(number) => match number.to_i64() {
             Some(millis) => Ok(millis),
             None => {
-                let millis = float_of(*number).floor();
+                let millis = number.to_f64().floor();
                 if millis.is_finite() && millis.abs() < 9.0e15 {
                     Ok(millis as i64)
                 } else {
@@ -492,6 +522,17 @@ fn timestamp(name: &str, value: &Value) -> ExecutionResult<i64> {
         Value::String(text) => dates::parse_iso(text).map_err(|message| error(format!("`{name}`: {message}"))),
         other => Err(error(format!("`{name}` expects epoch milliseconds or an ISO-8601 string, found {other:?}"))),
     }
+}
+
+/// Rounds a scaled value to an integer, a half away from zero (or to even):
+/// a value within a few ulps of a half counts as one, so `2.675` scaled by
+/// 100 (`267.49999999999997`) rounds as the decimal it was written as.
+pub(super) fn round_half(scaled: f64, even: bool) -> f64 {
+    let floor = scaled.floor();
+    if (scaled - floor - 0.5).abs() > scaled.abs().max(1.0) * 4.0 * f64::EPSILON {
+        return scaled.round();
+    }
+    if if even { floor.rem_euclid(2.0) == 1.0 } else { scaled > 0.0 } { floor + 1.0 } else { floor }
 }
 
 fn unit(name: &str, value: &Value) -> ExecutionResult<DateUnit> {

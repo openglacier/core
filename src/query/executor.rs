@@ -20,10 +20,13 @@ use super::plan_values::InsertDocument;
 use super::QueryRuntime;
 
 /// Trusted document scope applied below query syntax.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DocumentScope {
     place_id: Arc<str>,
     app_instance_id: Option<Arc<str>>,
+    /// Values each field may hold in the rows read, when present, see
+    /// [`Self::with_filters`].
+    filters: Arc<[(Arc<str>, Arc<[Value]>)]>,
 }
 
 impl DocumentScope {
@@ -33,6 +36,7 @@ impl DocumentScope {
         Self {
             place_id: place_id.into(),
             app_instance_id: Some(app_instance_id.into()),
+            filters: Arc::new([]),
         }
     }
 
@@ -42,31 +46,60 @@ impl DocumentScope {
         Self {
             place_id: place_id.into(),
             app_instance_id: None,
+            filters: Arc::new([]),
         }
+    }
+
+    /// The scope reading only the rows whose `field`, when present, holds
+    /// one of its values, for each filter: the restriction of a member of
+    /// the Place to some entities, applied to every read.
+    #[must_use]
+    pub fn with_filters(mut self, filters: impl IntoIterator<Item = (String, Vec<Value>)>) -> Self {
+        self.filters = filters.into_iter().map(|(field, values)| (Arc::from(field), Arc::from(values))).collect();
+        self
+    }
+
+    /// The App instance it keeps, if any.
+    #[must_use]
+    pub fn app_instance_id(&self) -> Option<&str> {
+        self.app_instance_id.as_deref()
     }
 
     /// The read-only `plan` reading only the rows of this scope (of its
     /// Place alone, with `place_only`), see [`super::scoped_read_plan`].
     /// The Place it keeps.
     #[must_use]
-    pub(crate) fn place_id(&self) -> &str {
+    pub fn place_id(&self) -> &str {
         &self.place_id
     }
 
     pub(crate) fn read_plan(&self, plan: &PhysicalPlan, place_only: bool) -> Option<PhysicalPlan> {
-        super::scoped_read_plan(plan, &self.place_id, self.app_instance_id.as_deref().filter(|_| !place_only))
+        super::scope::scoped_plan(plan, &self.place_id, self.app_instance_id.as_deref().filter(|_| !place_only), &self.filters)
     }
 
-    pub(crate) fn enforce(&self, document: &Document) -> Arc<Document> {
-        if let Some(app_instance_id) = self.app_instance_id.as_deref() { Arc::new(enforce_document_scope(
-            document,
-            &self.place_id,
-            app_instance_id,
-        )) } else {
+    /// `document`, written to `collection`, with the fields of this scope;
+    /// refused when it leaves the scope's filters (a field it holds takes
+    /// one of their values, a strict filter's field must be there), so a
+    /// write cannot reach rows its writer does not read.
+    pub(crate) fn enforce(&self, collection: &str, document: &Document) -> Result<Arc<Document>, String> {
+        for (field, values, strict) in super::scope::filters_of(&self.filters, collection) {
+            match document.get(field).filter(|value| !value.is_null()) {
+                Some(value) if values.contains(value) => {}
+                None if !strict => {}
+                _ => return Err(format!("this row is outside your access in the Place: {field} must be one of {}", crate::helpers::value_to_json(&Value::array(values.iter().cloned())))),
+            }
+        }
+        Ok(Arc::new(if let Some(app_instance_id) = self.app_instance_id.as_deref() { enforce_document_scope(document, &self.place_id, app_instance_id) } else {
             let mut scoped = document.clone();
             scoped.insert(PLACE_SCOPE_FIELD, self.place_id.as_ref());
-            Arc::new(scoped)
-        }
+            scoped
+        }))
+    }
+
+    /// Its filters, keyed `<field>` or `<collection>:<field>` (strict).
+    #[must_use]
+    pub fn filters(&self) -> &[(Arc<str>, Arc<[Value]>)] {
+        &self.filters
     }
 }
 
@@ -244,9 +277,16 @@ pub trait IncrementalPivotAccumulator: Send {
     /// Estimated bytes currently retained by the aggregate state.
     fn retained_bytes(&self) -> usize;
 
-    /// Produces the pivot result documents.
-    fn finish(self: Box<Self>) -> ExecutionResult<Vec<SyntheticDocument>>;
+    /// Moves the cells out, as records in row-key order for a run on disk.
+    fn spill(&mut self) -> ExecutionResult<Vec<Vec<u8>>>;
+
+    /// Emits the pivot result documents, merging the cells of the `runs`
+    /// (records [`Self::spill`] wrote) with those in memory.
+    fn finish(self: Box<Self>, runs: Vec<PivotRun<'_>>, emit: &mut dyn FnMut(SyntheticDocument) -> ExecutionResult<()>) -> ExecutionResult<()>;
 }
+
+/// Records of one spilled pivot run, in order.
+pub type PivotRun<'r> = Box<dyn Iterator<Item = ExecutionResult<Vec<u8>>> + 'r>;
 
 /// Incremental state for one grouped key.
 ///
@@ -337,7 +377,7 @@ pub enum CustomOperatorResult {
 pub(crate) fn execute_insert( storage: &dyn StorageEngine, runtime: &QueryRuntime, plan: &PhysicalPlan, document: &InsertDocument, scope: Option<&DocumentScope>, ) -> ExecutionResult<ExecutionOutput> {
     let (id, mut document) = runtime.prepare_insert(document)?.into_parts();
     if let Some(scope) = scope {
-        document = scope.enforce(document.as_ref());
+        document = scope.enforce(plan.source().collection().as_str(), document.as_ref()).map_err(ExecutionError::evaluation)?;
     }
     let mut transaction = storage.begin().map_err(ExecutionError::storage)?;
     let result = transaction.insert(plan.source().collection(), id, document).map_err(ExecutionError::storage)?;
@@ -357,7 +397,7 @@ pub(crate) fn execute_streaming_load( storage: &dyn StorageEngine, runtime: &Que
     let collection = plan.source().collection();
     let mutations = runtime.prepare_streaming_load(collection, read.as_ref(), mode, chunks)?.into_iter().map(|mutation| match (mutation, scope) {
         (StreamingLoadMutation::Insert { id, document }, None) => Ok(StorageMutation::insert(id, document)),
-        (StreamingLoadMutation::Insert { id, document }, Some(scope)) => Ok(StorageMutation::insert(id, scope.enforce(&document))),
+        (StreamingLoadMutation::Insert { id, document }, Some(scope)) => Ok(StorageMutation::insert(id, scope.enforce(collection.as_str(), &document).map_err(ExecutionError::evaluation)?)),
         (StreamingLoadMutation::Replace { id, document, precondition }, None) => Ok(StorageMutation::replace(id, document, precondition)),
         (StreamingLoadMutation::Replace { .. }, Some(_)) => Err(ExecutionError::unsupported_operator("insert", "a scoped insert cannot replace a stored document")),
     }).collect::<ExecutionResult<Vec<_>>>()?.into_iter();
@@ -1400,33 +1440,6 @@ fn sort_order(left: &Value, right: &Value, key: &SortKey) -> ExecutionResult<Ord
         .map_err(|error| ExecutionError::evaluation(format!("cannot sort field {}: {error}", key.field())))
 }
 
-/// Fails unless each key's values (`value(row, key)`) other than `null` are
-/// all numbers, all texts or all booleans: values of different kinds (a
-/// number and a text…) do not order transitively, which no sort can take.
-pub(crate) fn check_sort_kinds<'v>(keys: &[SortKey], rows: usize, value: impl Fn(usize, usize) -> Option<&'v Value>) -> ExecutionResult<()> {
-    for (index, key) in keys.iter().enumerate() {
-        let mut kinds = (0..rows).filter_map(|row| value(row, index).filter(|value| !value.is_null()).map(kind_rank));
-        if let Some(first) = kinds.next() {
-            if first > 3 || kinds.any(|kind| kind != first) {
-                return Err(ExecutionError::evaluation(format!("cannot sort field {}: its values must all be numbers, all texts or all booleans", key.field())));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Kind of a non-null sort value: 1 boolean, 2 number, 3 text, 4 array, 5 object.
-const fn kind_rank(value: &Value) -> u8 {
-    match value {
-        Value::Null => 0,
-        Value::Bool(_) => 1,
-        Value::Number(_) => 2,
-        Value::String(_) => 3,
-        Value::Array(_) => 4,
-        Value::Object(_) => 5,
-    }
-}
-
 const fn directed(ordering: Ordering, key: &SortKey) -> Ordering {
     match key.direction() {
         super::SortDirection::Ascending => ordering,
@@ -1471,7 +1484,6 @@ fn spill_value_encoded_len(value: &Value) -> usize {
 pub fn stable_sort( _runtime: &QueryRuntime, keys: &[SortKey], rows: &mut [ExecutionRow], ) -> ExecutionResult<()> {
     let mut failure = None;
     let values = rows.iter().flat_map(|row| keys.iter().map(|key| super::runtime_materializer::path_value(row.document(), key.field()))).collect::<Vec<_>>();
-    check_sort_kinds(keys, rows.len(), |row, key| values[row * keys.len() + key])?;
     let mut order = (0..rows.len()).collect::<Vec<_>>();
     order.sort_by(|left, right| {
         let (left, right) = (&values[left * keys.len()..][..keys.len()], &values[right * keys.len()..][..keys.len()]);
@@ -1575,8 +1587,8 @@ mod tests {
     #[test] fn scoped_streaming_load_stamps_the_scope_and_never_replaces() { let engine = crate::engine::Engine::new(Arc::new(MemoryStorage::new())); let plan = |n: i64| PhysicalPlan::new(source(), [PhysicalOperator::streaming_load(PhysicalLoadMode::Merge, [format!(r#"[{{"_id":"019fb7ae-9588-7057-830a-01bdb143b7ce","n":{n}}}]"#)]).unwrap()]).unwrap(); let scope = DocumentScope::new("p", "i"); let output = engine.execute_physical_scoped(&plan(1), &scope).unwrap(); assert_eq!(crate::helpers::document_to_json(output.rows()[0].document())["_place"], "p"); assert!(engine.execute_physical_scoped(&plan(2), &scope).unwrap_err().to_string().contains("cannot replace a stored document")); }
     #[test] fn streaming_load_of_empty_chunks_commits_no_mutation() { let storage = MemoryStorage::new(); let operator = PhysicalOperator::streaming_load(PhysicalLoadMode::Merge, ["[]", "[]"]) .unwrap(); let plan = PhysicalPlan::new(source(), [operator]).unwrap(); let output = crate::engine::Engine::new(Arc::new(storage)).execute_physical(&plan) .unwrap(); assert!(output.committed()); assert_eq!(output.statistics().mutated(), 0); assert_eq!(output.statistics().scanned(), 0); }
     #[test] fn pivot_of_empty_collection_is_empty() { use crate::query::plan_values::{PivotAggregate, PivotSpecification, PivotValue}; let specification = PivotSpecification::new( [ExpressionFieldPath::new(["region"]).unwrap()], [ExpressionFieldPath::new(["month"]).unwrap()], [PivotValue::new( ExpressionFieldPath::new(["revenue"]).unwrap(), PivotAggregate::Sum, None::<&str>, ) .unwrap()], ) .unwrap(); let storage = MemoryStorage::new(); let plan = PhysicalPlan::new(source(), [PhysicalOperator::pivot(specification)]).unwrap(); let output = crate::engine::Engine::new(Arc::new(storage)).execute_physical(&plan) .unwrap(); assert!(output.is_empty()); }
-    #[test] fn document_scope_overwrites_untrusted_scope_fields() { let scope = DocumentScope::new("place-a", "app-1"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-evil")), ("name", Value::from("item")), ]); let scoped = scope.enforce(&document); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-1"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
-    #[test] fn place_document_scope_forces_place_without_overwriting_app_instance() { let scope = DocumentScope::for_place("place-a"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-2")), ("name", Value::from("item")), ]); let scoped = scope.enforce(&document); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-2"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
+    #[test] fn document_scope_overwrites_untrusted_scope_fields() { let scope = DocumentScope::new("place-a", "app-1"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-evil")), ("name", Value::from("item")), ]); let scoped = scope.enforce("c", &document).unwrap(); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-1"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
+    #[test] fn place_document_scope_forces_place_without_overwriting_app_instance() { let scope = DocumentScope::for_place("place-a"); let document = Document::from_fields([ ("_place", Value::from("place-evil")), ("_app_instance", Value::from("app-2")), ("name", Value::from("item")), ]); let scoped = scope.enforce("c", &document).unwrap(); assert_eq!(scoped.get("_place"), Some(&Value::from("place-a"))); assert_eq!(scoped.get("_app_instance"), Some(&Value::from("app-2"))); assert_eq!(scoped.get("name"), Some(&Value::from("item"))); }
     #[test] fn execution_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<DocumentScope>(); assert_send_and_sync::<ExecutionOutput>(); assert_send_and_sync::<ExecutionRow>(); assert_send_and_sync::<ExecutionRowOrigin>(); assert_send_and_sync::<ExecutionError>(); assert_send_and_sync::<ExecutionStatistics>(); assert_send_and_sync::<PreparedInsertDocument>(); assert_send_and_sync::<SyntheticDocument>(); assert_send_and_sync::<StreamingLoadMutation>(); }
     #[test] fn top_selection_keeps_the_stable_sorted_prefix() { let mut seed = 0x9e37_79b9_u64; let random: Vec<u32> = (0..500).map(|_| { seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1); (seed >> 40) as u32 % 13 }).collect(); for keys in [random, (0..300).collect(), (0..300).rev().collect()] { for limit in [0_usize, 1, 3, 7, 50, 200, 1000] { let mut selection = TopSelection::new(limit); for (position, key) in keys.iter().enumerate() { selection.offer((*key, position), |row, worst| Ok(row.0 < worst.0), Ok, |left, right| Ok(left.0.cmp(&right.0))).unwrap(); } let mut expected: Vec<(u32, usize)> = keys.iter().copied().zip(0..).collect(); expected.sort_by_key(|row| row.0); expected.truncate(limit); assert_eq!(selection.worst().copied(), (limit > 0 && limit <= keys.len()).then(|| *expected.last().unwrap())); let mut kept = selection.into_arrival_order(); kept.sort_by_key(|row| row.0); assert_eq!(kept, expected, "limit {limit}"); } } }
     #[test] fn reservoir_samples_every_position_uniformly() { let (capacity, length, rounds) = (4_usize, 40_usize, 20_000_usize); let mut hits = vec![0_u32; length]; for _ in 0..rounds { let mut reservoir = Reservoir::new(capacity); for value in 0..length { reservoir.push(value); } assert_eq!(reservoir.seen(), length as u64); for value in reservoir.into_items() { hits[value] += 1; } } let expected = (rounds * capacity / length) as f64; for (position, hit) in hits.iter().enumerate() { assert!((f64::from(*hit) - expected).abs() < expected * 0.1, "position {position}: {hit} hits, expected ~{expected}"); } }

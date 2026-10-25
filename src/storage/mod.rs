@@ -8,9 +8,8 @@ pub mod history;
 pub mod memory;
 pub use history::{AsOf, Temporal, TemporalCache};
 pub use backend::{
-    glacier::{GlacierBackend, GlacierCollectionMetadata, GlacierFieldMetadata, GlacierFormatInfo, GLACIER_FORMAT_VERSION, GLACIER_PAGE_SIZE},
+    glacier::{GlacierBackend, GlacierStats, GlacierVerification, GlacierWriteMetrics, GLACIER_FORMAT_VERSION},
     memory::MemoryBackend,
-    StorageBackend,
 };
 pub use glacier::GlacierStorage;
 pub use memory::MemoryStorage;
@@ -322,6 +321,13 @@ impl FieldFacts {
     #[must_use]
     pub const fn documents(&self) -> u64 {
         self.documents
+    }
+
+    /// The top-level fields every value of which (null aside) is a number.
+    #[must_use]
+    pub fn number_fields(&self) -> std::collections::BTreeSet<String> {
+        use crate::model::PhysicalKind;
+        self.fields.iter().filter(|(_, fact)| fact.kinds.contains(&PhysicalKind::Number) && fact.kinds.iter().all(|kind| matches!(kind, PhysicalKind::Number | PhysicalKind::Null))).map(|(name, _)| name.clone()).collect()
     }
 
     /// Physical kinds a top-level field takes when every visible document
@@ -1146,61 +1152,34 @@ pub trait StorageTransaction: StorageRead {
     fn rollback(self: Box<Self>) -> StorageResult<()>;
 }
 
-/// Storage façade parameterized by a physical backend.
-///
-/// This type contains no document-specific storage logic. It delegates all
-/// physical operations to `B`, allowing the runtime to use one stable
-/// [`StorageEngine`] interface regardless of the selected backend.
-#[derive(Clone, Debug, Default)]
-pub struct BackendStorage<B> {
-    backend: B,
-}
-
-impl<B> BackendStorage<B> {
-    /// Creates a storage façade from a backend instance.
-    #[must_use]
-    #[inline]
-    pub const fn from_backend(backend: B) -> Self {
-        Self { backend }
-    }
-
-    /// Returns the configured backend.
-    #[must_use]
-    #[inline]
-    pub const fn backend(&self) -> &B {
-        &self.backend
-    }
-
-}
-
-impl<B: StorageBackend> StorageEngine for BackendStorage<B> {
-    fn read(&self) -> StorageResult<Box<dyn StorageRead + '_>> {
-        self.backend.read()
-    }
-
-    fn read_temporal(&self, temporal: &Temporal, cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + '_>> {
-        self.backend.read_temporal(temporal, cache)
-    }
-
-    fn begin(&self) -> StorageResult<Box<dyn StorageTransaction + '_>> {
-        self.backend.begin()
-    }
-
-    fn apply_batch_atomic( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
-        self.backend.apply_batch_atomic(collection, mutations)
-    }
-
-    fn apply_batch_atomic_summary( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<CommitResult> {
-        self.backend
-            .apply_batch_atomic_summary(collection, mutations)
-    }
-}
-
 /// Root storage engine interface.
 ///
 /// This trait is object-safe so the engine façade can hold
 /// `Arc<dyn StorageEngine>`.
+/// Stored bytes per value of a field, over every collection (see [`StorageEngine::usage_by`]).
+pub type KeyUsage = std::collections::BTreeMap<String, u64>;
+
 pub trait StorageEngine: Send + Sync {
+    /// Bytes held by the live documents of every collection, shared per value of the top-level
+    /// string field `key` (documents without it under ""), for usage accounting. The default
+    /// sizes each document as JSON; a column store shares each row group's bytes by its rows.
+    fn usage_by(&self, key: &str) -> StorageResult<KeyUsage> {
+        let read = self.read()?;
+        let mut usage = KeyUsage::new();
+        for collection in read.collections()? {
+            read.scan_each(&collection, ScanOptions::default(), &mut |stored| {
+                let name = match stored.document().get(key) {
+                    Some(crate::model::Value::String(text)) => text.to_string(),
+                    _ => String::new(),
+                };
+                let bytes = serde_json::to_vec(&crate::helpers::document_to_json(stored.document())).map_or(0, |json| json.len() as u64);
+                *usage.entry(name).or_default() += bytes;
+                Ok(true)
+            })?;
+        }
+        Ok(usage)
+    }
+
     /// Opens a consistent read snapshot.
     fn read(&self) -> StorageResult<Box<dyn StorageRead + '_>>;
 
@@ -1209,6 +1188,23 @@ pub trait StorageEngine: Send + Sync {
     /// the reads of one query. The default keeps no history.
     fn read_temporal(&self, _temporal: &Temporal, _cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + '_>> {
         Err(StorageError::history_unavailable())
+    }
+
+    /// A read snapshot with the history kept since [`history::HistorySource::floor`],
+    /// for backups: a diff holds the events after its parent's generation.
+    /// The default keeps no history.
+    fn history(&self) -> StorageResult<(Box<dyn StorageRead + '_>, Box<dyn history::HistorySource + '_>)> {
+        Err(StorageError::history_unavailable())
+    }
+
+    /// No backup will ask again for the events up to `generation`: a store
+    /// keeping a backup journal drops them. The default keeps everything.
+    fn release_history(&self, _generation: u64) -> StorageResult<()> { Ok(()) }
+
+    /// Writes recorded history into this store, which must have none and no
+    /// commit yet. The default cannot.
+    fn history_writer(&self) -> StorageResult<Box<dyn history::HistoryWriter + '_>> {
+        Err(StorageError::backend("history: this store cannot restore history"))
     }
 
     /// Begins a multi-collection transaction.

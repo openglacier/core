@@ -23,6 +23,8 @@ pub const FEATURE_NAMES: &[&str] = &[
     "llm",
     #[cfg(feature = "agent")]
     "agent",
+    #[cfg(feature = "mailsend")]
+    "mailsend",
     #[cfg(feature = "identity")]
     "identity",
     #[cfg(feature = "fabric")]
@@ -54,6 +56,6 @@ pub const fn has_fabric() -> bool {
 mod tests {
     use super::*;
     use crate::operation::ServiceCapability;
-    #[test] fn compiled_service_capabilities_match_features() { let capabilities = service_capabilities(); assert_eq!( capabilities.contains(ServiceCapability::Database), cfg!(feature = "database"), ); assert_eq!( capabilities.contains(ServiceCapability::Auth), cfg!(feature = "auth"), ); assert_eq!( capabilities.contains(ServiceCapability::Files), cfg!(feature = "files"), ); assert_eq!( capabilities.contains(ServiceCapability::Events), cfg!(feature = "events"), ); assert_eq!( capabilities.contains(ServiceCapability::DataImport), cfg!(feature = "data-import"), ); assert_eq!( capabilities.contains(ServiceCapability::Llm), cfg!(feature = "llm"), ); assert_eq!( capabilities.contains(ServiceCapability::Agent), cfg!(feature = "agent"), ); }
+    #[test] fn compiled_service_capabilities_match_features() { let capabilities = service_capabilities(); assert_eq!( capabilities.contains(ServiceCapability::Database), cfg!(feature = "database"), ); assert_eq!( capabilities.contains(ServiceCapability::Auth), cfg!(feature = "auth"), ); assert_eq!( capabilities.contains(ServiceCapability::Files), cfg!(feature = "files"), ); assert_eq!( capabilities.contains(ServiceCapability::Events), cfg!(feature = "events"), ); assert_eq!( capabilities.contains(ServiceCapability::DataImport), cfg!(feature = "data-import"), ); assert_eq!( capabilities.contains(ServiceCapability::Llm), cfg!(feature = "llm"), ); assert_eq!( capabilities.contains(ServiceCapability::Agent), cfg!(feature = "agent"), ); assert_eq!( capabilities.contains(ServiceCapability::Mail), cfg!(feature = "mailsend"), ); }
     #[test] fn feature_names_do_not_duplicate_entries() { let names = feature_names(); for (index, name) in names.iter().enumerate() { assert!( !names[..index].contains(name), "duplicate feature name: {name}" ); } }
 }

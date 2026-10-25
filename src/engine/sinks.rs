@@ -211,7 +211,7 @@ impl<'p, 'q> LookupJoin<'p, 'q> {
         let matches_memory = &self.matches_memory;
         let mut collect = |row: ExecutionRow| -> EngineResult<()> {
             let estimated = execution_row_working_bytes(&row).map_err(EngineError::execution)?;
-            if !matches_memory.fits(retained_bytes.saturating_add(estimated)) {
+            if !matches_memory.holds(retained_bytes.saturating_add(estimated)) {
                 return Err(EngineError::execution(ExecutionError::evaluation(
                     "one lookup result exceeds the governed query working set",
                 )));
@@ -249,7 +249,7 @@ enum Sink<'p, 'q> {
     Sample { reservoir: Reservoir<ExecutionRow>, limit: Option<usize> },
     Lookup(Box<LookupJoin<'p, 'q>>),
     Union { collection: &'p CollectionId, pipeline: &'p PhysicalSubPipeline, scanned: u64, filtered: u64 },
-    Pivot { accumulator: Option<Box<dyn IncrementalPivotAccumulator>>, memory: StageMemory<'q> },
+    Pivot { accumulator: Option<Box<dyn IncrementalPivotAccumulator>>, memory: StageMemory<'q>, runs: Vec<SpillRun> },
     /// The rows of the current partition (rows come sorted by partition).
     Window { spec: WindowSpec, memory: StageMemory<'q>, rows: Vec<ExecutionRow>, bytes: usize },
     /// The last row (rows come sorted by partition, then field) and the
@@ -286,13 +286,13 @@ impl Engine {
                     None => Sink::Sort { keys, memory: memory.stage(), spill: SpillEngine::default(), chunk: Vec::new(), chunk_bytes: 0, runs: Vec::new() },
                 },
                 PhysicalOperator::Distinct { fields } => Sink::Distinct { fields, memory: memory.stage(), seen: HashSet::new(), bytes: 0 },
-                PhysicalOperator::Group { keys } => {
+                PhysicalOperator::Group { keys, .. } => {
                     let (grouping_keys, _) = crate::query::group_field_layout(keys).map_err(EngineError::execution)?;
                     Sink::Group { keys, grouping_keys, limit, memory: memory.stage(), spill: SpillEngine::default(), groups: HashMap::new(), bytes: 0, runs: Vec::new() }
                 }
                 PhysicalOperator::Pivot { specification } => {
                     let accumulator = self.runtime.incremental_pivot_accumulator(specification).map_err(EngineError::execution)?;
-                    Sink::Pivot { accumulator: Some(accumulator), memory: memory.stage() }
+                    Sink::Pivot { accumulator: Some(accumulator), memory: memory.stage(), runs: Vec::new() }
                 }
                 PhysicalOperator::Lookup { .. } => Sink::Lookup(Box::new(LookupJoin::new(operator, memory).expect("a lookup operator"))),
                 PhysicalOperator::Union { collection, pipeline, .. } => Sink::Union { collection, pipeline, scanned: 0, filtered: 0 },
@@ -330,7 +330,7 @@ impl Engine {
             }
             Sink::TopN { keys, memory, top } => {
                 top.push_lazy(self.runtime.as_ref(), keys, row, execution_row_working_bytes).map_err(EngineError::execution)?;
-                if !memory.fits(top.live_bytes()) {
+                if !memory.holds(top.live_bytes()) {
                     return Err(EngineError::execution(ExecutionError::evaluation("top-n candidates exceed the governed query working set")));
                 }
                 Ok(())
@@ -341,7 +341,7 @@ impl Engine {
                     return Ok(());
                 }
                 *bytes = bytes.saturating_add(key.len()).saturating_add(48);
-                if !memory.fits(*bytes) {
+                if !memory.holds(*bytes) {
                     return Err(EngineError::execution(ExecutionError::evaluation("distinct keys exceed the governed query working set")));
                 }
                 seen.insert(key);
@@ -376,7 +376,7 @@ impl Engine {
                     *bytes = 0;
                 }
                 *bytes = bytes.saturating_add(execution_row_working_bytes(&row).map_err(EngineError::execution)?);
-                if !memory.fits(*bytes) {
+                if !memory.holds(*bytes) {
                     return Err(EngineError::execution(ExecutionError::evaluation("a window partition exceeds the governed query working set")));
                 }
                 rows.push(row);
@@ -395,15 +395,10 @@ impl Engine {
                 *last = Some(row.clone());
                 emit(row)
             }
-            Sink::Pivot { accumulator, memory } => {
+            Sink::Pivot { accumulator, memory, runs } => {
                 let accumulator = accumulator.as_mut().expect("pivot accumulator until finished");
                 accumulator.push(row.document()).map_err(EngineError::execution)?;
-                if !memory.fits(accumulator.retained_bytes()) {
-                    return Err(EngineError::execution(ExecutionError::evaluation(
-                        "pivot cells exceed the governed query working set; reduce the row or column cardinality",
-                    )));
-                }
-                Ok(())
+                spill_pivot(memory, accumulator.as_mut(), runs)
             }
         }
     }
@@ -509,12 +504,9 @@ impl Engine {
                         spec.fill(&previous, None, *next, generated, &mut emit)?;
                     }
                 }
-                Sink::Pivot { accumulator, memory } => {
-                    let rows = accumulator.take().expect("pivot accumulator until finished").finish().map_err(EngineError::execution)?;
+                Sink::Pivot { accumulator, memory, runs } => {
+                    finish_pivot(accumulator.take().expect("pivot accumulator until finished"), runs, &mut emit)?;
                     memory.release();
-                    for row in rows {
-                        emit(ExecutionRow::synthetic(row))?;
-                    }
                     *strategies = strategies.with(ExecutionStrategy::InMemoryPivot);
                 }
             }

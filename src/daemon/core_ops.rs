@@ -1,4 +1,4 @@
-//! Core, Fabric, LLM, Agent and database administration requests.
+//! Core, Fabric, LLM, Agent, Mail and database administration requests.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
 use super::*;
@@ -7,11 +7,11 @@ use super::serve::{diverged, ensure_operation_resource_authorized, failed, reply
 pub(super) fn handle_core_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: Option<&Engine>, authentication: &ConnectionAuth, operation: RoutedOperation) -> Handled {
     match operation {
         RoutedOperation::CoreHealth(Routed { id, .. }) => {
-            reply(writer, id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), "compiledCapabilities": ServiceCapabilities::compiled().names(), "buildFeatures": build_profile::feature_names(), }))?;
+            reply(writer, id, serde_json::json!({ "healthy": true, "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "classicAuthEnabled": settings.classic_auth_enabled, "allowPublic": settings.allow_public, "classicAuthEmail": settings.classic_auth_enabled && settings.classic_auth_email, "passwordReset": settings.password_reset_available(), "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), "compiledCapabilities": ServiceCapabilities::compiled().names(), "buildFeatures": build_profile::feature_names(), }))?;
         }
         RoutedOperation::CoreDiscover(Routed { id, .. }) => {
             // Public hello: the Core options a client needs before choosing its entry flow.
-            reply(writer, id, serde_json::json!({ "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "enrollmentMode": settings.enrollment_mode.as_str(), "classicAuthEnabled": settings.classic_auth_enabled, "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), }))?;
+            reply(writer, id, serde_json::json!({ "version": PROTOCOL_VERSION, "authRequired": settings.authorization_mode.is_enforced(), "enrollmentMode": settings.enrollment_mode.as_str(), "classicAuthEnabled": settings.classic_auth_enabled, "allowPublic": settings.allow_public, "classicAuthEmail": settings.classic_auth_enabled && settings.classic_auth_email, "passwordReset": settings.password_reset_available(), "capabilities": settings.service_capabilities.names(), "publishedCapabilities": settings.published_capabilities.names(), }))?;
         }
         RoutedOperation::CoreOperations(Routed { id, .. }) => {
             let operations = OPERATION_CATALOG
@@ -165,6 +165,20 @@ pub(super) fn handle_llm_operation(writer: &mut TcpStream, settings: &Connection
                 "finishReason": statistics.finish_reason,
             }));
         }
+        RoutedOperation::LlmEmbed(Routed { id, input }) => {
+            let owner = llm_run_owner(authentication, delegation);
+            let result = service.schedule(owner).and_then(|mut run| service.embed(&mut run, &input.input, input.normalize));
+            match result {
+                Ok(embeddings) => reply(writer, id, serde_json::json!({
+                    "model": service.status().model,
+                    "dimensions": embeddings.vectors.first().map_or(0, Vec::len),
+                    "embeddings": embeddings.vectors,
+                    "promptTokens": embeddings.prompt_tokens,
+                    "elapsedMs": embeddings.elapsed_ms,
+                }))?,
+                Err(error) => write_stream_response(writer, &StreamResponse::error(Some(id), WireError::new(error.code(), error.to_string())))?,
+            }
+        }
         RoutedOperation::LlmCancel(Routed { id, input }) => {
             let owner = llm_run_owner(authentication, delegation);
             let cancelled = service.cancel(input.run_id, &owner);
@@ -186,10 +200,11 @@ pub(super) fn handle_agent_operation(writer: &mut TcpStream, settings: &Connecti
         RoutedOperation::AgentStatus(Routed { id, .. }) => {
             return Ok(reply(writer, id, serde_json::to_value(service.status()).expect("agent status serializes"))?);
         }
-        RoutedOperation::AgentRun(Routed { id, input }) => (id, input),
+        RoutedOperation::AgentRun(Routed { id, input }) => (id, AgentWork::Run(input)),
+        RoutedOperation::AgentApp(Routed { id, input }) => (id, AgentWork::App(input)),
         other => return diverged(other.id()),
     };
-    let requested = &input.context;
+    let requested = match &input { AgentWork::Run(input) => &input.context, AgentWork::App(input) => &input.context };
     let execution_context = if let Some(delegated) = delegation {
         if delegated.capability != "agent"
             || delegated.place_id.as_deref() != Some(requested.place_id.as_str())
@@ -205,6 +220,7 @@ pub(super) fn handle_agent_operation(writer: &mut TcpStream, settings: &Connecti
             place_id: requested.place_id.clone(),
             app_instance_id: requested.app_instance_id.clone(),
             access: PlaceAccess::Role(place_role),
+            filters: delegated.filters.clone(),
         }
     } else {
         let Some(engine) = engine else {
@@ -219,7 +235,7 @@ pub(super) fn handle_agent_operation(writer: &mut TcpStream, settings: &Connecti
         };
         #[cfg(feature = "fabric")]
         match GatewayAgentInvoker::connect(settings, token) {
-            Ok(invoker) => OgdAgentInvoker::Gateway(invoker),
+            Ok(invoker) => OgdAgentInvoker::Gateway(Box::new(invoker)),
             Err(error) => {
                 write_stream_response(writer, &StreamResponse::error(Some(id), WireError::new(error.code(), error.to_string())))?;
                 return Ok(());
@@ -253,9 +269,22 @@ pub(super) fn handle_agent_operation(writer: &mut TcpStream, settings: &Connecti
         "stateless":true,
     })))?;
     let mut stream_error = None;
-    let result = service.run(&input, &mut invoker, |event| stream_partial(writer, id, event, &mut stream_error));
-    finish_stream(writer, id, stream_error, result, |error| error.code().to_owned(), |statistics| serde_json::to_value(statistics).expect("agent statistics serialize"))
+    match input {
+        AgentWork::Run(input) => {
+            let result = service.run(&input, &mut invoker, |event| stream_partial(writer, id, event, &mut stream_error));
+            finish_stream(writer, id, stream_error, result, |error| error.code().to_owned(), |statistics| serde_json::to_value(statistics).expect("agent statistics serialize"))
+        }
+        AgentWork::App(input) => {
+            // The model of a Place is kept per reader: what place.schema shows depends on who asks.
+            let reader = delegation.map_or_else(|| format!("{:?}", authentication.principal()), |delegated| format!("{:?}|{:?}", delegated.principal, delegated.place_role));
+            let result = crate::service::generate::run(&input, &reader, &mut invoker, |event| stream_partial(writer, id, event, &mut stream_error));
+            finish_stream(writer, id, stream_error, result, |error| error.code().to_owned(), |result| result)
+        }
+    }
 }
+
+#[cfg(feature = "agent")]
+enum AgentWork { Run(crate::operation::AgentRunInput), App(crate::operation::AgentAppInput) }
 
 #[cfg(feature = "database")]
 pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, operation: RoutedOperation) -> Handled {
@@ -290,6 +319,7 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
                         RequestedExecutionContext {
                             place_id: place_id.to_owned(),
                             app_instance_id: app_instance_id.clone(),
+                            as_profile: None,
                         },
                     )?;
                 }
@@ -297,9 +327,8 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
                 ensure_operation_resource_authorized(settings, engine, authentication.principal(), id, OperationKind::CollectionsList, "*")?;
             }
 
-            let snapshot = engine.storage().read().map_err(failed(id, "collections.failed"))?;
             let collections = list_storage_collections(
-                snapshot.as_ref(), stats, place_id.as_deref(), app_instance_id.as_deref(),
+                engine, stats, place_id.as_deref(), app_instance_id.as_deref(),
             ).map_err(failed(id, "collections.failed"))?;
             reply(writer, id, serde_json::json!({"collections": collections}))?;
         }
@@ -307,14 +336,8 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
             let data = if let Some(storage) = settings.glacier_storage.as_ref() {
                 serde_json::json!({
                     "backend": "glacier",
-                    "generation": storage.generation().unwrap_or_default(),
-                    "documents": storage.document_count().unwrap_or_default(),
-                    "storeBytes": storage.store_bytes().unwrap_or_default(),
-                    "walBytes": storage.wal_bytes().unwrap_or_default(),
-                    "startup": storage.startup_metrics(),
-                    "read": storage.read_metrics(),
-                    "resident": storage.resident_memory(),
-                    "write": storage.write_metrics(),
+                    "store": storage.stats().unwrap_or_default(),
+                    "write": storage.write_metrics().unwrap_or_default(),
                 })
             } else {
                 let snapshot = engine.storage().read().map_err(failed(id, "storage.stats_failed"))?;
@@ -336,10 +359,16 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
             };
             reply(writer, id, data)?;
         }
-        RoutedOperation::BackupCreate(Routed { id, input: BackupNameInput { name } }) => {
+        RoutedOperation::BackupCreate(Routed { id, input: BackupCreateInput { name, parent, history } }) => {
             let path = backup_path(settings, id, &name)?;
-            let summary = backup::create(engine.storage(), &path, backup_metadata(&settings.instance_id)).map_err(failed(id, "backup.create_failed"))?;
-            reply(writer, id, serde_json::json!({"name": name, "collections": summary.collections, "documents": summary.documents}))?;
+            let metadata = backup_metadata(&settings.instance_id);
+            let summary = match &parent {
+                Some(_) if history => return Err(super::serve::request_error(id, "backup.invalid_input", "a diff holds no history: history goes with a full backup")),
+                Some(parent) => backup::create_diff(engine.storage(), &path, metadata, &backup_path(settings, id, parent)?),
+                None if history => backup::create_with_history(engine.storage(), &path, metadata),
+                None => backup::create(engine.storage(), &path, metadata),
+            }.map_err(failed(id, "backup.create_failed"))?;
+            reply(writer, id, serde_json::json!({"name": name, "kind": if parent.is_some() { "diff" } else { "full" }, "parent": parent, "history": history, "collections": summary.collections, "documents": summary.documents, "removed": summary.removed, "events": summary.events}))?;
         }
         RoutedOperation::BackupInspect(Routed { id, input: BackupNameInput { name } }) => {
             let path = backup_path(settings, id, &name)?;
@@ -352,7 +381,10 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
                 "sizeBytes": summary.size_bytes,
                 "collections": summary.collections,
                 "documents": summary.documents,
+                "removed": summary.removed,
+                "events": summary.events,
                 "source": summary.source,
+                "chain": summary.chain,
             }))?;
         }
         RoutedOperation::BackupRestore(Routed { id, input: BackupRestoreInput { name, replace } }) => {
@@ -360,7 +392,7 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
             let summary = backup::restore(engine.storage(), &path, replace).map_err(failed(id, "backup.restore_failed"))?;
             let payload = serde_json::json!({"name": name, "replace": replace, "collections": summary.collections, "documents": summary.documents});
             publish_durable_event(engine, Audience::Global, "backup.restored", payload);
-            reply(writer, id, serde_json::json!({"restored": true, "name": name, "collections": summary.collections, "documents": summary.documents}))?;
+            reply(writer, id, serde_json::json!({"restored": true, "name": name, "collections": summary.collections, "documents": summary.documents, "removed": summary.removed}))?;
         }
         other => return diverged(other.id()),
     }
@@ -371,4 +403,36 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
 fn backup_path(settings: &ConnectionSettings, id: RequestId, name: &str) -> Result<PathBuf, Stop> {
     backup_file_path(&settings.backup_path, name)
         .ok_or_else(|| super::serve::request_error(id, "backup.invalid_name", "backup name must be a simple file name"))
+}
+
+/// `mail.send` needs write access to the Place through a member identity, never through its public policy.
+#[cfg(feature = "mailsend")]
+pub(super) fn handle_mail_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: Option<&Engine>, authentication: &ConnectionAuth, delegation: Option<&GatewayDelegation>, operation: RoutedOperation) -> Handled {
+    let service = settings.mail_service.as_ref()
+        .expect("mail operation routed without an enabled mail provider");
+    let RoutedOperation::MailSend(Routed { id, input }) = operation else { return diverged(operation.id()) };
+    let writer_of = |principal: &Principal, access: Option<PlaceAccess>| matches!(principal, Principal::Identity { .. }) && matches!(access, Some(PlaceAccess::Role(role)) if role.can_write());
+    let allowed = match delegation {
+        Some(delegated) => {
+            if delegated.capability != "mail" || delegated.place_id.as_deref() != Some(input.context.place_id.as_str()) {
+                reject!(id, "mail.context_mismatch", "mail.send context does not match the Gateway delegation");
+            }
+            writer_of(&delegated.principal, delegated.access())
+        }
+        None if !settings.authorization_mode.is_enforced() => true,
+        None => {
+            let Some(engine) = engine else {
+                reject!(id, "mail.context_unavailable", "standalone mail.send requires a local database engine to validate its Place");
+            };
+            let context = resolve_query_execution_context(engine, id, authentication.principal(), input.context.clone())?;
+            writer_of(&context.principal, Some(context.access))
+        }
+    };
+    if !allowed {
+        reject!(id, "authorization.denied", "mail.send requires write access to the Place");
+    }
+    match service.send(&input) {
+        Ok(message_id) => Ok(reply(writer, id, serde_json::json!({ "messageId": message_id, "recipients": input.to.len() + input.cc.len() + input.bcc.len() }))?),
+        Err(error) => reject!(id, error.code(), error.to_string()),
+    }
 }

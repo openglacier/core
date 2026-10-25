@@ -1,0 +1,50 @@
+[
+ {
+  "id": "E1",
+  "q": "Quel est le résultat net du T2 2026 comparé au budget ?",
+  "a": "but: comparer\nmesures: rt\nperiode: 2026-T2\ngran: trimestre\ncmp: budget\nblocs: kpi, ecarts"
+ },
+ {
+  "id": "E2",
+  "q": "quantity sold by product over the last 12 months",
+  "a": "but: decomposer\nmesures: ventes.quantity\ndims: ventes.article\nperiode: 12m\ngran: mois\nblocs: barres, tableau"
+ },
+ {
+  "id": "E3",
+  "q": "les investissements et les capitaux propres sur 2 ans",
+  "a": "but: tendance\nmesures: capex, cap\nperiode: 24m\ngran: mois\nblocs: kpi, courbe"
+ },
+ {
+  "id": "E4",
+  "q": "Who are our 3 biggest client groups by margin?",
+  "a": "but: classer\nmesures: ventes.margin\ndims: ventes.client_group\nblocs: classement\ntop: 3\ntri: ventes.margin desc"
+ },
+ {
+  "id": "E5",
+  "q": "donne moi la recette de la tarte tatin",
+  "a": "but: hors"
+ },
+ {
+  "id": "E6",
+  "q": "et la performance ?",
+  "a": "but: synthese\nmesures: ca, marge, rt\nblocs: kpi, courbe\nnote: « performance » est ambigu : activité, marge et résultat affichés."
+ },
+ {
+  "id": "E7",
+  "prev_q": "CA par mois en 2025",
+  "prev_a": "but: tendance\nmesures: ca\nperiode: 2025\ngran: mois\nblocs: courbe",
+  "q": "ajoute la marge et enlève la comparaison",
+  "a": "+mesures: marge\n=cmp: aucun"
+ },
+ {
+  "id": "E8",
+  "q": "explain the fall in net income last quarter",
+  "a": "but: expliquer\nmesures: rt, ca, cos, opex\nperiode: dernier-T\ngran: trimestre\nblocs: cascade, ecarts"
+ },
+ {
+  "id": "E9",
+  "q": "chiffre d'affaires du client Dupont en 2026 et en 2025",
+  "values": "ventes.client=DUPONT SA",
+  "a": "but: comparer\nmesures: ventes.revenue\nfiltres: ventes.client=DUPONT SA\nperiode: 2026\ngran: annee\nblocs: kpi, barres"
+ }
+]

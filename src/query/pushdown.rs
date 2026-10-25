@@ -26,8 +26,9 @@ use super::{parse_expression, BinaryOperator, Expression, ExpressionFieldPath, E
 /// `operators` with each filter moved as close to the source as it can go.
 pub(super) fn push_filters(operators: Vec<PhysicalOperator>) -> Vec<PhysicalOperator> {
     // `where a and b` is `where a | where b`: each conjunct moves on its own;
-    // conjuncts of one filter that stay side by side are joined back
-    // (`origin`), so a plan where nothing moves is the plan as written.
+    // filters that end side by side are joined (`and` short-circuits as the
+    // second filter only meets the rows the first keeps), so that the
+    // storage pushdowns and batch paths, which take one filter, see them all.
     let mut pushed: Vec<(PhysicalOperator, Option<usize>)> = Vec::with_capacity(operators.len());
     for (origin, operator) in operators.into_iter().enumerate() {
         let PhysicalOperator::Filter { predicate } = operator else {
@@ -56,7 +57,7 @@ pub(super) fn push_filters(operators: Vec<PhysicalOperator>) -> Vec<PhysicalOper
     let mut joined: Vec<(PhysicalOperator, Option<usize>)> = Vec::with_capacity(pushed.len());
     for (operator, origin) in pushed {
         match (joined.last_mut(), operator) {
-            (Some((PhysicalOperator::Filter { predicate: before }, Some(last))), PhysicalOperator::Filter { predicate }) if origin == Some(*last) => {
+            (Some((PhysicalOperator::Filter { predicate: before }, _)), PhysicalOperator::Filter { predicate }) => {
                 let span = before.span();
                 *before = Expression::binary(before.clone(), BinaryOperator::And, predicate, span);
             }
@@ -148,7 +149,7 @@ fn passes(operator: &PhysicalOperator, reads: &[ExpressionFieldPath], total: boo
         PhysicalOperator::Filter { .. } => total.then_some(false),
         PhysicalOperator::Lookup { into, .. } => ExpressionFieldPath::new([into.as_ref()]).ok().filter(|into| untouched(std::slice::from_ref(into))).map(|_| false),
         PhysicalOperator::Select { fields } => keys(fields).then_some(false),
-        PhysicalOperator::Group { keys: fields } => {
+        PhysicalOperator::Group { keys: fields, .. } => {
             let fields = fields.iter().filter(|field| !field.first().starts_with("__og_")).cloned().collect::<Vec<_>>();
             (!fields.is_empty() && keys(&fields)).then_some(true)
         }

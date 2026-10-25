@@ -24,12 +24,15 @@ pub mod helpers;
 pub mod memory;
 pub mod operation;
 pub mod query;
+pub mod search;
 pub mod service;
 pub mod daemon;
 pub mod view;
 #[cfg(feature = "cli")]
 pub mod cli;
 pub mod spill;
+#[cfg(feature = "native-import")]
+pub mod import;
 pub use model::capability::{ capabilities_of, capabilities_of_number, Capabilities, Capability, ValueCapabilities, };
 pub use model::compare::{
     compare, compare_numbers, equals, greater_than, greater_than_or_equal, less_than,
@@ -51,7 +54,7 @@ pub use access::place::{parse_sharing_permission, sharing_permission, ExecutionC
 pub use operation::{decode_operation_request, Audience, Event as CoreEvent, IncomingRequest, OperationKind, OperationRequest, OperationResponse, OperationRouter, RoutedOperation, APP_CREATE, APP_DELETE, APP_GET, APP_INSTANCE_CREATE, APP_INSTANCE_LIST, APP_INSTANCE_REMOVE, APP_LIST, APP_UPDATE, AUTH_BEGIN, AUTH_COMPLETE, BACKUP_CREATE, BACKUP_INSPECT, BACKUP_RESTORE, COLLECTIONS_LIST, AUTH_ENROLL_BEGIN, AUTH_ENROLL_COMPLETE, DEVICE_REGISTER, DEVICE_REVOKE, EVENTS_SUBSCRIBE, DATA_ANALYZE, DATA_IMPORT, DATA_MAPPING_SAVE, IDENTITY_REGISTER, IDENTITY_RENEW, PLACE_CREATE, PLACE_DELETE, PLACE_GET, PLACE_LIST, PLACE_UPDATE, PLACE_PUBLIC_SET, QUERY_EXECUTE, SHARING_CREATE, SHARING_DELETE, SHARING_UPDATE};
 pub use event_engine::{EventEngine, EventEngineSnapshot, EventSubscription, DEFAULT_EVENT_CAPACITY, DEFAULT_SUBSCRIBER_CAPACITY};
 pub use files::{FileCapabilities, FileEntry, FileId, FileKind, FileMetadata, FileModelError, FileRange, FileReader, FileResult, FileStore, FileStoreEntry, FileStoreError, FileWrite, StoreId, FILES_COLLECTION};
-pub use memory::{MemoryClass, MemoryClassSnapshot, MemoryEvent, MemoryEventKind, MemoryEventSnapshot, MemoryGovernor, MemoryProfile, MemoryProfileConfig, MemoryReclaimer, MemoryReservation, MemoryReservationError, MemorySnapshot, ProcessMemoryPressure, ProcessMemoryPressureError, ProcessMemorySnapshot, QueryAdmissionError, QueryMemoryPermit, QueryMemoryRecord, QueryMemorySnapshot, WorkloadClass, DEFAULT_MEMORY_EVENT_CAPACITY, MEMORY_EVENT_MIN_BYTES};
+pub use memory::{MemoryClass, MemoryClassSnapshot, MemoryEvent, MemoryEventKind, MemoryEventSnapshot, MemoryGovernor, MemoryProfile, MemoryProfileConfig, MemoryReservation, MemoryReservationError, MemorySnapshot, ProcessMemoryPressure, ProcessMemoryPressureError, ProcessMemorySnapshot, QueryAdmissionError, QueryMemoryPermit, QueryMemoryRecord, QueryMemorySnapshot, WorkloadClass, DEFAULT_MEMORY_EVENT_CAPACITY, MEMORY_EVENT_MIN_BYTES};
 pub use model::value::{Number, NumberKind, PhysicalKind, Value};
 pub const API_VERSION: u32 = 1;
 

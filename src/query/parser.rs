@@ -99,6 +99,10 @@ pub enum ParseErrorKind {
 
     /// Des tokens sont présents après la fin attendue de la requête.
     UnexpectedToken { found: TokenKind },
+
+    /// Stages separated by `;` and line breaks that do not fit together
+    /// (styles mixed, an empty stage, a block without `end`).
+    Separators { message: String },
 }
 
 impl ParseError {
@@ -158,6 +162,8 @@ impl fmt::Display for ParseErrorKind {
             Self::UnexpectedEndKeyword => {
                 formatter.write_str("unexpected `end` outside a sub-pipeline")
             }
+
+            Self::Separators { message } => formatter.write_str(message),
 
             Self::UnclosedSubPipeline { stage_span } => {
                 write!(
@@ -446,193 +452,49 @@ impl<'stream, 'source> Parser<'stream, 'source> {
 
     fn parse_array(&mut self) -> ParseResult<ValueAst> {
         let opening = self.consume(TokenKind::LeftBracket)?;
-        let mut values = Vec::new();
-
-        if self.check(TokenKind::RightBracket) {
-            let closing = self.advance();
-            let span = opening.span().join(closing.span());
-
-            return Ok(ValueAst::Array(ArrayAst::new(
-                opening.span(),
-                values,
-                closing.span(),
-                span,
-            )));
-        }
-
-        loop {
-            if self.is_at_end() {
-                return Err(ParseError::new(
-                    ParseErrorKind::UnclosedArray {
-                        opening_span: opening.span(),
-                    },
-                    self.current().span(),
-                ));
-            }
-
-            values.push(self.parse_value_node()?);
-
-            if self.check(TokenKind::Comma) {
-                self.advance();
-
-                if self.check(TokenKind::RightBracket) {
-                    let closing = self.advance();
-                    let span = opening.span().join(closing.span());
-
-                    return Ok(ValueAst::Array(ArrayAst::new(
-                        opening.span(),
-                        values,
-                        closing.span(),
-                        span,
-                    )));
-                }
-
-                if self.is_at_end() {
-                    return Err(ParseError::new(
-                        ParseErrorKind::UnclosedArray {
-                            opening_span: opening.span(),
-                        },
-                        self.current().span(),
-                    ));
-                }
-
-                continue;
-            }
-
-            if self.check(TokenKind::RightBracket) {
-                let closing = self.advance();
-                let span = opening.span().join(closing.span());
-
-                return Ok(ValueAst::Array(ArrayAst::new(
-                    opening.span(),
-                    values,
-                    closing.span(),
-                    span,
-                )));
-            }
-
-            if self.is_at_end() {
-                return Err(ParseError::new(
-                    ParseErrorKind::UnclosedArray {
-                        opening_span: opening.span(),
-                    },
-                    self.current().span(),
-                ));
-            }
-
-            return Err(self.error_current(ParseErrorKind::ExpectedCommaOrArrayEnd {
-                found: self.current().kind(),
-            }));
-        }
+        let (values, closing) = self.parse_list(opening, TokenKind::RightBracket, |opening_span| ParseErrorKind::UnclosedArray { opening_span }, |found| ParseErrorKind::ExpectedCommaOrArrayEnd { found }, Self::parse_value_node)?;
+        Ok(ValueAst::Array(ArrayAst::new(opening.span(), values, closing.span(), opening.span().join(closing.span()))))
     }
 
     fn parse_object(&mut self) -> ParseResult<ValueAst> {
         let opening = self.consume(TokenKind::LeftBrace)?;
-        let mut fields = Vec::new();
+        let (fields, closing) = self.parse_list(opening, TokenKind::RightBrace, |opening_span| ParseErrorKind::UnclosedObject { opening_span }, |found| ParseErrorKind::ExpectedCommaOrObjectEnd { found }, Self::parse_object_field)?;
+        Ok(ValueAst::Object(ObjectAst::new(opening.span(), fields, closing.span(), opening.span().join(closing.span()))))
+    }
 
-        if self.check(TokenKind::RightBrace) {
-            let closing = self.advance();
-            let span = opening.span().join(closing.span());
-
-            return Ok(ValueAst::Object(ObjectAst::new(
-                opening.span(),
-                fields,
-                closing.span(),
-                span,
-            )));
+    fn parse_object_field(&mut self) -> ParseResult<ObjectFieldAst> {
+        let key_token = self.current();
+        let key = match key_token.kind() {
+            TokenKind::Identifier => ObjectKeyAst::Identifier(NameAst::new(self.advance().span())),
+            TokenKind::String => ObjectKeyAst::String(StringAst::new(self.advance().span())),
+            found => return Err(self.error_current(ParseErrorKind::ExpectedObjectKey { found })),
+        };
+        if !self.check(TokenKind::Colon) {
+            return Err(self.error_current(ParseErrorKind::ExpectedColonAfterObjectKey { found: self.current().kind() }));
         }
+        let colon = self.advance();
+        let value = self.parse_value_node()?;
+        let field_span = key.span().join(value.span());
+        Ok(ObjectFieldAst::new(key, colon.span(), value, field_span))
+    }
+
+    /// Items after `opening` up to the `closing` token, comma separated with
+    /// an optional trailing comma; returns them with the closing token.
+    fn parse_list<T>(&mut self, opening: Token, closing: TokenKind, unclosed: fn(Span) -> ParseErrorKind, unexpected: fn(TokenKind) -> ParseErrorKind, mut item: impl FnMut(&mut Self) -> ParseResult<T>) -> ParseResult<(Vec<T>, Token)> {
+        let mut items = Vec::new();
         loop {
+            if self.check(closing) {
+                return Ok((items, self.advance()));
+            }
             if self.is_at_end() {
-                return Err(ParseError::new(
-                    ParseErrorKind::UnclosedObject {
-                        opening_span: opening.span(),
-                    },
-                    self.current().span(),
-                ));
+                return Err(ParseError::new(unclosed(opening.span()), self.current().span()));
             }
-
-            let key_token = self.current();
-            let key = match key_token.kind() {
-                TokenKind::Identifier => {
-                    self.advance();
-                    ObjectKeyAst::Identifier(NameAst::new(key_token.span()))
-                }
-
-                TokenKind::String => {
-                    self.advance();
-                    ObjectKeyAst::String(StringAst::new(key_token.span()))
-                }
-
-                found => {
-                    return Err(self.error_current(ParseErrorKind::ExpectedObjectKey { found }));
-                }
-            };
-
-            if !self.check(TokenKind::Colon) {
-                return Err(
-                    self.error_current(ParseErrorKind::ExpectedColonAfterObjectKey {
-                        found: self.current().kind(),
-                    }),
-                );
-            }
-
-            let colon = self.advance();
-            let value = self.parse_value_node()?;
-            let field_span = key.span().join(value.span());
-
-            fields.push(ObjectFieldAst::new(key, colon.span(), value, field_span));
-
+            items.push(item(self)?);
             if self.check(TokenKind::Comma) {
                 self.advance();
-
-                if self.check(TokenKind::RightBrace) {
-                    let closing = self.advance();
-                    let span = opening.span().join(closing.span());
-
-                    return Ok(ValueAst::Object(ObjectAst::new(
-                        opening.span(),
-                        fields,
-                        closing.span(),
-                        span,
-                    )));
-                }
-
-                if self.is_at_end() {
-                    return Err(ParseError::new(
-                        ParseErrorKind::UnclosedObject {
-                            opening_span: opening.span(),
-                        },
-                        self.current().span(),
-                    ));
-                }
-
-                continue;
+            } else if !self.check(closing) {
+                return Err(if self.is_at_end() { ParseError::new(unclosed(opening.span()), self.current().span()) } else { self.error_current(unexpected(self.current().kind())) });
             }
-            if self.check(TokenKind::RightBrace) {
-                let closing = self.advance();
-                let span = opening.span().join(closing.span());
-
-                return Ok(ValueAst::Object(ObjectAst::new(
-                    opening.span(),
-                    fields,
-                    closing.span(),
-                    span,
-                )));
-            }
-            if self.is_at_end() {
-                return Err(ParseError::new(
-                    ParseErrorKind::UnclosedObject {
-                        opening_span: opening.span(),
-                    },
-                    self.current().span(),
-                ));
-            }
-
-            return Err(
-                self.error_current(ParseErrorKind::ExpectedCommaOrObjectEnd {
-                    found: self.current().kind(),
-                }),
-            );
         }
     }
 
@@ -992,8 +854,12 @@ pub fn parse_tokens(stream: &TokenStream<'_>) -> ParseResult<PipelineAst> {
     Parser::new(stream).parse_pipeline()
 }
 
+/// Parses a query whose stages are separated by `|`, or by `;` and line
+/// breaks ([`super::normalize`]); the spans are those of `source`.
 pub fn parse(source: &str) -> QueryParseResult<PipelineAst> {
-    let stream = lex(source)?;
+    let source = super::separators::normalize(source)
+        .map_err(|message| ParseError::new(ParseErrorKind::Separators { message }, Span::at(0)))?;
+    let stream = lex(&source)?;
     let pipeline = parse_tokens(&stream)?;
     Ok(pipeline)
 }

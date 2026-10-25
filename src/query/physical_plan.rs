@@ -71,6 +71,14 @@ impl PhysicalPlan {
         })
     }
 
+    /// The same plan with operator `index` replaced.
+    pub fn with_operator(&self, index: usize, operator: PhysicalOperator) -> PhysicalPlanResult<Self> {
+        let mut operators = self.operators.to_vec();
+        operators[index] = operator;
+        let plan = Self::new(self.source.clone(), operators)?;
+        Ok(if self.order_free { plan.with_order_free_consumer(self.field_demand.as_deref().map(<[_]>::to_vec)) } else { plan })
+    }
+
     /// Declares that the consumer of this plan's rows ignores their source
     /// order and reads `fields` from them (`None`: whole rows). Executors may
     /// then read only the fields the plan needs, from an unordered cursor.
@@ -195,6 +203,36 @@ impl PhysicalPlan {
     pub const fn is_memory_streaming(&self) -> bool {
         matches!(self.memory_mode, MemoryExecutionMode::Streaming)
     }
+
+    /// Returns whether every blocking stage holds at most [`SMALL_STATE_ROWS`]
+    /// rows: a top-N (`sort` then `limit n`), or a stage fed by a few rows,
+    /// such as a bounded `lookup`. Admission then counts the plan with
+    /// streaming ones, not with heavy operations.
+    #[must_use]
+    pub fn is_small_state(&self) -> bool {
+        small_state_rows(&self.operators).is_some()
+    }
+}
+
+/// Largest state a blocking stage of a light plan holds, in rows.
+pub const SMALL_STATE_ROWS: usize = 10_000;
+
+/// Rows out of `operators` at most (inner `None`: unbounded), or `None` when
+/// a blocking stage may hold more than [`SMALL_STATE_ROWS`] rows.
+fn small_state_rows(operators: &[PhysicalOperator]) -> Option<Option<usize>> {
+    let (small, mut rows) = (|rows: Option<usize>| rows.is_some_and(|rows| rows <= SMALL_STATE_ROWS), None);
+    for (index, operator) in operators.iter().enumerate() {
+        let properties = operator.execution_properties();
+        let inner = match operator { PhysicalOperator::Lookup { pipeline, .. } | PhysicalOperator::Union { pipeline, .. } => Some(small_state_rows(pipeline.operators())?), _ => None };
+        let top_n = matches!((operator, operators.get(index + 1)), (PhysicalOperator::Sort { .. }, Some(PhysicalOperator::Limit { count })) if *count <= SMALL_STATE_ROWS);
+        if !matches!(properties.flow, Flow::Streaming) && !top_n && !(small(rows) && inner.is_none_or(small)) { return None; }
+        rows = match (operator, properties.cardinality) {
+            (PhysicalOperator::Union { .. }, _) => rows.zip(inner.flatten()).map(|(a, b)| a.saturating_add(b)),
+            (_, CardinalityEffect::Expand | CardinalityEffect::Unknown) => None,
+            _ => match (rows, properties.stream_row_bound()) { (Some(a), Some(b)) => Some(a.min(b)), (a, b) => a.or(b) },
+        };
+    }
+    Some(rows)
 }
 
 /// Memory execution contract selected for a physical plan.
@@ -508,8 +546,12 @@ pub enum PhysicalOperator {
     /// Inserts one fully typed and validated document.
     Insert { document: InsertDocument },
 
-    /// Groups rows by the supplied field keys.
-    Group { keys: Arc<[ExpressionFieldPath]> },
+    /// Groups rows by the supplied field keys. `auto`: a compact `group`
+    /// whose items after the first are each summed when their values are
+    /// numbers and a key otherwise, which the engine decides from the
+    /// storage's field facts before running; undecided, every item but the
+    /// last is a key and the last is summed.
+    Group { keys: Arc<[ExpressionFieldPath]>, auto: bool },
 
     /// Reshapes rows according to one validated pivot specification.
     Pivot { specification: PivotSpecification },
@@ -616,7 +658,7 @@ impl PhysicalOperator {
         let chunks = chunks
             .into_iter()
             .map(|chunk| {
-                non_empty_text(chunk.as_ref(), PhysicalPlanError::empty_load_chunk)
+                crate::helpers::non_empty_text(chunk.as_ref(), PhysicalPlanError::empty_load_chunk)
                     .map(Arc::<str>::from)
             })
             .collect::<PhysicalPlanResult<Vec<_>>>()?;
@@ -635,7 +677,7 @@ impl PhysicalOperator {
 
     /// Creates a validated load operator.
     pub fn load(target: impl AsRef<str>) -> PhysicalPlanResult<Self> {
-        let target = non_empty_text(target.as_ref(), PhysicalPlanError::empty_load_target)?;
+        let target = crate::helpers::non_empty_text(target.as_ref(), PhysicalPlanError::empty_load_target)?;
 
         Ok(Self::Load {
             target: Arc::from(target),
@@ -728,7 +770,15 @@ impl PhysicalOperator {
 
         Ok(Self::Group {
             keys: Arc::from(keys),
+            auto: false,
         })
+    }
+
+    /// The same compact `group`, whose items are decided by their kinds
+    /// (see [`Self::Group`]).
+    #[must_use]
+    pub fn with_auto_measures(self) -> Self {
+        match self { Self::Group { keys, .. } => Self::Group { keys, auto: true }, other => other }
     }
 
     /// Creates a pivot operator from a specification already validated by the
@@ -741,7 +791,10 @@ impl PhysicalOperator {
     /// Creates the operator of a stage run through its compiled form or the
     /// runtime; its effect and row bound come from the stage catalogue.
     pub fn custom( name: StageName, arguments: impl AsRef<str> ) -> PhysicalPlanResult<Self> {
-        let arguments = arguments.as_ref();
+        // Arguments written on several lines (a `derive` of one field per line) read as one: line breaks and tabs
+        // outside a string are spaces. Inside a string they stay refused.
+        let spaced = spaced_arguments(arguments.as_ref());
+        let arguments = spaced.as_str();
         if arguments.chars().any(char::is_control) {
             return Err(PhysicalPlanError::new(
                 PhysicalPlanErrorKind::InvalidCustomArguments {
@@ -780,7 +833,7 @@ impl PhysicalOperator {
             Self::Filter { predicate } => predicate.for_each_field(&mut add),
             Self::Sort { keys } => keys.iter().for_each(|key| add(key.field())),
             Self::Distinct { fields: keys } if !keys.is_empty() => keys.iter().for_each(&mut add),
-            Self::Group { keys } => super::group_field_layout(keys).ok()?.1.iter().for_each(&mut add),
+            Self::Group { keys, .. } => super::group_field_layout(keys).ok()?.1.iter().for_each(&mut add),
             Self::Pivot { specification } => specification
                 .rows()
                 .iter()
@@ -1264,7 +1317,7 @@ impl PhysicalOperator {
     #[must_use]
     pub fn group_keys(&self) -> Option<&[ExpressionFieldPath]> {
         match self {
-            Self::Group { keys } => Some(keys),
+            Self::Group { keys, .. } => Some(keys),
             _ => None,
         }
     }
@@ -1652,14 +1705,6 @@ fn validate_subpipeline(operators: &[PhysicalOperator]) -> PhysicalPlanResult<()
     Ok(())
 }
 
-fn non_empty_text( text: &str, error: fn() -> PhysicalPlanError, ) -> PhysicalPlanResult<&str> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Err(error());
-    }
-    Ok(text)
-}
-
 fn validate_plan( _source: &PhysicalSource, operators: &[PhysicalOperator], ) -> PhysicalPlanResult<()> {
     let mut prefix = Vec::with_capacity(operators.len());
     for operator in operators {
@@ -1758,35 +1803,7 @@ fn validate_fields( fields: &[ExpressionFieldPath], context: PhysicalFieldContex
 }
 
 fn validate_identifier(identifier: &str) -> PhysicalPlanResult<()> {
-    let mut characters = identifier.chars();
-
-    let Some(first) = characters.next() else {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::InvalidCountAlias {
-                alias: Arc::from(identifier),
-            },
-        ));
-    };
-
-    if first != '_' && !first.is_alphabetic() {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::InvalidCountAlias {
-                alias: Arc::from(identifier),
-            },
-        ));
-    }
-
-    if characters.any(|character| {
-        character != '_' && !character.is_alphabetic() && !character.is_ascii_digit()
-    }) {
-        return Err(PhysicalPlanError::new(
-            PhysicalPlanErrorKind::InvalidCountAlias {
-                alias: Arc::from(identifier),
-            },
-        ));
-    }
-
-    Ok(())
+    if crate::helpers::is_identifier(identifier) { Ok(()) } else { Err(PhysicalPlanError::new(PhysicalPlanErrorKind::InvalidCountAlias { alias: Arc::from(identifier) })) }
 }
 
 fn negotiate_source_access_vector(operators: &[PhysicalOperator]) -> (AccessVector, usize) {
@@ -1890,15 +1907,43 @@ pub fn source_field_demand( operators: &[PhysicalOperator], demand: Option<&[Exp
     needed
 }
 
+
+/// `arguments` with each line break, carriage return or tab outside a string (`"…"`) replaced by a space.
+fn spaced_arguments(arguments: &str) -> String {
+    let mut out = String::with_capacity(arguments.len());
+    let (mut quote, mut escaped) = (None::<char>, false);
+    for character in arguments.chars() {
+        match quote {
+            Some(open) => {
+                if escaped { escaped = false; } else if character == '\\' { escaped = true; } else if character == open { quote = None; }
+                out.push(character);
+            }
+            None => {
+                if character == '"' { quote = Some(character); }
+                out.push(if matches!(character, '\n' | '\r' | '\t') { ' ' } else { character });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn custom_arguments_on_several_lines_read_as_one() {
+        let name = StageName::parse("derive").unwrap();
+        let operator = PhysicalOperator::custom(name.clone(), "a = 1,\n         b = \"x y\"").unwrap();
+        assert!(matches!(operator, PhysicalOperator::Custom { ref arguments, .. } if &**arguments == "a = 1,          b = \"x y\""));
+        assert!(PhysicalOperator::custom(name, "a = \"x\ny\"").is_err());
+    }
 
-    #[test] fn negotiates_projected_values_for_filter_group_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Group { keys: Arc::from([field]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
+
+    #[test] fn negotiates_projected_values_for_filter_group_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Group { keys: Arc::from([field]), auto: false }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
     #[test] fn negotiates_projected_values_for_filter_sort_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["score"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field)]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
     #[test] fn explicit_distinct_negotiates_projected_values_but_document_distinct_does_not() { let field = ExpressionFieldPath::new(["name"]).unwrap(); assert_eq!( negotiate_source_access_vector(&[PhysicalOperator::Distinct { fields: Arc::from([field]), }]), (AccessVector::ProjectedValues, 0) ); assert_eq!( negotiate_source_access_vector(&[PhysicalOperator::Distinct { fields: Arc::from([]), }]), (AccessVector::Document, 0) ); }
     #[test] fn reusable_projection_is_negotiated_from_stage_properties() { let predicate = crate::query::parse_expression(r#"active == true"#).unwrap(); let field = ExpressionFieldPath::new(["score"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field)]), }, ]; assert_eq!( negotiate_source_projection_reuse(&operators), ProjectionReuse::Reusable ); assert!(operators .iter() .all(|operator| operator.execution_properties().defers_materialization())); assert!(operators .iter() .all(|operator| operator.execution_properties().reuses_projection())); }
     #[test] fn materializing_or_unsupported_stage_blocks_projection_reuse() { let field = ExpressionFieldPath::new(["score"]).unwrap(); let with_skip = vec![ PhysicalOperator::Skip { count: 1 }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field.clone())]), }, ]; assert_eq!( negotiate_source_projection_reuse(&with_skip), ProjectionReuse::None ); let document_distinct = [PhysicalOperator::Distinct { fields: Arc::from([]), }]; assert_eq!( negotiate_source_projection_reuse(&document_distinct), ProjectionReuse::None ); assert!(!document_distinct[0] .execution_properties() .defers_materialization()); assert!(!document_distinct[0] .execution_properties() .reuses_projection()); }
-    #[test] fn incompatible_source_stage_forces_document_vector() { let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Skip { count: 1 }, PhysicalOperator::Group { keys: Arc::from([field]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::Document, 0) ); }
+    #[test] fn incompatible_source_stage_forces_document_vector() { let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Skip { count: 1 }, PhysicalOperator::Group { keys: Arc::from([field]), auto: false }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::Document, 0) ); }
 
     use super::*;
 
@@ -1964,6 +2009,7 @@ mod tests {
     #[test] fn supports_streaming_load() { let operator = PhysicalOperator::streaming_load(PhysicalLoadMode::Replace, ["batch1", "batch2"]) .unwrap(); assert_eq!(operator.kind(), PhysicalOperatorKind::StreamingLoad); assert_eq!( operator.streaming_load_mode(), Some(PhysicalLoadMode::Replace) ); assert_eq!(operator.streaming_load_chunks().unwrap().len(), 2); assert!(operator.execution_properties().writes()); assert!(operator.execution_properties().closes_linear_pipeline()); }
     #[test] fn row_local_read_only_custom_operator_is_streaming() { let operator = PhysicalOperator::custom( StageName::parse("select").unwrap(), "CAFacture - COGS as Marge") .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::Streaming )); assert!(!matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); }
     #[test] fn cardinality_changing_custom_operator_is_set_level() { let operator = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3") .unwrap(); assert!(matches!( operator.execution_properties().flow, Flow::GovernedBlocking )); assert!(matches!( operator.execution_properties().scope, super::super::execution_properties::Scope::Set )); }
+    #[test] fn blocking_stages_over_a_few_rows_are_small_state() { let plan = |operators: Vec<PhysicalOperator>| PhysicalPlan::new(PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), operators).unwrap(); let sort = || PhysicalOperator::sort([SortKey::ascending(field(&["name"]))]).unwrap(); assert!(plan(vec![sort(), PhysicalOperator::limit(10)]).is_small_state()); assert!(!plan(vec![sort(), PhysicalOperator::limit(SMALL_STATE_ROWS + 1)]).is_small_state()); assert!(!plan(vec![sort()]).is_small_state()); assert!(plan(vec![PhysicalOperator::limit(2), sort()]).is_small_state()); assert!(plan(vec![PhysicalOperator::limit(2)]).is_small_state()); }
     #[test] fn classifies_streaming_and_blocking_memory_contracts() { let collection = CollectionId::parse("users").unwrap(); let streaming = PhysicalPlan::new( PhysicalSource::collection_scan(collection.clone()), [PhysicalOperator::limit(2)], ) .unwrap(); assert_eq!( streaming.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming.is_memory_streaming()); let blocking = PhysicalPlan::new( PhysicalSource::collection_scan(collection), [PhysicalOperator::sort([SortKey::ascending(field(&["name"]))]).unwrap()], ) .unwrap(); assert_eq!( blocking.memory_execution_mode(), MemoryExecutionMode::GovernedBlocking ); assert!(!blocking.is_memory_streaming()); let streaming_count = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("users").unwrap()), [ PhysicalOperator::filter(parse_expression("active == true").unwrap()), PhysicalOperator::count("count").unwrap(), ], ) .unwrap(); assert_eq!( streaming_count.memory_execution_mode(), MemoryExecutionMode::Streaming ); assert!(streaming_count.is_memory_streaming()); }
     #[test] fn declared_row_bound_is_consumed_through_properties() { let name = StageName::parse("first").unwrap(); let pure = PhysicalOperator::custom(name.clone(), "").unwrap(); assert_eq!(pure.execution_properties().stream_row_bound(), Some(1)); assert_eq!(pure.execution_properties().linear_bound(), Some(1)); let projecting = PhysicalOperator::custom(name.clone(), "profile").unwrap(); assert_eq!(projecting.execution_properties().stream_row_bound(), Some(1)); assert_eq!(projecting.execution_properties().linear_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().stream_row_bound(), Some(3)); }
     #[test] fn sample_and_single_declare_their_row_properties() { let single = PhysicalOperator::custom(StageName::parse("single").unwrap(), "").unwrap(); assert_eq!(single.execution_properties().exact_rows(), Some(1)); assert_eq!(single.execution_properties().stream_row_bound(), Some(1)); assert_eq!(single.execution_properties().linear_bound(), None); let sample = PhysicalOperator::custom(StageName::parse("sample").unwrap(), "3").unwrap(); assert_eq!(sample.execution_properties().retained_rows(), Some(3)); assert_eq!(sample.execution_properties().stream_row_bound(), None); assert_eq!(PhysicalOperator::limit(3).execution_properties().retained_rows(), None); }

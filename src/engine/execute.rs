@@ -13,6 +13,12 @@ use super::changes;
 use crate::query::{execute_insert, execute_streaming_load, insert_document, into_target, streaming_load_specification, DocumentScope};
 use crate::storage::{CommitResult, UuidV7Generator, VersionPrecondition};
 
+/// What a transaction keeps of each pending write besides a written document (its staged entry, its log entry,
+/// its planned change): what a delete holds. A written document takes about twice its encoded size in memory.
+/// Measured on an import of a million rows (ideas/data-import-rust.md): counted at its encoded size alone, a
+/// write held four times its share of the query's memory and its transaction never moved out of it.
+const PENDING_RECORD_BYTES: usize = 320;
+
 /// Whether a write still sees the stored rows after `operator`: it keeps,
 /// drops, reorders or rewrites them but neither merges nor expands them.
 fn keeps_stored_rows(operator: &PhysicalOperator) -> bool {
@@ -129,7 +135,7 @@ impl Engine {
         let charged = !physical.source().collection().as_str().starts_with('_');
         let statistics = self.stream_rows(physical, scope, |row| {
             held = held.saturating_add(execution_row_working_bytes(&row).map_err(EngineError::execution)?);
-            if charged && !stage.fits(held) {
+            if charged && !stage.holds(held) {
                 return Err(EngineError::execution(ExecutionError::evaluation("the result rows exceed the governed query working set")));
             }
             rows.push(row);
@@ -205,18 +211,22 @@ impl Engine {
         let (mut rows, mut written, failure) = (Vec::new(), 0u64, std::cell::Cell::new(None));
         let name = if into.is_some() { "into" } else { operators[first].name() };
         let mut write = |mut row: ExecutionRow| -> Result<(), StorageError> {
-            let bytes = if delete { 64 } else { execution_row_working_bytes(&row).map_err(execution_storage_error)? };
+            let bytes = if delete { PENDING_RECORD_BYTES } else { execution_row_encoded_len(&row).saturating_mul(2).saturating_add(PENDING_RECORD_BYTES) };
             held.0 = held.0.saturating_add(bytes);
             if !stage.fits(held.0 + held.1) && transaction.spill()? {
                 held.0 = 0;
             }
-            if !stage.fits(held.0 + held.1) {
+            if !stage.holds(held.0 + held.1) {
                 failure.set(Some(EngineError::execution(ExecutionError::evaluation(format!("{name}: the written rows exceed the governed query working set")))));
                 return Err(StorageError::backend(name));
             }
             let precondition = VersionPrecondition::Exact(row.version());
+            let enforce = |row: &ExecutionRow| scope.map_or_else(|| Ok(row.shared_document()), |scope| scope.enforce(collection.as_str(), row.document()).map_err(|message| {
+                failure.set(Some(EngineError::execution(ExecutionError::evaluation(message))));
+                StorageError::backend(name)
+            }));
             if into.is_some() {
-                let document = scope.map_or_else(|| row.shared_document(), |scope| scope.enforce(row.document()));
+                let document = enforce(&row)?;
                 transaction.insert(collection, ids.next_id(), document)?;
                 written += 1;
                 return Ok(());
@@ -226,7 +236,7 @@ impl Engine {
                 }
                 return Ok(());
             } else if row.changed() && row.is_stored() {
-                let document = scope.map_or_else(|| row.shared_document(), |scope| scope.enforce(row.document()));
+                let document = enforce(&row)?;
                 row.committed(transaction.replace(collection, row.id(), document, precondition)?.into_stored());
             }
             // The returned rows stay in memory.

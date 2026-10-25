@@ -2,7 +2,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
 use super::*;
-use super::serve::{diverged, failed, reply, request_error, store_failed, Connection, Handled, Stop};
+use super::serve::{diverged, failed, failure, reply, request_error, store_failed, Connection, Handled, Stop};
 
 /// Checks that the caller may read, or with `write` change, the Files of an AppInstance.
 #[cfg(feature = "files")]
@@ -76,7 +76,13 @@ pub(super) fn handle_file_operation(connection: &mut Connection, settings: &Conn
                 return Err(ConnectionError::Read(io::Error::new(io::ErrorKind::UnexpectedEof,format!("data worker upload ended after {copied} of {size} bytes"))).into());
             }
             drop(out);
-            let result=run_data_worker_for_path(id,&temp,&operation,mapping.as_ref());
+            // An import answers each batch of documents as a partial, then its summary: the Gateway stages the
+            // batches as they come instead of receiving the whole file in one response.
+            let result=if operation=="import" {
+                run_data_worker_import(id,&temp,mapping.as_ref(),&mut |documents| Ok(write_stream_response(writer,&StreamResponse::partial(id,serde_json::json!({"documents":documents})))?))
+            } else {
+                run_data_worker_for_path(id,&temp,&operation,mapping.as_ref()).map_err(Stop::from)
+            };
             let _=fs::remove_file(&temp);
             reply(writer, id, result?)?;
         }
@@ -102,6 +108,9 @@ pub(super) fn handle_file_operation(connection: &mut Connection, settings: &Conn
         #[cfg(feature = "files")]
         RoutedOperation::FileWrite(Routed { id, input: FileWriteInput { place_id, instance_id, file_id, parent_id, name, content_type, size } }) => {
             ensure_file_access(engine, delegation, principal, id, &place_id, &instance_id, true)?;
+            // Refused before the transfer starts when the file would cross a storage limit.
+            #[cfg(feature = "auth")]
+            super::usage_ops::check_storage(engine, id, &place_id, size)?;
             let file_store=scoped_native_file_store(settings,id,&place_id,&instance_id)?;
             let existing=file_id.as_deref().map(|value|load_file_entry(engine,id,&place_id,&instance_id,value)).transpose()?;
             if existing.as_ref().is_some_and(|entry|entry.kind!=crate::files::FileKind::File){
@@ -507,6 +516,24 @@ fn file_sync_status(settings: &ConnectionSettings, runtime: &FileSyncRuntime) ->
             }));
         }
     }
+    // Errors of the last pass that no Error entry of the index records: a Place or
+    // an instance that could not be read, a local creation, move or deletion refused.
+    let recorded: HashSet<&str> = index.entries.iter()
+        .filter(|entry| entry.state == FileSyncEntryState::Error)
+        .map(|entry| entry.file_id.as_str()).collect();
+    for error in runtime.last_run_errors.iter().filter(|error| error.str_field("fileId").is_none_or(|file_id| !recorded.contains(file_id))) {
+        errors += 1;
+        let reason = error.str_field("error").unwrap_or("the last pass reported an error without a reason").to_owned();
+        *reasons.entry(reason.clone()).or_insert(0) += 1;
+        diagnostics.push(serde_json::json!({
+            "state": FileSyncEntryState::Error,
+            "reason": reason,
+            "placeId": error.get("placeId"),
+            "instanceId": error.get("instanceId"),
+            "fileId": error.get("fileId"),
+            "path": error.get("path"),
+        }));
+    }
     diagnostics.sort_by(|left, right| {
         left.str_field("path").unwrap_or_default()
             .cmp(right.str_field("path").unwrap_or_default())
@@ -537,6 +564,7 @@ fn file_sync_status(settings: &ConnectionSettings, runtime: &FileSyncRuntime) ->
         "lastTrigger": runtime.last_trigger.clone(),
         "lastRunAt": runtime.last_run_at,
         "lastRunError": runtime.last_run_error.clone(),
+        "lastRunErrors": runtime.last_run_errors.clone(),
         "entries": {
             "total": index.entries.len(),
             "synced": synced,
@@ -563,27 +591,105 @@ pub(super) fn resolve_app_table_collection(app:&JsonValue, table:&str)->Option<S
     declaration.as_str().or_else(||declaration.str_field("name")).map(str::to_owned)
 }
 
+/// The data worker's command: `ogd data-worker` when the native worker is compiled (feature `native-import`), unless
+/// `OG_DATA_WORKER=python` asks for the Python module (`OG_DATA_WORKER_PYTHON`, `OG_DATA_WORKER_MODULE`), which is
+/// also the only worker of a build without it.
+fn data_worker_command()->Command{
+    #[cfg(feature="native-import")]
+    if env_text("OG_DATA_WORKER").as_deref()!=Some("python") {
+        if let Some(ogd)=env_text("OG_DATA_WORKER_OGD").map(PathBuf::from).or_else(||env::current_exe().ok()) { let mut command=Command::new(ogd); command.arg("data-worker"); return command; }
+    }
+    let mut command=Command::new(env_text("OG_DATA_WORKER_PYTHON").unwrap_or_else(||"python3".to_owned()));
+    command.args(["-m",&env_text("OG_DATA_WORKER_MODULE").unwrap_or_else(||"glacierdb.data_worker".to_owned())]); command
+}
+
+/// Starts the data worker on `request` (written to its stdin, then closed). It runs in a process of its own: whatever
+/// stops it (a panic, its memory or processor limit, a signal) fails the request, never the Core.
+fn spawn_data_worker(id:RequestId,command:&mut Command,request:&JsonValue)->Result<std::process::Child,QueryResponse>{
+    let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e|QueryResponse::request_error(id,"worker.unavailable",format!("cannot start data worker: {e}")))?;
+    if let Some(mut stdin)=child.stdin.take(){serde_json::to_writer(&mut stdin,request).map_err(failure(id, "worker.protocol_error"))?;}
+    Ok(child)
+}
+
 pub(super) fn run_data_worker_for_path(id:RequestId,path:&Path,operation:&str,mapping:Option<&JsonValue>)->Result<JsonValue,QueryResponse>{
-    let python=env::var("OG_DATA_WORKER_PYTHON").unwrap_or_else(|_|"python3".to_owned());
-    let module=env::var("OG_DATA_WORKER_MODULE").unwrap_or_else(|_|"openglacier.data_worker".to_owned());
-    let mut child=Command::new(python).args(["-m",module.as_str()]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e|QueryResponse::request_error(id,"worker.unavailable",format!("cannot start data worker: {e}")))?;
-    let request=serde_json::json!({"operation":operation,"file":path.to_string_lossy(),"mapping":mapping});
-    if let Some(mut stdin)=child.stdin.take(){serde_json::to_writer(&mut stdin,&request).map_err(|e|QueryResponse::request_error(id,"worker.protocol_error",e.to_string()))?;}
-    let output=child.wait_with_output().map_err(|e|QueryResponse::request_error(id,"worker.failed",e.to_string()))?;
-    let value:JsonValue=serde_json::from_slice(&output.stdout).map_err(|e|QueryResponse::request_error(id,"worker.protocol_error",format!("invalid worker JSON: {e}; stderr={}",String::from_utf8_lossy(&output.stderr))))?;
-    if !output.status.success() || value.str_field("status")==Some("error"){return Err(QueryResponse::request_error(id,"worker.failed",value.get("error").and_then(|v|v.get("message")).and_then(JsonValue::as_str).unwrap_or("data worker failed")));}
+    data_worker_result(id,&mut data_worker_command(),&serde_json::json!({"operation":operation,"file":path.to_string_lossy(),"mapping":mapping}))
+}
+
+/// The one JSON answer of the data worker `command` to `request` (an analysis, or the documents of a preview).
+pub(super) fn data_worker_result(id:RequestId,command:&mut Command,request:&JsonValue)->Result<JsonValue,QueryResponse>{
+    let child=spawn_data_worker(id,command,request)?;
+    let output=child.wait_with_output().map_err(failure(id, "worker.failed"))?;
+    if !output.status.success() && output.stdout.iter().all(u8::is_ascii_whitespace) { return Err(QueryResponse::request_error(id,"worker.failed",stopped(output.status,&String::from_utf8_lossy(&output.stderr)))); }
+    let value:JsonValue=serde_json::from_slice(&output.stdout).or_else(|_|output.stdout.split(|b|*b==b'\n').rev().find(|line|!line.trim_ascii().is_empty()).map_or_else(||serde_json::from_slice(b""),serde_json::from_slice)).map_err(|e|QueryResponse::request_error(id,"worker.protocol_error",format!("invalid worker JSON: {e}; stderr={}",String::from_utf8_lossy(&output.stderr))))?;
+    if !output.status.success() || value.str_field("status")==Some("error"){return Err(QueryResponse::request_error(id,"worker.failed",value["error"]["message"].as_str().unwrap_or("data worker failed")));}
     Ok(value)
 }
 
-pub(super) fn run_data_worker_for_file(settings:&ConnectionSettings,engine:&Engine,id:RequestId,place_id:&str,files_instance_id:&str,file_id:&str,operation:&str,mapping:Option<&JsonValue>)->Result<JsonValue,QueryResponse>{
+/// The import of `path` by the data worker, its documents given to `batch` as the worker writes them (one JSON line
+/// `{"documents": [...]}` per batch), so that no step holds the whole file; returns its summary (`rowCount`,
+/// `warnings`). A failing `batch` stops the worker.
+pub(super) fn run_data_worker_import(id:RequestId,path:&Path,mapping:Option<&JsonValue>,batch:&mut dyn FnMut(Vec<JsonValue>)->Result<(),Stop>)->Result<JsonValue,Stop>{
+    data_worker_import(id,&mut data_worker_command(),&serde_json::json!({"operation":"import","file":path.to_string_lossy(),"mapping":mapping,"batch":true}),batch)
+}
+
+/// [`run_data_worker_import`] with the data worker `command`.
+pub(super) fn data_worker_import(id:RequestId,command:&mut Command,request:&JsonValue,batch:&mut dyn FnMut(Vec<JsonValue>)->Result<(),Stop>)->Result<JsonValue,Stop>{
+    let mut child=spawn_data_worker(id,command,request)?;
+    let mut errors=child.stderr.take().expect("data worker stderr is piped");
+    let errors=thread::spawn(move||{let mut text=String::new(); let _=errors.read_to_string(&mut text); text});
+    let lines=io::BufRead::lines(io::BufReader::new(child.stdout.take().expect("data worker stdout is piped")));
+    let mut summary=None;
+    let read=(|| -> Result<(),Stop> {
+        for line in lines {
+            let line=line.map_err(failed(id, "worker.protocol_error"))?;
+            if line.trim().is_empty() { continue; }
+            let mut value:JsonValue=serde_json::from_str(&line).map_err(|e|request_error(id,"worker.protocol_error",format!("invalid worker JSON line: {e}")))?;
+            let batch_line=value.get("status").is_none();
+            match value.get_mut("documents").filter(|_|batch_line).map(JsonValue::take) {
+                Some(JsonValue::Array(documents)) => batch(documents)?,
+                Some(_) => reject!(id,"worker.protocol_error","a worker batch holds no document list"),
+                None => { summary=Some(value); break; }
+            }
+        }
+        Ok(())
+    })();
+    if read.is_err() { let _=child.kill(); }
+    let status=child.wait().map_err(failed(id, "worker.failed"))?;
+    let errors=errors.join().unwrap_or_default();
+    read?;
+    match summary {
+        Some(summary) if status.success() && summary.str_field("status")!=Some("error") => Ok(summary),
+        Some(summary) => reject!(id,"worker.failed",summary["error"]["message"].as_str().unwrap_or("data worker failed").to_owned()),
+        None if !status.success() => reject!(id,"worker.failed",stopped(status,&errors)),
+        None => reject!(id,"worker.protocol_error",format!("data worker ended without its summary; stderr={errors}")),
+    }
+}
+
+/// Why the data worker stopped without answering: its exit status or signal, and the end of what it wrote on stderr.
+fn stopped(status:std::process::ExitStatus,errors:&str)->String{
+    let errors=errors.trim(); let tail=errors.char_indices().rev().nth(500).map_or(errors,|(at,_)|&errors[at..]);
+    format!("the data worker stopped ({status}){}{tail}",if tail.is_empty() {""} else {": "})
+}
+
+/// Copies the file `file_id` of a Files instance to a temporary file for the data worker, and runs `run` on it.
+fn with_worker_copy<T>(settings:&ConnectionSettings,engine:&Engine,id:RequestId,place_id:&str,files_instance_id:&str,file_id:&str,run:impl FnOnce(&Path)->Result<T,Stop>)->Result<T,Stop>{
     let _context=resolve_file_context(engine,id,&Principal::Anonymous,place_id,files_instance_id,false).ok(); // actual caller authorization is checked before this helper
     let store=scoped_native_file_store(settings,id,place_id,files_instance_id)?; let entry=load_file_entry(engine,id,place_id,files_instance_id,file_id)?;
-    let mut source=store.read(&entry.remote_id,None).map_err(|e|QueryResponse::request_error(id,"file.store_error",e.to_string()))?;
+    let mut source=store.read(&entry.remote_id,None).map_err(failure(id, "file.store_error"))?;
     let extension=Path::new(&entry.name).extension().and_then(|v|v.to_str()).unwrap_or("dat"); let temp=env::temp_dir().join(format!("og-data-{}-{}.{}",std::process::id(),unix_time_millis(),extension));
-    {let mut out=fs::File::create(&temp).map_err(|e|QueryResponse::request_error(id,"worker.io_error",e.to_string()))?; io::copy(&mut source,&mut out).map_err(|e|QueryResponse::request_error(id,"worker.io_error",e.to_string()))?;}
-    let result=run_data_worker_for_path(id,&temp,operation,mapping);
+    {let mut out=fs::File::create(&temp).map_err(failure(id, "worker.io_error"))?; io::copy(&mut source,&mut out).map_err(failure(id, "worker.io_error"))?;}
+    let result=run(&temp);
     let _=fs::remove_file(&temp);
     result
+}
+
+/// The local data worker's import of a file of the Place, streamed to `batch` ([`run_data_worker_import`]).
+pub(super) fn run_data_worker_import_file(settings:&ConnectionSettings,engine:&Engine,id:RequestId,place_id:&str,files_instance_id:&str,file_id:&str,mapping:Option<&JsonValue>,batch:&mut dyn FnMut(Vec<JsonValue>)->Result<(),Stop>)->Result<JsonValue,Stop>{
+    with_worker_copy(settings,engine,id,place_id,files_instance_id,file_id,|path|run_data_worker_import(id,path,mapping,batch))
+}
+
+pub(super) fn run_data_worker_for_file(settings:&ConnectionSettings,engine:&Engine,id:RequestId,place_id:&str,files_instance_id:&str,file_id:&str,operation:&str,mapping:Option<&JsonValue>)->Result<JsonValue,Stop>{
+    with_worker_copy(settings,engine,id,place_id,files_instance_id,file_id,|path|Ok(run_data_worker_for_path(id,path,operation,mapping)?))
 }
 
 pub(super) fn scoped_native_file_store( settings:&ConnectionSettings, id:RequestId, place_id:&str, instance_id:&str, )->Result<NativeFileStore,QueryResponse>{
@@ -591,7 +697,7 @@ pub(super) fn scoped_native_file_store( settings:&ConnectionSettings, id:Request
         .join(file_scope_component(place_id))
         .join(file_scope_component(instance_id));
     NativeFileStore::new(StoreId::from(DEFAULT_FILES_STORE_ID),root)
-        .map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))
+        .map_err(failure(id, "file.store_error"))
 }
 
 pub(super) fn scoped_native_version_store( settings:&ConnectionSettings, id:RequestId, place_id:&str, instance_id:&str, )->Result<NativeFileStore,QueryResponse>{
@@ -600,7 +706,7 @@ pub(super) fn scoped_native_version_store( settings:&ConnectionSettings, id:Requ
         .join(file_scope_component(place_id))
         .join(file_scope_component(instance_id));
     NativeFileStore::new(StoreId::from(DEFAULT_FILES_STORE_ID),root)
-        .map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))
+        .map_err(failure(id, "file.store_error"))
 }
 
 pub(super) static NEXT_FILE_VERSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -646,11 +752,11 @@ pub(super) fn archive_current_file( engine:&Engine,settings:&ConnectionSettings,
     let sequence=NEXT_FILE_VERSION_ID.fetch_add(1,Ordering::Relaxed);
     let version_id=format!("version-{created_at}-{sequence}");
     let version_name=version_id.clone();
-    let mut reader=source.read(&file.remote_id,None).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
+    let mut reader=source.read(&file.remote_id,None).map_err(failure(id, "file.store_error"))?;
     let mut stored=versions.write(
         FileWrite{remote_id:None,parent_remote_id:None,name:&version_name,content_type:file.metadata.content_type.as_deref(),size:file.metadata.size},
         &mut reader
-    ).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
+    ).map_err(failure(id, "file.store_error"))?;
     stored.metadata.content_type=file.metadata.content_type.clone();
     let json=file_version_json(&version_id,file,&stored.remote_id,&stored.metadata,created_at);
     let query=insert_query("_file_versions",&json);
@@ -660,7 +766,7 @@ pub(super) fn archive_current_file( engine:&Engine,settings:&ConnectionSettings,
 pub(super) static NEXT_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn resolve_file_context( engine:&Engine, id:RequestId, principal:&Principal, place_id:&str, instance_id:&str, write:bool )->Result<ExecutionContext,QueryResponse>{
-    let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:Some(instance_id.to_owned())})?;
+    let context=resolve_query_execution_context(engine,id,principal,RequestedExecutionContext{place_id:place_id.to_owned(),app_instance_id:Some(instance_id.to_owned()),as_profile:None})?;
     if write && !context.access.can_write(){
         return Err(QueryResponse::request_error(id,"authorization.denied","Place access is read-only for Files"));
     }
@@ -703,7 +809,7 @@ pub(super) fn load_file_entry_json(engine:&Engine,id:RequestId,place_id:&str,ins
 }
 pub(super) fn load_file_entry(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<FileEntry,QueryResponse>{
     let json=load_file_entry_json(engine,id,place_id,instance_id,file_id)?;
-    json_to_file_entry(&json).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))
+    json_to_file_entry(&json).map_err(failure(id, "file.invalid_record"))
 }
 pub(super) fn list_file_children_raw(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:Option<&str>)->Result<Vec<JsonValue>,QueryResponse>{
     let parent=parent_id.map_or_else(||"parentId == null".to_owned(),|value|format!("parentId == {}",query_string(value)));
@@ -796,7 +902,7 @@ pub(super) fn ensure_file_trash_root(store:&dyn FileStore,id:RequestId)->Result<
 pub(super) fn trash_file_entry(engine:&Engine,settings:&ConnectionSettings,id:RequestId,place_id:&str,instance_id:&str,file_id:&str)->Result<JsonValue,QueryResponse>{
     let mut json=load_file_entry_json(engine,id,place_id,instance_id,file_id)?;
     if json.bool_field("trashed")==Some(true){return Ok(json);}
-    let entry=json_to_file_entry(&json).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
+    let entry=json_to_file_entry(&json).map_err(failure(id, "file.invalid_record"))?;
     let store=scoped_native_file_store(settings,id,place_id,instance_id)?;
     let trash_root=ensure_file_trash_root(&store,id)?;
     let stored=store.move_entry(&entry.remote_id,Some(&trash_root),entry.file_id.as_str())
@@ -804,17 +910,23 @@ pub(super) fn trash_file_entry(engine:&Engine,settings:&ConnectionSettings,id:Re
 
     let parent=json.get("parentId").cloned().unwrap_or(JsonValue::Null);
     let object=json.as_object_mut().ok_or_else(||QueryResponse::request_error(id,"file.invalid_record","File metadata is not an object"))?;
-    object.insert("remoteId".to_owned(),JsonValue::String(stored.remote_id.clone()));
     object.insert("trashed".to_owned(),JsonValue::Bool(true));
     object.insert("trashedAt".to_owned(),JsonValue::from(unix_time_millis()));
     object.insert("trashedParentId".to_owned(),parent);
-    if let Some(etag)=stored.metadata.etag.clone(){object.insert("etag".to_owned(),JsonValue::String(etag));}
-    if let Some(modified)=stored.metadata.modified_at{object.insert("modifiedAt".to_owned(),JsonValue::from(modified));}
+    persist_moved(engine,id,&store,place_id,instance_id,file_id,&entry,&stored,json)
+}
 
+/// Writes the record of an entry the store moved: its new remote id, etag and time; then its children's, for a directory.
+fn persist_moved(engine:&Engine,id:RequestId,store:&dyn FileStore,place_id:&str,instance_id:&str,file_id:&str,entry:&FileEntry,stored:&FileStoreEntry,mut json:JsonValue)->Result<JsonValue,QueryResponse>{
+    if let Some(object)=json.as_object_mut(){
+        object.insert("remoteId".to_owned(),JsonValue::String(stored.remote_id.clone()));
+        if let Some(etag)=stored.metadata.etag.clone(){object.insert("etag".to_owned(),JsonValue::String(etag));}
+        if let Some(modified)=stored.metadata.modified_at{object.insert("modifiedAt".to_owned(),JsonValue::from(modified));}
+    }
     let persisted=replace_file_json(engine,id,place_id,instance_id,file_id,&json)?;
     if entry.kind==crate::files::FileKind::Directory{
-        let moved=json_to_file_entry(&persisted).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
-        sync_moved_children(engine,id,&store,place_id,instance_id,&moved)?;
+        let moved=json_to_file_entry(&persisted).map_err(failure(id, "file.invalid_record"))?;
+        sync_moved_children(engine,id,store,place_id,instance_id,&moved)?;
     }
     Ok(persisted)
 }
@@ -831,7 +943,7 @@ pub(super) fn restore_file_entry( engine:&Engine,settings:&ConnectionSettings,id
         return Err(QueryResponse::request_error(id,"file.not_trashed","File entry is not in the trash"));
     }
 
-    let entry=json_to_file_entry(&json).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
+    let entry=json_to_file_entry(&json).map_err(failure(id, "file.invalid_record"))?;
     let old_parent=json.str_field("trashedParentId").map(str::to_owned);
     let parent=match old_parent.as_deref(){
         Some(parent_id)=>load_file_entry(engine,id,place_id,instance_id,parent_id)
@@ -848,20 +960,12 @@ pub(super) fn restore_file_entry( engine:&Engine,settings:&ConnectionSettings,id
         .map_err(|error|file_store_query_error(id,error))?;
 
     if let Some(object)=json.as_object_mut(){
-        object.insert("remoteId".to_owned(),JsonValue::String(stored.remote_id.clone()));
         object.insert("parentId".to_owned(),target_parent_id.map(JsonValue::String).unwrap_or(JsonValue::Null));
         object.insert("trashed".to_owned(),JsonValue::Bool(false));
         object.remove("trashedAt");
         object.remove("trashedParentId");
-        if let Some(etag)=stored.metadata.etag.clone(){object.insert("etag".to_owned(),JsonValue::String(etag));}
-        if let Some(modified)=stored.metadata.modified_at{object.insert("modifiedAt".to_owned(),JsonValue::from(modified));}
     }
-    let persisted=replace_file_json(engine,id,place_id,instance_id,file_id,&json)?;
-    if entry.kind==crate::files::FileKind::Directory{
-        let moved=json_to_file_entry(&persisted).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
-        sync_moved_children(engine,id,&store,place_id,instance_id,&moved)?;
-    }
-    Ok(persisted)
+    persist_moved(engine,id,&store,place_id,instance_id,file_id,&entry,&stored,json)
 }
 
 #[cfg(feature = "files")]
@@ -890,16 +994,16 @@ pub(super) fn permanently_delete_file_tree( engine:&Engine,settings:&ConnectionS
     let store=scoped_native_file_store(settings,id,place_id,instance_id)?;
     if entry.kind==crate::files::FileKind::Directory {
         // Children were removed first; delete handles the now-empty tree too.
-        store.delete(&entry.remote_id).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
+        store.delete(&entry.remote_id).map_err(failure(id, "file.store_error"))?;
     } else {
-        store.delete(&entry.remote_id).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
+        store.delete(&entry.remote_id).map_err(failure(id, "file.store_error"))?;
     }
     delete_file_metadata(engine,id,place_id,instance_id,file_id)
 }
 
 #[cfg(feature = "files")]
 pub(super) fn child_file_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:&str)->Result<Vec<FileEntry>,QueryResponse>{
-    list_file_children_raw(engine,id,place_id,instance_id,Some(parent_id))?.into_iter().map(|value|json_to_file_entry(&value).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))).collect()
+    list_file_children_raw(engine,id,place_id,instance_id,Some(parent_id))?.into_iter().map(|value|json_to_file_entry(&value).map_err(failure(id, "file.invalid_record"))).collect()
 }
 #[cfg(feature = "files")]
 pub(super) fn subtree_has_trashed_entries(engine:&Engine,id:RequestId,place_id:&str,instance_id:&str,parent_id:&str)->Result<bool,QueryResponse>{
@@ -916,9 +1020,9 @@ pub(super) fn subtree_has_trashed_entries(engine:&Engine,id:RequestId,place_id:&
 
 pub(super) fn sync_moved_children(engine:&Engine,id:RequestId,store:&dyn FileStore,place_id:&str,instance_id:&str,parent:&FileEntry)->Result<(),QueryResponse>{
     let persisted=list_file_children_raw(engine,id,place_id,instance_id,Some(parent.file_id.as_str()))?;
-    let remote=store.list(Some(&parent.remote_id)).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
+    let remote=store.list(Some(&parent.remote_id)).map_err(failure(id, "file.store_error"))?;
     for mut json in persisted {
-        let child=json_to_file_entry(&json).map_err(|message|QueryResponse::request_error(id,"file.invalid_record",message))?;
+        let child=json_to_file_entry(&json).map_err(failure(id, "file.invalid_record"))?;
         let Some(found)=remote.iter().find(|candidate|candidate.name==child.name) else {
             return Err(QueryResponse::request_error(id,"file.store_mismatch","provider child is missing after move"));
         };
@@ -941,7 +1045,7 @@ pub(super) fn sync_moved_children(engine:&Engine,id:RequestId,store:&dyn FileSto
 }
 #[cfg(feature = "files")]
 pub(super) fn persist_copied_children(engine:&Engine,id:RequestId,store:&dyn FileStore,place_id:&str,instance_id:&str,parent:&FileEntry)->Result<(),QueryResponse>{
-    let remote=store.list(Some(&parent.remote_id)).map_err(|error|QueryResponse::request_error(id,"file.store_error",error.to_string()))?;
+    let remote=store.list(Some(&parent.remote_id)).map_err(failure(id, "file.store_error"))?;
     for stored in remote {
         let child=file_entry_from_store(place_id,instance_id,Some(parent.file_id.as_str()),stored);
         persist_file_entry(engine,id,&child)?;

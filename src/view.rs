@@ -67,6 +67,7 @@ impl Statement {
                 let active = active.ok_or_else(|| format!("view {name} is not defined"))?;
                 if !dry {
                     rows(engine, &format!("on {VIEWS_COLLECTION} | where {scope} and state == \"active\" | set state = \"deleted\", deletedBy = {}, deletedAt = {now}", json!(author)))?;
+                    notify(place, name);
                 }
                 Ok(json!({"name": name, "version": active["version"], "state": "deleted"}))
             }
@@ -93,11 +94,19 @@ impl Statement {
                     }
                     rows(engine, &insert_query(VIEWS_COLLECTION, &view))?;
                     rows(engine, &format!("on {VIEWS_COLLECTION} | where {scope} and state == \"active\" and version < {next} | set state = \"superseded\""))?;
+                    notify(place, name);
                     view.as_object_mut().expect("an object").remove(PLACE_SCOPE_FIELD);
                 }
                 Ok(view)
             }
         }
+    }
+}
+
+/// Hands a redefined view to the refresh thread, when the daemon runs one.
+fn notify(place: Option<&str>, name: &str) {
+    if let Some(sender) = REFRESHER.get() {
+        let _ = sender.send((place.map(str::to_owned), name.to_owned()));
     }
 }
 
@@ -188,12 +197,13 @@ pub(crate) fn is_name(name: &str) -> bool {
 /// Most rows a `let $x = (on …)` query may return.
 const LET_ROWS: usize = 1000;
 
-/// Prepares `query` for `place` and `app_instance` ([`crate::query::prepare_query`]):
-/// its `on view` sources are read from `_views`, its `let` queries run in that scope.
-pub fn prepare(engine: &Engine, place: Option<&str>, app_instance: Option<&str>, query: &str, parameters: &serde_json::Map<String, JsonValue>) -> Result<String, String> {
-    let scope = place.map(|place| scope_of(place, app_instance));
+/// Prepares `query` for `scope` ([`crate::query::prepare_query`]): its `on
+/// view` sources are read from `_views`, its `let` queries run in that scope,
+/// its filters included; a materialized view is computed without them.
+pub fn prepare(engine: &Engine, scope: Option<&DocumentScope>, query: &str, parameters: &serde_json::Map<String, JsonValue>) -> Result<String, String> {
+    let place = scope.map(DocumentScope::place_id);
     let rows = |query: &str| {
-        let rows = execute(engine, scope.as_ref(), query, true)?;
+        let rows = execute(engine, scope, query, true)?;
         if rows.len() > LET_ROWS {
             return Err(format!("a query in `let` returns at most {LET_ROWS} rows"));
         }
@@ -201,7 +211,7 @@ pub fn prepare(engine: &Engine, place: Option<&str>, app_instance: Option<&str>,
     };
     let view = |name: &str, version| {
         let view = definition(engine, place, name, version)?;
-        match materialized(engine, place, app_instance, &view)? {
+        match materialized(engine, scope, &view)? {
             Some(cache) => Ok(format!("on {cache}")),
             None => query_of(&view),
         }
@@ -225,27 +235,64 @@ fn query_of(view: &JsonValue) -> Result<String, String> {
     view["query"].as_str().map(str::to_owned).ok_or_else(|| format!("view {} has no query", view["name"]))
 }
 
+/// The views `view` reads, at any depth, as `[name, version, place]` of the
+/// definitions read in `place` today, and the collections they read: a
+/// materialized view is computed again when one of them is redefined, or
+/// when one of the collections a redefined view now reads changes.
+fn dependencies(engine: &Engine, place: Option<&str>, view: &JsonValue) -> Result<(Vec<JsonValue>, Vec<String>), String> {
+    let (mut views, mut reads, mut pending) = (Vec::new(), Vec::new(), vec![view.clone()]);
+    while let Some(view) = pending.pop() {
+        let referenced = std::cell::RefCell::new(Vec::new());
+        let record = |name: &str, version: Option<i64>| { referenced.borrow_mut().push((name.to_owned(), version)); Ok(format!("on {CACHE_PREFIX}check")) };
+        let none = |_: &str| Ok(Vec::new());
+        prepare_view(&query_of(&view)?, &serde_json::Map::new(), Some(Sources { view: &record, rows: &none }), Vec::new(), true)?;
+        for (name, version) in referenced.take() {
+            let read = definition(engine, place, &name, version)?;
+            let id = json!([name, read["version"], read[PLACE_SCOPE_FIELD]]);
+            if views.contains(&id) || views.len() > 256 {
+                continue;
+            }
+            views.push(id);
+            reads.extend(read["reads"].as_array().into_iter().flatten().filter_map(|read| read.as_str().map(str::to_owned)));
+            pending.push(read);
+        }
+    }
+    reads.sort();
+    reads.dedup();
+    Ok((views, reads))
+}
+
 /// The cache collection holding the rows of `view` read in this scope, when
 /// it is materialized: computed again (into the other of its two
 /// collections, so a reader of the previous rows is not cut short) when a
-/// collection it reads changed since. `None`: the view is read inline.
-fn materialized(engine: &Engine, place: Option<&str>, app_instance: Option<&str>, view: &JsonValue) -> Result<Option<String>, String> {
+/// collection it reads changed since, or a view it reads was redefined. `None`: the view is read inline.
+/// A reader whose Place access filters its rows has rows of its own, computed under them.
+/// The rows of an earlier version of the view in the same scope are dropped once the new ones are in.
+fn materialized(engine: &Engine, scope: Option<&DocumentScope>, view: &JsonValue) -> Result<Option<String>, String> {
+    let (place, app_instance) = (scope.map(DocumentScope::place_id), scope.and_then(DocumentScope::app_instance_id));
     static REFRESHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if view["materialized"] != true {
         return Ok(None);
     }
+    let (views, through) = dependencies(engine, place, view)?;
     // Only the changes of this Place (and those og-core cannot attribute) count;
     // a storage that cannot tell computes it at every read.
-    let reads = view["reads"].as_array().map(Vec::as_slice).unwrap_or_default();
-    let changed = reads.iter().map(|name| engine.change_token(name.as_str().unwrap_or_default(), place)).collect::<Option<Vec<_>>>().map_or_else(|| json!(now_millis()), |changed| json!(changed));
-    let key = format!("{:016x}", fnv1a64(json!([view["name"], view["version"], view[PLACE_SCOPE_FIELD], place, app_instance]).to_string().as_bytes()));
+    let mut reads = view["reads"].as_array().into_iter().flatten().filter_map(|read| read.as_str().map(str::to_owned)).chain(through).collect::<Vec<_>>();
+    reads.sort();
+    reads.dedup();
+    let tokens = reads.iter().map(|name| engine.change_token(name, place)).collect::<Option<Vec<_>>>().map_or_else(|| json!(now_millis()), |changed| json!(changed));
+    let changed = if views.is_empty() { tokens } else { json!({"reads": tokens, "views": views}) };
+    let filters = scope.map(|scope| format!("{:?}", scope.filters())).filter(|filters| filters != "[]");
+    let filtered = filters.is_some();
+    let scope_key = format!("{:016x}", fnv1a64(json!([view["name"], view[PLACE_SCOPE_FIELD], place, app_instance, filters]).to_string().as_bytes()));
+    let key = format!("{:016x}", fnv1a64(json!([view["name"], view["version"], view[PLACE_SCOPE_FIELD], place, app_instance, filters]).to_string().as_bytes()));
     let current = || rows(engine, &format!("on {CACHE_COLLECTION} | where key == {}", json!(key))).map(|rows| rows.into_iter().next());
     let fresh = |entry: &Option<JsonValue>| entry.as_ref().filter(|entry| entry["changed"] == changed).map(|entry| entry["collection"].as_str().unwrap_or_default().to_owned());
     if let Some(cache) = fresh(&current()?) {
         return Ok(Some(cache));
     }
     // Prepared before taking the lock: the views it reads refresh their own caches.
-    let body = prepare(engine, place, app_instance, &query_of(view)?, &serde_json::Map::new())?;
+    let body = prepare(engine, scope, &query_of(view)?, &serde_json::Map::new())?;
     let _refreshing = crate::helpers::lock_unpoisoned(&REFRESHING);
     let entry = current()?;
     if let Some(cache) = fresh(&entry) {
@@ -254,16 +301,95 @@ fn materialized(engine: &Engine, place: Option<&str>, app_instance: Option<&str>
     let slot = entry.as_ref().map_or(0, |entry| 1 - entry["slot"].as_i64().unwrap_or(1));
     let cache = format!("{CACHE_PREFIX}v{key}s{slot}");
     rows(engine, &format!("on {cache} | delete"))?;
-    execute(engine, place.map(|place| scope_of(place, app_instance)).as_ref(), &format!("{body} | into {cache}"), false).map_err(|error| format!("view {}: {error}", view["name"]))?;
-    let record = json!({"key": key, "view": view["name"], "version": view["version"], "place": place, "appInstance": app_instance, "slot": slot, "collection": cache, "changed": changed, "computedAt": now_millis()});
+    execute(engine, scope, &format!("{body} | into {cache}"), false).map_err(|error| format!("view {}: {error}", view["name"]))?;
+    let record = json!({"key": key, "scope": scope_key, "view": view["name"], "version": view["version"], "viewPlace": view[PLACE_SCOPE_FIELD], "place": place, "appInstance": app_instance, "filtered": filtered, "slot": slot, "collection": cache, "changed": changed, "reads": reads, "computedAt": now_millis()});
     rows(engine, &format!("on {CACHE_COLLECTION} | where key == {} | delete", json!(key)))?;
     rows(engine, &insert_query(CACHE_COLLECTION, &record))?;
+    // An earlier version of this view in this scope: its rows are no longer read.
+    for earlier in rows(engine, &format!("on {CACHE_COLLECTION} | where scope? == {} and key != {}", json!(scope_key), json!(key)))? {
+        drop_entry(engine, &earlier)?;
+    }
     Ok(Some(cache))
+}
+
+/// Removes a cache entry and the rows of both its collections.
+fn drop_entry(engine: &Engine, entry: &JsonValue) -> Result<(), String> {
+    let Some(key) = entry["key"].as_str() else { return Ok(()) };
+    for slot in 0..2 {
+        rows(engine, &format!("on {CACHE_PREFIX}v{key}s{slot} | delete"))?;
+    }
+    rows(engine, &format!("on {CACHE_COLLECTION} | where key == {} | delete", json!(key))).map(drop)
+}
+
+/// Where a redefinition is sent to be followed by [`refresh`] (set by the daemon, [`start_refresher`]).
+static REFRESHER: std::sync::OnceLock<std::sync::mpsc::Sender<(Option<String>, String)>> = std::sync::OnceLock::new();
+
+/// Starts the thread computing again, after a `define view` or `undefine view`,
+/// the materialized views kept in a cache that read the view (or are it).
+pub fn start_refresher(engine: std::sync::Arc<Engine>) {
+    let (sender, receiver) = std::sync::mpsc::channel::<(Option<String>, String)>();
+    if REFRESHER.set(sender).is_err() {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("og-view-refresh".to_owned()).spawn(move || {
+        while let Ok((place, name)) = receiver.recv() {
+            // Several redefinitions in a row: one pass for each view named.
+            let mut named = vec![(place, name)];
+            while let Ok(next) = receiver.try_recv() {
+                if !named.contains(&next) { named.push(next); }
+            }
+            for (place, name) in named {
+                if let Err(message) = refresh(&engine, place.as_deref(), &name) {
+                    eprintln!("[ogd] view refresh after {name}: {message}");
+                }
+            }
+        }
+    });
+    if let Err(error) = spawned {
+        eprintln!("[ogd] the view refresh thread did not start: {error}");
+    }
+}
+
+/// Computes again, in each scope a cache holds them for, the materialized
+/// views that read view `name` of `place` (`None`: a standard view) or are it.
+/// A scope filtered by a Place access is left to its next read. Returns how many were computed.
+pub fn refresh(engine: &Engine, place: Option<&str>, name: &str) -> Result<usize, String> {
+    let entries = rows(engine, &format!("on {CACHE_COLLECTION} | where filtered? != true"))?;
+    let mut scopes: Vec<(Option<String>, Option<String>, String)> = Vec::new();
+    for entry in &entries {
+        let scope = (entry["place"].as_str().map(str::to_owned), entry["appInstance"].as_str().map(str::to_owned), entry["view"].as_str().unwrap_or_default().to_owned());
+        // A Place view is read by that Place only; a standard one, by every Place without its own.
+        if (place.is_none() || scope.0.as_deref() == place) && !scope.2.is_empty() && !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+    }
+    let mut computed = 0;
+    for (reader, app_instance, view) in scopes {
+        let Ok(definition) = definition(engine, reader.as_deref(), &view, None) else {
+            // The view is gone: its rows are no longer read.
+            for entry in entries.iter().filter(|entry| entry["view"] == view.as_str() && entry["place"].as_str() == reader.as_deref()) {
+                drop_entry(engine, entry)?;
+            }
+            continue;
+        };
+        if definition["materialized"] != true {
+            continue;
+        }
+        let reads_it = view == name || dependencies(engine, reader.as_deref(), &definition).is_ok_and(|(views, _)| views.iter().any(|id| id[0] == name));
+        if reads_it {
+            let scope = reader.as_deref().map(|reader| scope_of(reader, app_instance.as_deref()));
+            materialized(engine, scope.as_ref(), &definition)?;
+            computed += 1;
+        }
+    }
+    Ok(computed)
 }
 
 fn parse_statement(query: &str, define: bool) -> Result<Statement, String> {
     let ranges = stage_ranges(query)?;
     let stage = |index: usize| query[ranges[index].clone()].trim();
+    // The closing `end` as the statement writes it.
+    let end = if crate::query::separated_by_lines(query) { "`end`" } else { "`| end`" };
     let name = head(stage(0)).map(|(_, rest)| rest.trim()).unwrap_or_default();
     if !is_name(name) {
         return Err(format!("invalid view name {name:?}: expected names joined by dots, such as finance.cube"));
@@ -274,7 +400,7 @@ fn parse_statement(query: &str, define: bool) -> Result<Statement, String> {
     }
     let last = ranges.len() - 1;
     if last == 0 || stage(last) != "end" {
-        return Err(format!("define view {name} must end with `| end`"));
+        return Err(format!("define view {name} must end with {end}"));
     }
     let (mut description, mut version, mut body, mut materialized) = (None, None, None, false);
     let mut index = 1;
@@ -287,7 +413,7 @@ fn parse_statement(query: &str, define: bool) -> Result<Statement, String> {
             "version" if version.is_none() => version = Some(rest.parse::<i64>().ok().filter(|version| *version > 0).ok_or_else(|| format!("define view {name}: version takes a positive integer"))?),
             "exec" if rest.is_empty() => {
                 if last < index + 3 || stage(last - 1) != "end" {
-                    return Err(format!("define view {name}: exec takes a query closed by `| end`, before the final `| end`"));
+                    return Err(format!("define view {name}: exec takes a query closed by {end}, before the final {end}"));
                 }
                 body = Some(query[ranges[index + 1].start..ranges[last - 2].end].trim().to_owned());
                 index = last - 1;
@@ -336,7 +462,7 @@ fn check(engine: &Engine, place: Option<&str>, name: &str, body: &str) -> Result
     Ok((parameters, reads))
 }
 
-fn collect_reads(operators: &[PhysicalOperator], reads: &mut Vec<String>) {
+pub(crate) fn collect_reads(operators: &[PhysicalOperator], reads: &mut Vec<String>) {
     for operator in operators {
         if let PhysicalOperator::Lookup { collection, pipeline, .. } | PhysicalOperator::Union { collection, pipeline, .. } = operator {
             reads.push(collection.to_string());
@@ -374,7 +500,8 @@ pub(crate) fn execute(engine: &Engine, scope: Option<&DocumentScope>, text: &str
 
 /// Runs `query` with `parameters` as a request of `place` and `app_instance` ([`prepare`]), returning its rows.
 pub fn query(engine: &Engine, place: &str, app_instance: Option<&str>, query: &str, parameters: &serde_json::Map<String, JsonValue>) -> Result<Vec<JsonValue>, String> {
-    execute(engine, Some(&scope_of(place, app_instance)), &prepare(engine, Some(place), app_instance, query, parameters)?, false)
+    let scope = scope_of(place, app_instance);
+    execute(engine, Some(&scope), &prepare(engine, Some(&scope), query, parameters)?, false)
 }
 
 /// Runs the writes `texts`, each [`prepare`]d as a request of `place` and `app_instance`, in one transaction
@@ -382,7 +509,7 @@ pub fn query(engine: &Engine, place: &str, app_instance: Option<&str>, query: &s
 pub fn write_together(engine: &Engine, place: &str, app_instance: Option<&str>, texts: &[String], parameters: &serde_json::Map<String, JsonValue>) -> Result<(), String> {
     let scope = scope_of(place, app_instance);
     let plans = texts.iter().map(|text| {
-        let planned = engine.plan(&pipeline(&literals(engine, &prepare(engine, Some(place), app_instance, text, parameters)?)?)?).map_err(|error| error.to_string())?;
+        let planned = engine.plan(&pipeline(&literals(engine, &prepare(engine, Some(&scope), text, parameters)?)?)?).map_err(|error| error.to_string())?;
         Ok((planned.physical().clone(), Some(scope.clone())))
     }).collect::<Result<Vec<_>, String>>()?;
     engine.execute_together(&plans).map(drop).map_err(|error| error.to_string())
@@ -400,14 +527,99 @@ mod tests {
     #[test] fn parses_view_statements() { assert_eq!(Statement::parse("on views"), None); assert_eq!(Statement::parse("undefine view a.b"), Some(Ok(Statement::Undefine { name: "a.b".into() }))); assert_eq!(Statement::parse("define view a | description \"x | y\" | exec | on t | group | by k | sum v | end | where v > 1 || v < 0 | end | end"), Some(Ok(Statement::Define { name: "a".into(), description: Some("x | y".into()), version: None, body: Some("on t | group | by k | sum v | end | where v > 1 || v < 0".into()), materialized: false }))); assert_eq!(Statement::parse("define view a | version 2 | end"), Some(Ok(Statement::Define { name: "a".into(), description: None, version: Some(2), body: None, materialized: false }))); for (text, error) in [("define view a.", "invalid view name"), ("define view a | exec | on t | end", "exec takes a query"), ("define view a | where x | end", "unknown clause"), ("define view a | exec | on t", "must end with"), ("define view a | version 0 | end", "positive integer"), ("define view a | version 1 | version 2 | end", "twice"), ("define view a | description x | end", "takes a string"), ("define view a | version 1 | exec | on t | end | end", "either exec"), ("undefine view a | end", "no clause")] { assert!(Statement::parse(text).unwrap().unwrap_err().contains(error), "{text}"); } }
     #[test] fn define_checks_the_body_and_lists_its_parameters_and_reads() { let engine = engine(); let view = run(&engine, Some("p"), "define view finance.cube | description \"cube\" | exec | let $from = $to - 1 | on ledger | where scenario == $scenario and amount >= $from | lookup accounts as a | where a.account == account | into accounts | end | end | end").unwrap(); assert_eq!((view["version"].clone(), view["parameters"].clone(), view["reads"].clone(), view["description"].clone()), (json!(1), json!(["to", "scenario"]), json!(["accounts", "ledger"]), json!("cube"))); assert!(view["query"].as_str().unwrap().starts_with("let $from")); for (text, error) in [("define view w | exec | on ledger | set amount = 0 | end | end", "only reads"), ("define view w | exec | on ledger | where | end | end", "where"), ("define view w | exec | let $x = amount | on ledger | end | end", "cannot depend on documents"), ("define view w | end", "not defined"), ("define view w | version 3 | end", "no version 3"), ("undefine view w", "not defined")] { assert!(run(&engine, Some("p"), text).unwrap_err().contains(error), "{text}"); } assert_eq!(states(&engine).len(), 1); }
     #[test] fn versions_supersede_restore_and_delete_per_place() { let engine = engine(); for (place, text) in [(Some("p"), "define view v | description \"one\" | exec | on ledger | end | end"), (Some("p"), "define view v | exec | on ledger | where amount > $min | end | end"), (Some("q"), "define view v | exec | on accounts | end | end"), (None, "define view v | exec | on ledger | end | end"), (Some("p"), "undefine view v")] { run(&engine, place, text).unwrap(); } let restored = run(&engine, Some("p"), "define view v | version 1 | description \"back\" | end").unwrap(); assert_eq!((restored["version"].clone(), restored["query"].clone(), restored["parameters"].clone(), restored["description"].clone()), (json!(3), json!("on ledger"), json!([]), json!("back"))); assert_eq!(run(&engine, Some("p"), "define view v | end").unwrap()["description"], "back"); assert_eq!(states(&engine), [("-:v".into(), 1, "active".into()), ("p:v".into(), 1, "superseded".into()), ("p:v".into(), 2, "deleted".into()), ("p:v".into(), 3, "superseded".into()), ("p:v".into(), 4, "active".into()), ("q:v".into(), 1, "active".into())]); }
-    fn read(engine: &Engine, place: Option<&str>, text: &str, parameters: JsonValue) -> Result<Vec<JsonValue>, String> { rows(engine, &prepare(engine, place, None, text, parameters.as_object().unwrap())?) }
+    fn read(engine: &Engine, place: Option<&str>, text: &str, parameters: JsonValue) -> Result<Vec<JsonValue>, String> { rows(engine, &prepare(engine, place.map(|place| scope_of(place, None)).as_ref(), text, parameters.as_object().unwrap())?) }
     #[test] fn on_view_reads_the_place_view_else_the_standard_one_with_the_caller_variables() { let engine = engine(); rows(&engine, r#"on ledger | insert {account: "701", amount: 30, scenario: "budget"}"#).unwrap(); for (place, text) in [(None, "define view v | exec | on ledger | where scenario == $scenario | end | end"), (Some("p"), "define view v | exec | let $min = 20 | on ledger | where amount >= $min and scenario == $scenario | end | end"), (Some("p"), "define view v | exec | on ledger | end | end"), (Some("p"), "undefine view v")] { run(&engine, place, text).unwrap(); } let count = |place, text: &str, parameters| read(&engine, place, text, parameters).map(|rows| rows.len()); assert_eq!(count(Some("q"), "on view v", json!({"scenario": "actual"})), Ok(1)); assert_eq!(count(Some("p"), "let $scenario = \"budget\" | on view v | where account == \"701\"", json!({})), Ok(1)); assert_eq!(count(Some("p"), "on view v version 1 | count as n", json!({"scenario": "actual", "min": 0})), Ok(1)); assert_eq!(read(&engine, Some("p"), "on view v version 1", json!({"scenario": "budget", "min": 0})).unwrap()[0]["account"], "701"); assert_eq!(count(Some("p"), "on view v version 2 | union | on view v version 1 | end", json!({"scenario": "budget"})), Ok(3)); for (text, error) in [("on view v", "$scenario is not bound"), ("on view w", "view w is not defined"), ("on view v version 9", "no version 9"), ("on view v as x y", "takes only `version <n>` and `as <alias>`"), ("let $scenario = \"actual\" | on view v version 1 | where amount >= $min", "$min is not bound")] { assert!(read(&engine, Some("p"), text, json!({})).unwrap_err().contains(error), "{text}"); } assert!(crate::query::prepare_query("on view v", &serde_json::Map::new()).unwrap_err().contains("query.execute")); }
     #[test] fn views_read_views_and_lookups_without_cycles() { let engine = engine(); run(&engine, None, "define view a | exec | on accounts | where account == $account | end | end").unwrap(); let b = run(&engine, None, "define view b | exec | on ledger | lookup view a as x | where x.account == account | into accounts | end | end | end").unwrap(); assert_eq!((b["parameters"].clone(), b["reads"].clone()), (json!(["account"]), json!(["accounts", "ledger"]))); assert_eq!(read(&engine, None, "on view b | select account, accounts", json!({"account": "601"})).unwrap(), [json!({"account": "601", "accounts": [{"account": "601"}]})]); for text in ["define view a | exec | on view b | end | end", "define view c | exec | on view c | end | end"] { assert!(run(&engine, None, text).unwrap_err().contains("cycle"), "{text}"); } assert!(crate::query::reads_place("explain on t | union | on view a | end") && !crate::query::reads_place("define view x | exec | on view a | end | end") && !crate::query::reads_place("on view | where a == 1")); }
     #[test] fn apps_deliver_standard_views_once_and_withdraw_them() { let engine = engine(); let views = |list: JsonValue| list.as_array().unwrap().clone(); deliver(&engine, "system.f", &views(json!([{"name": "f.a", "query": "on ledger"}, {"name": "f.b", "description": "b", "query": "on view f.a | where amount > $min"}]))).unwrap(); deliver(&engine, "system.f", &views(json!([{"name": "f.a", "query": "on ledger"}, {"name": "f.b", "description": "b", "query": "on view f.a | where amount > $min"}]))).unwrap(); run(&engine, Some("p"), "define view f.a | exec | on accounts | end | end").unwrap(); deliver(&engine, "system.f", &views(json!([{"name": "f.a", "query": "on ledger | where amount > 1"}]))).unwrap(); assert_eq!(states(&engine), [("-:f.a".into(), 1, "superseded".into()), ("-:f.a".into(), 2, "active".into()), ("-:f.b".into(), 1, "deleted".into()), ("p:f.a".into(), 1, "active".into())]); assert!(deliver(&engine, "system.f", &views(json!([{"name": "f.c", "query": "on ledger | delete"}]))).unwrap_err().contains("App system.f, view f.c: a view only reads")); }
     #[test] fn values_are_constant_collections_read_by_sources_lookups_and_views() { let engine = engine(); let rules = r#"values [{prefix: "60", category: "Achats"}, {prefix: "601", category: "Matieres"}, {prefix: "7", category: "Ventes"}]"#; assert_eq!(rows(&engine, &format!("on {rules} | where len(prefix) > 1 | count as n")).unwrap(), [json!({"n": 2})]); let rewritten = literals(&engine, &format!("on ledger | union | on {rules} | end | lookup {rules} as r | where starts_with(account, r.prefix) | end")).unwrap(); assert_eq!(rewritten.matches(VALUES_PREFIX).count(), 2); assert_eq!(engine.storage().read().unwrap().collections().unwrap().iter().filter(|collection| collection.as_str().starts_with(VALUES_PREFIX)).count(), 1); run(&engine, None, &format!("define view ref.rules | exec | on {rules} | end | end")).unwrap(); assert_eq!(read(&engine, Some("p"), "on ledger as g | lookup view ref.rules as r | where starts_with(g.account, r.prefix) | derive n = len(r.prefix) | sort n desc | first | into rule | end | select account, rule", json!({})).unwrap(), [json!({"account": "601", "rule": [{"category": "Matieres", "n": 3, "prefix": "601"}]})]); let name = rewritten.split_whitespace().find(|word| word.starts_with(VALUES_PREFIX)).unwrap(); let scoped = |text: &str| engine.execute_physical_scoped(engine.plan(&pipeline(text).unwrap()).unwrap().physical(), &DocumentScope::new("p", "app")).map(|output| output.rows().len()); assert_eq!(scoped(&format!("on {name}")).unwrap(), 3); assert!(scoped(&format!("on {name} | delete")).is_err() && rows(&engine, &format!("on {name} | delete")).unwrap_err().contains("constant")); rows(&engine, &format!("on {name} | into copied")).unwrap(); assert_eq!(rows(&engine, "on copied | count as n").unwrap(), [json!({"n": 3})]); for (text, error) in [("on values []", "non-empty array of objects"), ("on values [1]", "non-empty array of objects"), ("on values [{a: 1}", "unclosed")] { assert!(rows(&engine, text).unwrap_err().contains(error), "{text}"); } assert_eq!(literals(&engine, "on values | where values == 1").unwrap(), "on values | where values == 1"); assert_eq!(rows(&engine, r#"on ledger | lookup values [{code: "601", label: "x"}] as v on code == account into hit | select hit"#).unwrap(), [json!({"hit": [{"code": "601", "label": "x"}]})]); }
     #[test] fn let_reads_the_rows_of_a_query_in_the_place() { let engine = engine(); rows(&engine, r#"on settings | insert {_place: "p", opening: 7}"#).unwrap(); rows(&engine, r#"on settings | insert {_place: "q", opening: 1}"#).unwrap(); let opening = |place| read(&engine, place, "let $s = (on settings | limit 1) | let $month = get(at($s, 0), \"opening\") | on ledger | derive m = $month | select m", json!({})).map(|rows| rows[0]["m"].clone()); assert_eq!(opening(Some("p")), Ok(json!(7))); assert_eq!(opening(Some("q")), Ok(json!(1))); assert_eq!(read(&engine, None, "let $a = (on ledger | where amount > $min | select amount), $n = len($a) | on accounts | derive n = $n | select n", json!({"min": 5})).unwrap(), [json!({"n": 1})]); for (text, error) in [("let $a = (on ledger | delete) | on ledger", "only reads"), ("let $a = (on view nope) | on ledger", "view nope is not defined")] { assert!(read(&engine, Some("p"), text, json!({})).unwrap_err().contains(error), "{text}"); } assert!(crate::query::prepare_query("let $a = (on ledger) | on ledger", &serde_json::Map::new()).unwrap_err().contains("query.execute")); assert!(crate::query::reads_place("let $a = (on t) | on u")); let view = run(&engine, None, "define view s | exec | let $s = (on settings | where k == $k) | on ledger | where amount > len($s) | end | end").unwrap(); assert_eq!((view["parameters"].clone(), view["reads"].clone()), (json!(["k"]), json!(["ledger", "settings"]))); }
     #[test] fn a_place_computes_a_materialized_view_from_other_materialized_views() { let engine = engine(); run(&engine, None, "define view m | materialized | exec | on ledger | group | by scenario | sum amount as total | end | end | end").unwrap(); run(&engine, None, "define view both | materialized | exec | on view m | union | on view m | end | end | end").unwrap(); rows(&engine, r#"on ledger | insert {_place: "p", amount: 7, scenario: "actual"}"#).unwrap(); assert_eq!(read(&engine, Some("p"), "on view both | select total", json!({})).unwrap(), [json!({"total": 7}), json!({"total": 7})]); assert_eq!(read(&engine, None, "on view both | select total", json!({})).unwrap().len(), 2); }
-    #[test] fn materialized_views_keep_their_rows_per_scope_until_a_read_collection_changes() { let engine = engine(); run(&engine, None, "define view m | materialized | exec | on ledger | group | by scenario | sum amount as total | end | end | end").unwrap(); let total = |place| { let prepared = prepare(&engine, place, None, "on view m | select total", &serde_json::Map::new()).unwrap(); assert!(prepared.contains(CACHE_PREFIX), "{prepared}"); (prepared.clone(), rows(&engine, &prepared).unwrap().iter().map(|row| row["total"].clone()).collect::<Vec<_>>()) }; let (first, totals) = total(None); assert_eq!(totals, [json!(10)]); assert_eq!(total(None), (first.clone(), totals)); rows(&engine, r#"on ledger | insert {account: "602", amount: 5, scenario: "actual"}"#).unwrap(); let (second, totals) = total(None); assert_ne!(first, second); assert_eq!(totals, [json!(15)]); rows(&engine, r#"on accounts | insert {account: "603"}"#).unwrap(); assert_eq!(total(None).0, second); rows(&engine, r#"on ledger | insert {_place: "p", amount: 7, scenario: "actual"}"#).unwrap(); assert_eq!(read(&engine, Some("p"), "on view m | select total", json!({})).unwrap(), [json!({"total": 7})]); assert_eq!(rows(&engine, &format!("on {CACHE_COLLECTION} | count as n")).unwrap(), [json!({"n": 2})]); assert!(run(&engine, None, "define view w | materialized | exec | on ledger | where amount > $min | end | end").unwrap_err().contains("takes no parameter")); }
-    #[test] fn a_place_keeps_its_cache_while_only_other_places_write() { let engine = engine(); run(&engine, None, "define view m | materialized | exec | on ledger | group | by scenario | sum amount as total | end | end | end").unwrap(); let write = |place: Option<&str>, amount: i64| { let planned = engine.plan(&pipeline(&format!("on ledger | insert {{amount: {amount}, scenario: \"actual\"}}")).unwrap()).unwrap(); match place { Some(place) => engine.execute_physical_scoped(planned.physical(), &DocumentScope::for_place(place)), None => engine.execute_physical(planned.physical()) }.unwrap(); }; let cache = |place| prepare(&engine, Some(place), None, "on view m", &serde_json::Map::new()).unwrap(); let total = |place| rows(&engine, &prepare(&engine, Some(place), None, "on view m | select total", &serde_json::Map::new()).unwrap()).unwrap(); write(Some("p"), 1); write(Some("q"), 2); let (p, q) = (cache("p"), cache("q")); write(Some("q"), 3); assert_eq!(cache("p"), p); assert_ne!(cache("q"), q); assert_eq!(total("q"), [json!({"total": 5})]); write(Some("p"), 4); assert_ne!(cache("p"), p); assert_eq!(total("p"), [json!({"total": 5})]); let (p, q) = (cache("p"), cache("q")); write(None, 8); assert!(cache("p") != p && cache("q") != q); }
+    #[test] fn materialized_views_keep_their_rows_per_scope_until_a_read_collection_changes() { let engine = engine(); run(&engine, None, "define view m | materialized | exec | on ledger | group | by scenario | sum amount as total | end | end | end").unwrap(); let total = |place: Option<&str>| { let prepared = prepare(&engine, place.map(|place| scope_of(place, None)).as_ref(), "on view m | select total", &serde_json::Map::new()).unwrap(); assert!(prepared.contains(CACHE_PREFIX), "{prepared}"); (prepared.clone(), rows(&engine, &prepared).unwrap().iter().map(|row| row["total"].clone()).collect::<Vec<_>>()) }; let (first, totals) = total(None); assert_eq!(totals, [json!(10)]); assert_eq!(total(None), (first.clone(), totals)); rows(&engine, r#"on ledger | insert {account: "602", amount: 5, scenario: "actual"}"#).unwrap(); let (second, totals) = total(None); assert_ne!(first, second); assert_eq!(totals, [json!(15)]); rows(&engine, r#"on accounts | insert {account: "603"}"#).unwrap(); assert_eq!(total(None).0, second); rows(&engine, r#"on ledger | insert {_place: "p", amount: 7, scenario: "actual"}"#).unwrap(); assert_eq!(read(&engine, Some("p"), "on view m | select total", json!({})).unwrap(), [json!({"total": 7})]); assert_eq!(rows(&engine, &format!("on {CACHE_COLLECTION} | count as n")).unwrap(), [json!({"n": 2})]); assert!(run(&engine, None, "define view w | materialized | exec | on ledger | where amount > $min | end | end").unwrap_err().contains("takes no parameter")); }
+    #[test] fn a_place_keeps_its_cache_while_only_other_places_write() { let engine = engine(); run(&engine, None, "define view m | materialized | exec | on ledger | group | by scenario | sum amount as total | end | end | end").unwrap(); let write = |place: Option<&str>, amount: i64| { let planned = engine.plan(&pipeline(&format!("on ledger | insert {{amount: {amount}, scenario: \"actual\"}}")).unwrap()).unwrap(); match place { Some(place) => engine.execute_physical_scoped(planned.physical(), &DocumentScope::for_place(place)), None => engine.execute_physical(planned.physical()) }.unwrap(); }; let cache = |place| prepare(&engine, Some(&scope_of(place, None)), "on view m", &serde_json::Map::new()).unwrap(); let total = |place| rows(&engine, &prepare(&engine, Some(&scope_of(place, None)), "on view m | select total", &serde_json::Map::new()).unwrap()).unwrap(); write(Some("p"), 1); write(Some("q"), 2); let (p, q) = (cache("p"), cache("q")); write(Some("q"), 3); assert_eq!(cache("p"), p); assert_ne!(cache("q"), q); assert_eq!(total("q"), [json!({"total": 5})]); write(Some("p"), 4); assert_ne!(cache("p"), p); assert_eq!(total("p"), [json!({"total": 5})]); let (p, q) = (cache("p"), cache("q")); write(None, 8); assert!(cache("p") != p && cache("q") != q); }
+    #[test] fn organisation_tree_climbs_the_parents_and_lets_rows_filter_by_any_node_and_roll_up_by_any_level() { let engine = engine(); let apps: JsonValue = serde_json::from_str(include_str!("../apps.json")).unwrap(); let organisation = apps.as_array().unwrap().iter().find(|app| app["appId"] == "system.organisation").unwrap(); deliver(&engine, "system.organisation", organisation["definition"]["queryViews"].as_array().unwrap()).unwrap(); rows(&engine, r#"on values [{code: "groupe", rank: 1}, {code: "societe", rank: 2}, {code: "site", rank: 3}] | derive _place = "p" | into org_levels"#).unwrap(); rows(&engine, r#"on values [{code: "G", level: "groupe", parent: ""}, {code: "S1", level: "societe", parent: "G"}, {code: "S2", level: "societe", parent: "G"}, {code: "L1", level: "site", parent: "S1"}, {code: "L2", level: "site", parent: "S1"}, {code: "P1", level: "site", parent: "S2"}, {code: "X", level: "site", parent: "Z"}, {code: "C1", level: "site", parent: "C2"}, {code: "C2", level: "site", parent: "C1"}] | derive _place = "p", label = concat("Nœud ", code) | into org"#).unwrap(); let tree = read(&engine, Some("p"), "on view org.tree | sort code | select code, path, depth, codes, levels, broken", json!({})).unwrap(); let node = |code: &str| tree.iter().find(|row| row["code"] == code).unwrap().clone(); assert_eq!(node("L1"), json!({"code": "L1", "path": "G/S1/L1/", "depth": 2, "codes": ["G", "S1", "L1"], "levels": ["groupe", "societe", "site"], "broken": false})); assert_eq!((node("G")["path"].clone(), node("G")["depth"].clone()), (json!("G/"), json!(0))); assert_eq!((node("X")["path"].clone(), node("X")["levels"].clone()), (json!("Z/X/"), json!([null, "site"]))); assert_eq!((node("C1")["broken"].clone(), node("P1")["broken"].clone()), (json!(true), json!(false))); rows(&engine, r#"on values [{entity: "L1", revenue: 100}, {entity: "L2", revenue: 50}, {entity: "P1", revenue: 30}, {entity: "Q", revenue: 5}] | derive _place = "p" | into ventes"#).unwrap(); let s1 = read(&engine, Some("p"), r#"on ventes | lookup view org.tree on code == entity into o | where starts_with(get(coalesce(at(o, 0), {}), "path", ""), "G/S1/") | derive k = 0 | group | by k | sum revenue as revenue | end | select revenue"#, json!({})).unwrap(); assert_eq!(s1, vec![json!({"revenue": 150})]); let by_company = read(&engine, Some("p"), r#"on ventes | lookup view org.tree on code == entity into o | derive n = coalesce(at(o, 0), {}) | derive i = index_of(coalesce(get(n, "levels"), []), "societe") | derive societe = if(i < 0, "(non rattaché)", at(get(n, "codes"), i)) | group | by societe | sum revenue as revenue | end | sort societe | select societe, revenue"#, json!({})).unwrap(); assert_eq!(by_company, vec![json!({"societe": "(non rattaché)", "revenue": 5}), json!({"societe": "S1", "revenue": 150}), json!({"societe": "S2", "revenue": 30})]); }
+    #[test] fn finance_indicator_definitions_carry_the_vocabulary_of_the_semantic_model() { let engine = engine(); let apps: JsonValue = serde_json::from_str(include_str!("../apps.json")).unwrap(); let finance = apps.as_array().unwrap().iter().find(|app| app["name"] == "Finance").unwrap(); assert_eq!(finance["definition"]["queryViews"].as_array().unwrap().iter().find(|view| view["name"] == "finance.indicators").unwrap()["measures"], json!({"from": "finance.indicators.definitions"})); deliver(&engine, "system.finance", finance["definition"]["queryViews"].as_array().unwrap()).unwrap(); let rows = read(&engine, Some("p"), r#"on view finance.indicators.definitions | where id == "ebe" or id == "cos_abs" | sort id | select id, vocabulary"#, json!({})).unwrap(); assert_eq!(rows, vec![json!({"id": "cos_abs", "vocabulary": null}), json!({"id": "ebe", "vocabulary": {"fr": ["excédent brut d'exploitation"], "en": ["EBITDA"]}})]); }
+    #[test] fn finance_rolling_windows_span_fiscal_years() { let engine = engine(); let apps: JsonValue = serde_json::from_str(include_str!("../apps.json")).unwrap(); let finance = apps.as_array().unwrap().iter().find(|app| app["name"] == "Finance").unwrap(); deliver(&engine, "system.finance", finance["definition"]["queryViews"].as_array().unwrap()).unwrap(); rows(&engine, r#"on values [{m: 0}] | derive m = range(0, 24) | unwind m | derive account = ["706000", "512000"] | unwind account | derive _place = "p", scenario = "actual", version = null, entity = "E", date = date_add("2024-01-01", m, "month"), balance = if(account == "706000", -10 * (m % 12 + 1) - m, 5 * m + 3) | select _place, scenario, version, entity, account, date, balance | into finance"#).unwrap(); let period = |end: &str, gran: &str| read(&engine, Some("p"), "on view finance.period | sort category | select category, kind, window_from, window_to, value", json!({"end": end, "gran": gran, "span": 3})).unwrap(); let rolling = period("2025-02-01", "rolling"); assert!(!rolling.is_empty()); assert!(rolling.iter().all(|row| row["window_from"] == json!(1733011200000i64) && row["window_to"] == json!(1738368000000i64)), "{rolling:?}"); let months: Vec<Vec<JsonValue>> = ["2024-12-01", "2025-01-01", "2025-02-01"].iter().map(|end| period(end, "month")).collect(); for row in &rolling { let of = |rows: &Vec<JsonValue>| rows.iter().find(|item| item["category"] == row["category"]).map_or(0.0, |item| item["value"].as_f64().unwrap_or(0.0)); let expected = if row["kind"] == "flow" { months.iter().map(of).sum::<f64>() } else { of(&months[2]) }; assert!((row["value"].as_f64().unwrap_or(0.0) - expected).abs() < 1e-9, "{row:?} expected {expected}"); } }
+    #[test] fn finance_balances_follow_the_opening_of_the_place() { let engine = engine(); let apps: JsonValue = serde_json::from_str(include_str!("../apps.json")).unwrap(); let finance = apps.as_array().unwrap().iter().find(|app| app["name"] == "Finance").unwrap(); deliver(&engine, "system.finance", finance["definition"]["queryViews"].as_array().unwrap()).unwrap(); rows(&engine, r#"on finance_settings | insert {_place: "p", opening: {day: 1, month: 7}, balance_opening: 1}"#).unwrap(); rows(&engine, r#"on values [{m: 0}] | derive m = range(0, 12) | unwind m | derive account = ["601000", "602000"] | unwind account | where account == "601000" or m < 8 | derive _place = "p", scenario = "actual", version = null, entity = "E", date = date_add("2025-01-01", m, "month"), balance = 10 * (m + 1) | select _place, scenario, version, entity, account, date, balance | into finance"#).unwrap(); let balances = |account: &str| read(&engine, Some("p"), &format!("on view finance.classified | where account == \"{account}\" | sort date | select balance"), json!({"from": "2025-01-01", "to": "2025-12-01"})).unwrap().iter().map(|row| row["balance"].as_i64().unwrap()).collect::<Vec<_>>(); assert_eq!(balances("601000"), [10, 20, 30, 40, 50, 60, 10, 20, 30, 40, 50, 60]); assert_eq!(balances("602000"), [10, 20, 30, 40, 50, 60, 10, 20, -60, -60, -60, -60]); rows(&engine, "on finance_settings | set balance_opening = 7").unwrap(); assert_eq!(balances("601000"), (1..=12).map(|month| 10 * month).collect::<Vec<_>>()); rows(&engine, r#"on finance_rules | insert {_place: "p", prefix: "601", category: "X", when: {sign: "credit"}}"#).unwrap(); let rule = read(&engine, Some("p"), r#"on view finance.accounts | where account == "601000" and format == "standard" | select debit, credit"#, json!({})).unwrap(); assert_eq!(rule[0]["credit"], "X"); assert!(rule[0]["debit"].as_str().is_some_and(|category| category != "X" && category != "_unclassified"), "{rule:?}"); }
+    #[test] fn stages_read_the_same_separated_by_pipes_semicolons_or_lines() {
+        let engine = engine();
+        rows(&engine, r#"on ledger | insert [{account: "602", amount: 5, scenario: "actual"}, {account: "701", amount: 30, scenario: "budget"}]"#).unwrap();
+        for (pipes, semicolons, lines) in [
+            ("on ledger | where amount > 5 | sort amount desc | select account, amount", "on ledger; where amount > 5; sort amount desc; select account, amount;", "on ledger\nwhere amount > 5\n  and amount < 100\nsort amount desc\nselect account,\n  amount\n"),
+            ("on ledger | group | by scenario | sum amount as total | count as n | end | sort scenario", "on ledger; group; by scenario; sum amount as total; count as n; end; sort scenario", "on ledger\ngroup\n  by scenario\n  sum amount as total\n  count as n\nend\nsort scenario"),
+            ("on ledger | lookup accounts as a | where a.account == account | into hit | end | derive n = len(hit) | select account, n | sort account", "on ledger; lookup accounts as a; where a.account == account; into hit; end; derive n = len(hit); select account, n; sort account", "on ledger\nlookup accounts as a\n  where a.account == account\n  into hit\nend\nderive n = len(hit)\nselect account, n\nsort account"),
+            ("on ledger | lookup accounts as a on a.account == account into hit | select account, hit | sort account", "on ledger; lookup accounts as a on a.account == account into hit; select account, hit; sort account", "on ledger\nlookup accounts as a\n  on a.account == account into hit\nselect account, hit\nsort account"),
+            ("on ledger | union | on accounts | end | count as n", "on ledger; union; on accounts; end; count as n", "on ledger\nunion\n  on accounts\nend\ncount as n"),
+            ("on ledger | pivot | rows scenario | columns account | values amount | aggregate sum | end | sort scenario", "on ledger; pivot; rows scenario; columns account; values amount; aggregate sum; end; sort scenario", "on ledger\npivot\n  rows scenario\n  columns account\n  values amount\n  aggregate sum\nend\nsort scenario"),
+            ("on ledger | window | order by amount | row_number as n | end | select account, n | sort n", "on ledger; window; order by amount; row_number as n; end; select account, n; sort n", "on ledger\nwindow\n  order by amount\n  row_number as n\nend\nselect account, n\nsort n"),
+            ("let $min = 6 | on ledger | where amount >= $min | count as n", "let $min = 6; on ledger; where amount >= $min; count as n", "let $min = 6\non ledger\nwhere amount >= $min\ncount as n"),
+            ("let $s = (on accounts | limit 1) | on ledger | derive k = len($s) | select k | first", "let $s = (on accounts | limit 1); on ledger; derive k = len($s); select k; first", "let $s = (on accounts\n  limit 1)\non ledger\nderive k = len($s)\nselect k\nfirst"),
+        ] {
+            let expected = read(&engine, None, pipes, json!({})).unwrap();
+            assert!(!expected.is_empty(), "{pipes}");
+            for text in [semicolons, lines] {
+                assert_eq!(read(&engine, None, text, json!({})).unwrap(), expected, "{text}");
+                if !text.contains('$') {
+                    assert_eq!(rows(&engine, text).unwrap(), rows(&engine, pipes).unwrap(), "{text}");
+                }
+            }
+        }
+        // A view keeps its body as written, and reads the same in any style.
+        let body = "on ledger\n  group\n    by scenario\n    sum amount as total\n  end";
+        let text = format!("define view cube\ndescription \"by scenario\"\nexec\n  {body}\nend\nend");
+        assert_eq!(Statement::parse(&text), Some(Ok(Statement::Define { name: "cube".into(), description: Some("by scenario".into()), version: None, body: Some(body.into()), materialized: false })));
+        run(&engine, None, &text).unwrap();
+        assert_eq!(rows(&engine, "on _views | where name == \"cube\"").unwrap()[0]["query"], body);
+        run(&engine, None, "define view total; materialized; exec; on view cube; group; by scenario; sum total as total; end; end; end;").unwrap();
+        for view in ["cube", "total"] {
+            let expected = read(&engine, None, &format!("on view {view} | sort scenario"), json!({})).unwrap();
+            assert_eq!(expected.len(), 2);
+            assert_eq!(read(&engine, None, &format!("on view {view}\nsort scenario"), json!({})).unwrap(), expected);
+            assert_eq!(read(&engine, None, &format!("on view {view}; sort scenario"), json!({})).unwrap(), expected);
+        }
+        // Errors say which style and which line.
+        for (text, error) in [
+            ("on ledger; where amount > 5 | sort amount", "not both"),
+            ("on ledger;; where amount > 5", "empty stage before `;` at line 1"),
+            ("on ledger\nlookup accounts as a on a.account == account\n  into hit\nselect account", "line 3 starts a new stage `into`"),
+            ("on ledger\nwhere amount > 5\nend", "`end` at line 3 closes no block"),
+        ] {
+            assert!(read(&engine, None, text, json!({})).unwrap_err().contains(error), "{text}");
+            assert!(rows(&engine, text).unwrap_err().contains(error), "{text}");
+        }
+        assert!(run(&engine, None, "define view v\nexec\n  on ledger\nend").unwrap_err().contains("exec takes a query closed by `end`"));
+        assert!(run(&engine, None, "define view v; exec; on ledger; end; end; where amount > 1").unwrap_err().contains("must end with `end`"));
+    }
+    #[test] fn a_redefined_view_refreshes_the_materialized_views_reading_it() {
+        let engine = engine();
+        let count = |engine: &Engine| read(engine, None, "on view b", json!({})).unwrap().len();
+        let entries = |engine: &Engine| rows(engine, &format!("on {CACHE_COLLECTION} | count as n")).unwrap()[0]["n"].clone();
+        run(&engine, None, "define view a | exec | on ledger | end | end").unwrap();
+        run(&engine, None, "define view b | materialized | exec | on view a | select amount, account | end | end").unwrap();
+        run(&engine, None, "define view c | materialized | exec | on view b | where amount? != null | end | end").unwrap();
+        assert_eq!(count(&engine), 1);
+        // A view read by b changes: b and c (which reads b) are computed again.
+        run(&engine, None, "define view a | exec | on ledger | where amount > 100 | end | end").unwrap();
+        assert_eq!((count(&engine), read(&engine, None, "on view c", json!({})).unwrap().len()), (0, 0));
+        // It now reads another collection: a write there reaches b.
+        run(&engine, None, "define view a | exec | on accounts | end | end").unwrap();
+        assert_eq!(count(&engine), 1);
+        rows(&engine, r#"on accounts | insert {account: "9"}"#).unwrap();
+        assert_eq!(count(&engine), 2);
+        read(&engine, None, "on view c", json!({})).unwrap();
+        assert_eq!(entries(&engine), json!(2));
+        // The refresh computes the caches of the views reading a: b and c, read without a Place.
+        run(&engine, None, "define view a | exec | on ledger | end | end").unwrap();
+        assert_eq!(refresh(&engine, None, "a"), Ok(2));
+        let cached = rows(&engine, &format!("on {CACHE_COLLECTION} | where view == \"b\"")).unwrap()[0]["collection"].as_str().unwrap().to_owned();
+        assert_eq!(rows(&engine, &format!("on {cached} | count as n")).unwrap(), [json!({"n": 1})]);
+        assert_eq!(refresh(&engine, Some("q"), "a"), Ok(0));
+        // A new version of b drops the rows of the one before; an undefined c leaves the cache.
+        run(&engine, None, "define view b | materialized | exec | on view a | end | end").unwrap();
+        assert_eq!(count(&engine), 1);
+        assert_eq!(rows(&engine, &format!("on {cached} | count as n")).unwrap(), [json!({"n": 0})]);
+        run(&engine, None, "undefine view c").unwrap();
+        refresh(&engine, None, "c").unwrap();
+        assert_eq!(entries(&engine), json!(1));
+    }
     #[test] fn explain_writes_nothing_and_a_place_reads_only_its_views() { let engine = engine(); assert_eq!(Statement::parse("define view v | exec | on ledger | end | end").unwrap().unwrap().run(&engine, Some("p"), "ann", true).unwrap()["version"], 1); assert!(states(&engine).is_empty()); for place in ["p", "q"] { run(&engine, Some(place), &format!("define view {place} | exec | on ledger | end | end")).unwrap(); } let read = |text: &str| engine.execute_physical_scoped(engine.plan(&pipeline(text).unwrap()).unwrap().physical(), &DocumentScope::new("p", "app")).map(|output| output.rows().len()); assert_eq!(read("on _views | where state == \"active\"").unwrap(), 1); assert!(read("on _views | set state = \"x\"").is_err()); }
 }

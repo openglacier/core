@@ -146,7 +146,7 @@ on data
 
 > **Note:** this compound form is supported: exactly one `by`, then any number of `sum` directives. `group` opens a sub-pipeline when its header is empty, which is the same syntactic property `load` has (see [`SubPipelinePolicy`](#53-compound-stages-and-end)).
 
-For compact `group`, one item is a grouping key. With two or more items, every item except the last is a grouping dimension and the last item is summed. Therefore `group x, y, z` groups by `(x, y)` and sums `z`. `as` can rename every dimension and the summed value. Use the compound `group | by ... | sum ... | avg ... | end` form for several measures or for other aggregates (`avg`, `min`, `max`, `first`, `last`, `count`).
+For compact `group`, the first item is a grouping key; each later item is summed when every value it takes is a number, and is a key otherwise. Therefore `group tPeriode, CAFacture, CAFacture - COGS as Marge` groups by `tPeriode` and sums both amounts. `as` can rename every key and sum. Use the compound `group | by ... | sum ... | avg ... | end` form for several measures or for other aggregates (`avg`, `min`, `max`, `first`, `last`, `count`).
 
 Every stage has a single responsibility.
 
@@ -315,6 +315,8 @@ exact bounded document path, also without a preliminary rescan.
 ---
 
 # Part II — Language reference
+
+The user-facing guide and reference is the book *The OpenGlacier Modeling Language* (`og-books/manifest/the_ogml_language`, `mdbook serve og-books/manifest/the_ogml_language`): one entry per stage and per function, views and caches, modeling patterns, the full grammar and an index. This part stays the developer reference, next to the code.
 
 Contents:
 
@@ -518,7 +520,9 @@ is identical to `on users | where age >= 18 | select name`.
 
 ### 2.2 The pipe `|`
 
-`|` separates stages and is the only statement separator. A single `|` outside brackets is always a stage boundary. `||` is always the boolean "or" operator, never two stage boundaries, so `where a || b` is one stage.
+`|` separates stages. A single `|` outside brackets is always a stage boundary. `||` is always the boolean "or" operator, never two stage boundaries, so `where a || b` is one stage.
+
+A query that holds no top-level `|` separates its stages with `;` and with line breaks instead (`on users; where age >= 18`, or one stage per line). A line break ends a stage when brackets are balanced, the line does not end on a continuation (`,`, an operator, `and`, `as`…) and the next line starts with a stage word or a directive of its block. One style per query; text in parentheses keeps its own. `query::normalize` (`separators.rs`) writes these separators as `|` byte for byte before the query is prepared and parsed, so both styles give the same stages and the same spans; the query itself is kept as written. Full rules: the OGML book, section 3.2.
 
 ### 2.3 Identifiers
 
@@ -738,7 +742,7 @@ A bare boolean field or literal is a valid predicate: `where active`, `where tru
 
 ### 4.4 Functions
 
-Functions are called by name with parenthesised arguments, and any expression can be an argument. Unknown names and wrong argument counts are rejected when the query is parsed:
+Functions are called by name with parenthesised arguments, and any expression can be an argument. There is no general `null` propagation: numeric, text and date functions refuse `null` (`` `upper` expects a string, found Null ``); `coalesce`, `exists`, `optional`, `nullif`, `concat` (skips it), `to_int`/`to_float`/`to_string` (keep it), `type`, `merge` (skips it) and the aggregates `sum`, `avg`, `median`, `percentile`, `stddev` (skip `null` items) accept it, while `min` and `max` refuse a `null` item. Unknown names and wrong argument counts are rejected when the query is parsed:
 
 ```text
 invalid expression "nope(age) > 1" for stage "where": unknown function `nope`; available functions: abs, sqrt, …
@@ -752,13 +756,14 @@ invalid expression "abs(age, 2) > 1" for stage "where": function `abs` expects 1
 | `abs(x)` | Absolute value, integer kept | `abs(-qty)` → `3` |
 | `sqrt(x)` | Square root (float); negative input is an error | `sqrt(16)` → `4.0` |
 | `pow(x, y)` | Power; integer when exact | `pow(qty, 2)` → `9` |
-| `round(x [, digits])` | Rounds half away from zero. Integer without `digits`, float with `digits` (0 to 15) | `round(13.333, 2)` → `13.33` |
+| `round(x [, digits [, mode]])` | Rounds a half away from zero (`"half_up"`, the default) or to even (`"half_even"`, banker's rounding); a value written as a decimal half (`2.675`) counts as one. Integer without `digits`, float with `digits` (0 to 15) | `round(13.333, 2)` → `13.33`, `round(2.675, 2)` → `2.68`, `round(0.125, 2, "half_even")` → `0.12` |
 | `trunc(x [, digits])` | Rounds toward zero, same rules as `round` | `trunc(-2.7)` → `-2` |
 | `floor(x)`, `ceil(x)` | Rounded down / up, as an integer | `floor(12.5)` → `12` |
 | `sign(x)` | `-1`, `0` or `1` | `sign(-qty)` → `-1` |
 | `ln(x)`, `log10(x)`, `log(x, base)`, `exp(x)` | Logarithms (positive input) and exponential, as floats | `log(8, 2)` → `3.0` |
 | `min(a, b, …)`, `max(a, b, …)` | Smallest / largest argument; with one array argument, over its elements | `max(age, 30)`, `max(scores)` |
 | `sum(a, b, …)`, `avg(a, b, …)` | Sum (integer while every term is) / mean; with one array argument, over its elements; `null` items are skipped | `sum(scores)`, `avg([])` → `null` |
+| `median(a, b, …)`, `percentile(array, fraction)`, `stddev(a, b, …)` | Middle value, value at a fraction (0 to 1) linear between the two closest values (a spreadsheet's inclusive percentile), sample standard deviation; with one array argument, over its elements; `null` items are skipped; `null` when there are no values (fewer than two for `stddev`) | `median([3, 1, 2])` → `2.0`, `percentile(scores, 0.9)` |
 | `div(a, b [, fallback])` | Safe division: `fallback` when `b` is 0 (`null` without fallback), else `a / b` | `div(price, qty - 1, 0)` |
 
 **Logic, missing values and conversions**
@@ -772,7 +777,7 @@ invalid expression "abs(age, 2) > 1" for stage "where": function `abs` expects 1
 | `optional(x)` | `x`, or `null` when missing; what `x?` means | `optional(nick)` |
 | `nullif(a, b)` | `null` when `a == b`, else `a` | `nullif(status, "")` |
 | `between(x, low, high)` | `low <= x <= high`; what `x between low and high` means | |
-| `bucket(x, [b0, b1, …] [, default])` | Lower bound `b(i)` of the range `[b(i), b(i+1))` holding `x`, else `default` (or `null`) | `bucket(age, [0, 18, 65])` → `18` |
+| `bucket(x, [b0, b1, …] [, default])` | Lower bound `b(i)` of the range `[b(i), b(i+1))` holding `x`, else `default` (or `null`); the last bound closes the last range | `bucket(age, [0, 18, 65])` → `18`, `bucket(70, [0, 18, 65], "old")` → `"old"` |
 | `to_int(x)` | Integer from a number (truncated), a numeric string, a boolean; `null` stays `null` | `to_int("42")` → `42` |
 | `to_float(x)` | Float from a number, a numeric string or a boolean | `to_float("2.5")` → `2.5` |
 | `to_string(x)` | Text; numbers, booleans, arrays and objects are written as JSON | `to_string(qty)` → `"3"` |
@@ -829,6 +834,8 @@ invalid expression "abs(age, 2) > 1" for stage "where": function `abs` expects 1
 | `fiscal_year(t, closing)` | Fiscal year holding `t`, named after the year it closes in, for a year closing at the end of month `closing` (1 to 12; 12 is the calendar year), or opening on the date `closing` (a timestamp on the first day of a month, repeated every year) | `fiscal_year("2026-07-01", 6)` → `2027`, as `fiscal_year("2026-07-01", "2019-07-01")` |
 | `fiscal_month(t, closing)` | Month within the fiscal year, 1 to 12 | `fiscal_month("2026-07-01", 6)` → `1` |
 | `fiscal_start(t, closing)`, `fiscal_end(t, closing)` | First and last day of the fiscal year, epoch milliseconds | `fiscal_end("2026-07-01", 6)` → 2027-06-30 |
+| `month_end(t)` | Last day of the month, epoch milliseconds | `month_end("2024-02-10")` → 2024-02-29 |
+| `days_in(t, unit)` | Number of days of the unit holding `t` | `days_in("2024-02-10", "month")` → `29`, `days_in(at, "year")` |
 
 ```text
 on users | select name, upper(concat(name, "@", lower(city))) as handle, coalesce(nick, name) as display, if(age >= 18, "adult", "minor") as bracket
@@ -1030,7 +1037,10 @@ define view finance.cube
 - `define view <name> | description "…" | end` writes a new version with another description; `define view <name> | version <n> | end` restores version `n` as a new version; `undefine view <name>` marks the active version `deleted`. History is never rewritten.
 - `explain define view …` checks without writing. In a Place, views are defined by its Owner; a view defined outside a Place is a standard view and needs the right to write `_views`.
 - `on _views` lists and reads them back; in a Place it reads only that Place's views, and only `define` / `undefine` write them: `on _views | where state == "active" | select name, version, parameters`.
-- `| materialized |` (before `exec`) keeps the view's rows: the first read in a scope (Place, App instance) computes them into a cache collection (`_cache.v<key>s<0|1>`, rows scoped like any write), and later reads in that scope read it, until a collection the view reads changes for that Place: a write of the Place, or a write og-core cannot attribute to one Place (unscoped, `load`), which counts for every Place (the storage tells the generation of each collection's last change, og-core the Place of each scoped write; a restart computes the caches again). The rows are then computed again into the scope's other cache collection. A materialized view takes no parameter (its `let` bind them); filters after it reach the cache like any source. `on _cache` lists the caches (scope, view version, collection, `computedAt`); only og-core writes them. A view defined over a materialized view lists the collections it reads among its own `reads`.
+- `| materialized |` (before `exec`) keeps the view's rows: the first read in a scope (Place, App instance) computes them into a cache collection (`_cache.v<key>s<0|1>`, rows scoped like any write), and later reads in that scope read it, until a collection the view reads changes for that Place: a write of the Place, or a write og-core cannot attribute to one Place (unscoped, `load`), which counts for every Place (the storage tells the generation of each collection's last change, og-core the Place of each scoped write; a restart computes the caches again). The rows are then computed again into the scope's other cache collection. A materialized view takes no parameter (its `let` bind them); filters after it reach the cache like any source. `on _cache` lists the caches (key, scope, view version and Place, reading Place and App instance, slot, collection, the reads it follows, `changed`, `computedAt`); only og-core writes them. A view defined over a materialized view lists the collections it reads among its own `reads`.
+- A materialized view also follows the **views it reads**, at any depth: its cache records the name, version and Place of each definition read, and the collections it watches are those of the views as they are defined now. Redefining, restoring or undefining a view it reads computes it again, and so does a write to a collection that view now reads.
+- `ogd` computes them right away: a `define view` or `undefine view` is handed to the `og-view-refresh` thread, which computes again, in every scope a cache already exists for, the materialized views reading the redefined view (and the view itself); a scope filtered by a Place access is left to its next read. The rows of an earlier version of a view in a scope are dropped once the new ones are in, and the cache of an undefined view is removed.
+- The cache collections have no size cap of their own: they are stored data. The result cache of repeated reads ([9.1](#91-result-cache)) is separate, in memory and bounded.
 
 A view is read as a source, with `on view <name> [version <n>] [as <alias>]`, in the main pipeline or a `union` branch, and as the joined collection of `lookup view <name> [version <n>] as <alias> | … | end` (or the one-line `lookup view <name> as <alias> on <field> == <field> into <field>`):
 
@@ -1219,7 +1229,7 @@ sort <key> [asc|desc], ...
 key := <field.path> | <expression>
 ```
 
-Stable ordering on one or more keys. A key can be any expression: `sort price * qty desc`, `sort len(name), name`. An expression key is computed into a hidden field by a `derive`, sorted on, then dropped, so it follows the same execution rules as `derive … | sort …`. The default direction is `asc`. Missing fields and `null` sort before every other value in ascending order, and after them in descending order. `sort` is **blocking**: it must see every input document before emitting any. Followed by `limit N`, it runs as a bounded **Top-N** that keeps only N rows in memory.
+Stable ordering on one or more keys. A key can be any expression: `sort price * qty desc`, `sort len(name), name`. An expression key is computed into a hidden field by a `derive`, sorted on, then dropped, so it follows the same execution rules as `derive … | sort …`. The default direction is `asc`. Missing fields and `null` sort before every other value in ascending order, and after them in descending order. Values of different kinds sort by kind, as group keys do: booleans, numbers, texts, arrays, then objects (a number and a numeric text are not compared by value; `to_float(…)` in a `derive` first). `sort` is **blocking**: it must see every input document before emitting any. Followed by `limit N`, it runs as a bounded **Top-N** that keeps only N rows in memory.
 
 ```text
 on orders | sort price desc | limit 2
@@ -1361,12 +1371,17 @@ on orders | where price > 20 | count as expensive_orders
 
 ```text
 group <key> [as <alias>]                                   -- group + count
-group <key> [as <alias>], ..., <measure> [as <alias>]       -- group + sum(measure)
+group <key> [as <alias>], <item> [as <alias>], ...         -- numbers summed, other items keys
+group <expression> as <alias>, ...                         -- any item may be an expression
 ```
 
 - **One item:** group by that key and emit `count`.
-- **Two or more items:** every item except the last is a grouping key, and the **last item is summed**.
-- Every key and the measure can be renamed with `as`, and keys may be nested paths.
+- **Two or more items:** the first item is a grouping key. Each later item is **summed** when every value it takes is a number (`null` aside), and is a **key** otherwise. With no summed item, the group emits `count`.
+- What an item holds is known before the scan: from the storage's exact per-field kinds (or a scan of the collection on a store that keeps none), through the `where`, `limit`, `skip`, `sort` and `derive` stages before the `group`. An expression is a number when it is arithmetic or a numeric function (`round`, `len`, `date_part`, …); a comparison, a text or date function, a text or boolean field is a key.
+- When that cannot be known (another stage before the `group`, a nested path, `at`/`get`), the items keep their written roles: every item but the last is a key and the last is summed.
+- A numeric code (an integer client number) is summed too: to group by it, write the compound form, or `to_string(code) as code`.
+- Every key and sum can be renamed with `as`, and keys may be nested paths.
+- Any item may be an expression with `as <alias>`: `group tPeriode, CAFacture - COGS as Marge`. It is a `derive` of a hidden field before the `group`, at the same cost as writing that `derive`. When that `derive` is the only stage before a one-key `group`, a measure of `+`, `-`, `*`, `/` over number fields is computed on each storage block's typed columns as the block is folded, without the batch runner (`group tPeriode, CAFacture - COGS as Marge`: 37 → 22 ms on 2 M rows); a block it cannot compute exactly (another kind of value, an overflow, a division by zero) takes the general path.
 
 ```text
 on orders | group status
@@ -1382,6 +1397,9 @@ on orders | group region, qty
 -- {"qty":8,"region":"EU"}
 -- {"qty":8,"region":"US"}
 
+on orders | group region, qty, price * qty as revenue, status
+-- by region and status, sums qty and revenue
+
 on orders | group region as zone, status as state, qty as units
 -- {"state":"paid","units":3,"zone":"EU"} …
 
@@ -1394,13 +1412,13 @@ on orders | group product | sort count desc | limit 2
 -- {"count":2,"product":"P2"}
 ```
 
-Groups are emitted in group-key order. `group | limit N` is bounded: only the N smallest live keys are kept (see the execution rule in Part I). A sum stays an integer while every term is an integer and the total fits in 64 bits; otherwise it is a float. Non-numeric values are ignored by sums. Grouping keys are field paths: to group by a computed value, `derive` it first, as in the tour; the compound form below measures expressions directly.
+Groups are emitted in group-key order. `group | limit N` is bounded: only the N smallest live keys are kept (see the execution rule in Part I). A sum stays an integer while every term is an integer and the total fits in 64 bits; otherwise it is a float. Non-numeric values are ignored by sums. Keys and sums may be expressions (`group substr(tPeriode, 3, 4) as Annee, CAFacture`). For other aggregates, or a numeric key, use the compound form: `group | by tPeriode, Receptionnaire_Code | sum CAFacture | avg COGS | end`.
 
 **Compound form**, for several measures:
 
 ```text
 group
-| by <key> [as <alias>], ...
+| by <key> [as <alias>] | <expression> as <alias>, ...
 | sum|avg|min|max|first|last|list <value> [where <predicate>] [as <alias>]
 | first|last <value> by <order> [where <predicate>] [as <alias>]
 | count [<value>] [where <predicate>] [as <alias>]
@@ -1415,15 +1433,16 @@ group
 | `sum <field>` | Sum of the numeric values (integer while exact); the field is omitted when the group has no number | `<field>` |
 | `avg <field>` | Mean of the numeric values, `null` when there are none | `avg_<field>` |
 | `min <field>`, `max <field>` | Smallest / largest non-null value; values must be comparable (numbers, strings or booleans) | `min_<field>`, `max_<field>` |
-| `first <field>`, `last <field>` | Value on the first / last row of the group, in input order (`null` when missing) | `first_<field>`, `last_<field>` |
+| `first <field>`, `last <field>` | Value on the first / last row of the group, in input order (`null` when missing). A collection is read in storage order, which a replaced row may change and which differs between stores: use `by <order>` for a defined order | `first_<field>`, `last_<field>` |
 | `first <value> by <order>`, `last <value> by <order>` | Value on the row of smallest / largest `<order>`, whatever the input order; rows whose order is `null` or missing are skipped, equal orders keep the first / last row read; `null` when no row has an order | `first_<field>`, `last_<field>` |
+| `median <value>`, `percentile <value> <fraction>`, `stddev <value>` | The functions of the same name over the group's numbers: a `list` of them, reduced after the group, so these measures hold the group's values | `median_<field>`, `percentile_<field>`, `stddev_<field>` |
 | `count` | Number of rows | `count` |
 | `list <field>` | Array of the values neither missing nor null, in input order (`unwind` gives the rows back) | `list_<field>` |
 | `count <field>` | Number of rows where the field is present and not `null` | `count_<field>` |
 
 With no measure, the group emits `count`. Every measure runs on the same bounded, spillable executor as the compact form.
 
-A measure's `<value>` (and a `by` order) may be any expression; an expression needs `as <alias>`. `where <predicate>` measures only the rows the predicate keeps: the value counts as `null` on the others, which every measure ignores (`count where <predicate>` counts the kept rows). `first`/`last` with `where` need `by <order>`. An expression, or a value under `where`, is a `derive` of a hidden field before the `group`, as for `pivot` values; `first`/`last … by` read their value and order fields directly.
+A `by` key, a measure's `<value>` and a `by` order may be any expression; an expression needs `as <alias>`. `where <predicate>` measures only the rows the predicate keeps: the value counts as `null` on the others, which every measure ignores (`count where <predicate>` counts the kept rows). `first`/`last` with `where` need `by <order>`. An expression, or a value under `where`, is a `derive` of a hidden field before the `group`, as for `pivot` values; `first`/`last … by` read their value and order fields directly.
 
 ```text
 on ledger
@@ -1483,16 +1502,16 @@ on users | bucket age by [0, 18, 40] default "40+" as band
 
 ```text
 pivot
-| rows    <field>, ...
-| columns <field>, ...
+| rows    <field> | <expression> as <alias>, ...
+| columns <field> | <expression> as <alias>, ...
 | values  <field> [as <alias>] | <expression> as <alias>, ...
 | aggregate sum|count|avg|average|min|minimum|max|maximum|first|last
 | end
 ```
 
-`values` takes one or more measures, written like `select` items: a field, or any expression with an alias (`CAFacture - COGS as marge`). With one measure, each cell is named after its column; with several, `<column>.<name>`, where the name is the alias or the field's last segment, and names must be unique. An expression value is computed by a hidden `derive` before the pivot, so it runs on the same streamed prefix.
+`values` takes one or more measures, written like `select` items: a field, or any expression with an alias (`CAFacture - COGS as marge`). With one measure, each cell is named after its column; with several, `<column>.<name>`, where the name is the alias or the field's last segment, and names must be unique. An expression value, row or column is computed by a hidden `derive` before the pivot, so it runs on the same streamed prefix: `rows substr(tPeriode, 3, 4) as Annee`. A row is named after its alias; a column's alias is required but unused, since its values name the cells.
 
-Each directive appears exactly once. Stages may follow `pivot`, which emits one row per row key once its input is read: `| pivot | … | end | derive marge = coalesce(sales?, 0) - coalesce(costs?, 0)`; a cell with no row is absent (read it with `?`). Cells use the same aggregates as the compound `group`: sums stay integers when exact (a cell with no number is `0`), non-numeric values are ignored by `sum`/`avg`, missing values are skipped by every aggregate except `count`, which counts rows. It runs in `ogd` on a bounded executor of the `group` family: the prefix streams and only the aggregate cells are retained (one per row key and column). The state is charged to the query working set; a pivot with too many distinct rows × columns fails with `pivot cells exceed the governed query working set` (it does not spill, unlike `group`).
+Each directive appears exactly once. Stages may follow `pivot`, which emits one row per row key once its input is read: `| pivot | … | end | derive marge = coalesce(sales?, 0) - coalesce(costs?, 0)`; a cell with no row is absent (read it with `?`). Cells use the same aggregates as the compound `group`: sums stay integers when exact (a cell with no number is `0`), non-numeric values are ignored by `sum`/`avg`, missing values are skipped by every aggregate except `count`, which counts rows. It runs in `ogd` on a bounded executor of the `group` family: the prefix streams and only the aggregate cells are retained (one per row key and column). The state is charged to the query working set; beyond it, the cells spill to sorted runs on disk, merged back by row key at the end, as `group` does.
 
 #### `window`
 
@@ -1647,13 +1666,13 @@ Emits the main stream, then the documents of the sub-pipeline. The first sub-sta
 on users | select name | union | on products | select label | end
 ```
 
-A branch takes any read pipeline (`sort`, `group`, `lookup`, another `union`…): it then runs as a query of its own, governed like the main one, and any stage may follow the `end`: `on actual | group | by month | sum amount as a | end | union | on forecast | group | by month | sum amount as a | end | end | group | by month | sum a as a | end`.
+A branch takes any read pipeline (`sort`, `group`, `window`, `fill`, `lookup`, another `union`…), written as at the top level: it then runs as a query of its own, governed like the main one, and any stage may follow the `end`: `on actual | group | by month | sum amount as a | end | union | on forecast | group | by month | sum amount as a | end | end | group | by month | sum a as a | end`.
 
 ### Writes
 
 Every write runs in **one transaction**: all mutations commit, or none do. Write stages are **terminal**: nothing can follow them. The response contains the written documents and the mutation counters (`inserted`, `replaced`, `deleted`).
 
-A write (`set`, `delete`, `into`) streams its rows into the transaction and charges what it holds to the query memory budget. Past it, the write fails. Only the documents a `set` returns stay in memory. og-core also runs several writes in one transaction (`Engine::execute_together`, used by checked imports): each reads the rows as they were before it.
+A write (`set`, `delete`, `into`) streams its rows into the transaction and charges what it holds to the query memory budget. Past it, a Glacier transaction moves its pending writes to disk (its inserted rows to segments of their own, what it removes marked) and commits them as one at the end; the memory backend fails the write instead. Only the documents a `set` returns stay in memory. og-core also runs several writes in one transaction (`Engine::execute_together`, used by checked imports): each reads the rows as they were before it.
 
 #### `insert`
 
@@ -1854,7 +1873,15 @@ on _memory | where scope == "global" | select profile, current_bytes, pressure_s
 on _index_observations | where collection == "users" | select fingerprint, access, executions, average_elapsed_us
 ```
 
-Other system collections (`_apps`, `_devices`, `_identities`, `_permissions`, `_places`, …) are managed by `ogd` and protected by authorization.
+Stored system collections of the language:
+
+| Collection | Content |
+|---|---|
+| `_views` | Every version of every view (section 5.7), written by `define view` / `undefine view` only |
+| `_cache` | One entry per materialized view and scope; `_cache.v<key>s<0\|1>` hold the rows |
+| `_values.v<hash>` | The rows of a literal `values […]` source, written once, read by every Place |
+
+Other system collections (`_apps`, `_devices`, `_identities`, `_permissions`, `_places`, `_pools`, `_policies`, `_event_outbox`, …) are managed by `ogd` and protected by authorization.
 
 ---
 
@@ -1878,7 +1905,11 @@ A query returns a stream of documents followed by execution statistics. With `og
 | `streamed` | `true` when rows were streamed to the client as they were produced |
 | `timings_us` | Per-phase timings in microseconds. Parsed plans are cached, so a repeated query skips planning |
 
-Integers above 2³² are sent as floats on the wire so that JavaScript clients never lose precision silently. Integers beyond 2⁵³ are rejected on the wire.
+Integers above 2³² are sent as floats on the wire so that JavaScript clients never lose precision silently. Integers beyond 2⁵³ are rejected on the wire. The reverse holds for requests: a MessagePack client (msgpackr) sends such integers as floats, so where og-core expects a count (pool and policy limits) it takes a whole float as the integer it holds. Dates in epoch milliseconds come back as `1772323200000.0` for the same reason.
+
+### 9.1 Result cache
+
+`ogd` keeps the rows of read requests a Place repeats, under a key built from the prepared text (views expanded, parameters bound), the scope and the change tokens of the collections read: a write of the Place makes a new key, so kept rows are never stale. A read cheaper than 20 ms runs again instead; rows nobody asks for during a minute leave; a read arriving while the same one runs waits for its rows. The budget is the `results` memory class (128 MiB by default, at most 1/16 of the managed memory; one entry at most a quarter of it). `OGD_RESULT_CACHE=off` disables it.
 
 ---
 
@@ -1892,6 +1923,9 @@ ogcli [--address HOST:PORT] [--compact] [-q] ['QUERY']
 - With piped stdin, it runs one query per line.
 - On a terminal, it opens a REPL.
 - `-q` prints only the documents, and `--compact` prints one JSON document per line.
+- `--table` (or `format table` in the REPL) draws the results as a table.
+- `import FILE [COLLECTION]` loads a CSV or TSV file through `load | with merge` requests (see the main README).
+- Tab completes commands, operations, stages, collections, fields and paths.
 - `--param NAME=VALUE` binds `$NAME` (repeatable); see [5.4](#54-parameters-name).
 
 A line starting with `.` sends a raw protocol operation (`.OPERATION [JSON payload]`). These are not query stages:
@@ -2013,11 +2047,8 @@ This list is kept honest on purpose. Every item was observed on a live `ogd` bui
 |---|---|---|
 | Parameters and `let` (`$name`) | Bound as literals before planning: each distinct set of values is planned (and cached) separately | None needed |
 | Missing fields | A missing field fails the query, except in `exists`, `coalesce` and optional paths | `x?`, `exists(x) and …`, `coalesce(x, default)` |
-| `pivot` | Aggregate cells must fit the query working set (no spill) | Filter or `select` before it to cut row/column cardinality |
-| `fill` | Top level only; `<field>` and `by` are field paths; at most 100,000 grid values | `derive` computed fields first |
-| `window` | Each partition must fit the query working set (the sort before it spills); top level only; partition and order keys are field paths | Partition more finely; `derive` computed keys first |
-| `group` keys | Field paths only | `derive` the computed key first |
-| `sort` | A key's values other than `null` must all be numbers, all texts or all booleans (values of different kinds do not order) | `to_string(…)` or `to_float(…)` in a `derive` first |
+| `fill` | Top level or a `union` branch; `<field>` and `by` are field paths; at most 100,000 grid values | `derive` computed fields first |
+| `window` | Each partition must fit the query working set (the sort before it spills); top level or a `union` branch; partition and order keys are field paths | Partition more finely; `derive` computed keys first |
 | `aggregate` | Not a stage | `group`, `count`, `pivot` |
 | Date/Time | No native type; date functions read epoch milliseconds or ISO-8601 strings, in UTC | `date_*` functions |
 
@@ -2025,39 +2056,47 @@ This list is kept honest on purpose. Every item was observed on a live `ogd` bui
 
 ## 14. Grammar summary
 
-The pipeline layer (lexer and parser) is below. The planner then interprets each stage's argument text with the stage-specific grammar from [section 6](#6-stage-reference).
+The pipeline layer (lexer and parser) is below; the planner then reads each stage's argument text with the stage grammar of [section 6](#6-stage-reference). The complete grammar, stage by stage, is appendix B of *The OpenGlacier Modeling Language* (`og-books/manifest/the_ogml_language/src/grammar.md`).
 
 ```ebnf
-request      = [ "explain" ] , { let-header } , query ;   (* `$name` values are bound before parsing *)
-let-header   = "let" , variable , "=" , expression , { "," , variable , "=" , expression } , "|" ;
+request      = view-statement | [ "explain" ] , { let-header } , query ;   (* `$name` values are bound before parsing *)
+let-header   = "let" , binding , { "," , binding } , "|" ;
+binding      = variable , ( "=" | "?=" ) , ( expression | "(" , query , ")" ) ;
 variable     = "$" , identifier ;
 query        = source , { "|" , stage } ;
-source       = ( "on" | "from" ) , collection , [ "as" , identifier ] ;
+source       = ( "on" | "from" ) , target , [ "as" , identifier ] ;
+target       = collection , [ "as" , "of" , ( string | integer ) | "history" ]
+             | "values" , "[" , object , { "," , object } , "]"
+             | "view" , view-name , [ "version" , integer ] ;
 collection   = identifier , { "." , identifier } ;
+view-name    = identifier , { "." , identifier } ;
+
+view-statement = [ "explain" ] , ( "define" , "view" , view-name , { "|" , ( "description" , string | "version" , integer | "materialized" ) } ,
+                 [ "|" , "exec" , "|" , query , "|" , "end" ] , "|" , "end"
+               | "undefine" , "view" , view-name ) ;
 
 stage        = simple-stage | compound-stage ;
 simple-stage = stage-name , arguments ;
 compound-stage
              = ( "lookup" | "join" ) , arguments , sub-pipeline   (* unless the header contains `into` *)
-             | "union" , sub-pipeline
-             | "pivot" , sub-pipeline
+             | ( "union" | "pivot" | "window" ) , sub-pipeline
              | ( "load" | "group" ) , sub-pipeline ;   (* header-less form only *)
 sub-pipeline = { "|" , stage } , "|" , "end" ;
 arguments    = { token } ;                        (* up to the next top-level "|", brackets balanced *)
 
-expression   = or-expr | json-literal ;
+expression   = or-expr ;
 or-expr      = and-expr , { ( "or" | "||" ) , and-expr } ;
 and-expr     = not-expr , { ( "and" | "&&" ) , not-expr } ;
-not-expr     = ( "not" | "!" ) , eq-expr | eq-expr ;
+not-expr     = ( "not" | "!" ) , not-expr | eq-expr ;
 eq-expr      = rel-expr , { ( "==" | "!=" ) , rel-expr } ;
 rel-expr     = add-expr , { ( "<" | "<=" | ">" | ">=" | "in" | "not" , "in" ) , add-expr
                           | [ "not" ] , "between" , add-expr , ( "and" | "&&" ) , add-expr } ;
 add-expr     = mul-expr , { ( "+" | "-" ) , mul-expr } ;
 mul-expr     = unary , { ( "*" | "/" | "%" ) , unary } ;
 unary        = ( "-" | "+" ) , number                  (* folded into a signed literal *)
-             | ( "-" | "+" ) , unary | not-expr | primary ;
-primary      = literal | call | field-path | array | object | "(" , expression , ")" ;
-object       = "{" , JSON members with quoted keys , "}" ;
+             | ( "-" | "+" ) , unary | primary ;
+primary      = literal | variable | call | field-path | array | object | "(" , expression , ")" ;
+object       = "{" , [ ( string | identifier ) , ":" , expression , { "," , … } ] , "}" ;   (* bare keys in insert, values, load *)
 call         = identifier , "(" , [ expression , { "," , expression } ] , ")" ;
 array        = "[" , [ expression , { "," , expression } ] , "]" ;
 field-path   = identifier , [ "?" ] , { "." , identifier , [ "?" ] } ;   (* any "?" makes the path optional *)
@@ -2067,5 +2106,5 @@ identifier   = ( letter | "_" ) , { letter | digit | "_" } ;   (* Unicode letter
 number       = [ "+" | "-" ] , digit , { digit } , [ "." , digit , { digit } ] , [ ( "e" | "E" ) , [ "+" | "-" ] , digit , { digit } ]
              | "." , digit , { digit } ;
 string       = '"' , { char | escape } , '"' ;
-escape       = "\" , ( '"' | "\" | "/" | "b" | "f" | "n" | "r" | "t" ) ;
+escape       = "\" , ( '"' | "\" | "/" | "b" | "f" | "n" | "r" | "t" | "u" , 4 * hex ) ;
 ```

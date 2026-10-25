@@ -68,7 +68,6 @@ impl Document {
     pub fn values_mut(&mut self) -> ValuesMut<'_> { ValuesMut { inner: self.fields.values_mut() } }
     #[must_use]
     pub fn into_iter_fields(self) -> IntoIter { IntoIter { inner: self.fields.into_iter() } }
-    #[must_use] pub const fn as_map(&self) -> &BTreeMap<FieldName, Value> { &self.fields }
     #[must_use] pub fn into_map(self) -> BTreeMap<FieldName, Value> { self.fields }
 
     pub fn extend<I, K>(&mut self, fields: I)

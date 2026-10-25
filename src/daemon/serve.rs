@@ -31,6 +31,11 @@ pub(super) fn failed<E: Display>(id: RequestId, code: &'static str) -> impl FnOn
     move |error| request_error(id, code, error.to_string())
 }
 
+/// [`failed`] for a function answering a [`QueryResponse`].
+pub(super) fn failure<E: Display>(id: RequestId, code: &'static str) -> impl FnOnce(E) -> QueryResponse {
+    move |error| QueryResponse::request_error(id, code, error.to_string())
+}
+
 pub(super) fn auth_failed(id: RequestId) -> impl FnOnce(crate::AuthError) -> Stop {
     failed(id, "auth.failed")
 }
@@ -101,6 +106,11 @@ pub(super) fn ensure_operation_resource_authorized(settings: &ConnectionSettings
         AccessPolicy::Permission { action, resource } => (action, resource),
         AccessPolicy::Public | AccessPolicy::Authenticated | AccessPolicy::Query => return Ok(()),
     };
+    ensure_authorized(settings, engine, principal, id, action, resource)
+}
+
+/// `action` on `resource` for this connection, as an operation's own access policy would check it.
+pub(super) fn ensure_permission(settings: &ConnectionSettings, engine: &Engine, principal: &Principal, id: RequestId, action: AuthorizationAction, resource: &str) -> Handled {
     ensure_authorized(settings, engine, principal, id, action, resource)
 }
 
@@ -324,6 +334,8 @@ fn handle_standard_operation(writer: &mut TcpStream, settings: &ConnectionSettin
         HandlerKind::Llm => super::core_ops::handle_llm_operation(writer, settings, authentication, delegation, operation),
         #[cfg(feature = "agent")]
         HandlerKind::Agent => super::core_ops::handle_agent_operation(writer, settings, engine, authentication, delegation, operation),
+        #[cfg(feature = "mailsend")]
+        HandlerKind::Mail => super::core_ops::handle_mail_operation(writer, settings, engine, authentication, delegation, operation),
         #[cfg(feature = "database")]
         HandlerKind::Collections | HandlerKind::Storage | HandlerKind::Backup => super::core_ops::handle_database_operation(writer, settings, database, authentication, delegation, operation),
         #[cfg(feature = "auth")]

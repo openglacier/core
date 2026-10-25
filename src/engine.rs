@@ -13,6 +13,7 @@ const DEFAULT_PLANNER_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 mod execute;
 mod changes;
+pub mod results;
 use crate::query::codec::{encode_bytes, encode_varint, Decoder};
 mod sinks;
 
@@ -168,14 +169,8 @@ enum KeyKind {
 fn equality_key(value: &Value) -> (KeyKind, Vec<u8>) {
     match value {
         Value::Number(number) => {
-            let value = match *number {
-                crate::Number::Signed(value) => value as f64,
-                crate::Number::Unsigned(value) => value as f64,
-                crate::Number::Float(value) => value,
-            };
-            let value = if value == 0.0 { 0.0 } else { value };
             let mut key = vec![b'n'];
-            key.extend_from_slice(&value.to_bits().to_be_bytes());
+            key.extend_from_slice(&number_key_bits(*number).to_be_bytes());
             (KeyKind::Number, key)
         }
         Value::String(text) => {
@@ -367,12 +362,7 @@ impl LookupKeyFilter {
 
 /// Numeric value of a key as [`equality_key`] hashes it.
 fn number_key_bits(number: crate::Number) -> u64 {
-    let value = match number {
-        crate::Number::Signed(value) => value as f64,
-        crate::Number::Unsigned(value) => value as f64,
-        crate::Number::Float(value) => value,
-    };
-    if value == 0.0 { 0.0_f64.to_bits() } else { value.to_bits() }
+    crate::helpers::normalize_zero(number.to_f64()).to_bits()
 }
 
 /// How many rows `prefix` emits at most: the smallest row bound of its
@@ -468,9 +458,79 @@ struct BatchGroups<'a> {
 type BlockAdmit<'g> = &'g mut dyn FnMut(&crate::storage::ProjectedBlock<'_, '_>, &[usize]) -> EngineResult<bool>;
 
 /// Fields and admission of a consumer's block gate
-/// ([`Engine::stream_slot_batches_gated`]), and whether it only refuses
-/// blocks (their rows otherwise go on as usual).
-type BlockGateOn<'g> = (&'g [crate::query::ExpressionFieldPath], BlockAdmit<'g>, bool);
+/// ([`Engine::stream_slot_batches_gated`]), whether it only refuses blocks
+/// (their rows otherwise go on as usual), and whether the blocks it takes
+/// need no prefix (it computes the prefix's fields itself).
+type BlockGateOn<'g> = (&'g [crate::query::ExpressionFieldPath], BlockAdmit<'g>, bool, bool);
+
+/// A `derive` that is the whole prefix of a block-folded `group`, every
+/// field of which is a group measure of arithmetic over source fields
+/// ([`crate::query::BlockKernel`]): the fold computes them on each block
+/// instead of the batch runner. `sources` are the fields the block gate
+/// reads; `inputs` gives each group input field from them.
+struct FusedDerive { sources: Vec<crate::query::ExpressionFieldPath>, inputs: Vec<FusedInput> }
+
+enum FusedInput { Source(usize), Kernel(crate::query::BlockKernel) }
+
+fn fused_derive(prefix: &PhysicalPlan, fields: &[crate::query::ExpressionFieldPath], key_indexes: &[usize]) -> Option<FusedDerive> {
+    let [PhysicalOperator::Custom { stage: Some(crate::query::Stage::Derive), arguments, .. }] = prefix.operators() else { return None };
+    let assignments = crate::query::split_derive_assignments(arguments).ok()?;
+    let targets = assignments.iter().map(|(target, _)| crate::query::ExpressionFieldPath::new([target.trim()]).ok()).collect::<Option<Vec<_>>>()?;
+    // Every computed field feeds a measure, once: none is left to fail unseen.
+    if (1..targets.len()).any(|at| targets[..at].contains(&targets[at])) || !targets.iter().all(|target| fields.iter().position(|field| field == target).is_some_and(|at| !key_indexes.contains(&at))) {
+        return None;
+    }
+    let mut sources = Vec::new();
+    let mut source = |field: &crate::query::ExpressionFieldPath| -> Option<usize> {
+        if field.len() != 1 || targets.contains(field) {
+            return None;
+        }
+        Some(sources.iter().position(|known| known == field).unwrap_or_else(|| { sources.push(field.clone()); sources.len() - 1 }))
+    };
+    let mut inputs = Vec::with_capacity(fields.len());
+    for field in fields {
+        inputs.push(match targets.iter().position(|target| target == field) {
+            Some(at) => FusedInput::Kernel(crate::query::BlockKernel::compile(&crate::query::parse_expression(assignments[at].1.trim()).ok()?, &mut source)?),
+            None => FusedInput::Source(source(field)?),
+        });
+    }
+    Some(FusedDerive { sources, inputs })
+}
+
+/// [`Engine::resolve_compact_group`] for the group at `at`, with the
+/// top-level source fields whose values are all numbers; `None` when an
+/// item stays undecided.
+fn resolve_group_items(physical: &PhysicalPlan, at: usize, numbers: &std::collections::BTreeSet<String>) -> Option<PhysicalPlan> {
+    let source = |path: &crate::query::ExpressionFieldPath| (path.len() == 1).then(|| numbers.contains(path.first()));
+    let mut derived = Vec::<(crate::query::ExpressionFieldPath, Option<bool>)>::new();
+    let kind = |derived: &[(crate::query::ExpressionFieldPath, Option<bool>)], path: &crate::query::ExpressionFieldPath| derived.iter().rev().find(|(field, _)| field == path).map_or_else(|| source(path), |(_, kind)| *kind);
+    for operator in &physical.operators()[..at] {
+        match operator {
+            PhysicalOperator::Filter { .. } | PhysicalOperator::Limit { .. } | PhysicalOperator::Skip { .. } | PhysicalOperator::Sort { .. } => {}
+            PhysicalOperator::Custom { stage: Some(crate::query::Stage::Derive), arguments, .. } => {
+                for (target, text) in crate::query::split_derive_assignments(arguments).ok()? {
+                    let expression = crate::query::parse_expression(text.trim()).ok()?;
+                    let summable = crate::query::summable(&expression, &|path| kind(&derived, path));
+                    derived.push((crate::query::ExpressionFieldPath::new(target.trim().split('.')).ok()?, summable));
+                }
+            }
+            _ => return None,
+        }
+    }
+    let PhysicalOperator::Group { keys, .. } = &physical.operators()[at] else { return None };
+    let mut fields = vec![keys.first()?.clone()];
+    for field in &keys[1..] {
+        let (path, alias, _) = crate::query::compact_group_item(field)?;
+        let text = path.to_string();
+        fields.push(match kind(&derived, &path)? {
+            true if alias.contains('.') => return None,
+            true => crate::query::group_measure_marker("sum", &text, &alias).ok()?,
+            false if alias == text => path,
+            false => crate::query::group_key_marker(&text, &alias).ok()?,
+        });
+    }
+    physical.with_operator(at, PhysicalOperator::group(fields).ok()?).ok()
+}
 
 /// A sort right after a `group`, and its bound ([`BatchGroups::finish`]).
 type GroupTop<'k> = Option<(&'k [crate::query::SortKey], Option<usize>)>;
@@ -515,16 +575,21 @@ impl<'a> BatchGroups<'a> {
     /// block column of each group input field. Every block folds here, so
     /// rows fold in scan order.
     fn push_block(&mut self, block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]) -> Result<(), StorageError> {
+        let key = columns[self.key_indexes[0]];
+        self.push_block_inputs(block, key, &columns.iter().map(|column| &block.columns[*column]).collect::<Vec<_>>())
+    }
+
+    /// [`Self::push_block`] with the key in the block's column `key` and
+    /// the group input fields in `inputs`, some computed from the block.
+    fn push_block_inputs(&mut self, block: &crate::storage::ProjectedBlock<'_, '_>, key: usize, inputs: &[&crate::storage::BlockColumn<'_, '_>]) -> Result<(), StorageError> {
         if self.exceeded {
             return Ok(());
         }
-        let inputs = columns.iter().map(|column| &block.columns[*column]).collect::<Vec<_>>();
-        let key = columns[self.key_indexes[0]];
         let mut keys = std::mem::take(&mut self.batch_keys);
         self.table.block_keys(&block.columns[key], block.codes[key], &mut keys);
         self.create_new(&keys)?;
         if !self.exceeded {
-            self.dense.fold_block(&keys, &inputs).map_err(execution_storage_error)?;
+            self.dense.fold_block(&keys, inputs).map_err(execution_storage_error)?;
         }
         self.batch_keys = keys;
         Ok(())
@@ -601,9 +666,9 @@ impl<'a> BatchGroups<'a> {
     }
 
     /// Keeps in `narrowed` the rows of `selection` a full bounded group may
-    /// still keep by its first key field: a number whose key component
-    /// sorts above the frontier's first one is left out before any id is
-    /// looked up. `false` (nothing decided) while the group is not full.
+    /// still keep by its first key field: a number or a text whose key
+    /// component sorts above the frontier's first one is left out before any
+    /// id is looked up. `false` (nothing decided) while the group is not full.
     fn narrow(&self, column: Option<&crate::query::Column>, selection: &[u32], narrowed: &mut Vec<u32>) -> bool {
         use crate::query::Tag;
         let (Some(limit), Some(column)) = (self.limit, column) else { return false };
@@ -615,6 +680,7 @@ impl<'a> BatchGroups<'a> {
         let frontier = match largest.get(at..) {
             Some([1, tag @ 3..=5, word @ ..]) if word.len() >= 8 => (1u8, *tag, u64::from_be_bytes(word[..8].try_into().expect("eight bytes"))),
             Some([1, tag @ 0..=2, ..]) => (1, *tag, 0),
+            Some([1, 6, ..]) => return narrow_text(column, &largest[at..], selection, narrowed),
             Some([1, ..]) => return false,
             _ => (0, 0, 0),
         };
@@ -717,7 +783,7 @@ impl<'a> BatchGroups<'a> {
                 self.forget(evicted);
                 self.estimated_bytes = self.estimated_bytes.saturating_sub(group_state_estimate(largest_len, self.keys.len()));
             }
-            if !self.memory.fits(self.estimated_bytes.saturating_add(state_estimate)) {
+            if !self.memory.holds(self.estimated_bytes.saturating_add(state_estimate)) {
                 return Err(StorageError::backend("bounded group limit exceeds the governed working set"));
             }
         } else if !self.memory.fits(self.estimated_bytes.saturating_add(state_estimate).saturating_add(self.table.bytes())) {
@@ -866,9 +932,9 @@ fn scan_batched(
     let options = options.with_number_codes(program.number_codes());
     let mut runner = crate::query::BatchRunner::new(Arc::clone(program));
     let mut values = Vec::new();
-    let mut scanned = 0u64;
+    let scanned = std::cell::Cell::new(0u64);
     let mut flush = |runner: &mut crate::query::BatchRunner| -> Result<bool, StorageError> {
-        scanned = scanned.saturating_add(runner.len() as u64);
+        scanned.set(scanned.get().saturating_add(runner.len() as u64));
         let more = if runner.run().is_ok() {
             on_batch(runner)?
         } else {
@@ -949,12 +1015,19 @@ fn scan_batched(
             Ok(true)
         })?;
     }
+    // The rows of pruned row groups count as refused, scanned and dropped,
+    // as a store that prunes nothing counts them.
+    if pruning.is_some() && !stopped && options.limit().is_none() && read.supports_projected_blocks() {
+        let pruned = usize::try_from(read.count(collection)?).unwrap_or(usize::MAX).saturating_sub(scanned.get() as usize + runner.len() + refused.get());
+        refused.set(refused.get() + pruned);
+        dropped.set(dropped.get() + pruned);
+    }
     let pending = dropped.take();
     runner.skip(pending);
     if !stopped && (!runner.is_empty() || pending > 0) {
         flush(&mut runner)?;
     }
-    Ok(scanned.saturating_add(refused.get() as u64))
+    Ok(scanned.get().saturating_add(refused.get() as u64))
 }
 
 /// Locator handed to a visitor whose scan declined locators
@@ -1395,6 +1468,7 @@ pub struct Engine {
     indexing: Arc<IndexingEngine>,
     memory_governor: MemoryGovernor,
     changes: Arc<changes::Changes>,
+    results: Arc<results::Results>,
     /// Set on the engine a temporal or system-collection query runs on (its
     /// storage is already that view).
     bound: bool,
@@ -1416,6 +1490,7 @@ impl Engine {
                 memory_governor.clone(),
             )),
             indexing: Arc::new(IndexingEngine::new()),
+            results: Arc::new(results::Results::new(memory_governor.profile().result_cache_bytes, memory_governor.clone())),
             memory_governor,
             changes: Arc::new(changes::Changes::new()),
             bound: false,
@@ -1428,6 +1503,12 @@ impl Engine {
     #[must_use]
     pub fn change_token(&self, collection: &str, place: Option<&str>) -> Option<serde_json::Value> {
         self.changes.token(self.storage.as_ref(), collection, place)
+    }
+
+    /// The rows of the reads a Place repeats ([`results`]).
+    #[must_use]
+    pub fn results(&self) -> &results::Results {
+        &self.results
     }
 
     #[must_use]
@@ -1468,6 +1549,7 @@ impl Engine {
             indexing: Arc::clone(&self.indexing),
             memory_governor: self.memory_governor.clone(),
             changes: Arc::clone(&self.changes),
+            results: Arc::clone(&self.results),
             bound: true,
         }
     }
@@ -1484,7 +1566,43 @@ impl Engine {
 
     /// Plans a normalized pipeline.
     pub fn plan(&self, pipeline: &PlannerPipeline) -> EngineResult<PlannedQuery> {
-        self.planner.plan(pipeline).map(PlannedQuery::new).map_err(EngineError::planning)
+        let planned = self.planner.plan(pipeline).map(PlannedQuery::new).map_err(EngineError::planning)?;
+        self.resolve_compact_group(planned)
+    }
+
+    /// Decides the items of a compact `group` after the first: summed when
+    /// every value they take is a number, a key otherwise
+    /// ([`PhysicalOperator::Group`]'s `auto`), from the kinds of the source
+    /// fields (the storage's facts, or a scan when it keeps none) through
+    /// the stages before it. Left as written (the last item summed) when a
+    /// kind cannot be known: a stage other than `where`, `limit`, `skip`,
+    /// `sort` or `derive` before it, a nested field, a function of unknown
+    /// result.
+    fn resolve_compact_group(&self, planned: PlannedQuery) -> EngineResult<PlannedQuery> {
+        let physical = planned.physical();
+        let Some(at) = physical.operators().iter().position(|operator| matches!(operator, PhysicalOperator::Group { auto: true, .. })) else { return Ok(planned) };
+        let collection = physical.source().collection();
+        if self.is_virtual(collection) || collection.as_str().starts_with('_') {
+            return Ok(planned);
+        }
+        let read = self.storage.read().map_err(storage_engine_error)?;
+        let numbers = match read.field_facts(collection).map_err(storage_engine_error)? {
+            Some(facts) => facts.number_fields(),
+            None => {
+                let mut kinds = HashMap::<String, (bool, bool)>::new();
+                read.scan_each(collection, ScanOptions::default(), &mut |stored| {
+                    for (name, value) in stored.document().iter() {
+                        let (number, other) = kinds.entry(name.to_string()).or_default();
+                        *number |= value.as_number().is_some();
+                        *other |= !value.is_null() && value.as_number().is_none();
+                    }
+                    Ok(true)
+                }).map_err(storage_engine_error)?;
+                kinds.into_iter().filter(|(_, (number, other))| *number && !other).map(|(name, _)| name).collect()
+            }
+        };
+        drop(read);
+        Ok(resolve_group_items(physical, at, &numbers).map_or(planned, PlannedQuery::new))
     }
 
     /// The rows of a collection scan that the leading filters `gate` keep,
@@ -1550,19 +1668,24 @@ impl Engine {
     /// source it reads keeps only the rows of that scope
     /// ([`crate::query::scoped_read_plan`]). `None` for a plan that writes.
     /// Never cached: the plan cache is keyed by request text alone.
-    pub fn plan_scoped(&self, pipeline: &PlannerPipeline, place: &str, app_instance: Option<&str>) -> EngineResult<Option<PlannedQuery>> {
+    pub fn plan_scoped(&self, pipeline: &PlannerPipeline, scope: &crate::query::DocumentScope) -> EngineResult<Option<PlannedQuery>> {
         let planned = self.plan(pipeline)?;
-        Ok(crate::query::scoped_read_plan(planned.physical(), place, app_instance).map(PlannedQuery::new))
+        Ok(scope.read_plan(planned.physical(), false).map(PlannedQuery::new))
     }
 
     /// Plans with a bounded cache keyed by normalized request text.
+    /// The cache keeps plans before [`Self::resolve_compact_group`]: the
+    /// kinds it reads change with the data.
     pub fn plan_cached(&self, key: &str, pipeline: &PlannerPipeline) -> EngineResult<PlannedQuery> {
-        if let Some(planned) = self.planner_cache.get(key) {
-            return Ok(planned);
-        }
-        let planned = self.plan(pipeline)?;
-        self.planner_cache.insert(key.to_owned(), planned.clone());
-        Ok(planned)
+        let planned = match self.planner_cache.get(key) {
+            Some(planned) => planned,
+            None => {
+                let planned = self.planner.plan(pipeline).map(PlannedQuery::new).map_err(EngineError::planning)?;
+                self.planner_cache.insert(key.to_owned(), planned.clone());
+                planned
+            }
+        };
+        self.resolve_compact_group(planned)
     }
 
     /// Plans a pipeline without running it and describes the plan: source
@@ -1620,7 +1743,15 @@ impl Engine {
     pub fn with_memory_governor(mut self, governor: MemoryGovernor) -> Self {
         let planner_cache_bytes = governor.profile().planner_cache_bytes;
         self.planner_cache = Arc::new(PlannerCache::new_governed(128, planner_cache_bytes, governor.clone()));
+        self.results = Arc::new(results::Results::new(governor.profile().result_cache_bytes, governor.clone()));
         self.memory_governor = governor;
+        self
+    }
+
+    /// Keeps no rows of repeated reads (`OGD_RESULT_CACHE=off`, for A/B).
+    #[must_use]
+    pub fn without_result_cache(mut self) -> Self {
+        self.results = Arc::new(results::Results::new(0, self.memory_governor.clone()));
         self
     }
 
@@ -2776,10 +2907,10 @@ impl Engine {
         // fail: they would only drop rows.
         let behind = |refuses: bool| -> EngineResult<bool> { Ok(prefix.operators().is_empty() || (refuses && only_total_filters(read.as_ref(), prefix)?)) };
         let gate_on = match gate_on {
-            Some(gate) if behind(gate.2)? => Some(gate),
+            Some(gate) if gate.3 || behind(gate.2)? => Some(gate),
             _ => None,
         };
-        let mut consumer = gate_on.and_then(|(fields, admit, _)| {
+        let mut consumer = gate_on.and_then(|(fields, admit, _, _)| {
             let columns = fields.iter().map(|field| sources.iter().position(|source| source == field)).collect::<Option<Vec<_>>>()?;
             let mask = (0..sources.len()).map(|source| columns.contains(&source)).collect::<Vec<_>>();
             Some((mask, move |block: &crate::storage::ProjectedBlock<'_, '_>| admit(block, &columns).map_err(backend_storage_error)))
@@ -2953,7 +3084,6 @@ impl Engine {
             return Ok(None);
         }
         let mut rows = rows.into_inner();
-        crate::query::check_sort_kinds(keys, rows.len(), |row, key| rows[row].0[key].as_ref())?;
         let mut failure = None;
         rows.sort_by(|left, right| {
             let ordering = crate::query::compare_owned_projected_rows(keys, &left.0, &right.0).unwrap_or_else(|error| {
@@ -3012,7 +3142,7 @@ impl Engine {
             &key_fields,
             &[],
             true,
-            Some((&key_fields[..], &mut admit, true)),
+            Some((&key_fields[..], &mut admit, true, false)),
             &mut |runner, fields| {
                 let positions = batch_positions.get_or_insert_with(|| positions_of(fields));
                 let columns = positions.iter().map(|position| runner.output(*position)).collect::<Vec<_>>();
@@ -3183,7 +3313,7 @@ impl Engine {
             fields,
             fields,
             true,
-            Some((fields, &mut admit, false)),
+            Some((fields, &mut admit, false, false)),
             &mut |runner, available| {
                 let Some(positions) = positions_of(available) else {
                     return Err(EngineError::execution(ExecutionError::evaluation("distinct fields are absent from the batch outputs")));
@@ -3219,9 +3349,10 @@ impl Engine {
             visitor(row)?;
             returned += 1;
         }
+        // Rows a distinct leaves out count as filtered, as on the row path.
         Ok(Some(ExecutionStatistics::streamed_with_strategies(
             statistics.scanned(),
-            statistics.filtered(),
+            statistics.filtered().saturating_add(statistics.returned().saturating_sub(returned)),
             returned,
             ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::InMemoryDistinct),
         )))
@@ -3356,7 +3487,7 @@ impl Engine {
         }
         Ok(Some(ExecutionStatistics::streamed_with_strategies(
             statistics.scanned(),
-            statistics.filtered(),
+            statistics.filtered().saturating_add(statistics.returned().saturating_sub(returned)),
             returned,
             ExecutionStrategies::default().with(ExecutionStrategy::CollectionScan).with(ExecutionStrategy::InMemoryDistinct),
         )))
@@ -3380,9 +3511,33 @@ impl Engine {
                 .collect::<Option<_>>()
                 .ok_or_else(|| EngineError::execution(ExecutionError::evaluation("group input is absent from the rows")))
         };
-        // A one-key group folds whole blocks.
-        let mut fold_block = |block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]| -> EngineResult<bool> { groups.borrow_mut().push_block(block, columns).map_err(storage_engine_error).map(|()| false) };
-        let gate = (key_indexes.len() == 1 && group_limit.is_none() && groups.borrow().dense.folds_blocks()).then_some((group_layout.fields(), &mut fold_block as BlockAdmit<'_>, false));
+        // A one-key group folds whole blocks; measures a lone `derive`
+        // computes are computed on the block's typed columns.
+        let fused = fused_derive(prefix, group_layout.fields(), &key_indexes);
+        let mut fold_block = |block: &crate::storage::ProjectedBlock<'_, '_>, columns: &[usize]| -> EngineResult<bool> {
+            let Some(fused) = &fused else {
+                return groups.borrow_mut().push_block(block, columns).map_err(storage_engine_error).map(|()| false);
+            };
+            let sources = columns.iter().map(|column| &block.columns[*column]).collect::<Vec<_>>();
+            let mut computed = Vec::with_capacity(fused.inputs.len());
+            for input in &fused.inputs {
+                if let FusedInput::Kernel(kernel) = input {
+                    // A block the kernel cannot compute goes through the `derive`.
+                    let Some(column) = kernel.run(block.rows, &sources) else { return Ok(true) };
+                    computed.push(column);
+                }
+            }
+            let computed = computed.iter().map(crate::query::KernelColumn::block).collect::<Vec<_>>();
+            let mut next = computed.iter();
+            let inputs = fused.inputs.iter().map(|input| match input {
+                FusedInput::Source(source) => sources[*source],
+                FusedInput::Kernel(_) => next.next().expect("one column per kernel"),
+            }).collect::<Vec<_>>();
+            let FusedInput::Source(key) = fused.inputs[key_indexes[0]] else { unreachable!("a fused key is a source field") };
+            groups.borrow_mut().push_block_inputs(block, columns[key], &inputs).map_err(storage_engine_error).map(|()| false)
+        };
+        let gate_fields = fused.as_ref().map_or(group_layout.fields(), |fused| &fused.sources[..]);
+        let gate = (key_indexes.len() == 1 && group_limit.is_none() && groups.borrow().dense.folds_blocks()).then_some((gate_fields, &mut fold_block as BlockAdmit<'_>, false, fused.is_some()));
         let Some(statistics) = self.stream_slot_batches_gated(
             prefix,
             group_layout.fields(),
@@ -3808,15 +3963,8 @@ impl Engine {
                 .runtime
                 .incremental_pivot_accumulator(specification)
                 .map_err(EngineError::execution)?;
-            let stage = memory.stage();
-            let over_budget = |accumulator: &dyn crate::query::IncrementalPivotAccumulator| {
-                if !stage.fits(accumulator.retained_bytes()) {
-                    return Err(EngineError::execution(ExecutionError::evaluation(
-                        "pivot cells exceed the governed query working set; reduce the row or column cardinality",
-                    )));
-                }
-                Ok(())
-            };
+            let (stage, runs) = (memory.stage(), std::cell::RefCell::new(Vec::new()));
+            let over_budget = |accumulator: &mut dyn crate::query::IncrementalPivotAccumulator| spill_pivot(&stage, accumulator, &mut runs.borrow_mut());
             // Rows reach the accumulator as batches or slots when it folds
             // them; documents otherwise.
             let pivot_fields = specification
@@ -3848,7 +3996,7 @@ impl Engine {
                         let (mut row_refs, mut column_refs, mut value_refs) = (Vec::new(), Vec::new(), Vec::new());
                         let mut accumulator = accumulator.borrow_mut();
                         if accumulator.push_batch(&rows, &cols, &values, runner.selection()).map_err(EngineError::execution)? {
-                            return over_budget(accumulator.as_ref());
+                            return over_budget(accumulator.as_mut());
                         }
                         for &row in runner.selection() {
                             let row = row as usize;
@@ -3857,18 +4005,18 @@ impl Engine {
                             read(&values, row, &mut value_refs);
                             accumulator.push_refs(&row_refs, &column_refs, &value_refs).map_err(EngineError::execution)?;
                         }
-                        over_budget(accumulator.as_ref())
+                        over_budget(accumulator.as_mut())
                     },
                     &mut |row| {
                         let mut accumulator = accumulator.borrow_mut();
                         accumulator.push_slots(row.fields, row.values).map_err(EngineError::execution)?;
-                        over_budget(accumulator.as_ref())
+                        over_budget(accumulator.as_mut())
                     },
                 )?
             } else if accumulator.folds_slots() {
                 self.stream_slot_rows(&prefix, &pivot_fields, &mut |row| {
                     accumulator.push_slots(row.fields, row.values).map_err(EngineError::execution)?;
-                    over_budget(accumulator.as_ref())
+                    over_budget(accumulator.as_mut())
                 })?
             } else {
                 None
@@ -3877,18 +4025,15 @@ impl Engine {
                 || {
                     self.stream_read_pipeline(&prefix, &mut |stored| {
                         accumulator.push(stored.document()).map_err(EngineError::execution)?;
-                        over_budget(accumulator.as_ref())
+                        over_budget(accumulator.as_mut())
                     })
                     .map(|statistics| statistics.expect("validated streaming prefix"))
                 },
                 Ok,
             )?;
-            let rows = accumulator.finish().map_err(EngineError::execution)?;
+            let runs = runs.into_inner();
+            let returned = finish_pivot(accumulator, &runs, visitor)?;
             drop(stage);
-            let returned = rows.len() as u64;
-            for row in rows {
-                visitor(ExecutionRow::synthetic(row))?;
-            }
             return Ok(Some(ExecutionStatistics::streamed_with_strategies(
                 prefix_stats.scanned(),
                 prefix_stats.filtered(),
@@ -4073,7 +4218,7 @@ impl Engine {
             )));
         }
 
-        if let [PhysicalOperator::Group { keys: group_keys }, PhysicalOperator::Sort { keys: sort_keys }] = core {
+        if let [PhysicalOperator::Group { keys: group_keys, .. }, PhysicalOperator::Sort { keys: sort_keys }] = core {
             // Reuse the same governed in-memory group primitive used by GROUP
             // alone before choosing the external path. Chaining SORT/LIMIT must
             // not force spill when the grouped state already fits the contract.
@@ -4120,7 +4265,7 @@ impl Engine {
                             execution_row_working_bytes(candidate)
                         })
                         .map_err(EngineError::execution)?;
-                        if !sort_memory.fits(top.live_bytes()) {
+                        if !sort_memory.holds(top.live_bytes()) {
                             return Err(EngineError::execution(ExecutionError::evaluation(
                                 "group-sort Top-N candidates exceed the governed working set",
                             )));
@@ -4215,7 +4360,7 @@ impl Engine {
                             execution_row_working_bytes(candidate)
                         })
                         .map_err(EngineError::execution)?;
-                        if !stage.fits(top.live_bytes()) {
+                        if !stage.holds(top.live_bytes()) {
                             return Err(EngineError::execution(ExecutionError::evaluation(
                                 "top-n candidates exceed the governed query working set",
                             )));
@@ -4382,7 +4527,7 @@ impl Engine {
                             .len()
                             .saturating_add(execution_row_encoded_len(&row))
                             .saturating_add(72);
-                        if !stage.fits(estimated) {
+                        if !stage.holds(estimated) {
                             return Err(EngineError::execution(ExecutionError::evaluation(
                                 "one distinct row exceeds the governed query working set",
                             )));
@@ -4426,7 +4571,7 @@ impl Engine {
                     strategies,
                 )));
             }
-            PhysicalOperator::Group { keys } => {
+            PhysicalOperator::Group { keys, .. } => {
                 if output_limit == Some(0) {
                     let strategies = ExecutionStrategies::default()
                         .with(source_strategy)
@@ -4618,11 +4763,11 @@ impl Engine {
             ("runtime_reserve_bytes", usize_value(snapshot.runtime_reserve_bytes)),
             ("managed_budget_bytes", optional_usize_value(snapshot.managed_budget_bytes)),
             ("operation_budget_bytes", usize_value(snapshot.operation_budget_bytes)),
-            ("active_operation_bytes", usize_value(snapshot.active_operation_bytes)),
-            ("peak_operation_bytes", usize_value(snapshot.peak_operation_bytes)),
             ("active_heavy_operations", usize_value(snapshot.active_heavy_operations)),
             ("rejected_operations", Value::from(snapshot.rejected_operations)),
-            ("budget_bytes", Value::Null),
+            ("running_operations", usize_value(snapshot.running_operations)),
+            ("waiting_operations", usize_value(snapshot.waiting_operations)),
+            ("query_slots", optional_usize_value((snapshot.query_slots != usize::MAX).then_some(snapshot.query_slots))),
         ]);
         // Operation rows share the global schema; fields without a per-operation meaning stay null.
         let operation_template = Document::from_fields(global.keys().map(|name| (name.clone(), Value::Null)));
@@ -4633,7 +4778,6 @@ impl Engine {
                 ("scope", Value::from("operation")),
                 ("operation_id", Value::from(record.id)),
                 ("class", Value::from(record.class.as_str())),
-                ("budget_bytes", usize_value(record.budget_bytes)),
             ]);
             insert_virtual_document(transaction.as_mut(), &collection, DocumentId::synthetic(0x7175_6572_796f, record.id), document)?;
         }
@@ -4773,7 +4917,7 @@ fn describe_operator(operator: &PhysicalOperator) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         PhysicalOperator::Select { fields } | PhysicalOperator::Distinct { fields } => joined(fields),
-        PhysicalOperator::Group { keys } => crate::query::describe_group_fields(keys),
+        PhysicalOperator::Group { keys, .. } => crate::query::describe_group_fields(keys),
         PhysicalOperator::Count { alias } => alias.to_string(),
         PhysicalOperator::Custom { arguments, .. } => arguments.to_string(),
         PhysicalOperator::Delete | PhysicalOperator::Insert { .. } | PhysicalOperator::Pivot { .. } => String::new(),
@@ -5284,6 +5428,60 @@ fn merge_group_runs( runtime: &QueryRuntime, keys: &[crate::query::ExpressionFie
     }
 }
 
+/// [`BatchGroups::narrow`] under a frontier whose first key is a text: its
+/// component is its tag 6 then its length-prefixed bytes, compared as such
+/// with each row's text; a row of another kind is kept, except a number,
+/// which sorts before any text.
+#[inline(never)]
+fn narrow_text(column: &crate::query::Column, frontier: &[u8], selection: &[u32], narrowed: &mut Vec<u32>) -> bool {
+    use crate::query::Tag;
+    let mut text = Vec::new();
+    narrowed.clear();
+    narrowed.extend_from_slice(selection);
+    crate::query::keep(narrowed, |row| match column.tag(row) {
+        Tag::Str => {
+            text.clear();
+            text.extend_from_slice(&[1, 6]);
+            crate::query::codec::encode_bytes(&mut text, column.str(row).as_bytes());
+            text.as_slice() <= frontier
+        }
+        _ => true,
+    });
+    true
+}
+
+/// Moves the cells of a pivot to a run on disk once they outgrow `stage`.
+fn spill_pivot(stage: &StageMemory<'_>, accumulator: &mut dyn crate::query::IncrementalPivotAccumulator, runs: &mut Vec<SpillRun>) -> EngineResult<()> {
+    if stage.fits(accumulator.retained_bytes()) {
+        return Ok(());
+    }
+    let mut writer = SpillEngine::default().create_run().map_err(engine_spill_error)?;
+    for record in accumulator.spill().map_err(EngineError::execution)? {
+        writer.append(&record).map_err(engine_spill_error)?;
+    }
+    runs.push(writer.finish().map_err(engine_spill_error)?);
+    stage.release();
+    Ok(())
+}
+
+/// Emits the rows of a pivot, its spilled `runs` merged back: the number
+/// of rows.
+fn finish_pivot(accumulator: Box<dyn crate::query::IncrementalPivotAccumulator>, runs: &[SpillRun], emit: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>) -> EngineResult<u64> {
+    let readers = runs.iter().map(|run| {
+        let mut reader = run.reader()?;
+        Ok(Box::new(std::iter::from_fn(move || reader.next_record().map_err(spill_engine_error).transpose())) as crate::query::PivotRun<'_>)
+    }).collect::<io::Result<Vec<_>>>().map_err(engine_spill_error)?;
+    let (mut failure, mut returned) = (None, 0u64);
+    let finished = accumulator.finish(readers, &mut |row| {
+        returned += 1;
+        emit(ExecutionRow::synthetic(row)).map_err(|error| ExecutionError::evaluation(failure.insert(error).to_string()))
+    });
+    match failure {
+        Some(error) => Err(error),
+        None => finished.map(|()| returned).map_err(EngineError::execution),
+    }
+}
+
 fn spill_engine_error(error: io::Error) -> ExecutionError {
     ExecutionError::evaluation(format!("spill I/O failed: {error}"))
 }
@@ -5382,7 +5580,7 @@ mod tests {
     #[test] fn plan_cached_records_a_miss_then_a_hit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 0, misses: 1, evictions: 0, } ); engine.plan_cached(source, &pipeline).expect("cached plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 1, misses: 1, evictions: 0, } ); }
     #[test] fn invalidating_planner_cache_forces_replanning() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); engine.invalidate_planner_cache(); engine.plan_cached(source, &pipeline).expect("replanned"); let stats = engine.planner_cache_stats(); assert_eq!(stats.hits, 0); assert_eq!(stats.misses, 2); }
     #[test] fn engine_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Engine>(); assert_send_and_sync::<PlannedQuery>(); assert_send_and_sync::<QueryOutput>(); assert_send_and_sync::<EngineError>(); }
-    #[test] fn memory_system_collection_exposes_global_and_class_rows() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit(1_024); let _held = governor .reserve(crate::memory::MemoryClass::Query, 128) .unwrap(); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 7); assert!(output.rows().iter().any(|row| { row.document().get("scope") == Some(&Value::from("global")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); assert!(output.rows().iter().any(|row| { row.document().get("class") == Some(&Value::from("query")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); }
+    #[test] fn memory_system_collection_exposes_global_and_class_rows() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit(1_024); let _held = governor .reserve(crate::memory::MemoryClass::Query, 128) .unwrap(); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 8); assert!(output.rows().iter().any(|row| { row.document().get("scope") == Some(&Value::from("global")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); assert!(output.rows().iter().any(|row| { row.document().get("class") == Some(&Value::from("query")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); }
     #[test] fn memory_events_system_collection_exposes_bounded_journal() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit_and_event_capacity(8 * 1024 * 1024, 8); let reservation = governor .reserve( crate::memory::MemoryClass::Import, crate::memory::MEMORY_EVENT_MIN_BYTES, ) .unwrap(); drop(reservation); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY_EVENTS).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 2); let kinds = output .rows() .iter() .filter_map(|row| row.document().get("kind")) .cloned() .collect::<Vec<_>>(); assert!(kinds.contains(&Value::from("reserved"))); assert!(kinds.contains(&Value::from("released"))); }
     #[test] fn sort_distinct_limit_has_a_bounded_streaming_executor() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let operators = vec![ PhysicalOperator::sort([crate::query::SortKey::ascending( crate::query::ExpressionFieldPath::new(["value"]).unwrap(), )]) .unwrap(), PhysicalOperator::distinct([]).unwrap(), PhysicalOperator::limit(10), ]; let plan = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("data").unwrap()), operators, ) .unwrap(); assert!(engine.supports_governed_blocking_streaming(&plan)); }
 }

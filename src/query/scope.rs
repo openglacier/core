@@ -13,24 +13,51 @@
 
 use super::{parse_expression, BinaryOperator, Expression, ExpressionView, Literal, PhysicalOperator, PhysicalPlan, PhysicalSubPipeline};
 use crate::helpers::{APP_INSTANCE_SCOPE_FIELD, PLACE_SCOPE_FIELD};
+use crate::Value;
+use std::sync::Arc;
 
 /// `plan` restricted to the rows of `place` (and of `app_instance`, when
 /// given) in every source it reads; `None` for a plan that writes, which
 /// keeps the transactional executor and its scope enforcement.
 #[must_use]
 pub fn scoped_read_plan(plan: &PhysicalPlan, place: &str, app_instance: Option<&str>) -> Option<PhysicalPlan> {
+    scoped_plan(plan, place, app_instance, &[])
+}
+
+/// [`scoped_read_plan`] whose sources also keep only the rows whose field,
+/// when present, holds one of the values of each of `filters`.
+pub(crate) fn scoped_plan(plan: &PhysicalPlan, place: &str, app_instance: Option<&str>, filters: &[(Arc<str>, Arc<[Value]>)]) -> Option<PhysicalPlan> {
     if plan.is_write() {
         return None;
     }
-    let operators = scoped_operators(plan.operators().to_vec(), None, plan.source().collection().as_str(), place, app_instance)?;
+    let scope = Scope { place, app_instance, filters };
+    let operators = scoped_operators(plan.operators().to_vec(), None, plan.source().collection().as_str(), &scope)?;
     PhysicalPlan::new(plan.source().clone(), operators).ok()
+}
+
+/// The filters the rows of `collection` keep, each with whether a row must
+/// hold its field: a filter keyed `<collection>:<field>` is strict on that
+/// collection and replaces there the plain `<field>` one, under which a row
+/// without the field passes.
+pub(crate) fn filters_of<'s>(filters: &'s [(Arc<str>, Arc<[Value]>)], collection: &'s str) -> impl Iterator<Item = (&'s str, &'s [Value], bool)> {
+    let strict = |field: &str| filters.iter().any(|(key, _)| key.split_once(':') == Some((collection, field)));
+    filters.iter().filter_map(move |(key, values)| match key.split_once(':') {
+        Some((name, field)) => (name == collection).then_some((field, &values[..], true)),
+        None => (!strict(key)).then_some((&key[..], &values[..], false)),
+    })
+}
+
+struct Scope<'s> {
+    place: &'s str,
+    app_instance: Option<&'s str>,
+    filters: &'s [(Arc<str>, Arc<[Value]>)],
 }
 
 /// `operators` reading `collection`; the constant rows of `values […]`
 /// belong to every scope and are not filtered.
-fn scoped_operators(operators: Vec<PhysicalOperator>, alias: Option<&str>, collection: &str, place: &str, app_instance: Option<&str>) -> Option<Vec<PhysicalOperator>> {
-    let mut scoped = Vec::with_capacity(operators.len() + 1);
-    let predicate = PhysicalOperator::filter(scope_predicate(alias, place, app_instance)?);
+fn scoped_operators(operators: Vec<PhysicalOperator>, alias: Option<&str>, collection: &str, scope: &Scope<'_>) -> Option<Vec<PhysicalOperator>> {
+    let mut scoped = Vec::with_capacity(operators.len() + 2);
+    let predicate = PhysicalOperator::filter(scope_predicate(alias, scope.place, scope.app_instance)?);
     let constant = collection.starts_with(crate::view::VALUES_PREFIX);
     let mut operators = operators.into_iter().peekable();
     // A leading `_id == "…"` stays first, so the source is still read by
@@ -42,6 +69,15 @@ fn scoped_operators(operators: Vec<PhysicalOperator>, alias: Option<&str>, colle
     }
     if !constant {
         scoped.push(predicate);
+        // `f? == null or f? in [...]` for each filter, `f? in [...]` for a strict one: it never fails either.
+        let path = |field: &str| alias.map_or_else(|| format!("{field}?"), |alias| format!("{alias}.{field}?"));
+        let text = filters_of(scope.filters, collection).map(|(field, values, strict)| {
+            let values = crate::helpers::value_to_json(&Value::array(values.iter().cloned()));
+            if strict { format!("{} in {values}", path(field)) } else { format!("({0} == null or {0} in {values})", path(field)) }
+        }).collect::<Vec<_>>();
+        if !text.is_empty() {
+            scoped.push(PhysicalOperator::filter(parse_expression(&text.join(" and ")).ok()?));
+        }
     }
     for operator in operators {
         scoped.push(match operator {
@@ -50,12 +86,12 @@ fn scoped_operators(operators: Vec<PhysicalOperator>, alias: Option<&str>, colle
                 // it is the outer alias: the joined row's own alias, when it
                 // has one, cannot be mistaken.
                 let inner = alias.as_deref();
-                let pipeline = PhysicalSubPipeline::new(scoped_operators(pipeline.operators().to_vec(), inner, collection.as_str(), place, app_instance)?).ok()?;
+                let pipeline = PhysicalSubPipeline::new(scoped_operators(pipeline.operators().to_vec(), inner, collection.as_str(), scope)?).ok()?;
                 PhysicalOperator::Lookup { collection, alias, outer_alias, into, pipeline }
             }
             PhysicalOperator::Union { collection, alias, pipeline } => {
                 // A union branch reads its rows by bare field names.
-                let pipeline = PhysicalSubPipeline::new(scoped_operators(pipeline.operators().to_vec(), None, collection.as_str(), place, app_instance)?).ok()?;
+                let pipeline = PhysicalSubPipeline::new(scoped_operators(pipeline.operators().to_vec(), None, collection.as_str(), scope)?).ok()?;
                 PhysicalOperator::Union { collection, alias, pipeline }
             }
             other => other,

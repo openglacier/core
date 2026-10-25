@@ -129,6 +129,14 @@ impl Number {
     #[must_use]
     pub const fn as_float(self) -> Option<f64> { match self { Self::Float(v) => Some(v), _ => None } }
 
+    /// The value as `f64`, rounding large integers.
+    #[must_use]
+    pub const fn to_f64(self) -> f64 { match self { Self::Signed(v) => v as f64, Self::Unsigned(v) => v as f64, Self::Float(v) => v } }
+
+    /// The value as `i64` when it is an integer that fits.
+    #[must_use]
+    pub const fn to_i64(self) -> Option<i64> { match self { Self::Signed(v) => Some(v), Self::Unsigned(v) if v <= i64::MAX as u64 => Some(v as i64), _ => None } }
+
     #[must_use]
     pub const fn physical_kind(self) -> NumberKind {
         match self {

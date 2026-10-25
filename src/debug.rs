@@ -102,7 +102,7 @@ impl DebugConfig {
     fn from_environment() -> Self {
         let raw = env::var("OGD_DEBUG").unwrap_or_default();
         let normalized = raw.trim().to_ascii_lowercase();
-        let all = matches!(normalized.as_str(), "1" | "true" | "yes" | "on" | "*");
+        let all = normalized == "*" || crate::helpers::flag(&normalized) == Some(true);
         let topics = if all || normalized.is_empty() {
             BTreeSet::new()
         } else {
@@ -136,12 +136,7 @@ fn config() -> &'static DebugConfig {
 }
 
 fn env_flag(name: &str) -> bool {
-    env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+    env::var(name).is_ok_and(|value| crate::helpers::flag(&value) == Some(true))
 }
 
 #[must_use]

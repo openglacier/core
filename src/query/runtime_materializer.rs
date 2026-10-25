@@ -25,7 +25,7 @@ use super::{
     parse_expression, projected_values::SlotRow, CustomOperatorResult, DocumentFields, ExecutionError, ExecutionResult,
     Expression, ExpressionFieldPath, ExpressionFieldResolver, IncrementalGroupAccumulator, IncrementalPivotAccumulator,
     InsertDocumentMaterializer, LookupFields, LookupScope, PhysicalLoadMode, PivotAggregate,
-    PivotSpecification, SetAssignment, SortKey, StageName, StreamingLoadMutation,
+    PivotSpecification, PivotValue, SetAssignment, SortKey, StageName, StreamingLoadMutation,
     SyntheticDocument,
 };
 
@@ -90,17 +90,7 @@ impl NearSpec {
         let mut dot = 0.0_f64;
         let mut document_norm = 0.0_f64;
         for (value, query_value) in values.iter().zip(self.query.iter()) {
-            let number = value.as_number().ok_or_else(|| {
-                ExecutionError::evaluation(format!(
-                    "near field {} must contain only numbers",
-                    self.field
-                ))
-            })?;
-            let value = match *number {
-                Number::Signed(value) => value as f64,
-                Number::Unsigned(value) => value as f64,
-                Number::Float(value) => value,
-            };
+            let value = value.as_number().ok_or_else(|| ExecutionError::evaluation(format!("near field {} must contain only numbers", self.field)))?.to_f64();
             dot = value.mul_add(*query_value, dot);
             document_norm = value.mul_add(value, document_norm);
         }
@@ -591,7 +581,9 @@ impl RuntimeMaterializer {
         for document in documents {
             accumulator.push(document)?;
         }
-        Box::new(accumulator).finish()
+        let mut rows = Vec::new();
+        Box::new(accumulator).finish(Vec::new(), &mut |row| { rows.push(row); Ok(()) })?;
+        Ok(rows)
     }
 
     /// Starts an incremental pivot that retains only its aggregate cells.
@@ -764,32 +756,111 @@ impl IncrementalPivotAccumulator for DefaultIncrementalPivotAccumulator {
         self.bytes.saturating_add(self.keys.bytes())
     }
 
-    fn finish(self: Box<Self>) -> ExecutionResult<Vec<SyntheticDocument>> {
-        let Self { specification, mut groups, labels, .. } = *self;
+    fn spill(&mut self) -> ExecutionResult<Vec<Vec<u8>>> {
+        let mut groups = std::mem::take(&mut self.groups);
         groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        let measures = specification.values().len();
-        groups
-            .into_iter()
-            .enumerate()
-            .map(|(index, (_, group))| {
-                let mut cells = BTreeMap::new();
+        (self.last_group, self.keys.rows) = (None, None);
+        self.by_key.clear();
+        self.by_values.clear();
+        self.keys.row_groups.clear();
+        // Columns and their labels stay: cell positions keep their meaning.
+        self.bytes = self.labels.iter().map(|label| PIVOT_ENTRY_BYTES + label.len() * 2).sum();
+        Ok(groups.iter().map(|(key, group)| {
+            let mut record = Vec::new();
+            encode_bytes(&mut record, key.as_bytes());
+            encode_varint(&mut record, group.row_values.len() as u64);
+            for value in &group.row_values {
+                match value {
+                    Some(value) => { record.push(1); encode_value(&mut record, value); }
+                    None => record.push(0),
+                }
+            }
+            for (position, cell) in group.cells.iter().enumerate() {
+                if let Some(cell) = cell {
+                    encode_varint(&mut record, position as u64);
+                    cell.encode(&mut record);
+                }
+            }
+            record
+        }).collect())
+    }
+
+    fn finish(mut self: Box<Self>, mut runs: Vec<super::executor::PivotRun<'_>>, emit: &mut dyn FnMut(SyntheticDocument) -> ExecutionResult<()>) -> ExecutionResult<()> {
+        if runs.is_empty() {
+            let mut groups = std::mem::take(&mut self.groups);
+            groups.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            return groups.into_iter().enumerate().try_for_each(|(index, (_, group))| emit(self.document(index, group)?));
+        }
+        let memory = self.spill()?;
+        runs.push(Box::new(memory.into_iter().map(Ok)));
+        let aggregates = self.specification.values().iter().map(PivotValue::aggregate).collect::<Vec<_>>();
+        let next = |run: &mut super::executor::PivotRun<'_>| run.next().map(|record| decode_pivot_group(&record?, &aggregates)).transpose();
+        let mut heads = runs.iter_mut().map(next).collect::<ExecutionResult<Vec<_>>>()?;
+        // A k-way merge on the row key: equal keys of several runs merge
+        // their cells, earlier runs first, as their rows came.
+        for index in 0.. {
+            let Some(key) = heads.iter().flatten().map(|(key, _)| key).min().cloned() else { return Ok(()) };
+            let mut merged: Option<PivotGroup> = None;
+            for (head, run) in heads.iter_mut().zip(runs.iter_mut()) {
+                if head.as_ref().is_none_or(|(head, _)| *head != key) {
+                    continue;
+                }
+                let (_, group) = std::mem::replace(head, next(run)?).expect("a head of the key");
+                let Some(merged) = merged.as_mut() else { merged = Some(group); continue };
                 for (position, cell) in group.cells.into_iter().enumerate() {
                     let Some(cell) = cell else { continue };
-                    let (column, measure) = (position / measures, position % measures);
-                    let mut name = labels[column].clone();
-                    if measures != 1 {
-                        name.push('.');
-                        name.push_str(specification.values()[measure].output_name());
+                    if merged.cells.len() <= position {
+                        merged.cells.resize_with(position + 1, || None);
                     }
-                    cells.insert(name, cell);
+                    match &mut merged.cells[position] {
+                        Some(existing) => existing.merge(cell)?,
+                        slot => *slot = Some(cell),
+                    }
                 }
-                build_pivot_document(index, &specification, group.row_values, cells)
-            })
-            .collect()
+            }
+            emit(self.document(index, merged.expect("a group of the key"))?)?;
+        }
+        Ok(())
     }
 }
 
+/// A [`PivotGroup`] and its row key from a spilled record.
+fn decode_pivot_group(record: &[u8], aggregates: &[PivotAggregate]) -> ExecutionResult<(String, PivotGroup)> {
+    let mut input = Decoder::new(record);
+    let key = input.str()?.to_owned();
+    let mut group = PivotGroup { row_values: Vec::new(), cells: Vec::new() };
+    for _ in 0..input.size()? {
+        group.row_values.push(if input.byte()? == 0 { None } else { Some(input.value()?) });
+    }
+    while !input.is_empty() {
+        let position = input.size()?;
+        let cell = MeasureState::decode(aggregates[position % aggregates.len()], &mut input)?;
+        if group.cells.len() <= position {
+            group.cells.resize_with(position + 1, || None);
+        }
+        group.cells[position] = Some(cell);
+    }
+    Ok((key, group))
+}
+
 impl DefaultIncrementalPivotAccumulator {
+    /// The result row of `group`, its cells named after their column.
+    fn document(&self, index: usize, group: PivotGroup) -> ExecutionResult<SyntheticDocument> {
+        let measures = self.specification.values().len();
+        let mut cells = BTreeMap::new();
+        for (position, cell) in group.cells.into_iter().enumerate() {
+            let Some(cell) = cell else { continue };
+            let (column, measure) = (position / measures, position % measures);
+            let mut name = self.labels[column].clone();
+            if measures != 1 {
+                name.push('.');
+                name.push_str(self.specification.values()[measure].output_name());
+            }
+            cells.insert(name, cell);
+        }
+        build_pivot_document(index, &self.specification, group.row_values, cells)
+    }
+
     /// Folds the rows of a batch into their cells, measure by measure: row
     /// `selection[i]` belongs to group `groups[i]` and column `indexes[i]`.
     /// The cells reach the states [`IncrementalPivotAccumulator::push_refs`]
@@ -977,15 +1048,15 @@ fn update_extreme( current: &mut Option<Value>, candidate: Option<Value>, minimu
 fn compare_ref(candidate: &ProjectedValueRef<'_>, existing: &Value) -> ExecutionResult<std::cmp::Ordering> {
     match (candidate, candidate.as_f64(), existing) {
         (ProjectedValueRef::String(text), _, Value::String(existing)) => Ok((*text).cmp(existing.as_ref())),
-        (_, Some(float), Value::Number(existing)) => float.partial_cmp(&number_as_f64(*existing)).ok_or_else(|| ExecutionError::evaluation("min/max cannot compare non-finite numbers")),
+        (_, Some(float), Value::Number(existing)) => float.partial_cmp(&existing.to_f64()).ok_or_else(|| ExecutionError::evaluation("min/max cannot compare non-finite numbers")),
         _ => compare_extreme_values(&candidate.to_value(), existing),
     }
 }
 
 fn compare_extreme_values(left: &Value, right: &Value) -> ExecutionResult<std::cmp::Ordering> {
     match (left, right) {
-        (Value::Number(left), Value::Number(right)) => number_as_f64(*left)
-            .partial_cmp(&number_as_f64(*right))
+        (Value::Number(left), Value::Number(right)) => left.to_f64()
+            .partial_cmp(&right.to_f64())
             .ok_or_else(|| ExecutionError::evaluation("min/max cannot compare non-finite numbers")),
         (Value::String(left), Value::String(right)) => Ok(left.cmp(right)),
         (Value::Bool(left), Value::Bool(right)) => Ok(left.cmp(right)),
@@ -1163,7 +1234,7 @@ impl MeasureState {
     fn push_extreme(&mut self, float: f64, cell: ProjectedValueRef<'_>) -> ExecutionResult<()> {
         if let Self::Extreme { minimum, value: Some(Value::Number(existing)) } = self {
             let wanted = if *minimum { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater };
-            match float.partial_cmp(&number_as_f64(*existing)) {
+            match float.partial_cmp(&existing.to_f64()) {
                 Some(ordering) if ordering == wanted => *existing = *cell.to_value().as_number().expect("a number cell"),
                 Some(_) => {}
                 None => return self.push_ref(Some(&cell)),
@@ -1201,13 +1272,13 @@ impl MeasureState {
             Self::Sum { seen, integer, total } => {
                 // Once inexact, a sum stays so: no term is looked at again.
                 if let Some(sum) = *integer {
-                    *integer = exact_integer(number).and_then(|term| sum.checked_add(term));
+                    *integer = number.to_i64().and_then(|term| sum.checked_add(term));
                 }
-                *total += number_as_f64(number);
+                *total += number.to_f64();
                 *seen = true;
             }
             Self::Avg { count, total } => {
-                *total += number_as_f64(number);
+                *total += number.to_f64();
                 *count = count.checked_add(1).ok_or_else(|| {
                     ExecutionError::evaluation("group count exceeds the supported u64 range")
                 })?;
@@ -1331,22 +1402,6 @@ fn push_slots<'v>(state: &mut MeasureState, slot: Option<usize>, order: Option<u
         (slot, Some(order)) => state.push_ordered(resolve(order), slot.and_then(&resolve)),
         (Some(slot), None) => state.push_ref(resolve(slot)),
         (None, None) => state.push(Some(&Value::Bool(true))),
-    }
-}
-
-fn exact_integer(number: Number) -> Option<i64> {
-    match number {
-        Number::Signed(value) => Some(value),
-        Number::Unsigned(value) => i64::try_from(value).ok(),
-        Number::Float(_) => None,
-    }
-}
-
-fn number_as_f64(number: Number) -> f64 {
-    match number {
-        Number::Signed(value) => value as f64,
-        Number::Unsigned(value) => value as f64,
-        Number::Float(value) => value,
     }
 }
 
@@ -1936,6 +1991,19 @@ pub(crate) fn describe_group_fields(fields: &[ExpressionFieldPath]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// One item of a compact `group` as written: its source field, its output
+/// name, and whether it is summed; `None` for any other group field.
+pub(crate) fn compact_group_item(field: &ExpressionFieldPath) -> Option<(ExpressionFieldPath, String, bool)> {
+    if let Ok(Some(measure)) = decode_group_measure_marker(field) {
+        return (measure.aggregate == PivotAggregate::Sum && measure.order.is_none()).then_some((measure.source?, measure.alias, true));
+    }
+    match decode_group_key_marker(field) {
+        Ok(Some((source, output))) => Some((source, output.to_string(), false)),
+        Ok(None) if !field.first().starts_with(GROUP_MARKER_PREFIX) => Some((field.clone(), field.to_string(), false)),
+        _ => None,
+    }
 }
 
 pub fn decode_group_key_marker( field: &ExpressionFieldPath, ) -> ExecutionResult<Option<(ExpressionFieldPath, ExpressionFieldPath)>> {
@@ -2707,7 +2775,7 @@ fn split_projection_items(source: &str) -> ExecutionResult<Vec<&str>> {
         .map_err(|message| ExecutionError::evaluation(format!("invalid select projection list: {message}")))
 }
 
-fn split_derive_assignments(source: &str) -> ExecutionResult<Vec<(&str, &str)>> {
+pub(crate) fn split_derive_assignments(source: &str) -> ExecutionResult<Vec<(&str, &str)>> {
     let parts = super::syntax::split_top_level(source, ',')
         .map_err(|message| ExecutionError::evaluation(format!("invalid derive assignment list: {message}")))?;
     parts

@@ -63,7 +63,7 @@ impl Pending {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Pending> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+        crate::helpers::lock_unpoisoned(&self.pending)
     }
 
     fn flush_until_closed(&self) {

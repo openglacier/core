@@ -12,6 +12,8 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
     let writer = &mut connection.writer;
     let principal = connection.authentication.principal();
     debug::log( DebugTopic::Query, Some(connection.id), format!("id={id} {}", query), );
+    let started = (Instant::now(), crate::helpers::now_millis());
+    let traced = settings.query_trace.is_some().then(|| (query.clone(), params.clone()));
 
     // `explain <query>` goes through the same checks as `<query>`
     // but returns its plan instead of running it.
@@ -35,6 +37,7 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
                         place_id: requested.place_id.clone(),
                         app_instance_id: requested.app_instance_id.clone(),
                         access,
+                        filters: value.filters.clone(),
                     })
                 } else { None }
             });
@@ -49,7 +52,7 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
     // A query reading its Place (views, `let` queries) is prepared once the
     // Place is known.
     let query = match params {
-        Some(parameters) => match crate::view::prepare(engine, execution_context.as_ref().map(|context| context.place_id.as_str()), execution_context.as_ref().and_then(|context| context.app_instance_id.as_deref()), &query, &parameters) {
+        Some(parameters) => match crate::view::prepare(engine, execution_context.as_ref().map(ExecutionContext::scope).as_ref(), &query, &parameters) {
             Ok(prepared) => prepared,
             Err(message) => reject!(id, "query.invalid", message),
         },
@@ -59,6 +62,7 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
         Ok(query) => query,
         Err(message) => reject!(id, "query.invalid", message),
     };
+    let prepare_us = elapsed_micros(started.0);
 
     // `define view` / `undefine view` write `_views` for the Place Owner, or a
     // standard view for a principal allowed to write `_views`.
@@ -99,6 +103,7 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
     if analyzed_access.as_ref().is_some_and(|access| access.action == AuthorizationAction::QueryWrite && access.collection.starts_with(crate::view::CACHE_COLLECTION)) {
         reject!(id, "query.invalid", "the cache of materialized views is written by og-core only");
     }
+    let grows = analyzed_access.as_ref().is_some_and(|access| access.grows);
     let scoped_write_collection = analyzed_access.as_ref()
         .filter(|access| access.action == AuthorizationAction::QueryWrite)
         .map(|access| access.collection.clone());
@@ -174,6 +179,23 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
     if explain {
         return Err(explain_request(engine, id, &query).into());
     }
+    // Past a storage limit, a Place takes no new documents (step 3 of wip/POLICIES.md).
+    #[cfg(feature = "auth")]
+    if let Some(context) = execution_context.as_ref().filter(|_| grows) {
+        super::usage_ops::check_storage(engine, id, &context.place_id, 0)?;
+    }
+    // An instance of an App its Place Owner's policy no longer includes is read-only (step 4).
+    #[cfg(feature = "auth")]
+    if settings.enrollment_mode.is_policy() && scoped_write_collection.is_some() {
+        if let Some(context) = execution_context.as_ref() {
+            match (context.app_instance_id.as_deref(), scoped_write_collection.as_deref()) {
+                (Some(instance_id), _) => super::policy_ops::check_instance_write(engine, id, &context.place_id, instance_id)?,
+                // Outside any instance, the collection written tells which App it belongs to.
+                (None, Some(collection)) => super::policy_ops::check_collection_write(engine, id, &context.place_id, collection)?,
+                (None, None) => {}
+            }
+        }
+    }
     let request = QueryRequest::new(id, query);
     *compact = request.query.contains("LOAD") || request.query.contains("load");
     event_engine.publish_global(
@@ -192,10 +214,31 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
     // A scoped read streams like any read: the trusted document scope is a
     // filter written into its plan, in front of every source it reads,
     // below query syntax. Scoped writes return a whole response.
-    let scope = execution_context.as_ref().map(|context| (context.place_id.as_str(), context.app_instance_id.as_deref()));
-    let streaming = try_write_streaming_request(engine, writer, &request, scope);
+    let scope = execution_context.as_ref().map(ExecutionContext::scope);
+    // A Place read of rows kept or being read for another reader is not run again.
+    let key = execution_context.as_ref().filter(|_| scoped_write_collection.is_none()).and_then(|context| result_key(engine, &request.query, context));
+    let prepared = traced.as_ref().map_or(0, |_| crate::helpers::fnv1a64(request.query.as_bytes()));
+    let connection_id = connection.id;
+    let trace = |cache: &str, ok: bool| trace(settings, &started, prepare_us, connection_id, principal, execution_context.as_ref(), traced, prepared, cache, ok);
+    let (lead, cache) = match key.map(|key| engine.results().begin(key)) {
+        Some(Lookup::Hit(rows)) => {
+            write_kept_rows(writer, id, &rows)?;
+            trace("hit", true);
+            event_engine.publish_global("query.finished", serde_json::json!({ "requestId": id }));
+            return Ok(());
+        }
+        Some(Lookup::Lead(lead)) => (Some(lead), "lead"),
+        Some(Lookup::Run) => (None, "run"),
+        None => (None, "none"),
+    };
+    let mut capture = lead.as_ref().map(|_| Rows::new(true));
+    let streaming = try_write_streaming_request(engine, writer, &request, scope.as_ref(), &mut capture);
     match streaming {
         Ok(true) => {
+            if let Some(lead) = lead {
+                lead.finish(capture);
+            }
+            trace(cache, true);
             event_engine.publish_global(
                 "query.finished",
                 serde_json::json!({ "requestId": id }),
@@ -211,7 +254,17 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
                 execution_context.as_ref(),
             ));
             let ok = response.is_ok();
+            if let Some(lead) = lead {
+                lead.finish(match &response {
+                    QueryResponse::Ok { documents, statistics, .. } => {
+                        let (mut rows, limit) = (Rows::new(false), engine.results().entry_limit());
+                        documents.iter().all(|document| rows.push_value(document.clone(), limit)).then(|| rows.with_statistics(statistics.clone()))
+                    }
+                    QueryResponse::Error { .. } => None,
+                });
+            }
             write_response(writer, &response)?;
+            trace(cache, ok);
             let event_type = if ok { "query.finished" } else { "query.failed" };
             event_engine.publish_global(
                 event_type,
@@ -221,6 +274,8 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
                 if let (Some(context), Some(collection)) =
                     (execution_context.as_ref(), scoped_write_collection.as_ref())
                 {
+                    #[cfg(feature = "auth")]
+                    if !grows { super::usage_ops::note_shrink(&context.place_id); }
                     let audience = place_audience(engine, id, &context.place_id)
                         .unwrap_or(Audience::Global);
                     publish_durable_event(
@@ -262,6 +317,40 @@ pub(super) fn handle_subscription_operation(connection: &mut Connection, setting
         serde_json::json!({ "subscriptionId": subscription_id }),
     );
     Ok(())
+}
+
+/// The key of a Place read's rows in the result cache (`engine/results.rs`):
+/// its prepared text, its scope and access filters, and the change tokens of
+/// the collections it reads. `None` when its rows cannot be kept: it writes,
+/// calls `now()`, or the storage cannot tell what changed.
+pub(super) fn result_key(engine: &Engine, query: &str, context: &ExecutionContext) -> Option<String> {
+    if query.split("now").skip(1).any(|rest| rest.trim_start().starts_with('(')) {
+        return None;
+    }
+    let planned = engine.plan(&parse_pipeline(query).ok()?).ok()?;
+    if planned.physical().is_write() {
+        return None;
+    }
+    let mut reads = vec![planned.physical().source().collection().to_string()];
+    crate::view::collect_reads(planned.physical().operators(), &mut reads);
+    let tokens = reads.iter().map(|read| engine.change_token(read, Some(&context.place_id))).collect::<Option<Vec<_>>>()?;
+    Some(format!("{}\n{}\n{:?}\n{}\n{query}", context.place_id, context.app_instance_id.as_deref().unwrap_or_default(), context.filters, serde_json::Value::from(tokens)))
+}
+
+/// One line of `OGD_QUERY_TRACE` for a query sent back: what was asked, in
+/// which scope, what ran (`prepared`: a hash of the prepared text) and
+/// what the result cache did (`hit`, `lead`, `run`, `none`).
+#[allow(clippy::too_many_arguments)]
+fn trace(settings: &ConnectionSettings, started: &(Instant, i64), prepare_us: u64, connection: u64, principal: &Principal, context: Option<&ExecutionContext>, asked: Option<(String, Option<serde_json::Map<String, serde_json::Value>>)>, prepared: u64, cache: &str, ok: bool) {
+    let (Some(file), Some((query, params))) = (settings.query_trace.as_ref(), asked) else { return };
+    let line = serde_json::json!({
+        "t": started.1, "us": elapsed_micros(started.0), "prepare_us": prepare_us, "connection": connection,
+        "who": principal_actor(context.map_or(principal, |context| &context.principal)),
+        "place": context.map(|context| &context.place_id), "app": context.and_then(|context| context.app_instance_id.as_deref()),
+        "filters": context.map(|context| format!("{:?}", context.filters)), "query": query, "params": params,
+        "prepared": format!("{prepared:016x}"), "cache": cache, "ok": ok,
+    });
+    let _ = writeln!(crate::helpers::lock_unpoisoned(file), "{line}");
 }
 
 /// The commit author of a principal (`None` when anonymous).

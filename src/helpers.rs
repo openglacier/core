@@ -16,12 +16,6 @@ pub const PLACE_SCOPE_FIELD: &str = "_place";
 pub const APP_INSTANCE_SCOPE_FIELD: &str = "_app_instance";
 
 #[must_use]
-pub fn document_scope_matches(document: &Document, place_id: &str, app_instance_id: &str) -> bool {
-    document.get(PLACE_SCOPE_FIELD) == Some(&Value::from(place_id))
-        && document.get(APP_INSTANCE_SCOPE_FIELD) == Some(&Value::from(app_instance_id))
-}
-
-#[must_use]
 pub fn enforce_document_scope( document: &Document, place_id: &str, app_instance_id: &str, ) -> Document {
     let mut scoped = document.clone();
     scoped.insert(PLACE_SCOPE_FIELD, place_id);
@@ -79,6 +73,21 @@ pub fn u128_to_usize_saturating(value: u128) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
 }
 
+/// The environment variable `name`: `None` when it is unset, an error when it is not Unicode.
+pub fn env_var(name: &str) -> Result<Option<String>, std::env::VarError> {
+    match std::env::var(name) { Ok(value) => Ok(Some(value)), Err(std::env::VarError::NotPresent) => Ok(None), Err(error) => Err(error) }
+}
+/// The environment variable `name` trimmed, `None` when it is unset, empty or not Unicode.
+#[must_use]
+pub fn env_text(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|value| value.trim().to_owned()).filter(|value| !value.is_empty())
+}
+/// A yes/no setting: `1`, `true`, `yes`, `on` or `0`, `false`, `no`, `off`, in any case; `None` for anything else.
+#[must_use]
+pub fn flag(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() { "1" | "true" | "yes" | "on" => Some(true), "0" | "false" | "no" | "off" => Some(false), _ => None }
+}
+
 #[must_use]
 pub fn document_to_json(document: &Document) -> JsonValue {
     JsonValue::Object(
@@ -106,7 +115,6 @@ pub trait JsonFields {
     /// The string field, or `""` when it is missing or not a string.
     fn string_field(&self, key: &str) -> String { self.str_field(key).unwrap_or_default().to_owned() }
     fn u64_field(&self, key: &str) -> Option<u64> { self.field(key)?.as_u64() }
-    fn i64_field(&self, key: &str) -> Option<i64> { self.field(key)?.as_i64() }
     fn bool_field(&self, key: &str) -> Option<bool> { self.field(key)?.as_bool() }
     fn array_field(&self, key: &str) -> Option<&Vec<JsonValue>> { self.field(key)?.as_array() }
     fn object_field(&self, key: &str) -> Option<&Map<String, JsonValue>> { self.field(key)?.as_object() }
@@ -284,6 +292,14 @@ pub fn common_prefix_len<T: PartialEq>(left: &[T], right: &[T]) -> usize {
     left.iter().zip(right).take_while(|(left, right)| left == right).count()
 }
 
+/// First index of `0..len` where `before` turns false (`before` holds on a prefix).
+#[inline]
+pub fn partition_point(len: usize, mut before: impl FnMut(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, len);
+    while low < high { let middle = (low + high) / 2; if before(middle) { low = middle + 1 } else { high = middle } }
+    low
+}
+
 /// Replaces negative zero by positive zero.
 #[inline]
 #[must_use]
@@ -302,6 +318,26 @@ pub fn is_identifier_start(character: char) -> bool {
 #[must_use]
 pub fn is_identifier_continue(character: char) -> bool {
     character == '_' || character.is_alphabetic() || character.is_ascii_digit()
+}
+
+/// The documents a `scan_each` visits, for a `scan` built on it.
+pub fn collect_scan(scan_each: impl FnOnce(&mut dyn FnMut(crate::storage::StoredDocument) -> crate::storage::StorageResult<bool>) -> crate::storage::StorageResult<()>) -> crate::storage::StorageResult<Vec<crate::storage::StoredDocument>> {
+    let mut documents = Vec::new();
+    scan_each(&mut |stored| { documents.push(stored); Ok(true) })?;
+    Ok(documents)
+}
+
+/// `text` trimmed, or `error()` when nothing is left.
+pub fn non_empty_text<E>(text: &str, error: impl FnOnce() -> E) -> Result<&str, E> {
+    let text = text.trim();
+    if text.is_empty() { Err(error()) } else { Ok(text) }
+}
+
+/// A whole identifier.
+#[inline]
+#[must_use]
+pub fn is_identifier(text: &str) -> bool {
+    text.starts_with(is_identifier_start) && text.chars().all(is_identifier_continue)
 }
 
 /// Appends the conjuncts of `expression` (its `and` operands, ungrouped,

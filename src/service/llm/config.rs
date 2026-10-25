@@ -12,7 +12,9 @@ const DEFAULT_MAX_TOKENS: u32 = 512;
 const DEFAULT_SEED: u32 = 1234;
 const DEFAULT_MAX_PARALLEL: u32 = 1;
 const DEFAULT_QUEUE_SIZE: u32 = 16;
-const DEFAULT_PREFIX_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+/// Room for the prefixes of a Place (routing and intent): the state of a 31B dense model at 4k tokens is 1.1 GiB.
+const DEFAULT_PREFIX_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const _: () = assert!(DEFAULT_CONTEXT_SIZE > 0 && DEFAULT_MAX_TOKENS > 0 && DEFAULT_MAX_PARALLEL > 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmDevice {
@@ -85,176 +87,66 @@ pub struct LlmConfig {
     /// Maximum host-memory budget used by ephemeral llama.cpp sequence-state
     /// snapshots for intra-Agent prompt-prefix reuse. Set to 0 to disable.
     pub prefix_cache_max_bytes: u64,
+    /// Pooling of `llm.embed` (`OGD_LLM_POOLING`: mean, cls, last or none); `None` keeps the model's own.
+    pub pooling: Option<LlmPooling>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmPooling { None, Mean, Cls, Last }
+
+impl LlmPooling {
+    pub const fn as_str(self) -> &'static str { match self { Self::None => "none", Self::Mean => "mean", Self::Cls => "cls", Self::Last => "last" } }
 }
 
 impl LlmConfig {
     pub fn from_environment() -> Result<Self, LlmConfigError> {
-        let model_path = env::var("OGD_LLM_MODEL")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from);
-        let context_size = parse_u32("OGD_LLM_CONTEXT_SIZE", DEFAULT_CONTEXT_SIZE)?;
-        let context_size = NonZeroU32::new(context_size).ok_or_else(|| {
-            LlmConfigError::Invalid("OGD_LLM_CONTEXT_SIZE must be greater than zero".to_owned())
-        })?;
-        let threads = match env::var("OGD_LLM_THREADS") {
-            Ok(value) => {
-                let parsed = value
-                    .parse::<i32>()
-                    .map_err(|source| LlmConfigError::Integer {
-                        name: "OGD_LLM_THREADS",
-                        value,
-                        source,
-                    })?;
-                if parsed <= 0 {
-                    return Err(LlmConfigError::Invalid(
-                        "OGD_LLM_THREADS must be greater than zero".to_owned(),
-                    ));
-                }
-                Some(parsed)
-            }
-            Err(env::VarError::NotPresent) => None,
-            Err(source) => {
-                return Err(LlmConfigError::Environment {
-                    name: "OGD_LLM_THREADS",
-                    source,
-                })
-            }
+        let pooling = [("", None), ("model", None), ("none", Some(LlmPooling::None)), ("mean", Some(LlmPooling::Mean)), ("cls", Some(LlmPooling::Cls)), ("last", Some(LlmPooling::Last))];
+        let gpu_layers = match var("OGD_LLM_GPU_LAYERS")? {
+            None => LlmGpuLayers::Auto,
+            Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "auto" => LlmGpuLayers::Auto, "all" => LlmGpuLayers::All,
+                layers => LlmGpuLayers::Count(layers.parse().map_err(|source| LlmConfigError::Integer { name: "OGD_LLM_GPU_LAYERS", value: value.clone(), source })?),
+            },
         };
-        let max_tokens = parse_u32("OGD_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)?;
-        if max_tokens == 0 {
-            return Err(LlmConfigError::Invalid(
-                "OGD_LLM_MAX_TOKENS must be greater than zero".to_owned(),
-            ));
-        }
-        let seed = parse_u32("OGD_LLM_SEED", DEFAULT_SEED)?;
-        let max_parallel = parse_u32("OGD_LLM_MAX_PARALLEL", DEFAULT_MAX_PARALLEL)?;
-        if max_parallel == 0 {
-            return Err(LlmConfigError::Invalid(
-                "OGD_LLM_MAX_PARALLEL must be greater than zero".to_owned(),
-            ));
-        }
-        let queue_size = parse_u32("OGD_LLM_QUEUE_SIZE", DEFAULT_QUEUE_SIZE)?;
-        let device = parse_device()?;
-        let gpu_layers = parse_gpu_layers()?;
-        let thinking = parse_thinking()?;
-        let prefix_cache_max_bytes = parse_u64(
-            "OGD_LLM_PREFIX_CACHE_MAX_BYTES",
-            DEFAULT_PREFIX_CACHE_MAX_BYTES,
-        )?;
-        let chat_template = env::var("OGD_LLM_CHAT_TEMPLATE")
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty());
         Ok(Self {
-            model_path,
-            context_size,
-            threads,
-            max_tokens,
-            seed,
-            max_parallel,
-            queue_size,
-            chat_template,
-            device,
+            model_path: crate::helpers::env_text("OGD_LLM_MODEL").map(PathBuf::from),
+            context_size: NonZeroU32::new(positive("OGD_LLM_CONTEXT_SIZE", DEFAULT_CONTEXT_SIZE)?).unwrap_or(NonZeroU32::MIN),
+            // Every core by default: llama.cpp's own default (4, and one busy core measured with a 35B partly on CPU)
+            // leaves the CPU part of a model idle.
+            threads: match var("OGD_LLM_THREADS")? { Some(_) => Some(positive("OGD_LLM_THREADS", 1)?), None => std::thread::available_parallelism().ok().and_then(|cores| i32::try_from(cores.get()).ok()) },
+            max_tokens: positive("OGD_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)?,
+            seed: integer("OGD_LLM_SEED", DEFAULT_SEED)?,
+            max_parallel: positive("OGD_LLM_MAX_PARALLEL", DEFAULT_MAX_PARALLEL)?,
+            queue_size: integer("OGD_LLM_QUEUE_SIZE", DEFAULT_QUEUE_SIZE)?,
+            chat_template: crate::helpers::env_text("OGD_LLM_CHAT_TEMPLATE"),
+            device: choice("OGD_LLM_DEVICE", LlmDevice::Auto, &[("auto", LlmDevice::Auto), ("cpu", LlmDevice::Cpu), ("cuda", LlmDevice::Cuda)], "auto, cpu or cuda")?,
             gpu_layers,
-            thinking,
-            prefix_cache_max_bytes,
+            thinking: choice("OGD_LLM_THINKING", LlmThinking::Auto, &[("auto", LlmThinking::Auto), ("on", LlmThinking::On), ("true", LlmThinking::On), ("1", LlmThinking::On), ("off", LlmThinking::Off), ("false", LlmThinking::Off), ("0", LlmThinking::Off)], "auto, on or off")?,
+            prefix_cache_max_bytes: integer("OGD_LLM_PREFIX_CACHE_MAX_BYTES", DEFAULT_PREFIX_CACHE_MAX_BYTES)?,
+            pooling: choice("OGD_LLM_POOLING", None, &pooling, "model, mean, cls, last or none")?,
         })
     }
 }
 
-fn parse_device() -> Result<LlmDevice, LlmConfigError> {
-    match env::var("OGD_LLM_DEVICE") {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(LlmDevice::Auto),
-            "cpu" => Ok(LlmDevice::Cpu),
-            "cuda" => Ok(LlmDevice::Cuda),
-            _ => Err(LlmConfigError::Invalid(format!(
-                "OGD_LLM_DEVICE must be one of auto, cpu or cuda; got {value:?}"
-            ))),
-        },
-        Err(env::VarError::NotPresent) => Ok(LlmDevice::Auto),
-        Err(source) => Err(LlmConfigError::Environment {
-            name: "OGD_LLM_DEVICE",
-            source,
-        }),
-    }
+fn var(name: &'static str) -> Result<Option<String>, LlmConfigError> { crate::helpers::env_var(name).map_err(|source| LlmConfigError::Environment { name, source }) }
+
+/// An integer setting, `default` when it is unset.
+fn integer<T: std::str::FromStr<Err = std::num::ParseIntError>>(name: &'static str, default: T) -> Result<T, LlmConfigError> {
+    var(name)?.map_or(Ok(default), |value| value.parse().map_err(|source| LlmConfigError::Integer { name, value, source }))
 }
 
-fn parse_gpu_layers() -> Result<LlmGpuLayers, LlmConfigError> {
-    match env::var("OGD_LLM_GPU_LAYERS") {
-        Ok(value) => {
-            let trimmed = value.trim();
-            if trimmed.eq_ignore_ascii_case("auto") {
-                return Ok(LlmGpuLayers::Auto);
-            }
-            if trimmed.eq_ignore_ascii_case("all") {
-                return Ok(LlmGpuLayers::All);
-            }
-            trimmed
-                .parse::<u32>()
-                .map(LlmGpuLayers::Count)
-                .map_err(|source| LlmConfigError::Integer {
-                    name: "OGD_LLM_GPU_LAYERS",
-                    value,
-                    source,
-                })
-        }
-        Err(env::VarError::NotPresent) => Ok(LlmGpuLayers::Auto),
-        Err(source) => Err(LlmConfigError::Environment {
-            name: "OGD_LLM_GPU_LAYERS",
-            source,
-        }),
-    }
+/// An integer setting greater than zero.
+fn positive<T: std::str::FromStr<Err = std::num::ParseIntError> + PartialOrd + Default>(name: &'static str, default: T) -> Result<T, LlmConfigError> {
+    let value = integer(name, default)?;
+    if value <= T::default() { return Err(LlmConfigError::Invalid(format!("{name} must be greater than zero"))); }
+    Ok(value)
 }
 
-
-fn parse_thinking() -> Result<LlmThinking, LlmConfigError> {
-    match env::var("OGD_LLM_THINKING") {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(LlmThinking::Auto),
-            "on" | "true" | "1" => Ok(LlmThinking::On),
-            "off" | "false" | "0" => Ok(LlmThinking::Off),
-            _ => Err(LlmConfigError::Invalid(format!(
-                "OGD_LLM_THINKING must be one of auto, on or off; got {value:?}"
-            ))),
-        },
-        Err(env::VarError::NotPresent) => Ok(LlmThinking::Auto),
-        Err(source) => Err(LlmConfigError::Environment {
-            name: "OGD_LLM_THINKING",
-            source,
-        }),
-    }
-}
-
-
-fn parse_u64(name: &'static str, default: u64) -> Result<u64, LlmConfigError> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<u64>()
-            .map_err(|source| LlmConfigError::Integer {
-                name,
-                value,
-                source,
-            }),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(LlmConfigError::Environment { name, source }),
-    }
-}
-
-fn parse_u32(name: &'static str, default: u32) -> Result<u32, LlmConfigError> {
-    match env::var(name) {
-        Ok(value) => value
-            .parse::<u32>()
-            .map_err(|source| LlmConfigError::Integer {
-                name,
-                value,
-                source,
-            }),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(source) => Err(LlmConfigError::Environment { name, source }),
-    }
+/// A setting among `choices` (in any case), `default` when it is unset.
+fn choice<T: Copy>(name: &'static str, default: T, choices: &[(&str, T)], expected: &str) -> Result<T, LlmConfigError> {
+    let Some(value) = var(name)? else { return Ok(default) };
+    let key = value.trim().to_ascii_lowercase();
+    choices.iter().find(|(word, _)| *word == key).map(|(_, choice)| *choice).ok_or_else(|| LlmConfigError::Invalid(format!("{name} must be one of {expected}; got {value:?}")))
 }
 
 #[derive(Debug)]
@@ -299,6 +191,5 @@ impl Error for LlmConfigError {
 mod tests {
     use super::*;
 
-    #[test] fn defaults_are_bounded_and_non_zero() { assert!(DEFAULT_CONTEXT_SIZE > 0); assert!(DEFAULT_MAX_TOKENS > 0); assert!(DEFAULT_MAX_PARALLEL > 0); }
     #[test] fn thinking_labels_are_stable() { assert_eq!(LlmThinking::Auto.as_str(), "auto"); assert_eq!(LlmThinking::On.as_str(), "on"); assert_eq!(LlmThinking::Off.as_str(), "off"); }
 }

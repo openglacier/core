@@ -26,7 +26,7 @@ use ratatui::{
 };
 use serde_json::{json, Value};
 
-use super::{execute_background_line, Client, Config, Result, NAME};
+use super::{complete::{common_prefix, Completer}, execute_background_line, local_command, Client, Config, Local, Output, Result, NAME};
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const MAX_BUFFER_LINES: usize = 2_000;
@@ -164,10 +164,13 @@ struct Job {
     run_id: Option<u64>,
     scroll: u16,
     follow: bool,
+    /// Table output is drawn unwrapped and scrolls sideways instead.
+    wrap: bool,
+    hscroll: u16,
 }
 
 impl Job {
-    fn new(id: u64, command: String) -> Self {
+    fn new(id: u64, command: String, wrap: bool) -> Self {
         Self {
             id,
             command,
@@ -176,6 +179,8 @@ impl Job {
             run_id: None,
             scroll: 0,
             follow: true,
+            wrap,
+            hscroll: 0,
         }
     }
 
@@ -267,12 +272,16 @@ enum JobEvent {
 
 struct App {
     config: Config,
+    completer: Completer,
     events: mpsc::Sender<JobEvent>,
     jobs: Vec<Job>,
     focused: Option<usize>,
     next_job_id: u64,
     input: String,
     cursor: usize,
+    /// Submitted lines, oldest first, and the one ↑/↓ show while browsing.
+    history: Vec<String>,
+    history_at: Option<usize>,
     view: ViewMode,
     notice: String,
     exit: bool,
@@ -282,6 +291,7 @@ struct App {
 impl App {
     fn new(config: Config, events: mpsc::Sender<JobEvent>) -> Self {
         Self {
+            completer: Completer::new(config.clone()),
             config,
             events,
             jobs: Vec::new(),
@@ -289,8 +299,10 @@ impl App {
             next_job_id: 1,
             input: String::new(),
             cursor: 0,
+            history: Vec::new(),
+            history_at: None,
             view: ViewMode::Tiles,
-            notice: "Enter: run · Tab: focus · Ctrl-T: tabs/tiles · Ctrl-W: close · Ctrl-X/:cancel: cancel LLM · PgUp/PgDn: scroll · :help".into(),
+            notice: "Enter: run · Alt-Enter: run in focused job · Ctrl-O: edit · Ctrl-R: rerun · ↑/↓: history · Tab: complete/focus · Ctrl-W: close · :help".into(),
             exit: false,
             failed: false,
         }
@@ -336,6 +348,14 @@ impl App {
                     self.cancel_focused();
                     return;
                 }
+                KeyCode::Char('o') => {
+                    self.edit_focused();
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    self.rerun_focused();
+                    return;
+                }
                 KeyCode::Char('a') => {
                     self.cursor = 0;
                     return;
@@ -359,13 +379,19 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Enter => self.submit_input(),
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.submit_input(true),
+            KeyCode::Enter => self.submit_input(false),
+            KeyCode::Tab if !self.input.trim().is_empty() => self.complete(),
             KeyCode::Tab => self.focus_next(),
             KeyCode::BackTab => self.focus_previous(),
             KeyCode::PageUp => self.scroll_focused_up(10),
             KeyCode::PageDown => self.scroll_focused_down(10),
-            KeyCode::Up if self.input.is_empty() => self.scroll_focused_up(1),
-            KeyCode::Down if self.input.is_empty() => self.scroll_focused_down(1),
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_focused_up(1),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_focused_down(1),
+            KeyCode::Up => self.history_back(),
+            KeyCode::Down => self.history_forward(),
+            KeyCode::Left if self.input.is_empty() => self.scroll_focused_sideways(-8),
+            KeyCode::Right if self.input.is_empty() => self.scroll_focused_sideways(8),
             KeyCode::Left => self.move_cursor_left(),
             KeyCode::Right => self.move_cursor_right(),
             KeyCode::Home => self.cursor = 0,
@@ -381,17 +407,52 @@ impl App {
         }
     }
 
-    fn submit_input(&mut self) {
+    /// Runs the input line; `in_place` reuses the focused job's view.
+    fn submit_input(&mut self, in_place: bool) {
         let line = self.input.trim().to_owned();
         self.input.clear();
         self.cursor = 0;
+        self.history_at = None;
         if line.is_empty() {
             return;
         }
+        if self.history.last() != Some(&line) {
+            self.history.push(line.clone());
+        }
         if line.starts_with(':') {
-            self.handle_tui_command(&line);
-        } else {
-            self.spawn_job(line);
+            return self.handle_tui_command(&line);
+        }
+        match local_command(&line) {
+            Ok(None) => self.spawn_job(line, in_place),
+            Ok(Some(Local::Quit)) => self.exit = true,
+            Ok(Some(Local::Help)) => self.handle_tui_command(":help"),
+            Ok(Some(Local::Format(output))) => {
+                self.config.output = output;
+                self.notice = format!("format: {}", output.label());
+            }
+            Ok(Some(Local::Reconnect)) => {
+                self.completer.invalidate();
+                self.notice = match Client::connect(&self.config) {
+                    Ok(_) => format!("connection to {} verified", self.config.address),
+                    Err(error) => format!("{NAME}: {error}"),
+                };
+            }
+            Err(error) => self.notice = format!("{NAME}: {error}"),
+        }
+    }
+
+    /// Completes the word before the cursor: the single candidate, or the
+    /// prefix every candidate shares, with the candidates in the notice line.
+    fn complete(&mut self) {
+        let (start, candidates) = self.completer.complete(&self.input, self.cursor);
+        let replacement = match &candidates[..] {
+            [] => { self.notice = "no completion".into(); return }
+            [only] => { self.notice.clear(); only.clone() }
+            many => { self.notice = truncate(&many.join("  "), 400); common_prefix(many).to_owned() }
+        };
+        if replacement.len() > self.cursor - start || candidates.len() == 1 {
+            self.input.replace_range(start..self.cursor, &replacement);
+            self.cursor = start + replacement.len();
         }
     }
 
@@ -410,6 +471,8 @@ impl App {
             ":prev" => self.focus_previous(),
             ":close" => self.close_focused(),
             ":cancel" => self.cancel_focused(),
+            ":edit" => self.edit_focused(),
+            ":rerun" => self.rerun_focused(),
             ":clear" => {
                 if let Some(job) = self.focused_job_mut() {
                     job.lines.clear();
@@ -417,20 +480,35 @@ impl App {
                 }
             }
             ":help" => {
-                self.notice = "TUI: :tabs :tiles :next :prev :close :cancel :clear :quit · Ctrl-T toggle · Ctrl-W close · Ctrl-X cancel LLM · Alt-1..9 focus".into();
+                self.notice = "TUI: :tabs :tiles :next :prev :close :cancel :clear :edit :rerun :quit · Alt-Enter run in focused job · Ctrl-O edit · Ctrl-R rerun · ↑/↓ history · Shift-↑/↓ scroll · format table|pretty|compact · import FILE [COLLECTION] · Tab complete · ←/→ scroll a table · Ctrl-T toggle · Ctrl-W close · Ctrl-X cancel LLM · Alt-1..9 focus".into();
             }
             _ => self.notice = format!("unknown TUI command: {line}"),
         }
     }
 
-    fn spawn_job(&mut self, line: String) {
+    /// Starts `line` in a new job, or in the focused one when `in_place`: that
+    /// job takes a new id, so output still coming from its previous run is dropped.
+    fn spawn_job(&mut self, line: String, in_place: bool) {
         let job_id = self.next_job_id;
         self.next_job_id = self.next_job_id.wrapping_add(1);
         let config = self.config.clone();
         let events = self.events.clone();
-        self.jobs.push(Job::new(job_id, line.clone()));
-        self.focused = Some(self.jobs.len() - 1);
-        self.notice = format!("job #{job_id} started");
+        let job = Job::new(job_id, line.clone(), self.config.output != Output::Table);
+        match self.focused.filter(|_| in_place) {
+            Some(index) => {
+                let previous = std::mem::replace(&mut self.jobs[index], job);
+                self.notice = if matches!(previous.status, JobStatus::Running | JobStatus::Queued) {
+                    format!("job #{job_id} replaces #{}; its remote request continues unless cancelled", previous.id)
+                } else {
+                    format!("job #{job_id} started in place of #{}", previous.id)
+                };
+            }
+            None => {
+                self.jobs.push(job);
+                self.focused = Some(self.jobs.len() - 1);
+                self.notice = format!("job #{job_id} started");
+            }
+        }
 
         thread::spawn(move || {
             let result = execute_background_line(&config, &line, |message| {
@@ -450,6 +528,53 @@ impl App {
         });
     }
 
+    /// Puts the focused job's line in the input, to change it and run it again.
+    fn edit_focused(&mut self) {
+        match self.focused.and_then(|index| self.jobs.get(index)) {
+            Some(job) => {
+                self.input = job.command.clone();
+                self.cursor = self.input.len();
+                self.history_at = None;
+                self.notice = "Enter: new job · Alt-Enter: run in this job".into();
+            }
+            None => self.notice = "no focused job".into(),
+        }
+    }
+
+    fn rerun_focused(&mut self) {
+        match self.focused.and_then(|index| self.jobs.get(index)) {
+            Some(job) => {
+                let line = job.command.clone();
+                self.spawn_job(line, true);
+            }
+            None => self.notice = "no focused job".into(),
+        }
+    }
+
+    /// ↑: an older line, from an empty input or while browsing. Browsing
+    /// stops once the shown line is edited.
+    fn history_back(&mut self) {
+        let browsing = self.history_at.filter(|at| self.history.get(*at) == Some(&self.input));
+        let at = match browsing {
+            Some(at) => at.saturating_sub(1),
+            None if self.input.is_empty() && !self.history.is_empty() => self.history.len() - 1,
+            None => return,
+        };
+        self.show_history(Some(at));
+    }
+
+    /// ↓: a newer line, then back to an empty input.
+    fn history_forward(&mut self) {
+        let Some(at) = self.history_at.filter(|at| self.history.get(*at) == Some(&self.input)) else { return };
+        self.show_history((at + 1 < self.history.len()).then_some(at + 1));
+    }
+
+    fn show_history(&mut self, at: Option<usize>) {
+        self.history_at = at;
+        self.input = at.map_or_else(String::new, |at| self.history[at].clone());
+        self.cursor = self.input.len();
+    }
+
     fn cancel_focused(&mut self) {
         let Some(index) = self.focused else {
             self.notice = "no focused job".into();
@@ -465,7 +590,7 @@ impl App {
         };
         let command = format!(".llm.cancel {}", json!({"runId": run_id}));
         self.notice = format!("cancelling run {run_id}");
-        self.spawn_job(command);
+        self.spawn_job(command, false);
     }
 
     fn close_focused(&mut self) {
@@ -519,6 +644,12 @@ impl App {
     fn scroll_focused_down(&mut self, amount: u16) {
         if let Some(job) = self.focused_job_mut() {
             job.scroll_down(amount);
+        }
+    }
+
+    fn scroll_focused_sideways(&mut self, amount: i32) {
+        if let Some(job) = self.focused_job_mut().filter(|job| !job.wrap) {
+            job.hscroll = (i32::from(job.hscroll) + amount).clamp(0, i32::from(u16::MAX)) as u16;
         }
     }
 
@@ -657,9 +788,8 @@ impl App {
                     .border_style(border_style)
                     .title(job.title()),
             )
-            .scroll((scroll, 0))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, area);
+            .scroll((scroll, job.hscroll));
+        frame.render_widget(if job.wrap { paragraph.wrap(Wrap { trim: false }) } else { paragraph }, area);
     }
 
     fn draw_input(&self, frame: &mut Frame<'_>, area: Rect) {
@@ -746,5 +876,6 @@ mod tests {
     use super::*;
 
     #[test] fn run_metadata_is_extracted() { assert_eq!( parse_run_metadata(r#"{"runId":7,"state":"queued","type":"run"}"#), Some((7, Some("queued".to_owned()))) ); assert_eq!(parse_run_metadata(r#"{"text":"x"}"#), None); }
+    #[test] fn edits_reruns_in_place_and_browses_history() { let (mut config, _) = super::super::Args::parse(Vec::<String>::new()).unwrap(); (config.address, config.identity) = ("127.0.0.1:1".into(), None); let mut app = App::new(config, mpsc::channel().0); for line in ["on a", "on b"] { app.insert_str(line); app.submit_input(false); } assert_eq!(app.jobs.len(), 2); app.edit_focused(); assert_eq!(app.input, "on b"); app.insert_str(" | limit 1"); app.submit_input(true); assert_eq!((app.jobs.len(), app.jobs[1].command.as_str(), app.jobs[1].id), (2, "on b | limit 1", 3)); app.rerun_focused(); assert_eq!((app.jobs.len(), app.jobs[1].id), (2, 4)); app.history_back(); assert_eq!(app.input, "on b | limit 1"); app.history_back(); app.history_back(); app.history_back(); assert_eq!(app.input, "on a"); app.history_forward(); assert_eq!(app.input, "on b"); app.insert('x'); app.history_forward(); assert_eq!(app.input, "on bx"); }
     #[test] fn tiles_follow_groups_of_four() { assert_eq!(visible_job_indexes(7, 0, ViewMode::Tiles), vec![0, 1, 2, 3]); assert_eq!(visible_job_indexes(7, 5, ViewMode::Tiles), vec![4, 5, 6]); assert_eq!(visible_job_indexes(7, 5, ViewMode::Tabs), vec![5]); }
 }

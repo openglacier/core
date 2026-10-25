@@ -147,20 +147,50 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                     Err(AgentError::capability(operation, "ogd was built without the llm feature"))
                 }
             }
+            "place.schema" => {
+                let engine = self.engine
+                    .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
+                if data.str_field("placeId") != Some(self.context.place_id.as_str()) {
+                    return Err(AgentError::capability(operation, "the Agent reads the schema of its own Place only"));
+                }
+                super::place_ops::place_schema_for(engine, RequestId::Number(0), &self.context.principal, &self.context.place_id)
+                    .map(AgentCapabilityResponse::message)
+                    .map_err(|error| AgentError::capability(operation, match error { QueryResponse::Error { error, .. } => error.message, other => format!("{other:?}") }))
+            }
+            "place.search" => {
+                #[cfg(feature = "search")]
+                {
+                    let engine = self.engine
+                        .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
+                    let mut input: crate::operation::PlaceSearchInput = serde_json::from_value(data)
+                        .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                    if input.place_id != self.context.place_id {
+                        return Err(AgentError::capability(operation, "the Agent searches its own Place only"));
+                    }
+                    crate::operation::OperationPayload::validate(&mut input, operation)
+                        .map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                    super::place_ops::place_search_for(engine, Some(&self.settings.files_path), RequestId::Number(0), &self.context.principal, None, &input)
+                        .map(AgentCapabilityResponse::message)
+                        .map_err(|error| AgentError::capability(operation, match error { QueryResponse::Error { error, .. } => error.message, other => format!("{other:?}") }))
+                }
+                #[cfg(not(feature = "search"))]
+                {
+                    let _ = data;
+                    Err(AgentError::capability(operation, "ogd was built without the search feature"))
+                }
+            }
             "collections.list" => {
                 if !self.settings.service_capabilities.contains(ServiceCapability::Database) {
                     return Err(AgentError::capability(operation, "local database capability is disabled"));
                 }
                 let engine = self.engine
                     .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
-                let snapshot = engine.storage().read()
-                    .map_err(|error| AgentError::capability(operation, error.to_string()))?;
                 let collections = list_storage_collections(
-                    snapshot.as_ref(),
+                    engine,
                     false,
                     Some(&self.context.place_id),
                     self.context.app_instance_id.as_deref(),
-                ).map_err(|error| AgentError::capability(operation, error.to_string()))?;
+                ).map_err(|error| AgentError::capability(operation, error))?;
                 Ok(AgentCapabilityResponse::message(
                     serde_json::json!({"collections":collections}),
                 ))
@@ -173,7 +203,18 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                     .ok_or_else(|| AgentError::capability(operation, "local database engine is unavailable"))?;
                 let query = data.str_field("query")
                     .ok_or_else(|| AgentError::capability(operation, "query is required"))?;
-                let query = crate::query::prepare_query(query, &serde_json::Map::new())
+                // What the Agent asks for may not read a system collection; a view of the Place, prepared into what it
+                // reads, may.
+                if !query.trim_start().starts_with("on view ") {
+                    let access = QueryAccess::analyze(query)
+                        .map_err(|error| AgentError::capability(operation, error))?;
+                    if access.collection.starts_with('_') {
+                        return Err(AgentError::capability(operation, "Agent queries cannot access system collections"));
+                    }
+                }
+                // Prepared as query.execute prepares a Place read: its views and `let` queries within the Agent's scope.
+                let query = crate::view::prepare(engine, Some(&self.context.scope()), query, &serde_json::Map::new())
+                    .and_then(|query| crate::view::literals(engine, &query))
                     .map_err(|message| AgentError::capability(operation, message))?;
                 let query = query.as_str();
                 if data.bool_field("readOnly") != Some(true) {
@@ -185,11 +226,6 @@ impl AgentCapabilityInvoker for LocalAgentInvoker<'_> {
                     .map_err(|error| AgentError::capability(operation, error.to_string()))?;
                 if plan.is_write() {
                     return Err(AgentError::capability(operation, "read-only Agent query attempted to mutate storage"));
-                }
-                let access = QueryAccess::analyze(query)
-                    .map_err(|error| AgentError::capability(operation, error))?;
-                if access.collection.starts_with('_') {
-                    return Err(AgentError::capability(operation, "Agent queries cannot access system collections"));
                 }
                 match execute_request_scoped(
                     engine,
@@ -319,7 +355,7 @@ impl AgentCapabilityInvoker for GatewayAgentInvoker {
 pub(super) enum OgdAgentInvoker<'a> {
     Local(LocalAgentInvoker<'a>),
     #[cfg(feature = "fabric")]
-    Gateway(GatewayAgentInvoker),
+    Gateway(Box<GatewayAgentInvoker>),
 }
 
 #[cfg(feature = "agent")]

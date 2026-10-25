@@ -15,7 +15,7 @@ use super::super::{
     ReplaceResult, ScanDirection, ScanOptions, StorageError, StorageMutation, StorageRead,
     StorageResult, StorageTransaction, StoredDocument, Temporal, TemporalCache, VersionPrecondition,
 };
-use super::StorageBackend;
+use crate::storage::StorageEngine;
 
 /// Thread-safe in-memory storage engine.
 ///
@@ -46,6 +46,49 @@ impl MemoryHistory {
 }
 
 impl MemoryBackend {
+    /// Applies `mutations` as one commit, returning the stored documents when `keep` is set.
+    fn apply_atomic(&self, collection: &CollectionId, mutations: Vec<StorageMutation>, keep: bool) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
+        if mutations.is_empty() {
+            return Ok((Vec::new(), CommitResult::default()));
+        }
+        let mut state = self.write_state()?;
+        let target = state.collections.get(collection);
+        let mut staged = BTreeMap::<DocumentId, StoredDocument>::new();
+        let mut stored = Vec::with_capacity(if keep { mutations.len() } else { 0 });
+        let (mut inserted, mut replaced) = (0u64, 0u64);
+        for mutation in mutations {
+            let document = match mutation {
+                StorageMutation::Insert { id, document } => {
+                    if staged.contains_key(&id) || target.is_some_and(|target| target.contains_key(&id)) {
+                        return Err(StorageError::document_already_exists(collection.clone(), id));
+                    }
+                    inserted = increment_counter(inserted)?;
+                    StoredDocument::new(id, DocumentVersion::INITIAL, document)?
+                }
+                StorageMutation::Replace { id, document, precondition } => {
+                    let current = staged.get(&id).or_else(|| target.and_then(|target| target.get(&id))).ok_or_else(|| StorageError::document_not_found(collection.clone(), id))?;
+                    ensure_version(collection, &id, current.version(), precondition)?;
+                    replaced = increment_counter(replaced)?;
+                    StoredDocument::new(id, current.version().next()?, document)?
+                }
+            };
+            if keep { stored.push(document.clone()); }
+            staged.insert(*document.id(), document);
+        }
+        state.generation = next_generation(state.generation)?;
+        let generation = state.generation;
+        state.changed.insert(collection.clone(), generation);
+        self.record_history(|history| {
+            for document in staged.values() {
+                history.put(collection, generation, document);
+            }
+            history.timeline.push(CommitRecord::now(generation));
+        })?;
+        let target = Arc::make_mut(state.collections.entry(collection.clone()).or_default());
+        target.extend(staged);
+        Ok((stored, CommitResult::new(inserted, replaced, 0)))
+    }
+
     /// Creates an empty in-memory storage engine.
     #[must_use]
     #[inline]
@@ -140,7 +183,7 @@ impl MemoryBackend {
     }
 }
 
-impl StorageBackend for MemoryBackend {
+impl StorageEngine for MemoryBackend {
     fn read(&self) -> StorageResult<Box<dyn StorageRead + '_>> {
         let snapshot = {
             let state = self.read_state()?;
@@ -162,6 +205,13 @@ impl StorageBackend for MemoryBackend {
         temporal_read(Box::new(snapshot), Box::new(source), temporal, cache)
     }
 
+    fn history(&self) -> StorageResult<(Box<dyn StorageRead + '_>, Box<dyn HistorySource + '_>)> {
+        let history = self.history.as_ref().ok_or_else(StorageError::history_unavailable)?;
+        let snapshot = MemorySnapshot::from_state(&*self.read_state()?);
+        let source = MemoryHistorySource { history: Arc::clone(history), generation: snapshot.generation };
+        Ok((Box::new(snapshot), Box::new(source)))
+    }
+
     fn begin(&self) -> StorageResult<Box<dyn StorageTransaction + '_>> {
         let transaction = {
             let state = self.read_state()?;
@@ -171,141 +221,9 @@ impl StorageBackend for MemoryBackend {
         Ok(Box::new(transaction))
     }
 
-    fn apply_batch_atomic( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> {
-        if mutations.is_empty() {
-            return Ok((Vec::new(), CommitResult::default()));
-        }
+    fn apply_batch_atomic( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<(Vec<StoredDocument>, CommitResult)> { self.apply_atomic(collection, mutations, true) }
 
-        let mut state = self.write_state()?;
-        let target = state.collections.get(collection);
-        let mut staged = BTreeMap::<DocumentId, StoredDocument>::new();
-        let mut stored = Vec::with_capacity(mutations.len());
-        let mut inserted = 0u64;
-        let mut replaced = 0u64;
-
-        for mutation in mutations {
-            match mutation {
-                StorageMutation::Insert { id, document } => {
-                    if staged.contains_key(&id)
-                        || target.is_some_and(|target| target.contains_key(&id))
-                    {
-                        return Err(StorageError::document_already_exists(
-                            collection.clone(),
-                            id,
-                        ));
-                    }
-
-                    let document = StoredDocument::new(id, DocumentVersion::INITIAL, document)?;
-                    staged.insert(id, document.clone());
-                    stored.push(document);
-                    inserted = increment_counter(inserted)?;
-                }
-                StorageMutation::Replace {
-                    id,
-                    document,
-                    precondition,
-                } => {
-                    let current = staged
-                        .get(&id)
-                        .or_else(|| target.and_then(|target| target.get(&id)))
-                        .ok_or_else(|| {
-                            StorageError::document_not_found(collection.clone(), id)
-                        })?;
-                    ensure_version(collection, &id, current.version(), precondition)?;
-                    let document =
-                        StoredDocument::new(id, current.version().next()?, document)?;
-                    staged.insert(id, document.clone());
-                    stored.push(document);
-                    replaced = increment_counter(replaced)?;
-                }
-            }
-        }
-
-        state.generation = next_generation(state.generation)?;
-        let generation = state.generation;
-        state.changed.insert(collection.clone(), generation);
-        self.record_history(|history| {
-            for document in staged.values() {
-                history.put(collection, generation, document);
-            }
-            history.timeline.push(CommitRecord::now(generation));
-        })?;
-        let target = state.collections.entry(collection.clone()).or_default();
-        let target = Arc::make_mut(target);
-        for (id, document) in staged {
-            target.insert(id, document);
-        }
-
-        Ok((stored, CommitResult::new(inserted, replaced, 0)))
-    }
-
-    fn apply_batch_atomic_summary( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<CommitResult> {
-        if mutations.is_empty() {
-            return Ok(CommitResult::default());
-        }
-
-        let mut state = self.write_state()?;
-        let target = state.collections.get(collection);
-        let mut staged = BTreeMap::<DocumentId, StoredDocument>::new();
-        let mut inserted = 0u64;
-        let mut replaced = 0u64;
-
-        for mutation in mutations {
-            match mutation {
-                StorageMutation::Insert { id, document } => {
-                    if staged.contains_key(&id)
-                        || target.is_some_and(|target| target.contains_key(&id))
-                    {
-                        return Err(StorageError::document_already_exists(
-                            collection.clone(),
-                            id,
-                        ));
-                    }
-
-                    staged.insert(
-                        id,
-                        StoredDocument::new(id, DocumentVersion::INITIAL, document)?,
-                    );
-                    inserted = increment_counter(inserted)?;
-                }
-                StorageMutation::Replace {
-                    id,
-                    document,
-                    precondition,
-                } => {
-                    let current = staged
-                        .get(&id)
-                        .or_else(|| target.and_then(|target| target.get(&id)))
-                        .ok_or_else(|| {
-                            StorageError::document_not_found(collection.clone(), id)
-                        })?;
-                    ensure_version(collection, &id, current.version(), precondition)?;
-                    staged.insert(
-                        id,
-                        StoredDocument::new(id, current.version().next()?, document)?,
-                    );
-                    replaced = increment_counter(replaced)?;
-                }
-            }
-        }
-
-        state.generation = next_generation(state.generation)?;
-        let generation = state.generation;
-        state.changed.insert(collection.clone(), generation);
-        self.record_history(|history| {
-            for document in staged.values() {
-                history.put(collection, generation, document);
-            }
-            history.timeline.push(CommitRecord::now(generation));
-        })?;
-        let target = state.collections.entry(collection.clone()).or_default();
-        let target = Arc::make_mut(target);
-        for (id, document) in staged {
-            target.insert(id, document);
-        }
-
-        Ok(CommitResult::new(inserted, replaced, 0))
-    }
+    fn apply_batch_atomic_summary( &self, collection: &CollectionId, mutations: Vec<StorageMutation>, ) -> StorageResult<CommitResult> { self.apply_atomic(collection, mutations, false).map(|(_, result)| result) }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -351,6 +269,10 @@ impl HistorySource for MemoryHistorySource {
 
     fn floor(&self) -> u64 { 0 }
 
+    fn collections(&self) -> StorageResult<Vec<CollectionId>> {
+        Ok(self.history.read().map_err(|_| StorageError::backend("in-memory history lock poisoned"))?.events.keys().cloned().collect())
+    }
+
     fn events(&self, collection: &CollectionId, after: u64, upto: u64, ids: Option<&std::collections::HashSet<DocumentId>>, _documents: bool, visitor: &mut dyn FnMut(HistoryEvent) -> StorageResult<bool>) -> StorageResult<()> {
         let upto = upto.min(self.generation);
         let history = self.history.read().map_err(|_| StorageError::backend("in-memory history lock poisoned"))?;
@@ -376,54 +298,33 @@ impl HistorySource for MemoryHistorySource {
     }
 }
 
+/// The reads of the collections a snapshot or a transaction holds (`self.collections`).
+macro_rules! read_collections { () => {
+    fn get(&self, collection: &CollectionId, id: &DocumentId) -> StorageResult<Option<StoredDocument>> { Ok(get_document(&self.collections, collection, id)) }
+    fn scan(&self, collection: &CollectionId, options: ScanOptions) -> StorageResult<Vec<StoredDocument>> { Ok(scan_collection(&self.collections, collection, options)) }
+    fn count(&self, collection: &CollectionId) -> StorageResult<u64> { Ok(self.collections.get(collection).map_or(0, |documents| documents.len() as u64)) }
+    fn collection_exists(&self, collection: &CollectionId) -> StorageResult<bool> { Ok(self.collections.contains_key(collection)) }
+    fn collections(&self) -> StorageResult<Vec<CollectionId>> { Ok(list_collections(&self.collections)) }
+} }
+
 impl StorageRead for MemorySnapshot {
     fn changed(&self, collection: &CollectionId) -> StorageResult<Option<u64>> {
         Ok(Some(self.changed.get(collection).copied().unwrap_or(0)))
     }
 
-    fn get( &self, collection: &CollectionId, id: &DocumentId, ) -> StorageResult<Option<StoredDocument>> {
-        Ok(get_document(&self.collections, collection, id))
-    }
-
-    fn scan( &self, collection: &CollectionId, options: ScanOptions, ) -> StorageResult<Vec<StoredDocument>> {
-        Ok(scan_collection(&self.collections, collection, options))
-    }
+    read_collections!();
 
     fn scan_each( &self, collection: &CollectionId, options: ScanOptions, visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>, ) -> StorageResult<()> {
         let Some(documents) = self.collections.get(collection) else {
             return Ok(());
         };
-        let limit = options.limit().unwrap_or(usize::MAX);
-        match options.direction() {
-            ScanDirection::Forward => {
-                for stored in documents.values().take(limit) {
-                    if !visitor(stored.clone())? {
-                        break;
-                    }
-                }
-            }
-            ScanDirection::Reverse => {
-                for stored in documents.values().rev().take(limit) {
-                    if !visitor(stored.clone())? {
-                        break;
-                    }
-                }
+        let rows: Box<dyn Iterator<Item = &StoredDocument>> = match options.direction() { ScanDirection::Forward => Box::new(documents.values()), ScanDirection::Reverse => Box::new(documents.values().rev()) };
+        for stored in rows.take(options.limit().unwrap_or(usize::MAX)) {
+            if !visitor(stored.clone())? {
+                break;
             }
         }
         Ok(())
-    }
-
-    fn count(&self, collection: &CollectionId) -> StorageResult<u64> {
-        let count = self.collections.get(collection).map_or(0, |documents| documents.len());
-        u64::try_from(count).map_err(|_| StorageError::backend("collection count overflow"))
-    }
-
-    fn collection_exists(&self, collection: &CollectionId) -> StorageResult<bool> {
-        Ok(self.collections.contains_key(collection))
-    }
-
-    fn collections(&self) -> StorageResult<Vec<CollectionId>> {
-        Ok(list_collections(&self.collections))
     }
 }
 
@@ -501,26 +402,7 @@ impl<'storage> MemoryTransaction<'storage> {
 }
 
 impl StorageRead for MemoryTransaction<'_> {
-    fn get( &self, collection: &CollectionId, id: &DocumentId, ) -> StorageResult<Option<StoredDocument>> {
-        Ok(get_document(&self.collections, collection, id))
-    }
-
-    fn scan( &self, collection: &CollectionId, options: ScanOptions, ) -> StorageResult<Vec<StoredDocument>> {
-        Ok(scan_collection(&self.collections, collection, options))
-    }
-
-    fn count(&self, collection: &CollectionId) -> StorageResult<u64> {
-        let count = self.collections.get(collection).map_or(0, |documents| documents.len());
-        u64::try_from(count).map_err(|_| StorageError::backend("collection count overflow"))
-    }
-
-    fn collection_exists(&self, collection: &CollectionId) -> StorageResult<bool> {
-        Ok(self.collections.contains_key(collection))
-    }
-
-    fn collections(&self) -> StorageResult<Vec<CollectionId>> {
-        Ok(list_collections(&self.collections))
-    }
+    read_collections!();
 }
 
 impl StorageTransaction for MemoryTransaction<'_> {
@@ -757,7 +639,7 @@ mod tests {
     #[test] fn clear_on_empty_storage_is_a_no_op() { let storage = MemoryBackend::new(); storage.clear().unwrap(); assert_eq!(storage.generation().unwrap(), 0); }
     #[test] fn helper_rejects_incorrect_version() { let error = ensure_version( &collection("users"), &document_id("42"), DocumentVersion::new(3), VersionPrecondition::Exact(DocumentVersion::new(2)), ) .unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::VersionConflict { .. } )); }
     #[test] fn memory_storage_is_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<MemoryBackend>(); }
-    #[test] fn memory_backend_implements_storage_backend() { fn accept_backend(_: &dyn StorageBackend) {} let backend = MemoryBackend::new(); accept_backend(&backend); }
+    #[test] fn memory_backend_implements_storage_engine() { fn accept_backend(_: &dyn StorageEngine) {} let backend = MemoryBackend::new(); accept_backend(&backend); }
     #[test] fn atomic_batch_commits_one_generation() { let storage = MemoryBackend::new(); let users = collection("users"); let (stored, commit) = storage .apply_batch_atomic( &users, vec![ StorageMutation::insert(document_id("a"), Arc::new(Document::new())), StorageMutation::insert(document_id("b"), Arc::new(Document::new())), ], ) .unwrap(); assert_eq!(stored.len(), 2); assert_eq!(commit.inserted(), 2); assert_eq!(commit.replaced(), 0); assert_eq!(storage.generation().unwrap(), 1); assert_eq!(storage.document_count().unwrap(), 2); }
     #[test] fn atomic_batch_failure_leaves_storage_unchanged() { let storage = MemoryBackend::new(); let users = collection("users"); let duplicate = document_id("a"); let error = storage .apply_batch_atomic( &users, vec![ StorageMutation::insert(duplicate, Arc::new(Document::new())), StorageMutation::insert(duplicate, Arc::new(Document::new())), ], ) .unwrap_err(); assert!(matches!( error.kind(), StorageErrorKind::DocumentAlreadyExists { .. } )); assert_eq!(storage.generation().unwrap(), 0); assert_eq!(storage.collection_count().unwrap(), 0); assert_eq!(storage.document_count().unwrap(), 0); }
     #[test] fn atomic_batch_preserves_order_and_sequential_versions() { let storage = MemoryBackend::new(); let users = collection("users"); let id = document_id("a"); let (stored, commit) = storage .apply_batch_atomic( &users, vec![ StorageMutation::insert(id, Arc::new(Document::new())), StorageMutation::replace( id, Arc::new(Document::new()), VersionPrecondition::Exact(DocumentVersion::INITIAL), ), StorageMutation::replace( id, Arc::new(Document::new()), VersionPrecondition::Exact(DocumentVersion::new(2)), ), ], ) .unwrap(); assert_eq!( stored.iter().map(StoredDocument::id).collect::<Vec<_>>(), vec![&id, &id, &id] ); assert_eq!(stored[0].version(), DocumentVersion::INITIAL); assert_eq!(stored[1].version(), DocumentVersion::new(2)); assert_eq!(stored[2].version(), DocumentVersion::new(3)); assert_eq!(commit.inserted(), 1); assert_eq!(commit.replaced(), 2); }

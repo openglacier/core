@@ -232,6 +232,8 @@ n’accorde jamais l’administration.
 place.list
 place.get
 app.instance.list
+place.schema
+place.search
 query.context.resolve
 file.list
 file.read

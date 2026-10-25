@@ -51,6 +51,8 @@ struct PendingEnrollment {
     device_public_key: String,
     bytes: [u8; 32],
     expires_at: u64,
+    /// Policy of the enrollment token, in policy enrollment mode.
+    policy_id: Option<String>,
 }
 
 /// Enrollment data proven by one Ed25519 device signature.
@@ -61,6 +63,9 @@ pub struct EnrollmentIdentity {
     pub identity_public_key: String,
     pub device_id: String,
     pub device_public_key: String,
+    /// Policy the identity takes, bound by [`ConnectionAuth::bind_enrollment_policy`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_id: Option<String>,
 }
 
 /// Authentication state owned by one socket connection.
@@ -109,6 +114,16 @@ impl ConnectionAuth {
         self.enrollment = None;
         self.principal = principal.clone();
         Ok(principal)
+    }
+
+    /// Promotes an anonymous connection to the identity a verified machine access acts for.
+    /// The device of the principal is the access itself (`machine:<accessId>`), never a key.
+    pub fn establish_machine(&mut self, identity_id: String, access_id: &str) -> Principal {
+        let principal = Principal::Identity { identity_id, device_id: format!("machine:{access_id}") };
+        self.pending = None;
+        self.enrollment = None;
+        self.principal = principal.clone();
+        principal
     }
 
     #[must_use]
@@ -171,6 +186,7 @@ impl ConnectionAuth {
             device_public_key,
             bytes,
             expires_at,
+            policy_id: None,
         });
         Ok(AuthChallenge {
             challenge_id: id,
@@ -197,7 +213,13 @@ impl ConnectionAuth {
             identity_public_key: pending.identity_public_key,
             device_id: pending.device_id,
             device_public_key: pending.device_public_key,
+            policy_id: pending.policy_id,
         })
+    }
+
+    /// Binds the pending enrollment to the policy of its token: the identity takes it at completion.
+    pub fn bind_enrollment_policy(&mut self, policy_id: String) {
+        if let Some(pending) = self.enrollment.as_mut() { pending.policy_id = Some(policy_id); }
     }
 
     /// Verifies the signature and promotes the connection principal.

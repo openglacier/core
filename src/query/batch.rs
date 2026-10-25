@@ -23,7 +23,7 @@ use std::sync::Arc;
 use crate::model::{Number, Value};
 use crate::storage::{BlockCodes, BlockColumn, DocumentId, DocumentVersion, ProjectedValueRef};
 
-use super::eval::{arithmetic_value, binary, evaluate_optional, float_of, integer_of, unary};
+use super::eval::{arithmetic_value, binary, evaluate_optional, number_arithmetic, unary};
 use super::runtime_materializer::SlotOperation;
 use super::{
     BinaryOperator, Expression, ExpressionFieldPath, ExpressionFieldResolver, ExpressionView, Function,
@@ -1517,7 +1517,7 @@ fn compute(node: &Node, out: &mut Column, columns: &mut [Column], selection: &[u
             for &row in selection {
                 let row = row as usize;
                 match (a.number(row), b.number(row)) {
-                    (Some(x), Some(y)) => out.set_number(row, arith(*operator, x, y).ok_or(Abort)?),
+                    (Some(x), Some(y)) => out.set_number(row, number_arithmetic(*operator, x, y).map_err(|_| Abort)?),
                     _ => reference(out, row, arithmetic_value(*operator, &present(a, row)?, &present(b, row)?))?,
                 }
             }
@@ -1693,8 +1693,8 @@ fn compute(node: &Node, out: &mut Column, columns: &mut [Column], selection: &[u
                         return Err(Abort);
                     }
                     match (a.number(row), b.number(row)) {
-                        (_, Some(divisor)) if float_of(divisor) == 0.0 => zero.push(row as u32),
-                        (Some(x), Some(y)) => out.set_number(row, arith(BinaryOperator::Divide, x, y).ok_or(Abort)?),
+                        (_, Some(divisor)) if divisor.to_f64() == 0.0 => zero.push(row as u32),
+                        (Some(x), Some(y)) => out.set_number(row, number_arithmetic(BinaryOperator::Divide, x, y).map_err(|_| Abort)?),
                         _ => reference(out, row, arithmetic_value(BinaryOperator::Divide, &present(a, row)?, &present(b, row)?))?,
                     }
                 }
@@ -1954,33 +1954,6 @@ fn float_arith(operator: BinaryOperator, x: &[u64], y: &[u64], out: &mut Column,
     Ok(())
 }
 
-/// [`arithmetic_value`] on two numbers; `None` where it fails.
-#[inline]
-fn arith(operator: BinaryOperator, a: Number, b: Number) -> Option<Number> {
-    if matches!(operator, BinaryOperator::Divide | BinaryOperator::Remainder) && float_of(b) == 0.0 {
-        return None;
-    }
-    if let (Some(x), Some(y), false) = (integer_of(a), integer_of(b), operator == BinaryOperator::Divide) {
-        let result = match operator {
-            BinaryOperator::Add => x.checked_add(y),
-            BinaryOperator::Subtract => x.checked_sub(y),
-            BinaryOperator::Multiply => x.checked_mul(y),
-            _ => x.checked_rem(y),
-        };
-        if let Some(result) = result {
-            return Some(Number::Signed(result));
-        }
-    }
-    let (x, y) = (float_of(a), float_of(b));
-    let value = match operator {
-        BinaryOperator::Add => x + y,
-        BinaryOperator::Subtract => x - y,
-        BinaryOperator::Multiply => x * y,
-        BinaryOperator::Divide => x / y,
-        _ => x % y,
-    };
-    value.is_finite().then(|| Number::Float(if value == 0.0 { 0.0 } else { value }))
-}
 
 /// `integral` of the evaluator: an integer when the value fits exactly.
 #[inline]
@@ -1996,7 +1969,7 @@ fn integral(out: &mut Column, row: usize, value: f64) -> Step {
 /// A non-negative integer argument (`count` of the functions module).
 #[inline]
 fn count_of(column: &Column, row: usize) -> Option<usize> {
-    column.number(row).and_then(integer_of).and_then(|value| usize::try_from(value).ok())
+    column.number(row).and_then(Number::to_i64).and_then(|value| usize::try_from(value).ok())
 }
 
 /// Characters of a string (bytes when ASCII).
@@ -2053,10 +2026,10 @@ fn write_json_scalar(out: &mut String, column: &Column, row: usize) -> bool {
 fn timestamp(column: &Column, row: usize) -> Option<Result<i64, Abort>> {
     Some(match column.tag(row) {
         Tag::Signed | Tag::Unsigned | Tag::Float => match column.number(row).expect("numeric tag") {
-            number => match integer_of(number) {
+            number => match number.to_i64() {
                 Some(millis) => Ok(millis),
                 None => {
-                    let millis = float_of(number).floor();
+                    let millis = number.to_f64().floor();
                     if millis.is_finite() && millis.abs() < 9.0e15 { Ok(millis as i64) } else { Err(Abort) }
                 }
             },
@@ -2112,9 +2085,12 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
             }
         }
         Function::Round | Function::Trunc | Function::Floor | Function::Ceil => {
+            if column(2).is_some() {
+                return Ok(false);
+            }
             let digits = match column(1) {
                 None => 0,
-                Some(digits) => match digits.number(row).and_then(integer_of) {
+                Some(digits) => match digits.number(row).and_then(Number::to_i64) {
                     Some(digits) if (0..=15).contains(&digits) => digits,
                     _ => return Ok(false),
                 },
@@ -2128,7 +2104,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
                         Function::Floor => scaled.floor(),
                         Function::Ceil => scaled.ceil(),
                         Function::Trunc => scaled.trunc(),
-                        _ => scaled.round(),
+                        _ => super::functions::round_half(scaled, false),
                     };
                     if digits == 0 { integral(out, row, rounded)? } else { out.set_float(row, rounded / scale)? }
                 }
@@ -2137,7 +2113,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
         }
         Function::Sign => {
             let Some(number) = a.number(row) else { return Ok(false) };
-            let value = float_of(number);
+            let value = number.to_f64();
             out.set(row, Tag::Signed, (if value > 0.0 { 1_i64 } else if value < 0.0 { -1 } else { 0 }) as u64);
         }
         Function::Abs => match a.tag(row) {
@@ -2167,7 +2143,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
         },
         Function::ToFloat => match a.tag(row) {
             Tag::Null => out.set_null(row),
-            Tag::Signed | Tag::Unsigned | Tag::Float => out.set_float(row, float_of(a.number(row).expect("numeric tag")))?,
+            Tag::Signed | Tag::Unsigned | Tag::Float => out.set_float(row, a.number(row).expect("numeric tag").to_f64())?,
             Tag::Str => match a.str(row).trim().parse::<f64>() {
                 Ok(parsed) if parsed.is_finite() => out.set_float(row, parsed)?,
                 _ => return Err(Abort),
@@ -2189,7 +2165,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
         Function::Len if a.tag(row) == Tag::Str => out.set(row, Tag::Unsigned, char_len(a.str(row)) as u64),
         Function::Len if a.tag(row) == Tag::List => out.set(row, Tag::Unsigned, a.list(row).len() as u64),
         Function::At if a.tag(row) == Tag::List => {
-            let Some(index) = column(1).expect("at index").number(row).and_then(integer_of) else { return Ok(false) };
+            let Some(index) = column(1).expect("at index").number(row).and_then(Number::to_i64) else { return Ok(false) };
             let length = a.list(row).len();
             let position = if index < 0 { length as i64 + index } else { index };
             match usize::try_from(position).ok().filter(|position| *position < length) {
@@ -2235,7 +2211,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
         }
         Function::Substr => {
             let start = column(1).expect("substr start");
-            let (Tag::Str, Some(first)) = (a.tag(row), start.number(row).and_then(integer_of)) else { return Ok(false) };
+            let (Tag::Str, Some(first)) = (a.tag(row), start.number(row).and_then(Number::to_i64)) else { return Ok(false) };
             let text = a.str(row);
             let len = char_len(text) as i64;
             let first = if first < 0 { (len + first).max(0) } else { first.min(len) };
@@ -2342,7 +2318,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
             out.set(row, Tag::Unsigned, length as u64);
         }
         Function::At => {
-            let (Some(items), Some(index)) = (a.array(row), column(1).expect("at index").number(row).and_then(integer_of)) else { return Ok(false) };
+            let (Some(items), Some(index)) = (a.array(row), column(1).expect("at index").number(row).and_then(Number::to_i64)) else { return Ok(false) };
             let position = if index < 0 { items.len() as i64 + index } else { index };
             match usize::try_from(position).ok().and_then(|position| items.get(position)) {
                 Some(item) => out.set_value(row, item.clone()),
@@ -2428,7 +2404,7 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
             }
             let millis = millis?;
             if function == Function::DateAdd {
-                let Some(amount) = second.number(row).and_then(integer_of) else { return Ok(false) };
+                let Some(amount) = second.number(row).and_then(Number::to_i64) else { return Ok(false) };
                 let unit = super::dates::DateUnit::parse(unit.str(row)).map_err(|_| Abort)?;
                 out.set(row, Tag::Signed, super::dates::add(millis, amount, unit).map_err(|_| Abort)? as u64);
             } else {
@@ -2457,6 +2433,87 @@ fn eager_fast(function: Function, node: &Node, columns: &[Column], out: &mut Col
         return Err(Abort);
     }
     Ok(true)
+}
+
+// ------------------------------------------------------------------ block kernels
+
+/// Arithmetic over the typed number columns of one storage block, for a
+/// consumer that folds whole blocks (a `group` measure computed by a
+/// `derive`): `+`, `-`, `*`, `/` of fields and number literals.
+///
+/// A computed block holds exactly what the evaluator gives row by row:
+/// integers while every operand is one and no result overflows, finite
+/// floats otherwise. A block it cannot compute so ([`Self::run`] gives
+/// `None`: another kind of column, an overflow, a division by zero, a
+/// non-finite result) takes the general path, which fails where the
+/// evaluator fails.
+#[derive(Clone, Debug)]
+pub enum BlockKernel { Field(usize), Signed(i64), Float(f64), Binary(BinaryOperator, Box<Self>, Box<Self>) }
+
+/// One computed column of a block.
+#[derive(Debug, PartialEq)]
+pub enum KernelColumn { Signed(Vec<i64>), Floats(Vec<f64>) }
+
+impl KernelColumn {
+    #[must_use]
+    pub fn block(&self) -> BlockColumn<'_, 'static> {
+        match self { Self::Signed(values) => BlockColumn::Signed(values), Self::Floats(values) => BlockColumn::Floats(values) }
+    }
+
+    fn floats(self) -> Vec<f64> {
+        match self { Self::Signed(values) => values.into_iter().map(|value| value as f64).collect(), Self::Floats(values) => values }
+    }
+}
+
+impl BlockKernel {
+    /// The kernel of `expression`, whose fields `field` numbers; `None` when
+    /// it holds anything else.
+    pub fn compile(expression: &Expression, field: &mut dyn FnMut(&ExpressionFieldPath) -> Option<usize>) -> Option<Self> {
+        if let Some(value) = expression.constant() {
+            return match value.as_number()? { Number::Float(value) => Some(Self::Float(*value)), number => number.to_i64().map(Self::Signed) };
+        }
+        match expression.view() {
+            ExpressionView::Field(path) => field(path).map(Self::Field),
+            ExpressionView::Group(inner) => Self::compile(inner, field),
+            ExpressionView::Binary { left, operator: operator @ (BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply | BinaryOperator::Divide), right } => {
+                Some(Self::Binary(operator, Box::new(Self::compile(left, field)?), Box::new(Self::compile(right, field)?)))
+            }
+            _ => None,
+        }
+    }
+
+    /// The kernel over a block of `rows` rows whose fields are `columns`.
+    #[must_use]
+    pub fn run(&self, rows: usize, columns: &[&BlockColumn<'_, '_>]) -> Option<KernelColumn> {
+        Some(match self {
+            Self::Field(index) => match columns[*index] {
+                BlockColumn::Signed(values) => KernelColumn::Signed(values.to_vec()),
+                BlockColumn::Unsigned(values) => KernelColumn::Signed(values.iter().map(|value| i64::try_from(*value).ok()).collect::<Option<_>>()?),
+                BlockColumn::Floats(values) => KernelColumn::Floats(values.to_vec()),
+                _ => return None,
+            },
+            Self::Signed(value) => KernelColumn::Signed(vec![*value; rows]),
+            Self::Float(value) => KernelColumn::Floats(vec![*value; rows]),
+            Self::Binary(operator, left, right) => match (left.run(rows, columns)?, right.run(rows, columns)?) {
+                (KernelColumn::Signed(left), KernelColumn::Signed(right)) if *operator != BinaryOperator::Divide => {
+                    let apply = match operator { BinaryOperator::Add => i64::checked_add, BinaryOperator::Subtract => i64::checked_sub, _ => i64::checked_mul };
+                    // An overflow turns that row only into a float: not a typed column.
+                    KernelColumn::Signed(left.iter().zip(&right).map(|(left, right)| apply(*left, *right)).collect::<Option<_>>()?)
+                }
+                (left, right) => {
+                    let (left, right) = (left.floats(), right.floats());
+                    let result = left.iter().zip(&right).map(|(left, right)| match operator {
+                        BinaryOperator::Add => left + right,
+                        BinaryOperator::Subtract => left - right,
+                        BinaryOperator::Multiply => left * right,
+                        _ if *right == 0.0 => f64::NAN,
+                        _ => left / right,
+                    });
+                    KernelColumn::Floats(result.map(|value| value.is_finite().then(|| crate::helpers::normalize_zero(value))).collect::<Option<_>>()?)
+                }
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -2649,4 +2706,5 @@ mod tests {
 
     #[test] fn keep_compacts_the_passing_rows_in_order() { let mut selection = vec![1, 4, 6, 9, 10]; keep(&mut selection, |row| row % 2 == 0); assert_eq!(selection, [4, 6, 10]); }
     #[test] fn a_failing_row_aborts_its_batch_only() { let mut values = rows(3, 3000, 0); for row in &mut values { row[0] = Some(Value::float(2.0).unwrap()); } values[1500][0] = Some(Value::string("x")); let (aborted, passed) = check(&["derive x = a * 2", "where x > 1"], &values); assert_eq!(aborted, 1); assert_eq!(passed, 3000 - BATCH_ROWS); }
+    #[test] fn block_kernels_compute_what_the_evaluator_gives() { let kernel = |text: &str| BlockKernel::compile(&crate::query::parse_expression(text).unwrap(), &mut |path| ["a", "b"].iter().position(|name| path.to_string() == *name)).unwrap(); let (ints, floats) = (BlockColumn::Signed(&[7, -2, i64::MAX]), BlockColumn::Floats(&[0.5, -1.0, 2.0])); let run = |text: &str, a: &BlockColumn<'_, '_>, b: &BlockColumn<'_, '_>| kernel(text).run(3, &[a, b]); assert_eq!(run("a - 1", &ints, &floats), Some(KernelColumn::Signed(vec![6, -3, i64::MAX - 1]))); assert_eq!(run("a + 1", &ints, &floats), None); assert_eq!(run("(a - b) * 2", &ints, &floats), Some(KernelColumn::Floats(vec![13.0, -2.0, (i64::MAX as f64 - 2.0) * 2.0]))); assert_eq!(run("b * 0 - 0", &floats, &floats), Some(KernelColumn::Floats(vec![0.0, 0.0, 0.0]))); assert_eq!(run("a / 2", &ints, &floats), Some(KernelColumn::Floats(vec![3.5, -1.0, i64::MAX as f64 / 2.0]))); assert_eq!(run("a / (b + 1)", &floats, &floats), None); assert_eq!(run("a + b", &BlockColumn::Strings(&["x", "y", "z"]), &floats), None); assert!(BlockKernel::compile(&crate::query::parse_expression("len(a)").unwrap(), &mut |_| Some(0)).is_none()); }
 }

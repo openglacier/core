@@ -21,6 +21,7 @@ pub enum ServiceCapability {
     DataImport,
     Llm,
     Agent,
+    Mail,
 }
 
 impl ServiceCapability {
@@ -34,6 +35,7 @@ impl ServiceCapability {
             Self::DataImport => "data.import",
             Self::Llm => "llm",
             Self::Agent => "agent",
+            Self::Mail => "mail",
         }
     }
 
@@ -47,6 +49,7 @@ impl ServiceCapability {
             "data.import" | "data-import" | "data_import" => Some(Self::DataImport),
             "llm" => Some(Self::Llm),
             "agent" => Some(Self::Agent),
+            "mail" => Some(Self::Mail),
             _ => None,
         }
     }
@@ -66,6 +69,7 @@ impl ServiceCapabilities {
     const DATA_IMPORT: u8 = 1 << 4;
     const LLM: u8 = 1 << 5;
     const AGENT: u8 = 1 << 6;
+    const MAIL: u8 = 1 << 7;
 
     pub const NONE: Self = Self { bits: 0 };
     /// All capability kinds known by this Core version, regardless of the current build.
@@ -76,7 +80,8 @@ impl ServiceCapabilities {
             | Self::EVENTS
             | Self::DATA_IMPORT
             | Self::LLM
-            | Self::AGENT,
+            | Self::AGENT
+            | Self::MAIL,
     };
 
     /// Capability implementations compiled into this build.
@@ -108,13 +113,16 @@ impl ServiceCapabilities {
         if cfg!(feature = "agent") {
             result = result.with(ServiceCapability::Agent);
         }
+        if cfg!(feature = "mailsend") {
+            result = result.with(ServiceCapability::Mail);
+        }
         result
     }
 
     /// Runtime defaults for this build.
     ///
     /// Optional extension services stay opt-in in an all-in-one build:
-    /// `data.import`, `llm` and `agent` may be compiled by `full` without being
+    /// `data.import`, `llm`, `agent` and `mail` may be compiled by `full` without being
     /// published/enabled unless explicitly requested. A dedicated extension-only
     /// build enables its compiled services so it is useful without extra config.
     #[must_use]
@@ -144,6 +152,9 @@ impl ServiceCapabilities {
             }
             if compiled.contains(ServiceCapability::Agent) {
                 result = result.with(ServiceCapability::Agent);
+            }
+            if compiled.contains(ServiceCapability::Mail) {
+                result = result.with(ServiceCapability::Mail);
             }
         }
         result
@@ -199,6 +210,7 @@ impl ServiceCapabilities {
             ServiceCapability::DataImport,
             ServiceCapability::Llm,
             ServiceCapability::Agent,
+            ServiceCapability::Mail,
         ]
         .into_iter()
         .filter(|capability| self.contains(*capability))
@@ -216,6 +228,7 @@ const fn service_capability_bit(capability: ServiceCapability) -> u8 {
         ServiceCapability::DataImport => ServiceCapabilities::DATA_IMPORT,
         ServiceCapability::Llm => ServiceCapabilities::LLM,
         ServiceCapability::Agent => ServiceCapabilities::AGENT,
+        ServiceCapability::Mail => ServiceCapabilities::MAIL,
     }
 }
 
@@ -226,6 +239,7 @@ const EVENTS: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilit
 const CAP_DATA_IMPORT: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::DATA_IMPORT, };
 const LLM: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::LLM, };
 const AGENT: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::AGENT, };
+const MAIL: ServiceCapabilities = ServiceCapabilities { bits: ServiceCapabilities::MAIL, };
 
 /// Transport/execution family for one operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +330,7 @@ pub enum HandlerKind {
     App,
     Llm,
     Agent,
+    Mail,
 }
 
 /// Coarse authorization contract attached to one operation.
@@ -412,7 +427,8 @@ macro_rules! define_operations {
                     | Self::FabricResourceSet
                     | Self::FabricResourceRemove
                     | Self::AppList
-                    | Self::AppInstanceList => OperationScope::Authority,
+                    | Self::AppInstanceList
+                    | Self::PlaceSchema => OperationScope::Authority,
                     _ => OperationScope::Local,
                 }
             }
@@ -438,6 +454,7 @@ macro_rules! define_operations {
                         HandlerKind::File => Some(ServiceCapability::Files),
                         HandlerKind::Llm => Some(ServiceCapability::Llm),
                         HandlerKind::Agent => Some(ServiceCapability::Agent),
+                        HandlerKind::Mail => Some(ServiceCapability::Mail),
                     },
                 }
             }
@@ -477,6 +494,7 @@ macro_rules! define_operations {
                         HandlerKind::Permission | HandlerKind::Sharing | HandlerKind::Place | HandlerKind::App => DATABASE,
                         HandlerKind::Llm => LLM,
                         HandlerKind::Agent => AGENT,
+                        HandlerKind::Mail => MAIL,
                     },
                 }
             }
@@ -541,9 +559,9 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    #[test] fn compiled_capabilities_follow_cargo_features() { let compiled = ServiceCapabilities::compiled(); assert_eq!( compiled.contains(ServiceCapability::Database), cfg!(feature = "database") ); assert_eq!( compiled.contains(ServiceCapability::Auth), cfg!(feature = "auth") ); assert_eq!( compiled.contains(ServiceCapability::Files), cfg!(feature = "files") ); assert_eq!( compiled.contains(ServiceCapability::Events), cfg!(feature = "events") ); assert_eq!( compiled.contains(ServiceCapability::DataImport), cfg!(feature = "data-import") ); assert_eq!( compiled.contains(ServiceCapability::Llm), cfg!(feature = "llm") ); assert_eq!( compiled.contains(ServiceCapability::Agent), cfg!(feature = "agent") ); }
+    #[test] fn compiled_capabilities_follow_cargo_features() { let compiled = ServiceCapabilities::compiled(); assert_eq!( compiled.contains(ServiceCapability::Database), cfg!(feature = "database") ); assert_eq!( compiled.contains(ServiceCapability::Auth), cfg!(feature = "auth") ); assert_eq!( compiled.contains(ServiceCapability::Files), cfg!(feature = "files") ); assert_eq!( compiled.contains(ServiceCapability::Events), cfg!(feature = "events") ); assert_eq!( compiled.contains(ServiceCapability::DataImport), cfg!(feature = "data-import") ); assert_eq!( compiled.contains(ServiceCapability::Llm), cfg!(feature = "llm") ); assert_eq!( compiled.contains(ServiceCapability::Agent), cfg!(feature = "agent") ); assert_eq!( compiled.contains(ServiceCapability::Mail), cfg!(feature = "mailsend") ); }
     #[test] fn runtime_defaults_are_a_subset_of_the_build() { let compiled = ServiceCapabilities::compiled(); let defaults = ServiceCapabilities::default_enabled(); assert!(compiled.contains_all(defaults)); let has_historical_default = [ ServiceCapability::Auth, ServiceCapability::Database, ServiceCapability::Files, ServiceCapability::Events, ] .into_iter() .any(|capability| compiled.contains(capability)); if has_historical_default { assert!(!defaults.contains(ServiceCapability::DataImport)); assert!(!defaults.contains(ServiceCapability::Llm)); assert!(!defaults.contains(ServiceCapability::Agent)); } }
-    #[test] fn operation_build_availability_follows_implementation_capabilities() { assert_eq!( OperationKind::QueryExecute.is_compiled(), cfg!(feature = "database") ); assert_eq!( OperationKind::AuthBegin.is_compiled(), cfg!(feature = "auth") ); assert_eq!( OperationKind::FileList.is_compiled(), cfg!(feature = "files") ); assert_eq!( OperationKind::EventsSubscribe.is_compiled(), cfg!(feature = "events") ); assert_eq!( OperationKind::DataWorkerRun.is_compiled(), cfg!(feature = "data-import") ); assert_eq!( OperationKind::LlmStatus.is_compiled(), cfg!(feature = "llm") ); assert_eq!( OperationKind::LlmGenerate.is_compiled(), cfg!(feature = "llm") ); assert_eq!( OperationKind::LlmCancel.is_compiled(), cfg!(feature = "llm") ); assert_eq!( OperationKind::AgentStatus.is_compiled(), cfg!(feature = "agent") ); assert_eq!( OperationKind::AgentRun.is_compiled(), cfg!(feature = "agent") ); assert!(OperationKind::Ping.is_compiled()); }
+    #[test] fn operation_build_availability_follows_implementation_capabilities() { assert_eq!( OperationKind::QueryExecute.is_compiled(), cfg!(feature = "database") ); assert_eq!( OperationKind::AuthBegin.is_compiled(), cfg!(feature = "auth") ); assert_eq!( OperationKind::FileList.is_compiled(), cfg!(feature = "files") ); assert_eq!( OperationKind::EventsSubscribe.is_compiled(), cfg!(feature = "events") ); assert_eq!( OperationKind::DataWorkerRun.is_compiled(), cfg!(feature = "data-import") ); assert_eq!( OperationKind::LlmStatus.is_compiled(), cfg!(feature = "llm") ); assert_eq!( OperationKind::LlmGenerate.is_compiled(), cfg!(feature = "llm") ); assert_eq!( OperationKind::LlmCancel.is_compiled(), cfg!(feature = "llm") ); assert_eq!( OperationKind::AgentStatus.is_compiled(), cfg!(feature = "agent") ); assert_eq!( OperationKind::AgentRun.is_compiled(), cfg!(feature = "agent") ); assert_eq!( OperationKind::MailSend.is_compiled(), cfg!(feature = "mailsend") ); assert!(OperationKind::Ping.is_compiled()); }
     #[test] fn provider_capability_is_distinct_from_local_dependencies() { assert_eq!( OperationKind::IdentityRegister.provider_capability(), Some(ServiceCapability::Auth) ); assert_eq!( OperationKind::IdentityRegister.implementation_capabilities(), AUTH ); assert!(OperationKind::IdentityRegister.requires_db_engine()); assert!(OperationKind::FileRead.requires_db_engine()); assert!(!OperationKind::DataWorkerRun.requires_db_engine()); assert!(!OperationKind::LlmStatus.requires_db_engine()); assert!(!OperationKind::AgentStatus.requires_db_engine()); assert_eq!( OperationKind::QueryExecute.provider_capability(), Some(ServiceCapability::Database) ); assert_eq!( OperationKind::FileRead.provider_capability(), Some(ServiceCapability::Files) ); assert_eq!( OperationKind::DataWorkerRun.provider_capability(), Some(ServiceCapability::DataImport) ); assert_eq!( OperationKind::LlmStatus.provider_capability(), Some(ServiceCapability::Llm) ); assert_eq!( OperationKind::LlmGenerate.provider_capability(), Some(ServiceCapability::Llm) ); assert_eq!( OperationKind::LlmCancel.provider_capability(), Some(ServiceCapability::Llm) ); assert_eq!( OperationKind::AgentStatus.provider_capability(), Some(ServiceCapability::Agent) ); assert_eq!( OperationKind::AgentRun.provider_capability(), Some(ServiceCapability::Agent) ); assert_eq!(OperationKind::Ping.provider_capability(), None); }
     #[test] fn operation_names_are_unique_and_non_empty() { let mut names = BTreeSet::new(); for operation in OPERATION_CATALOG { assert!(!operation.name.is_empty()); assert!( names.insert(operation.name), "duplicate operation {}", operation.name ); } assert_eq!(names.len(), OperationKind::ALL.len()); }
     #[test] fn every_kind_round_trips_through_the_catalogue() { for &kind in OperationKind::ALL { let descriptor = kind.descriptor(); assert_eq!( operation_by_name(descriptor.name).map(|entry| entry.kind), Some(kind) ); } }

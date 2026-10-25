@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Bounded, invalidatable LRU cache for compiled plans.
 use crate::{
     engine::PlannedQuery,
@@ -61,7 +62,7 @@ impl PlannerCache {
     }
 
     pub fn get(&self, key: &str) -> Option<PlannedQuery> {
-        let mut s = self.state.lock().expect("planner cache lock poisoned");
+        let mut s = crate::helpers::lock_unpoisoned(&self.state);
         let value = s.map.get(key).map(|entry| entry.value.clone());
         if value.is_some() {
             s.stats.hits = s.stats.hits.saturating_add(1);
@@ -79,7 +80,7 @@ impl PlannerCache {
             return;
         }
 
-        let mut s = self.state.lock().expect("planner cache lock poisoned");
+        let mut s = crate::helpers::lock_unpoisoned(&self.state);
         if let Some(previous) = s.map.remove(&key) {
             s.current_bytes = s.current_bytes.saturating_sub(previous.bytes);
             s.lru.retain(|cached| cached != &key);
@@ -117,7 +118,7 @@ impl PlannerCache {
     }
 
     pub fn invalidate_all(&self) {
-        let mut s = self.state.lock().expect("planner cache lock poisoned");
+        let mut s = crate::helpers::lock_unpoisoned(&self.state);
         s.map.clear();
         s.lru.clear();
         s.current_bytes = 0;

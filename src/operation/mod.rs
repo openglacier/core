@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Compact operation routing for the event-first core.
 mod catalog;
 mod definition;

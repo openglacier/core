@@ -17,7 +17,8 @@ env:
   # Loops aligned on 64 bytes: performance no longer moves with unrelated
   # changes of code layout. With --target, RUSTFLAGS skips build scripts.
   RUSTFLAGS: "-C llvm-args=-align-loops=64"
-  EXPECTED_RELEASE_ARCHIVES: 19
+  # 19 default archives + 3 full + 2 cli-tui (no full-cuda for now).
+  EXPECTED_RELEASE_ARCHIVES: 24
 
 jobs:
   validate:
@@ -309,6 +310,165 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+  # Profiles for the packaged targets (Debian packages openglacier-core-full
+  # and openglacier-cli-tui). Native runners: the cross 0.2.5
+  # images are too old for llama.cpp. Ubuntu 22.04 (glibc 2.35) keeps the
+  # binaries usable on Debian 12 (glibc 2.36).
+  profiles:
+    name: ${{ matrix.prefix }}-${{ matrix.name }}
+
+    needs:
+      - validate
+
+    runs-on: ${{ matrix.os }}
+
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - prefix: og-core-full
+            name: linux-x86_64-gnu
+            os: ubuntu-22.04
+            cargo_args: --bins --features full
+
+          - prefix: og-core-full
+            name: linux-x86_64-v3-gnu
+            os: ubuntu-22.04
+            cargo_args: --bins --features full
+            rustflags: "-C target-cpu=x86-64-v3"
+
+          - prefix: og-core-full
+            name: linux-aarch64-gnu
+            os: ubuntu-22.04-arm
+            cargo_args: --bins --features full
+
+
+          - prefix: og-cli-tui
+            name: linux-x86_64-gnu
+            os: ubuntu-22.04
+            cargo_args: --no-default-features --features cli-tui --bin ogcli
+
+          - prefix: og-cli-tui
+            name: linux-aarch64-gnu
+            os: ubuntu-22.04-arm
+            cargo_args: --no-default-features --features cli-tui --bin ogcli
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rustup update stable
+          rustup default stable
+
+          echo "TARGET=$(rustc -vV | sed -n 's/^host: //p')" >> "$GITHUB_ENV"
+
+          rustc --version
+          cargo --version
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang libclang-dev pkg-config file
+
+      - name: Build
+        shell: bash
+        env:
+          RUSTFLAGS: "-C llvm-args=-align-loops=64 ${{ matrix.rustflags || '' }}"
+        run: |
+          set -euo pipefail
+
+          cargo build \
+            --release \
+            --locked \
+            --target "$TARGET" \
+            ${{ matrix.cargo_args }}
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          RELEASE_NAME: ${{ matrix.name }}
+          PREFIX: ${{ matrix.prefix }}
+          FEATURES: ${{ matrix.cargo_args }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE="${PREFIX}-${VERSION}-${RELEASE_NAME}"
+
+          mkdir -p "package/${PACKAGE}/bin"
+          mkdir -p dist
+
+          FOUND=0
+          for BIN in ogd ogcli; do
+            if [ -f "target/${TARGET}/release/${BIN}" ]; then
+              cp "target/${TARGET}/release/${BIN}" "package/${PACKAGE}/bin/${BIN}"
+              chmod 755 "package/${PACKAGE}/bin/${BIN}"
+              FOUND=$((FOUND + 1))
+            fi
+          done
+
+          case "$PREFIX" in
+            og-cli-tui) WANTED=1 ;;
+            *) WANTED=2 ;;
+          esac
+
+          if [ "$FOUND" -ne "$WANTED" ]; then
+            echo "ERROR: expected ${WANTED} binaries, found ${FOUND}."
+            exit 1
+          fi
+
+          if [ -f LICENSE ]; then
+            cp LICENSE "package/${PACKAGE}/LICENSE"
+          fi
+
+          cat > "package/${PACKAGE}/VERSION" <<EOF
+          VERSION=${VERSION}
+          TARGET=${TARGET}
+          PLATFORM=${RELEASE_NAME}
+          PROFILE=${PREFIX}
+          CARGO=${FEATURES}
+          EOF
+
+          echo "==> Built binaries"
+
+          file "package/${PACKAGE}/bin/"*
+          ldd "package/${PACKAGE}/bin/"* || true
+
+          tar \
+            -C package \
+            -czf "dist/${PACKAGE}.tar.gz" \
+            "$PACKAGE"
+
+          (
+            cd dist
+            sha256sum "${PACKAGE}.tar.gz" \
+              > "${PACKAGE}.tar.gz.sha256"
+          )
+
+          ls -lh dist/
+          cat "dist/${PACKAGE}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.prefix }}-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
           compression-level: 0
@@ -616,6 +776,7 @@ jobs:
     needs:
       - validate
       - linux
+      - profiles
       - macos
       - windows
 
@@ -623,6 +784,8 @@ jobs:
 
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Checkout
@@ -687,6 +850,13 @@ jobs:
             cd release-assets
             sha256sum -c ./*.tar.gz.sha256
           )
+
+      # Provenance of every archive: mkdeb.sh checks it with
+      # `gh attestation verify <archive> --repo openglacier/core`.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release-assets/*.tar.gz
 
       - name: Prepare release notes prefix
         shell: bash

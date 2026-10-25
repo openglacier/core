@@ -241,12 +241,6 @@ impl Expression {
         matches!(self.kind, ExpressionKind::Field(_))
     }
 
-    /// Returns whether this node is a unary expression.
-    #[must_use]
-    pub const fn is_unary(&self) -> bool {
-        matches!(self.kind, ExpressionKind::Unary { .. })
-    }
-
     /// Returns whether this node is a binary expression.
     #[must_use]
     pub const fn is_binary(&self) -> bool {
@@ -482,12 +476,6 @@ impl ExpressionView<'_> {
     #[must_use]
     pub const fn is_field(self) -> bool {
         matches!(self, Self::Field(_))
-    }
-
-    /// Returns whether this view represents a unary expression.
-    #[must_use]
-    pub const fn is_unary(self) -> bool {
-        matches!(self, Self::Unary { .. })
     }
 
     /// Returns whether this view represents a binary expression.

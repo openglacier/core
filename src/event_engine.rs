@@ -103,23 +103,15 @@ pub struct HeartbeatHandle {
 }
 
 impl HeartbeatHandle {
-    fn signal_stop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-    }
-
-    pub fn stop(mut self) {
-        self.signal_stop();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
+    /// Stops the producer and waits for its thread, as dropping does.
+    pub fn stop(self) {}
 }
 
 impl Drop for HeartbeatHandle {
     fn drop(&mut self) {
-        self.signal_stop();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

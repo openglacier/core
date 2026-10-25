@@ -216,8 +216,8 @@ impl error::Error for ProcessMemoryPressureError {}
 
 /// Query memory admission failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct QueryAdmissionError { pub class: crate::memory::WorkloadClass, pub requested_bytes: usize, pub active_bytes: usize, pub operation_budget_bytes: usize, pub active_heavy_operations: usize, pub max_concurrent_heavy: usize }
-impl fmt::Display for QueryAdmissionError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "memory admission rejected for {}: requested {} bytes with {} operation bytes active; operation budget is {} bytes and {}/{} heavy operations are active", self.class.as_str(), self.requested_bytes, self.active_bytes, self.operation_budget_bytes, self.active_heavy_operations, self.max_concurrent_heavy) } }
+pub struct QueryAdmissionError { pub class: crate::memory::WorkloadClass, pub running_operations: usize, pub query_slots: usize, pub active_heavy_operations: usize }
+impl fmt::Display for QueryAdmissionError { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { write!(f, "no query slot for {} within the queue wait: {} operations running for {} slots per pool, {} heavy operations", self.class.as_str(), self.running_operations, self.query_slots, self.active_heavy_operations) } }
 impl error::Error for QueryAdmissionError {}
 
 /// Error returned when the hard memory budget cannot satisfy a reservation.

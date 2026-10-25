@@ -130,9 +130,7 @@ pub(super) fn read_gateway_message(websocket: &mut NodeWebSocket) -> Result<Opti
 
 #[cfg(feature = "fabric")]
 pub(super) fn gateway_response_for_request(websocket: &mut NodeWebSocket, request: &OperationRequest) -> Result<JsonValue, String> {
-    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
-    let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
-    write_gateway_message(websocket, &value)?;
+    let request_id = send_request(websocket, request)?;
     loop {
         let Some(message) = read_gateway_message(websocket)? else {
             return Err("gateway client channel closed before the response".to_owned());
@@ -176,9 +174,9 @@ pub(super) fn connect_authenticated_gateway_client( endpoint: &str, credential: 
     if let Some(error) = begin_response.get("error") {
         return Err(format!("upstream auth.begin rejected: {error}"));
     }
-    let challenge_id = begin_response.get("data").and_then(|value| value.get("challengeId")).and_then(JsonValue::as_str)
+    let challenge_id = begin_response["data"]["challengeId"].as_str()
         .ok_or_else(|| "upstream auth.begin did not return challengeId".to_owned())?;
-    let challenge = begin_response.get("data").and_then(|value| value.get("challenge")).and_then(JsonValue::as_str)
+    let challenge = begin_response["data"]["challenge"].as_str()
         .ok_or_else(|| "upstream auth.begin did not return challenge".to_owned())?;
     let challenge = decode_base64(challenge).map_err(|error| error.to_string())?;
     let complete = OperationRequest::new(
@@ -231,8 +229,8 @@ pub(super) fn connect_authenticated_gateway_client_any( _settings: &ConnectionSe
 }
 
 pub(super) fn write_json_wire_response(writer: &mut TcpStream, response: &JsonValue) -> Result<(), ConnectionError> {
-    let encoded = encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
-        .map_err(ConnectionError::Encode)?;
+    let id = serde_json::from_value::<RequestId>(response["id"].clone()).ok();
+    let encoded = super::encode_response_or_error(response, id)?;
     writer.write_all(&encoded).map_err(ConnectionError::Write)
 }
 
@@ -317,11 +315,149 @@ pub(super) fn tcp_pair() -> io::Result<(TcpStream, TcpStream)> {
     Ok((server, client))
 }
 
-#[cfg(feature = "fabric")]
+/// Relays a node data channel between its Gateway websocket and the local
+/// connection the Core serves, each side's bytes as soon as they arrive. Both
+/// sockets are nonblocking and the bridge sleeps in `poll(2)` until one of
+/// them can move: it used to wait up to 25 ms on the websocket before passing
+/// on what the Core had written, about 27 ms on every exchange. Each side is
+/// read only while the other has taken what came before (at most
+/// [`BRIDGE_TO_CORE_LIMIT`] waiting for the Core, nothing unflushed for the
+/// Gateway), so a slow reader slows its writer instead of filling memory.
+#[cfg(all(feature = "fabric", unix))]
+pub(super) fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) -> Result<(), String> {
+    use rustix::event::{poll, PollFd, PollFlags, Timespec};
+    let failed = |error: io::Error| error.to_string();
+    let would_block = |error: &tungstenite::Error| matches!(error, tungstenite::Error::Io(error) if error.kind() == io::ErrorKind::WouldBlock);
+    local.set_nonblocking(true).map_err(failed)?;
+    websocket_stream(&mut websocket)?.set_nonblocking(true).map_err(failed)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    // Bytes from the Gateway the Core has not taken yet, from `taken` on.
+    let (mut to_core, mut taken) = (Vec::<u8>::new(), 0usize);
+    // Frames for the Gateway the websocket could not write out yet.
+    let mut unflushed = false;
+    // A second of sleep at most: nothing is left behind by a wake-up, this only bounds a missed one.
+    let wake = Timespec { tv_sec: 1, tv_nsec: 0 };
+    loop {
+        // Gateway -> Core.
+        while to_core.len() - taken < BRIDGE_TO_CORE_LIMIT {
+            match websocket.read() {
+                Ok(WebSocketMessage::Binary(payload)) => {
+                    if taken == to_core.len() { to_core.clear(); taken = 0; }
+                    to_core.extend_from_slice(&payload);
+                }
+                Ok(WebSocketMessage::Close(_)) | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => return Ok(()),
+                Ok(WebSocketMessage::Text(_)) => return Err("node data channel requires binary frames".to_owned()),
+                // tungstenite answers a ping itself, on the next flush.
+                Ok(_) => {}
+                Err(error) if would_block(&error) => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        while taken < to_core.len() {
+            match local.write(&to_core[taken..]) {
+                Ok(bytes) => taken += bytes,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        // Core -> Gateway, while the websocket keeps up.
+        let mut read = 0;
+        while !unflushed && read < BRIDGE_TO_GATEWAY_TURN {
+            match local.read(&mut buffer) {
+                Ok(0) => { close_websocket_blocking(&mut websocket); return Ok(()); }
+                Ok(bytes) => {
+                    read += bytes;
+                    match websocket.write(WebSocketMessage::Binary(buffer[..bytes].to_vec().into())) {
+                        Ok(()) => {}
+                        Err(error) if would_block(&error) => unflushed = true,
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        match websocket.flush() {
+            Ok(()) => unflushed = false,
+            Err(error) if would_block(&error) => unflushed = true,
+            Err(error) => return Err(error.to_string()),
+        }
+        // Sleep until a side can move.
+        let flags = |read: bool, write: bool| {
+            let mut flags = PollFlags::empty();
+            if read { flags |= PollFlags::IN; }
+            if write { flags |= PollFlags::OUT; }
+            flags
+        };
+        let gateway_flags = flags(to_core.len() - taken < BRIDGE_TO_CORE_LIMIT, unflushed);
+        let core_flags = flags(!unflushed, taken < to_core.len());
+        let stream = websocket_stream(&mut websocket)?;
+        let mut fds = [PollFd::new(&*stream, gateway_flags), PollFd::new(&local, core_flags)];
+        match poll(&mut fds, Some(&wake)) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        // A side that hung up while it was not being read would wake every poll: settle it here.
+        let hung_up = |fd: &PollFd<'_>, watched: PollFlags| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR) && !watched.contains(PollFlags::IN);
+        let (gateway_gone, core_gone) = (hung_up(&fds[0], gateway_flags), hung_up(&fds[1], core_flags));
+        drop(fds);
+        if gateway_gone {
+            return Ok(());
+        }
+        if core_gone {
+            // What the Core wrote before closing is finite: pass it on, then close.
+            loop {
+                match local.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(bytes) => match websocket.write(WebSocketMessage::Binary(buffer[..bytes].to_vec().into())) {
+                        Err(error) if !would_block(&error) => return Err(error.to_string()),
+                        _ => {}
+                    },
+                }
+            }
+            close_websocket_blocking(&mut websocket);
+            return Ok(());
+        }
+    }
+}
+
+/// Bytes from the Gateway waiting for the Core past which the bridge stops reading the websocket.
+#[cfg(all(feature = "fabric", unix))]
+const BRIDGE_TO_CORE_LIMIT: usize = 8 * 1024 * 1024;
+/// Bytes the bridge reads from the Core in one turn before flushing them to the Gateway.
+#[cfg(all(feature = "fabric", unix))]
+const BRIDGE_TO_GATEWAY_TURN: usize = 1024 * 1024;
+
+/// The TCP stream under a node websocket, plain or TLS.
+#[cfg(all(feature = "fabric", unix))]
+fn websocket_stream(websocket: &mut NodeWebSocket) -> Result<&mut TcpStream, String> {
+    match websocket.get_mut() {
+        MaybeTlsStream::Plain(stream) => Ok(stream),
+        MaybeTlsStream::Rustls(stream) => Ok(stream.get_mut()),
+        _ => Err("unsupported node channel stream".to_owned()),
+    }
+}
+
+/// Sends what the websocket still holds, then its close frame, waiting for the socket (30 s at most).
+#[cfg(all(feature = "fabric", unix))]
+fn close_websocket_blocking(websocket: &mut NodeWebSocket) {
+    if let Ok(stream) = websocket_stream(websocket) {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    }
+    let _ = websocket.flush();
+    close_node_websocket(websocket);
+    let _ = websocket.flush();
+}
+
+#[cfg(all(feature = "fabric", not(unix)))]
 pub(super) fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) -> Result<(), String> {
     local.set_nonblocking(true).map_err(|error| error.to_string())?;
     configure_websocket_polling(&mut websocket).map_err(|error| error.to_string())?;
     let mut buffer = vec![0u8; 64 * 1024];
+    // The frame the local socket has not taken in full yet: being nonblocking, it takes a frame of several MB over
+    // several turns, while the Core keeps reading. The next frame is read once it is through.
+    let (mut pending, mut written) = (Vec::new(), 0);
     loop {
         loop {
             match local.read(&mut buffer) {
@@ -331,16 +467,25 @@ pub(super) fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: 
                 Err(error) => return Err(error.to_string()),
             }
         }
+        while written < pending.len() {
+            match local.write(&pending[written..]) {
+                Ok(bytes) => written += bytes,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.to_string()),
+            }
+        }
 
-        match websocket.read() {
-            Ok(WebSocketMessage::Binary(payload)) => local.write_all(&payload).map_err(|error| error.to_string())?,
-            Ok(WebSocketMessage::Close(_)) => return Ok(()),
-            Ok(WebSocketMessage::Ping(payload)) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
-            Ok(WebSocketMessage::Pong(_)) => {}
-            Ok(WebSocketMessage::Text(_)) => return Err("node data channel requires binary frames".to_owned()),
-            Ok(_) => {}
-            Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
-            Err(error) => return Err(error.to_string()),
+        if written == pending.len() {
+            match websocket.read() {
+                Ok(WebSocketMessage::Binary(payload)) => { (pending, written) = (payload.into(), 0); continue; }
+                Ok(WebSocketMessage::Close(_)) => return Ok(()),
+                Ok(WebSocketMessage::Ping(payload)) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
+                Ok(WebSocketMessage::Pong(_)) => {}
+                Ok(WebSocketMessage::Text(_)) => return Err("node data channel requires binary frames".to_owned()),
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Err(error) => return Err(error.to_string()),
+            }
         }
         thread::sleep(Duration::from_millis(1));
     }
@@ -613,7 +758,7 @@ pub(super) fn run_gateway_fabric( configuration: Configuration, node_credential:
         let discovery_sender = sender.clone();
         let spawned_endpoint = endpoint.clone();
         let spawned = thread::Builder::new()
-            .name(format!("ogd-gateway-{}", endpoint.replace('/', "_").replace(':', "_")))
+            .name(format!("ogd-gateway-{}", endpoint.replace(['/', ':'], "_")))
             .spawn(move || {
                 if let Err(error) = run_gateway_node(
                     endpoint,
@@ -851,6 +996,11 @@ pub(super) fn run_gateway_node( endpoint: String, configuration: &Configuration,
                     let delegated_app_instance_id = message.str_field("appInstanceId").map(str::to_owned);
                     let delegated_place_role = message.str_field("placeRole").and_then(PlaceRole::parse);
                     let delegated_public_access = message.str_field("publicAccess").and_then(PublicAccess::parse);
+                    // Filters the channel cannot read would widen the access: refused.
+                    let Ok(delegated_filters) = crate::access::place::access_filters(message.get("filters").unwrap_or(&serde_json::Value::Null)) else {
+                        debug::log(DebugTopic::Gateway, None, "rejecting node.open with invalid filters");
+                        continue;
+                    };
                     let endpoint = endpoint.clone();
                     let engine = engine.clone();
                     let operation_router = Arc::clone(&operation_router);
@@ -900,6 +1050,7 @@ pub(super) fn run_gateway_node( endpoint: String, configuration: &Configuration,
                                 place_role: delegated_place_role,
                                 public_access: delegated_public_access,
                                 token: delegated_token,
+                                filters: delegated_filters,
                             }),
                             (None, None, Some(capability)) if delegated_place_id.is_some() && delegated_public_access.is_some() => Some(GatewayDelegation {
                                 principal: Principal::Anonymous,
@@ -909,6 +1060,7 @@ pub(super) fn run_gateway_node( endpoint: String, configuration: &Configuration,
                                 place_role: None,
                                 public_access: delegated_public_access,
                                 token: delegated_token,
+                                filters: Vec::new(),
                             }),
                             _ => None,
                         };
@@ -990,35 +1142,57 @@ pub(super) fn run_gateway_node( _endpoint: String, _configuration: &Configuratio
     ))
 }
 
+/// A frame read for one request by [`next_frame`].
+#[cfg(feature = "fabric")]
+enum Frame { Response(JsonValue), Binary(tungstenite::Bytes), Closed }
+
+/// Sends `request` and returns its id as its responses carry it.
+#[cfg(feature = "fabric")]
+fn send_request(websocket: &mut NodeWebSocket, request: &OperationRequest) -> Result<JsonValue, String> {
+    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
+    write_gateway_message(websocket, &serde_json::to_value(request).map_err(|error| error.to_string())?)?;
+    Ok(request_id)
+}
+
+/// Next frame for `request_id`: its response (an upstream error becomes
+/// `Err`), a binary payload or the close; pings are answered and other
+/// frames skipped.
+#[cfg(feature = "fabric")]
+fn next_frame(websocket: &mut NodeWebSocket, request_id: &JsonValue, operation: &str) -> Result<Frame, String> {
+    loop {
+        match websocket.read().map_err(|error| error.to_string())? {
+            WebSocketMessage::Text(payload) => {
+                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
+                if message.str_field("kind") != Some("response") || message.get("id") != Some(request_id) {
+                    continue;
+                }
+                if message.str_field("status") == Some("error") || message.get("error").is_some() {
+                    return Err(format!("{operation} failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
+                }
+                return Ok(Frame::Response(message));
+            }
+            WebSocketMessage::Binary(payload) => return Ok(Frame::Binary(payload)),
+            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
+            WebSocketMessage::Close(_) => return Ok(Frame::Closed),
+            _ => {}
+        }
+    }
+}
+
 #[cfg(feature = "fabric")]
 pub(super) fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &OperationRequest, destination: &Path) -> Result<u64, String> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
-    let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
-    write_gateway_message(websocket, &value)?;
-
+    let request_id = send_request(websocket, request)?;
     let temporary = sync_temporary_path(destination);
-    let mut output: Option<fs::File> = None;
-    let mut expected = None::<u64>;
-    let mut received = 0u64;
-    loop {
-        let message = websocket.read().map_err(|error| error.to_string())?;
-        match message {
-            WebSocketMessage::Text(payload) => {
-                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                if message.str_field("kind") != Some("response") || message.get("id") != Some(&request_id) {
-                    continue;
-                }
-                if message.str_field("status") == Some("error") || message.get("error").is_some() {
-                    let _ = fs::remove_file(&temporary);
-                    return Err(format!("file.read failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
-                }
+    let (mut output, mut expected, mut received) = (None::<fs::File>, None::<u64>, 0u64);
+    let result = (|| loop {
+        match next_frame(websocket, &request_id, "file.read")? {
+            Frame::Response(message) => {
                 if message.str_field("status") == Some("complete") {
                     let Some(expected) = expected else { return Err("file.read completed without a raw header".to_owned()); };
                     if received != expected {
-                        let _ = fs::remove_file(&temporary);
                         return Err(format!("file.read ended after {received} of {expected} bytes"));
                     }
                     if let Some(mut file) = output.take() {
@@ -1030,32 +1204,30 @@ pub(super) fn gateway_raw_read_to_path(websocket: &mut NodeWebSocket, request: &
                     replace_sync_file(&temporary, destination)?;
                     return Ok(received);
                 }
-                if message.get("data").and_then(|data| data.get("stream")).and_then(JsonValue::as_str) == Some("raw") {
-                    let bytes = message.get("data").and_then(|data| data.get("bytes")).and_then(JsonValue::as_u64)
+                if message["data"]["stream"].as_str() == Some("raw") {
+                    let bytes = message["data"]["bytes"].as_u64()
                         .ok_or_else(|| "file.read raw header has no byte count".to_owned())?;
                     expected = Some(bytes);
                     output = Some(fs::OpenOptions::new().write(true).create(true).truncate(true).open(&temporary).map_err(|error| error.to_string())?);
                 }
             }
-            WebSocketMessage::Binary(payload) => {
+            Frame::Binary(payload) => {
                 let limit = expected.ok_or_else(|| "file.read sent binary data before its header".to_owned())?;
                 let next = received.saturating_add(payload.len() as u64);
                 if next > limit {
-                    let _ = fs::remove_file(&temporary);
                     return Err("file.read sent more bytes than announced".to_owned());
                 }
                 let file = output.as_mut().ok_or_else(|| "file.read has no local output".to_owned())?;
                 file.write_all(&payload).map_err(|error| error.to_string())?;
                 received = next;
             }
-            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
-            WebSocketMessage::Close(_) => {
-                let _ = fs::remove_file(&temporary);
-                return Err("gateway closed during file.read".to_owned());
-            }
-            _ => {}
+            Frame::Closed => return Err("gateway closed during file.read".to_owned()),
         }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
+    result
 }
 
 
@@ -1078,93 +1250,68 @@ pub(super) fn gateway_raw_write_from_path(websocket: &mut NodeWebSocket, request
             "local file changed before upload started (requested {requested} bytes, now {expected}); retrying on the next filesystem event"
         ));
     }
-
-    let request_id = serde_json::to_value(request.id).map_err(|error| error.to_string())?;
-    let value = serde_json::to_value(request).map_err(|error| error.to_string())?;
-    write_gateway_message(websocket, &value)?;
-
+    let request_id = send_request(websocket, request)?;
     loop {
-        let message = websocket.read().map_err(|error| error.to_string())?;
-        match message {
-            WebSocketMessage::Text(payload) => {
-                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                if message.str_field("kind") != Some("response") || message.get("id") != Some(&request_id) {
-                    continue;
-                }
-                if message.str_field("status") == Some("error") || message.get("error").is_some() {
-                    return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
-                }
-                let ready = message.get("data")
-                    .is_some_and(|data| data.str_field("stream") == Some("raw")
-                        && data.bool_field("ready") == Some(true));
-                if !ready {
-                    continue;
-                }
-                let announced = message.get("data").and_then(|data| data.get("bytes")).and_then(JsonValue::as_u64)
-                    .ok_or_else(|| "file.write raw header has no byte count".to_owned())?;
-                if announced != expected {
-                    return Err(format!("file.write expected {announced} bytes but local file has {expected}"));
-                }
-
-                let mut buffer = vec![0u8; 64 * 1024];
-                let mut remaining = expected;
-                while remaining > 0 {
-                    let limit = usize::try_from(remaining.min(buffer.len() as u64))
-                        .map_err(|_| "file.write remaining byte count is invalid".to_owned())?;
-                    let count = input.read(&mut buffer[..limit]).map_err(|error| error.to_string())?;
-                    if count == 0 {
-                        // Abort the raw session explicitly. Otherwise Gateway/Core
-                        // legitimately keeps waiting for the announced tail forever.
-                        close_node_websocket(websocket);
-                        return Err(format!(
-                            "local file changed during upload: reached EOF with {remaining} bytes still announced; the upload was aborted"
-                        ));
-                    }
-                    websocket.send(WebSocketMessage::Binary(buffer[..count].to_vec().into()))
-                        .map_err(|error| error.to_string())?;
-                    remaining = remaining.saturating_sub(count as u64);
-                }
-                break;
-            }
-            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
-            WebSocketMessage::Close(_) => return Err("gateway closed before file.write became ready".to_owned()),
-            _ => {}
+        let message = match next_frame(websocket, &request_id, "file.write")? {
+            Frame::Response(message) => message,
+            Frame::Binary(_) => continue,
+            Frame::Closed => return Err("gateway closed before file.write became ready".to_owned()),
+        };
+        let ready = message.get("data")
+            .is_some_and(|data| data.str_field("stream") == Some("raw")
+                && data.bool_field("ready") == Some(true));
+        if !ready {
+            continue;
         }
+        let announced = message["data"]["bytes"].as_u64()
+            .ok_or_else(|| "file.write raw header has no byte count".to_owned())?;
+        if announced != expected {
+            return Err(format!("file.write expected {announced} bytes but local file has {expected}"));
+        }
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut remaining = expected;
+        while remaining > 0 {
+            let limit = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| "file.write remaining byte count is invalid".to_owned())?;
+            let count = input.read(&mut buffer[..limit]).map_err(|error| error.to_string())?;
+            if count == 0 {
+                // Abort the raw session explicitly. Otherwise Gateway/Core
+                // legitimately keeps waiting for the announced tail forever.
+                close_node_websocket(websocket);
+                return Err(format!(
+                    "local file changed during upload: reached EOF with {remaining} bytes still announced; the upload was aborted"
+                ));
+            }
+            websocket.send(WebSocketMessage::Binary(buffer[..count].to_vec().into()))
+                .map_err(|error| error.to_string())?;
+            remaining = remaining.saturating_sub(count as u64);
+        }
+        break;
     }
 
     loop {
-        let message = websocket.read().map_err(|error| error.to_string())?;
-        match message {
-            WebSocketMessage::Text(payload) => {
-                let message = serde_json::from_str::<JsonValue>(&payload).map_err(|error| error.to_string())?;
-                if message.str_field("kind") != Some("response") || message.get("id") != Some(&request_id) {
-                    continue;
-                }
-                if message.str_field("status") == Some("error") || message.get("error").is_some() {
-                    return Err(format!("file.write failed upstream: {}", message.get("error").cloned().unwrap_or(JsonValue::Null)));
-                }
-                // file.write is a two-response BinaryIn operation:
-                //   1. status=ok, data={ready:true, stream:"raw", bytes:N}
-                //   2. status=ok, data={file:..., bytes:N, stream:"raw"}
-                //
-                // "complete" is the stream status used by MessageStream (and the
-                // Gateway synthesizes one after BinaryOut/file.read). Native Core
-                // OperationResponse::new() deliberately uses status="ok", so waiting
-                // for "complete" here leaves the sync stuck forever after the first
-                // successfully persisted file.
-                if message.str_field("status") == Some("ok") {
-                    let data = message.get("data").cloned()
-                        .ok_or_else(|| "file.write completed without data".to_owned())?;
-                    if data.bool_field("ready") == Some(true) {
-                        // Defensive: a duplicate readiness response is not terminal.
-                        continue;
-                    }
-                    return Ok(data);
-                }
+        let message = match next_frame(websocket, &request_id, "file.write")? {
+            Frame::Response(message) => message,
+            Frame::Binary(_) => continue,
+            Frame::Closed => return Err("gateway closed during file.write".to_owned()),
+        };
+        // file.write is a two-response BinaryIn operation:
+        //   1. status=ok, data={ready:true, stream:"raw", bytes:N}
+        //   2. status=ok, data={file:..., bytes:N, stream:"raw"}
+        //
+        // "complete" is the stream status used by MessageStream (and the
+        // Gateway synthesizes one after BinaryOut/file.read). Native Core
+        // OperationResponse::new() deliberately uses status="ok", so waiting
+        // for "complete" here leaves the sync stuck forever after the first
+        // successfully persisted file.
+        if message.str_field("status") == Some("ok") {
+            let data = message.get("data").cloned()
+                .ok_or_else(|| "file.write completed without data".to_owned())?;
+            if data.bool_field("ready") == Some(true) {
+                // Defensive: a duplicate readiness response is not terminal.
+                continue;
             }
-            WebSocketMessage::Ping(payload) => websocket.send(WebSocketMessage::Pong(payload)).map_err(|error| error.to_string())?,
-            WebSocketMessage::Close(_) => return Err("gateway closed during file.write".to_owned()),
-            _ => {}
+            return Ok(data);
         }
     }
 }
@@ -1244,4 +1391,39 @@ pub(super) fn run_upstream_event_relay_session( settings: &ConnectionSettings, e
             event_engine.publish(event);
         }
     }
+}
+
+#[cfg(all(test, feature = "fabric", unix))]
+mod bridge_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use tungstenite::Error as WsError;
+
+    /// A Gateway end (a websocket server) and a Core end (the local stream) joined by a bridge.
+    fn bridged() -> (WebSocket<TcpStream>, TcpStream, thread::JoinHandle<Result<(), String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (core, bridge_end) = tcp_pair().unwrap();
+        let bridge = thread::spawn(move || { let (websocket, _) = websocket_connect(url.as_str()).map_err(|error| error.to_string())?; bridge_websocket_channel(websocket, bridge_end) });
+        let (stream, _) = listener.accept().unwrap();
+        (tungstenite::accept(stream).unwrap(), core, bridge)
+    }
+
+    fn echo(mut core: TcpStream) -> thread::JoinHandle<()> {
+        thread::spawn(move || { let mut buffer = vec![0u8; 16 * 1024]; loop { match core.read(&mut buffer) { Ok(0) | Err(_) => return, Ok(bytes) => if core.write_all(&buffer[..bytes]).is_err() { return } } } })
+    }
+
+    fn read_bytes(gateway: &mut WebSocket<TcpStream>, count: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(count);
+        while bytes.len() < count { if let WebSocketMessage::Binary(payload) = gateway.read().unwrap() { bytes.extend_from_slice(&payload); } }
+        bytes
+    }
+
+    #[test] fn an_exchange_crosses_the_bridge_without_waiting() { let (mut gateway, core, _bridge) = bridged(); let _echo = echo(core); let mut samples = (0..30).map(|_| { let started = Instant::now(); gateway.send(WebSocketMessage::Binary(vec![1u8; 32].into())).unwrap(); read_bytes(&mut gateway, 32); started.elapsed() }).collect::<Vec<_>>(); samples.sort(); assert!(samples[15] < Duration::from_millis(5), "median round trip {:?}", samples[15]); }
+
+    #[test] fn bytes_cross_both_ways_whole_and_in_order() { let (mut gateway, core, _bridge) = bridged(); let _echo = echo(core); let sent = (0..8 * 1024 * 1024u32).map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8).collect::<Vec<_>>(); let mut stream = gateway.get_ref().try_clone().unwrap(); stream.set_nodelay(true).unwrap(); let reader = thread::spawn(move || { let mut gateway = gateway; let bytes = read_bytes(&mut gateway, 8 * 1024 * 1024); (gateway, bytes) }); let mut writer = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None); for chunk in sent.chunks(100_000) { writer.send(WebSocketMessage::Binary(chunk.to_vec().into())).unwrap(); } let (_gateway, received) = reader.join().unwrap(); assert!(received == sent); }
+
+    #[test] fn the_core_closing_delivers_what_it_wrote_then_closes_the_websocket() { let (mut gateway, mut core, bridge) = bridged(); let written = vec![9u8; 3 * 1024 * 1024]; core.write_all(&written).unwrap(); drop(core); assert_eq!(read_bytes(&mut gateway, written.len()).len(), written.len()); loop { match gateway.read() { Ok(WebSocketMessage::Close(_)) | Err(WsError::ConnectionClosed) => break, Ok(_) => {} Err(error) => panic!("{error}") } } assert!(bridge.join().unwrap().is_ok()); }
+
+    #[test] fn the_gateway_closing_ends_the_core_connection() { let (mut gateway, mut core, bridge) = bridged(); gateway.close(None).unwrap(); let _ = gateway.flush(); assert!(bridge.join().unwrap().is_ok()); core.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); assert_eq!(core.read(&mut [0u8; 8]).unwrap(), 0); }
 }

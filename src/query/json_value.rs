@@ -1,3 +1,4 @@
+#![cfg_attr(rustfmt, rustfmt_skip)]
 //! Shared JSON-to-runtime-value conversion for structured query literals.
 
 use crate::helpers::json_to_value;

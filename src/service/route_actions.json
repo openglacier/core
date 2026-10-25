@@ -1,0 +1,47 @@
+{
+ "note": "The routing prompt (wip/APP_MODELE_SEMANTIQUE.md, step 9): the model reads the request and answers « action: <one> » under grammar, followed after a previous request by « suite: oui|non » (does it go on from it); route.rs then applies the deterministic rules. Read by service/generate.rs and llm-bench/router.py.",
+ "intro": "Tu aiguilles une demande (français ou anglais) faite à l'assistant d'analyse de la Place. Réponds uniquement par « action: » et l'une de ces actions :",
+ "actions": [
+  {
+   "name": "app",
+   "text": "construire une App d'analyse : indicateurs, graphiques, tableaux, classements, comparaisons, explications chiffrées, synthèses, commentaires ou conseils sur les données"
+  },
+  {
+   "name": "repondre",
+   "text": "répondre en quelques phrases : salutation, question sur l'assistant, ses capacités, les données disponibles ou leur fraîcheur"
+  },
+  {
+   "name": "absent",
+   "text": "la demande porte sur des données que la Place n'a pas (absentes du catalogue) : le dire et indiquer quoi importer"
+  },
+  {
+   "name": "exporter",
+   "text": "fournir un fichier de données (Excel, CSV)"
+  },
+  {
+   "name": "rechercher",
+   "text": "retrouver des lignes ou des opérations précises (une écriture, des comptes, des anomalies, des dossiers à traiter)"
+  },
+  {
+   "name": "copier_app",
+   "text": "copier ou modifier une App installée"
+  },
+  {
+   "name": "creer_app",
+   "text": "créer une nouvelle application pour un usage de l'équipe"
+  },
+  {
+   "name": "projeter",
+   "text": "produire des chiffres futurs : prévisionnel, budget, objectifs, business plan"
+  },
+  {
+   "name": "simuler",
+   "text": "calculer l'effet d'une hypothèse (« et si », l'impact d'un changement)"
+  },
+  {
+   "name": "fiche",
+   "text": "une fiche sur un client, un fournisseur ou un article, réunissant plusieurs sources"
+  }
+ ],
+ "outro": "Après une demande précédente (« Demande précédente »), ajoute la ligne « suite: ». « suite: oui » seulement si la demande ne se comprend pas seule et prolonge ou modifie la précédente : elle y renvoie (« et … », « la même chose … », « plutôt … ») ou ajoute un découpage, une période, une comparaison, un bloc à la même analyse. Une demande qui se comprend seule est une nouvelle demande, même sur un sujet voisin : « suite: non ». Une suite reprend en général l'action de la précédente."
+}

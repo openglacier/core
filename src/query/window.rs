@@ -5,7 +5,6 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use std::sync::Arc;
 
-use super::eval::float_of;
 use super::executor::compare_sort_values;
 use super::runtime_materializer::{insert_path, path_value, MeasureState};
 use super::syntax::split_top_level_word;
@@ -197,7 +196,7 @@ fn grid(start: &Value, end: &Value, step: &Value) -> Result<Vec<Value>, String> 
     let mut grid = Vec::new();
     match (start, end, step) {
         (Value::Number(start), Value::Number(end), Value::Number(step)) => {
-            let (start, end, step) = (float_of(*start), float_of(*end), float_of(*step));
+            let (start, end, step) = (start.to_f64(), end.to_f64(), step.to_f64());
             let integers = [start, step].iter().all(|value| value.fract() == 0.0);
             if step.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
                 return Err("a fill step must be positive".to_owned());
@@ -217,7 +216,7 @@ fn grid(start: &Value, end: &Value, step: &Value) -> Result<Vec<Value>, String> 
             let unit = dates::DateUnit::parse(unit)?;
             let millis = |value: &Value| match value {
                 Value::String(text) => dates::parse_iso(text),
-                Value::Number(number) => Ok(float_of(*number) as i64),
+                Value::Number(number) => Ok(number.to_f64() as i64),
                 other => Err(format!("a fill bound is a date or a number, found {other:?}")),
             };
             let (first, last) = (millis(start)?, millis(end)?);

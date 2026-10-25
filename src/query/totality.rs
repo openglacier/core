@@ -124,6 +124,37 @@ impl Kinds {
     }
 }
 
+/// Whether every value `expression` gives (when it gives one) is a number:
+/// `Some(true)` for arithmetic, numeric functions and number fields,
+/// `Some(false)` for texts, booleans, dates and other values, `None` when
+/// that cannot be known. `field` tells it for a field.
+pub fn summable(expression: &Expression, field: &dyn Fn(&ExpressionFieldPath) -> Option<bool>) -> Option<bool> {
+    if let Some(value) = expression.constant() {
+        return Some(value.as_number().is_some());
+    }
+    // Every branch a number, or `None` when one cannot be known.
+    let all = |items: &mut dyn Iterator<Item = &Expression>| items.map(|item| summable(item, field)).try_fold(true, |all, next| Some(all & next?));
+    match expression.view() {
+        ExpressionView::Field(path) => field(path),
+        ExpressionView::Group(inner) => summable(inner, field),
+        ExpressionView::Unary { operator, .. } => Some(operator != UnaryOperator::Not),
+        ExpressionView::Binary { operator, .. } => Some(operator.is_arithmetic()),
+        ExpressionView::Literal(_) | ExpressionView::Array(_) => Some(false),
+        ExpressionView::Call { function, arguments } => match function {
+            "abs" | "sqrt" | "floor" | "ceil" | "round" | "trunc" | "pow" | "sum" | "avg" | "ln" | "log10" | "log" | "exp" | "sign" | "median" | "percentile" | "stddev"
+            | "to_int" | "to_float" | "len" | "index_of" | "date_diff" | "date_part" | "fiscal_year" | "fiscal_month" | "days_in" => Some(true),
+            "div" => arguments.get(2).map_or(Some(true), |fallback| summable(fallback, field)),
+            "min" | "max" | "coalesce" => all(&mut arguments.iter()),
+            "nullif" => summable(&arguments[0], field),
+            "if" => all(&mut arguments.iter().skip(1)),
+            "case" => all(&mut arguments.iter().enumerate().filter(|(at, _)| at % 2 == 1 || at + 1 == arguments.len()).map(|(_, argument)| argument)),
+            "optional" => summable(&arguments[0], field),
+            "at" | "get" => None,
+            _ => Some(false),
+        },
+    }
+}
+
 /// Kinds `expression` evaluates to on every row, or `None` when evaluating
 /// it may fail on some row. `field` gives the kinds of a field every row
 /// holds, `None` when a row may lack it or its kinds are unknown.

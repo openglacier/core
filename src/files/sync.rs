@@ -187,20 +187,13 @@ pub struct FileSyncIndexEntry {
     pub app_instance_id: String,
     pub file_id: String,
     pub materialized_path: PathBuf,
-    #[serde(default)]
     pub kind: Option<String>,
-    #[serde(default)]
     pub remote_etag: Option<String>,
-    #[serde(default)]
     pub remote_modified_at: Option<u64>,
-    #[serde(default)]
     pub local_size: Option<u64>,
-    #[serde(default)]
     pub local_modified_at: Option<u64>,
-    #[serde(default)]
     pub local_fingerprint: Option<String>,
     pub state: FileSyncEntryState,
-    #[serde(default)]
     pub last_error: Option<String>,
 }
 

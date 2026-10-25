@@ -166,7 +166,11 @@ impl ConnectionAdmission {
         {
             return None;
         }
-        self.governor.ensure_process_capacity(MemoryClass::Network, bytes).ok()?;
+        // Under process pressure only while operations run: an idle node,
+        // whose retained memory waiting would not free, still admits.
+        if self.governor.running_operations() > 0 {
+            self.governor.ensure_process_capacity(MemoryClass::Network, bytes).ok()?;
+        }
         match self.governor.reserve(MemoryClass::Network, bytes) {
             Ok(reservation) => {
                 state.refused_at_reserved_bytes = None;
@@ -192,6 +196,7 @@ mod tests {
     }
 
     #[test] fn budget_excludes_the_operation_envelope() { let profile = MemoryProfileConfig::for_limit(256 * MIB); let budget = connection_budget_bytes(profile); assert_eq!(budget, profile.managed_budget_bytes.unwrap() - profile.operation_budget_bytes); assert!(budget / CONNECTION_THREAD_FOOTPRINT_BYTES >= 64); }
+
 
     #[test] fn permits_reserve_and_release_network_memory() { let admission = admission_with_limit(256 * MIB); let permit = admission.acquire(2, AdmissionPriority::Gateway); assert_eq!(admission.governor.reserved_bytes(), 2 * CONNECTION_THREAD_FOOTPRINT_BYTES); drop(permit); assert_eq!(admission.governor.reserved_bytes(), 0); }
 

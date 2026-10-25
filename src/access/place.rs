@@ -20,6 +20,9 @@ pub struct RequestedExecutionContext {
     pub place_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_instance_id: Option<String>,
+    /// The Owner reads as a profile of the Place would (its Apps and filters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_profile: Option<String>,
 }
 
 /// Trusted execution context built by og-core after validating a request.
@@ -27,7 +30,7 @@ pub struct RequestedExecutionContext {
 /// This is deliberately distinct from `Principal`: the principal identifies
 /// who is connected, while this value identifies where one operation is
 /// allowed to execute.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionContext {
     pub principal: Principal,
     pub place_id: String,
@@ -35,6 +38,47 @@ pub struct ExecutionContext {
     pub app_instance_id: Option<String>,
     /// What grants this execution: a scope role, or the Place public policy.
     pub access: PlaceAccess,
+    /// The values a field may hold in the rows the principal reads, when
+    /// its Place access restricts it (`place.access.set` with `filters`).
+    pub filters: Vec<(String, Vec<crate::Value>)>,
+}
+
+impl ExecutionContext {
+    /// The document scope of this execution, its filters included.
+    #[must_use]
+    pub fn scope(&self) -> crate::query::DocumentScope {
+        let scope = self.app_instance_id.as_deref().map_or_else(|| crate::query::DocumentScope::for_place(self.place_id.as_str()), |app_instance| crate::query::DocumentScope::new(self.place_id.as_str(), app_instance));
+        scope.with_filters(self.filters.iter().cloned())
+    }
+}
+
+/// The filters of a Place access record or profile: `{"<field>": [<values>], …}`,
+/// a key `<collection>:<field>` being strict on that collection (see
+/// [`crate::query::DocumentScope::enforce`]); a key that is not a field name,
+/// or values that are not an array, are an error.
+pub fn access_filters(filters: &serde_json::Value) -> Result<Vec<(String, Vec<crate::Value>)>, String> {
+    let Some(filters) = filters.as_object() else { return if filters.is_null() { Ok(Vec::new()) } else { Err("filters must be an object of field: [values]".to_owned()) } };
+    filters.iter().map(|(key, values)| {
+        let (collection, field) = key.split_once(':').unwrap_or(("c", key));
+        if collection.is_empty() || !collection.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            || !(field.starts_with(|first: char| first.is_ascii_alphabetic()) && field.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+            return Err(format!("filter field {key:?} must be a field name"));
+        }
+        let values = values.as_array().ok_or_else(|| format!("filter {key:?} must list its values"))?;
+        Ok((key.clone(), values.iter().map(crate::helpers::json_to_value).collect::<Result<_, _>>().map_err(|error| error.to_string())?))
+    }).collect()
+}
+
+/// `filters` restricted by `more`: a field both filter keeps the values of both.
+#[must_use]
+pub fn intersect_filters(mut filters: Vec<(String, Vec<crate::Value>)>, more: Vec<(String, Vec<crate::Value>)>) -> Vec<(String, Vec<crate::Value>)> {
+    for (field, values) in more {
+        match filters.iter_mut().find(|(kept, _)| *kept == field) {
+            Some((_, kept)) => kept.retain(|value| values.contains(value)),
+            None => filters.push((field, values)),
+        }
+    }
+    filters
 }
 
 /// What grants access to one Place for one principal.
@@ -168,6 +212,16 @@ impl PlaceRole {
             "resident" => Some(Self::Resident),
             "member" => Some(Self::Member),
             _ => None,
+        }
+    }
+
+    /// The stronger of two roles.
+    #[must_use]
+    pub const fn strongest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Owner, _) | (_, Self::Owner) => Self::Owner,
+            (Self::Resident, _) | (_, Self::Resident) => Self::Resident,
+            _ => Self::Member,
         }
     }
 

@@ -10,7 +10,7 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-1.0.5-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
@@ -672,10 +672,10 @@ Glacier can execute eligible pipelines using only the fields required by the cur
 Conceptually:
 
 ```text
-Glacier record
+Glacier column segments
       │
       ▼
-read required fields only
+read required columns only
       │
       ▼
 where / sort / distinct / near
@@ -698,7 +698,7 @@ from memories
 | limit 5
 ```
 
-can read the embedding projection for candidate records and load complete documents only for the final winners.
+can read the embedding column for candidate rows and load complete documents only for the final winners.
 
 Projected access is an optimization.
 
@@ -784,82 +784,33 @@ OGD_STORAGE_PATH=./data/ogd.glacier \
 cargo run --release --bin ogd
 ```
 
-Glacier is an append-only, record-backed storage layout.
-
-Its main file starts with a fixed superblock followed by self-contained segment frames:
+A Glacier store is a directory:
 
 ```text
-+--------------------+--------------------+--------------------+-----+
-| Superblock         | Segment frame      | Segment frame      | ... |
-+--------------------+--------------------+--------------------+-----+
+<store>/
+  MANIFEST              live segments, deleted rows and field facts at one generation
+  <number>.g6           immutable column segments, one collection each (`.seg` in older stores)
+  wal-<number>.log      commits made after the manifest generation
+  LOCK                  held by the one process that has the store open
 ```
 
-Each segment contains:
+- **Segments** hold rows sorted by identifier, in row groups of up to 65 536 rows, one chunk per top-level field.
+  Each column picks its own encoding (constant, frame of reference with bit packing, dictionary, scaled decimal…)
+  and carries per-chunk statistics.
+- **Writes**: small commits are appended to the log and kept in an in-memory delta; large commits go straight to
+  segments. The delta is flushed to segments, and small or mostly deleted segments are compacted, as it grows.
+- **Reads** work on an immutable snapshot. Analytical scans hand whole blocks of columns to the batch engine,
+  and skip row groups that the statistics prove the leading filters drop.
+- **Recovery**: open replays the log after the manifest; a torn last record is cut, corruption is refused.
+  `ogd verify-glacier <store>` checks every segment chunk.
 
-```text
-segment header
-directory
-metadata delta
-records
-```
+The complete format is described in [`src/storage/backend/GLACIER.md`](src/storage/backend/GLACIER.md).
 
-Writes append new segment data rather than mutating existing records in place.
+## Migrating from Glacier 5
 
----
-
-## Physical document layout
-
-Stored documents use a field directory.
-
-Conceptually:
-
-```text
-Physical document
-      │
-      ├── header
-      │
-      ├── field directory
-      │      ├── name
-      │      ├── kind
-      │      ├── capabilities
-      │      ├── offset
-      │      └── length
-      │
-      └── encoded field payloads
-```
-
-A reader can therefore locate and decode selected fields without necessarily decoding the whole document.
-
-This is the basis for projected execution.
-
----
-
-## Glacier sidecars
-
-Glacier uses sidecar files to keep startup and primary lookups efficient.
-
-These include:
-
-```text
-.checkpoint
-.primary.<hash>
-```
-
-The checkpoint stores a snapshot of recoverable state.
-
-The compact primary index stores ordered record pointers used for document lookup.
-
-On startup, Glacier can restore from a checkpoint and replay only subsequent segment frames.
-
----
-
-## mmap-backed reads
-
-On supported 64-bit Unix targets, Glacier can use memory-mapped access for eligible read paths.
-
-Other targets retain a buffered fallback.
-
-The storage implementation also integrates mmap behavior with the process memory governor so mapped file pages and reclaimable application memory can be treated differently.
+ogd 1.0.3 and earlier stored Glacier data in a single `.glacier` file (format 5). That format is no longer read:
+create a backup with the old `ogd` (`.backup.create {"name": "migration"}`), then restore it with the new one on an
+empty store directory (`.backup.restore {"name": "migration"}`). Identifiers and versions are kept.
 
 ---
 
@@ -871,7 +822,7 @@ A transaction accumulates mutations and commits them as one storage generation.
 
 Glacier tracks generation and version information for document visibility.
 
-Its append-only representation allows readers to resolve the visible version of a document without modifying previous committed records.
+Segments are immutable: a reader keeps the snapshot it started with while later commits install new manifests.
 
 ---
 
@@ -890,8 +841,27 @@ For diagnostics or automation they can be called directly through `ogcli`.
 Example:
 
 ```text
-.backup.create {}
+.backup.create {"name": "monday"}
+.backup.create {"name": "tuesday", "parent": "monday"}
+.backup.restore {"name": "tuesday", "replace": true}
 ```
+
+A backup (`OGB2`, `src/backup.rs`) is its own format, read by any storage backend: each collection in blocks of
+65,536 documents laid out by field (identifiers and integers as deltas, strings through a dictionary of the block),
+compressed with zstd; values keep their exact types. On the TAURUS 360 demo (6.2 M documents, a 121 MB glacier
+store) it holds 73.6 MB, written in 14 s and restored in 22 s. `OGB1` files are still read.
+
+With `parent`, `backup.create` writes a diff: the documents changed since the parent backup and the ones removed.
+It needs a store keeping history (`OGD_HISTORY=on`) or a backup journal (`OGD_HISTORY=journal`, glacier: the
+commits since the last full backup, released by the next one). Restoring a diff restores its chain, the full backup
+then each diff, found by id in the backup directory and checked before the store is touched. A restored store gets
+a new lineage: its next backup is a full one.
+
+With `"history": true` (a store with `OGD_HISTORY=on`), the full backup also holds the recorded history: the state
+when history started, every write and delete with its generation and version, and the time and author of each
+commit. `backup.restore` on a running store restores the state; `ogd restore-backup <backup.ogb> <new-store>`
+restores the history into a new store directory, with the original generations, so `as of` and `history` answer as
+before over the whole period (demo with history: 6.45 M events, 150 MB written in 33 s, restored in 36 s).
 
 Use:
 
@@ -1153,6 +1123,57 @@ isolated venv
 
 This keeps Python-specific transformation logic outside the Rust database kernel.
 
+## App table semantics
+
+When an App is saved (and for every built-in App at start), og-core checks the semantic keys of `model.tables.<table>.fields`
+and of the `fields` of each `queryViews` entry: unique names; `role` (`measure`, `axis`, `attribute`); `aggregate` (`sum`,
+`last`, `avg`, `min`, `max`, `count`); `good` (`up`, `down`); a ratio's `num` and `den` name declared fields; `vocabulary`
+maps languages to lists of words; `dimension`, `provides` and `values.source` / `values.code` are identifiers; `measures`
+is `{"from": "<view>"}`. The format itself is described in `og-hub/REPORT_RUNTIME.md` (Table semantics).
+
+## Place schema
+
+`place.schema {"placeId"}` answers the declared schema of a Place, assembled from the App instances the caller sees (same
+access as `app.instance.list`; an Authority operation, like it):
+
+- `instances`: each visible instance (`instanceId`, `appId`, name, version) and `shows`, the fields its blocks show, tile
+  then full view: what the App deems important;
+- `tables`: each table of each instance (its rows are scoped to it) with its collection, `provides`, whether it imports,
+  `analytics` and its fields with their semantics;
+- `views`: the query views of the installed Apps, once per App, without their query: name, description, `fields`,
+  `measures`;
+- `referentials`: the tables that provide a referential of the Place (`provides`);
+- `collections`: each collection with the tables over it, its `owner` (the table that imports into it, else the first) and
+  their fields merged, the owner's first.
+
+The observed layer (the collections that hold rows of the Place) stays `collections.list`, on the node that holds the data.
+
+## Place search
+
+`place.search {"placeId", "text", "scope"?, "limit"?}` (feature `search`, in the default build; `src/search/`) finds what
+a Place holds by its words: the distinct text values of its collections (with their row count), its files and folders
+(with their path), the text of its files in passages of about 1,000 characters, its App instances and tables. Plain text
+formats (txt, md, csv, json, html, xml …) are read with `search`; PDF, spreadsheets (xlsx, xls, ods) and office documents
+(docx, pptx, odt, odp) with `search-documents` (default and `full`; `pdf-extract`, `calamine`, `zip`). A file over 32 MB, or
+one its reader fails on, is found by its name only. A word of the text finds the words equal to it, starting with it, or, when
+no entry holds it as it is, one typo away; accents, case, plurals and acronyms (« T.V.A. » → `tva`) are folded. Each hit
+gives `kind` (`value`, `file`, `folder`, `passage`, `app`, `table`), `text` (for a passage, the words around what was
+found), `count`, `score` and what it refers to (`collection`, `field`, `label`; `fileId`, `path`, `passage`; `instanceId`). `scope` keeps the hits under every key it names: `app:<instanceId>`,
+`collection:<name>`, `field:<collection>.<field>`, `folder:<fileId>` (what the folder holds, at any depth).
+
+The index is read within the caller's access: the hits are those of the App instances it sees, and values are read under
+its row filters (`place.access.set` `filters`). It is made of parts, one per source (each collection, the file list, the
+text of each file, the catalog), kept until the change token of their collection moves (`Engine::change_token`) or, for a
+file's text, its size, etag or time change: a write reads its part again, not the whole Place. A search reads file texts
+for 3 s at most; the others wait for the next search (`pending`). TAURUS 360 demo (180,679 entries): first search 1.4 s,
+then 3 ms in ogd; a write to `creances` reads that part again in 76 ms. 647 files (6.9 MB of Markdown, a PDF, two Excel
+workbooks; 6,132 passages): their texts read in 443 ms, then 1 to 5 ms per search, a new file read in 6 ms. A new kind of content is one more `Source` in `src/search/sources.rs`.
+
+Ask (`agent.app`) searches the request (without its linking, common and catalog words, nor years) when it routes it to
+`absent` or `rechercher`: `search` holds the hits, and `text` lists them (« Le catalogue d'analyse ne couvre pas cette
+demande, mais la Place contient : … »). A `rechercher` that finds nothing asked for an analysis (« les clients aux créances
+échues de plus de 90 jours »): it is built as an App (`searched: true`).
+
 ## Checked imports
 
 `data.import` writes the rows of the file into the App table only once the checks the App declares for that table let it.
@@ -1216,6 +1237,25 @@ the other instances out of `app.instance.list` and refuses their context (`app.i
 operations. The Owner and the App's maintainers always reach it; a public reader without a role does not reach a restricted
 App.
 
+A member's access can also restrict the rows it reads: `place.access.set` takes `filters`, `{"entity": ["BU1", "BU2"]}`
+(`{}` lifts them). `ogd` then keeps, in every source a query of that member reads in the Place (`lookup` and `union`
+included, the `let` queries and the views it reads), only the rows whose field, when present, holds one of the values:
+`entity? == null or entity? in ["BU1", "BU2"]`. On a collection whose table, in an App of the Place, declares the field
+(`model.tables.*.fields`), the filter is strict: `entity? in ["BU1", "BU2"]`, a row without the field is not read there. A
+key `<collection>:<field>` gives a strict filter on that collection only. A materialized view has rows of its own for each
+set of filters, computed under them. A write must stay within the filters: a row inserted, copied (`into`) or changed by
+`set` holding the field takes one of its values, and on a strict collection must hold it (`set` and `delete` only reach
+the rows the member reads). The Owner is never restricted. In Gateway mode, `query.context.resolve` returns the filters
+and the Gateway passes them to the database Core with the role.
+
+Profiles of a Place gather these settings under a name, set by its Owner: `place.update` takes `profiles`, the whole
+list, each `{"profileId", "name", "apps"?, "filters"?}`; `apps` lists the App instances its members see (left out: all of
+them), `filters` is as above. `place.access.set` takes `profileId` (`""` takes it away; left out, the member keeps its
+profile); a member has one profile at most, its filters restricted further by those of its own access. A profile given
+to a member cannot be removed (`place.profile_in_use`). The profiles are returned to the Owner only, in the Place record.
+The Owner previews a profile with `asProfile` in a query context (`query.execute`, `query.context.resolve`): its reads
+and App instances are those of the profile.
+
 For the broader openglacier model and project vision, see:
 
 https://github.com/openglacier/openglacier
@@ -1243,6 +1283,25 @@ OGD_NODE_IDENTITY_PASSWORD
 ```
 
 Enrollment and classic authentication also have dedicated configuration switches.
+
+### Classic authentication
+
+With `OGD_CLASSIC_AUTH_ENABLED`, an Identity signs in with an identifier and a password (`auth.classic.register`, then
+`auth.classic.login`), and a Place is shared with it by that identifier as well as by its Identity ID: `place.access.set`
+resolves an `identityId` that names no Identity through the active classic identifiers (case ignored), and
+`place.access.list` gives each member its `login`.
+
+`OGD_CLASSIC_AUTH_EMAIL` (default `false`) requires the identifier to be a valid email address when it is registered. With
+the `mail` capability on the same node (`mailsend` build, `OGD_MAIL_*`), it also offers a forgotten password reset:
+
+- `auth.classic.reset.request {"identifier", "language"?}` mails a code of 8 characters (`XXXX-XXXX`, about 40 bits) to
+  the address, valid 30 minutes; the answer is the same whether the address is registered or not, the mail leaves on its
+  own thread, and one mail per address goes out a minute at most;
+- `auth.classic.reset.complete {"identifier", "code", "password"}` sets the new password (12 bytes at least); a code
+  allows 5 tries, then the attempts of the address slow down like failed sign-ins.
+
+`core.discover` answers `classicAuthEmail` and `passwordReset` (both on) so the Hub asks for an email and shows the
+forgotten password link.
 
 For local query-engine development, authentication does not need to be enabled.
 
@@ -1317,7 +1376,7 @@ events.subscribe
 data.worker.run
 ```
 
-`core.discover` is the public client hello: it returns the Core options a client needs before choosing its entry flow (`authRequired`, `enrollmentMode`, `classicAuthEnabled`, capabilities). `core.health` stays the liveness probe.
+`core.discover` is the public client hello: it returns the Core options a client needs before choosing its entry flow (`authRequired`, `enrollmentMode`, `classicAuthEnabled`, `classicAuthEmail`, `passwordReset`, `allowPublic`, capabilities). `core.health` stays the liveness probe.
 
 The operation catalogue is itself discoverable.
 
@@ -1395,6 +1454,63 @@ Payloads are JSON:
 
 ---
 
+## Load a CSV or TSV file
+
+```text
+import ventes.csv
+import "exports/clients 2025.tsv" clients
+import codes.csv --sep ; --text
+```
+
+The first line names the fields; the collection defaults to the file name (`ventes`), made an identifier.
+The separator is a tab for `.tsv`, otherwise the most frequent of `, ; tab |` in the header (`--sep` forces it).
+Quoted fields, doubled quotes, line breaks inside quotes, CRLF and a UTF-8 BOM are handled.
+
+Cells are typed: integers (a leading zero such as `07500` stays text, and so does an integer beyond ±2⁵³), floats
+(`12,5` as well with a `;` or tab separator), `true`/`false`, empty = `null`, text otherwise. `--text` keeps every cell as text.
+
+Rows are sent as `load | with merge` requests of about 7 MiB, each committed on its own (a failure keeps the requests
+already committed); the next request is read while ogd writes the current one. Importing a file twice adds its rows twice.
+Measured: 2 M rows (97 MB, 7 columns) in 24.7 s on a local Glacier store, 1.5 s of it in the client.
+
+From the shell: `ogcli import ventes.csv` (progress on stderr, summary on stdout).
+
+---
+
+## Tables
+
+`--table`, or `format table` in the shell (`format pretty|compact|quiet` to go back), draws query results as a table:
+one column per top-level field, numbers right-aligned, null blank, objects and arrays as compact JSON, cells cut at 48
+characters, the first 1 000 rows, then the row count and the time. Operation results that are a list of objects
+(`.collections.list`) are drawn the same way. In the TUI, a table is not wrapped: ←/→ scroll it when the input is empty.
+
+---
+
+## Completion
+
+Tab completes, in the shell and in the TUI: commands and `on`/`from` first, `.operations`, stage names after `|`,
+collections after `on`, `from`, `into`, `lookup`, `join`, `union`, fields of the `on` collection (read from its first
+200 rows) elsewhere, file paths after `import`. Collections and fields are cached for a few seconds.
+
+---
+
+## Edit and rerun in the TUI
+
+`ogcli --tui` runs each line as a job in its own tab or tile. To work on one query without opening new tabs:
+
+| Key | Effect |
+|---|---|
+| Ctrl-O, `:edit` | Puts the focused job's line in the input |
+| Alt-Enter | Runs the input in the focused job, replacing its output (Enter opens a new job) |
+| Ctrl-R, `:rerun` | Runs the focused job's line again, in place |
+| ↑ / ↓ | Earlier and later lines, from an empty input; editing the shown line stops browsing |
+| Shift-↑ / Shift-↓, PgUp / PgDn | Scroll the focused job's output |
+
+A job replaced while it runs takes a new number; the output of its previous run is dropped, and that request continues
+on ogd unless cancelled (Ctrl-X for an LLM run).
+
+---
+
 ## Connect to another daemon
 
 `ogcli` can connect to another `ogd` address using its command-line configuration.
@@ -1461,9 +1577,13 @@ Important variables include:
 | `OGD_BACKUP_PATH` | Backup directory |
 | `OGD_AUTH_REQUIRED` | Enable authorization enforcement |
 | `OGD_CLASSIC_AUTH_ENABLED` | Enable classic authentication |
+| `OGD_CLASSIC_AUTH_EMAIL` | Classic identifiers must be email addresses (default `false`); with the `mail` capability on the node, enables the forgotten password reset by mail |
+| `OGD_ALLOW_PUBLIC` | Let Owners open a Place to the public, read-only or read/write (default `true`); off, `place.create` and `place.public.set` refuse a public access, a public Place can still go back to private, and `core.discover` answers `allowPublic: false` so the Hub hides the option |
 | `OGD_HEARTBEAT_ENABLED` | Enable heartbeat |
 | `OGD_HEARTBEAT_INTERVAL_MS` | Heartbeat interval |
 | `OGD_DEBUG_QUERY` | Query debugging |
+| `OGD_QUERY_TRACE` | File receiving one JSON line per `query.execute` (scope, prepared-text hash, durations, result cache) |
+| `OGD_RESULT_CACHE` | Keep the rows of repeated Place reads (on by default; `off` for A/B) |
 | `OGD_IMPORT_METRICS` | Import worker metrics |
 
 Default values include:

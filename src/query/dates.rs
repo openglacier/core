@@ -328,6 +328,13 @@ pub fn add(millis: i64, amount: i64, unit: DateUnit) -> Result<i64, String> {
     DateTime { year, month, day: date.day.min(days_in_month(year, month)), ..date }.to_millis().ok_or_else(overflow)
 }
 
+/// The last day of the unit holding `millis`, and the unit's number of days.
+pub fn span(millis: i64, unit: DateUnit) -> Result<(i64, i64), String> {
+    let start = trunc(millis, unit)?;
+    let next = add(start, 1, unit)?;
+    Ok((trunc(next - 1, DateUnit::Day)?, (next - start) / MS_PER_DAY))
+}
+
 /// Number of unit boundaries crossed from `start` to `end` (negative when `end` is earlier).
 pub fn diff(start: i64, end: i64, unit: DateUnit) -> Result<i64, String> {
     if let Some(months) = unit.months() {

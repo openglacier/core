@@ -11,7 +11,7 @@ use std::{
 use encoding_rs::UTF_8;
 use llama_cpp_2::{
     list_llama_ggml_backend_devices,
-    context::params::LlamaContextParams,
+    context::params::{LlamaContextParams, LlamaPoolingType},
     context::session::{LlamaStateSeqFlags, SeqState},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
@@ -31,7 +31,7 @@ use crate::{
 };
 
 use super::{
-    config::{LlmConfig, LlmDevice, LlmGpuLayers, LlmThinking},
+    config::{LlmConfig, LlmDevice, LlmGpuLayers, LlmPooling, LlmThinking},
     scheduler::{LlmScheduler, ScheduledRun},
 };
 
@@ -52,6 +52,15 @@ pub struct LlmRuntime {
     thinking: LlmThinking,
     prefix_cache: Mutex<PromptPrefixCache>,
     scheduler: LlmScheduler,
+    pooling: Option<LlmPooling>,
+}
+
+/// Vectors of `llm.embed`, one per input, in the order of the inputs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmEmbeddings {
+    pub vectors: Vec<Vec<f32>>,
+    pub prompt_tokens: usize,
+    pub elapsed_ms: u64,
 }
 
 impl LlmRuntime {
@@ -124,6 +133,7 @@ impl LlmRuntime {
             thinking: config.thinking,
             prefix_cache: Mutex::new(PromptPrefixCache::new(prefix_cache_max_bytes)),
             scheduler: LlmScheduler::new(config.max_parallel, config.queue_size),
+            pooling: config.pooling,
         })
     }
 
@@ -164,6 +174,63 @@ impl LlmRuntime {
         self.scheduler.cancel(run_id, owner)
     }
 
+    /// Context parameters shared by generation and embeddings: the configured context, batch, devices and threads.
+    fn context_params(&self, batch: u32) -> LlamaContextParams {
+        let mut params = LlamaContextParams::default().with_n_ctx(Some(self.context_size)).with_n_batch(batch);
+        if !self.gpu_offload {
+            params = params.with_offload_kqv(false).with_op_offload(false);
+        }
+        if let Some(threads) = self.threads {
+            params = params.with_n_threads(threads).with_n_threads_batch(threads);
+        }
+        params
+    }
+
+    /// One vector per text, each text its own sequence of one batch: the model's pooling, or `OGD_LLM_POOLING`.
+    /// Normalised to unit length when asked (cosine distance then reads as a dot product, `near` compares them).
+    pub fn embed(&self, run: &mut ScheduledRun, texts: &[String], normalize: bool) -> Result<LlmEmbeddings, LlmError> {
+        let started = Instant::now();
+        if !run.wait_until_active()? || run.is_cancelled() {
+            return Err(LlmError::Request("embedding cancelled".to_owned()));
+        }
+        // A model pooled on its last token reads it on the end-of-text marker (Qwen3-Embedding), as llama.cpp's server does.
+        let pooled_last = self.pooling.map_or_else(|| self.model.meta_val_str(&format!("{}.pooling_type", self.model.meta_val_str("general.architecture").unwrap_or_default())).ok().as_deref() == Some("3"), |pooling| pooling == LlmPooling::Last);
+        let eos = self.model.token_eos();
+        let tokens = texts.iter().map(|text| {
+            let mut tokens = self.model.str_to_token(text, self.add_bos).map_err(|error| LlmError::Request(error.to_string()))?;
+            if pooled_last && tokens.last() != Some(&eos) { tokens.push(eos); }
+            Ok(tokens)
+        }).collect::<Result<Vec<_>, LlmError>>()?;
+        let total: usize = tokens.iter().map(Vec::len).sum();
+        if tokens.iter().any(Vec::is_empty) {
+            return Err(LlmError::Request("an input gives no token".to_owned()));
+        }
+        if total > usize::try_from(self.context_size.get()).unwrap_or(usize::MAX) {
+            return Err(LlmError::Request(format!("the inputs hold {total} tokens but the context size is {}", self.context_size.get())));
+        }
+        let (batch_size, sequences) = (u32::try_from(total).unwrap_or(u32::MAX), u32::try_from(texts.len()).unwrap_or(u32::MAX));
+        let mut params = self.context_params(batch_size).with_n_ubatch(batch_size).with_n_seq_max(sequences).with_embeddings(true);
+        if let Some(pooling) = self.pooling {
+            params = params.with_pooling_type(match pooling { LlmPooling::None => LlamaPoolingType::None, LlmPooling::Mean => LlamaPoolingType::Mean, LlmPooling::Cls => LlamaPoolingType::Cls, LlmPooling::Last => LlamaPoolingType::Last });
+        }
+        let mut context = self.model.new_context(&self.backend, params).map_err(|error| LlmError::Runtime(error.to_string()))?;
+        let mut batch = LlamaBatch::new(total, i32::try_from(sequences).unwrap_or(i32::MAX));
+        for (sequence, text) in (0..).zip(&tokens) {
+            batch.add_sequence(text, sequence, true).map_err(|error| LlmError::Runtime(error.to_string()))?;
+        }
+        context.decode(&mut batch).map_err(|error| LlmError::Runtime(error.to_string()))?;
+        let mut vectors = Vec::with_capacity(texts.len());
+        for sequence in (0..).take(texts.len()) {
+            let mut vector = context.embeddings_seq_ith(sequence).map_err(|error| LlmError::Runtime(format!("no pooled embedding ({error}): use an embedding model, or set OGD_LLM_POOLING")))?.to_vec();
+            if normalize {
+                let norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+                if norm > 0.0 { vector.iter_mut().for_each(|value| *value /= norm); }
+            }
+            vectors.push(vector);
+        }
+        Ok(LlmEmbeddings { vectors, prompt_tokens: total, elapsed_ms: elapsed_millis(started) })
+    }
+
     pub fn generate<F>( &self, run: &mut ScheduledRun, request: &LlmGenerateInput, mut emit: F, ) -> Result<LlmGenerationStats, LlmError> where F: FnMut(LlmGenerationEvent) -> bool, {
         let started = Instant::now();
         if !run.wait_until_active()? {
@@ -185,28 +252,11 @@ impl LlmRuntime {
             });
         }
 
-        let use_common_chat = request_uses_tools(request)
-            || !matches!(self.thinking, LlmThinking::Auto);
-        let native_plan = if use_common_chat {
-            Some(self.common_chat_plan(request)?)
-        } else {
-            None
-        };
-        let prompt = if let Some(plan) = native_plan.as_ref() {
-            plan.prompt.clone()
-        } else {
-            let messages = request
-                .messages
-                .iter()
-                .map(|message| {
-                    LlamaChatMessage::new(message.role.clone(), message.content.clone())
-                        .map_err(|error| LlmError::Request(error.to_string()))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.model
-                .apply_chat_template(&self.template, &messages, true)
-                .map_err(|error| LlmError::Template(error.to_string()))?
-        };
+        // A caller's grammar is checked before any decoding: an invalid one is the request's error, not the daemon's.
+        let grammar = request.grammar.as_deref().map(|grammar| LlamaSampler::grammar(&self.model, grammar, "root").map_err(|error| LlmError::Request(format!("invalid grammar: {error}")))).transpose()?;
+        let (native_plan, prompt) = self.render(request)?;
+        // Without tools and without reasoning, the text is the answer itself: it is sent as it comes.
+        let stream = native_plan.is_none() || (!request_uses_tools(request) && request.thinking == Some(false));
 
         let prompt_add_bos = if native_plan.is_some() && matches!(self.add_bos, AddBos::Always) {
             let bos = self.special_token_piece(self.model.token_bos());
@@ -249,9 +299,18 @@ impl LlmRuntime {
         let cache_capture_allowed = request.cache_key.is_some()
             && request.tool_choice != LlmToolChoice::None
             && prompt_tokens.len() >= MIN_PREFIX_CACHE_TOKENS;
+        // A kept cache is captured at the end of the system message, the part of the prompt its next requests share.
+        let stable_tokens = if request.keep_cache && request.messages.len() > 1 && request.messages[0].role.eq_ignore_ascii_case("system") {
+            // The system message and an empty request (templates such as Qwen3.5's refuse a conversation without one): the
+            // prompt they render shares with the real one everything up to the request's text. A template that cannot
+            // render it leaves the cache to find the shared part itself.
+            let empty = LlmMessageInput { role: "user".into(), content: String::new(), tool_calls: Vec::new(), tool_call_id: None };
+            let probe = LlmGenerateInput { messages: vec![request.messages[0].clone(), empty], ..request.clone() };
+            self.render(&probe).ok().and_then(|(_, system)| self.model.str_to_token(&system, prompt_add_bos).ok()).map_or(0, |system| crate::helpers::common_prefix_len(&system, &prompt_tokens))
+        } else { 0 };
         let cache_plan = match request.cache_key.as_deref() {
             Some(cache_key) => match self.prefix_cache.lock() {
-                Ok(mut cache) => cache.plan(cache_key, &prompt_tokens, cache_capture_allowed),
+                Ok(mut cache) => cache.plan(cache_key, &prompt_tokens, cache_capture_allowed, stable_tokens),
                 Err(_) => PrefixCachePlan::Disabled,
             },
             None => PrefixCachePlan::Disabled,
@@ -260,21 +319,8 @@ impl LlmRuntime {
         let prompt_batch_size = u32::try_from(prompt_tokens.len())
             .map_err(|_| LlmError::Request("prompt token count exceeds u32::MAX".to_owned()))?;
         let make_context = || {
-            let mut context_params = LlamaContextParams::default()
-                .with_n_ctx(Some(self.context_size))
-                .with_n_batch(prompt_batch_size.max(1));
-            if !self.gpu_offload {
-                context_params = context_params
-                    .with_offload_kqv(false)
-                    .with_op_offload(false);
-            }
-            if let Some(threads) = self.threads {
-                context_params = context_params
-                    .with_n_threads(threads)
-                    .with_n_threads_batch(threads);
-            }
             self.model
-                .new_context(&self.backend, context_params)
+                .new_context(&self.backend, self.context_params(prompt_batch_size.max(1)))
                 .map_err(|error| LlmError::Runtime(error.to_string()))
         };
         let mut context = make_context()?;
@@ -429,6 +475,7 @@ impl LlmRuntime {
 
         let seed = request.seed.unwrap_or(self.seed);
         let mut sampler_chain = Vec::with_capacity(4);
+        sampler_chain.extend(grammar);
         if let Some(plan) = native_plan.as_ref() {
             if !plan.grammar.is_empty() {
                 // llama.cpp b10200 tool grammars are unsafe in-process for the
@@ -445,6 +492,11 @@ impl LlmRuntime {
                 // exposed tool set for explicit intents. This trades token-level
                 // grammar enforcement for process safety until llama.cpp is
                 // upgraded to a version where these grammars are safe.
+                //
+                // 2026-10-16: the likely cause was ours, the token accepted twice
+                // (once by `llama_sampler_sample`, once more by the loop), fixed
+                // below; a caller's grammar (`grammar`) runs safely since. Tool
+                // grammars stay off until tested again.
                 if debug::enabled(DebugTopic::Llm) {
                     debug::log(
                         DebugTopic::Llm,
@@ -458,11 +510,15 @@ impl LlmRuntime {
                 }
             }
         }
-        sampler_chain.extend([
-            LlamaSampler::temp(0.7),
-            LlamaSampler::top_p(0.9, 1),
-            LlamaSampler::dist(seed),
-        ]);
+        if request.greedy {
+            sampler_chain.push(LlamaSampler::greedy());
+        } else {
+            sampler_chain.extend([
+                LlamaSampler::temp(0.7),
+                LlamaSampler::top_p(0.9, 1),
+                LlamaSampler::dist(seed),
+            ]);
+        }
         let mut sampler = LlamaSampler::chain_simple(sampler_chain);
         let mut decoder = UTF_8.new_decoder();
         let mut completion_tokens = 0_u32;
@@ -475,8 +531,9 @@ impl LlmRuntime {
                 finish_reason = "cancelled";
                 break;
             }
+            // `llama_sampler_sample` accepts the token itself (grammar included): accepting it again advanced a grammar
+            // twice and aborted the daemon on `GGML_ASSERT(!stacks.empty())`.
             let token = sampler.sample(&context, batch.n_tokens() - 1);
-            sampler.accept(token);
             if self.model.is_eog_token(token) {
                 finish_reason = "stop";
                 break;
@@ -487,7 +544,7 @@ impl LlmRuntime {
                 .map_err(|error| LlmError::Runtime(error.to_string()))?;
             completion_tokens = completion_tokens.saturating_add(1);
 
-            if let Some(plan) = native_plan.as_ref() {
+            if let (Some(plan), false) = (native_plan.as_ref(), stream) {
                 generated.push_str(&piece);
                 if let Some(stop_at) = first_stop(&generated, &plan.additional_stops) {
                     generated.truncate(stop_at);
@@ -509,7 +566,7 @@ impl LlmRuntime {
                 .map_err(|error| LlmError::Runtime(error.to_string()))?;
         }
 
-        if let Some(plan) = native_plan.as_ref() {
+        if let (Some(plan), false) = (native_plan.as_ref(), stream) {
             if finish_reason != "cancelled" && finish_reason != "consumer_disconnected" {
                 if debug::enabled(DebugTopic::Llm) {
                     debug::log(
@@ -564,7 +621,7 @@ impl LlmRuntime {
         }
 
         if let Some(cache_key) = request.cache_key.as_deref() {
-            let keep_cache = generated_tool_calls
+            let keep_cache = (generated_tool_calls || request.keep_cache)
                 && finish_reason != "cancelled"
                 && finish_reason != "consumer_disconnected";
             if let Ok(mut cache) = self.prefix_cache.lock() {
@@ -674,7 +731,21 @@ impl LlmRuntime {
         Ok(plan)
     }
 
+    /// The prompt of a request, and the common/chat plan when tools or a reasoning policy need it.
+    fn render(&self, request: &LlmGenerateInput) -> Result<(Option<CommonChatPlan>, String), LlmError> {
+        if request_uses_tools(request) || !matches!(self.thinking, LlmThinking::Auto) || request.thinking.is_some() {
+            let plan = self.common_chat_plan(request)?;
+            let prompt = plan.prompt.clone();
+            return Ok((Some(plan), prompt));
+        }
+        let messages = request.messages.iter().map(|message| LlamaChatMessage::new(message.role.clone(), message.content.clone()).map_err(|error| LlmError::Request(error.to_string()))).collect::<Result<Vec<_>, _>>()?;
+        Ok((None, self.model.apply_chat_template(&self.template, &messages, true).map_err(|error| LlmError::Template(error.to_string()))?))
+    }
+
     fn common_chat_thinking_mode(&self, request: &LlmGenerateInput) -> CommonChatThinkingMode {
+        if let Some(thinking) = request.thinking {
+            return if thinking { CommonChatThinkingMode::On } else { CommonChatThinkingMode::Off };
+        }
         match self.thinking {
             LlmThinking::On => CommonChatThinkingMode::On,
             LlmThinking::Off => CommonChatThinkingMode::Off,
@@ -829,7 +900,8 @@ impl PromptPrefixCache {
         }
     }
 
-    fn plan( &mut self, key: &str, prompt_tokens: &[LlamaToken], allow_capture: bool, ) -> PrefixCachePlan {
+    /// `stable`: where the prompt part its next requests share ends (0 when unknown), captured on a first miss.
+    fn plan( &mut self, key: &str, prompt_tokens: &[LlamaToken], allow_capture: bool, stable: usize, ) -> PrefixCachePlan {
         if self.max_bytes == 0 {
             return PrefixCachePlan::Disabled;
         }
@@ -838,7 +910,7 @@ impl PromptPrefixCache {
 
         let Some(entry) = self.entries.get(key) else {
             return PrefixCachePlan::Miss {
-                capture_tokens: cache_capture_length(prompt_tokens.len(), 0, allow_capture),
+                capture_tokens: cache_capture_length(prompt_tokens.len(), stable, allow_capture),
                 common_prefix_tokens: 0,
             };
         };
