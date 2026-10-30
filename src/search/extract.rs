@@ -99,7 +99,7 @@ mod documents {
 
     pub(super) fn text(kind: &str, bytes: &[u8]) -> Option<String> {
         match kind {
-            "pdf" => pdf_extract::extract_text_from_mem(bytes).ok(),
+            "pdf" => pdf(bytes),
             "xlsx" | "xlsm" | "xls" | "ods" => sheets(bytes),
             "docx" => parts(bytes, |name| name == "word/document.xml" || name.starts_with("word/header") || name.starts_with("word/footer")),
             "pptx" => parts(bytes, |name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml")),
@@ -109,6 +109,11 @@ mod documents {
     }
 
     /// Each sheet: its name, then its rows, cells apart by tabs.
+    fn pdf(bytes: &[u8]) -> Option<String> {
+        let document = lopdf::Document::load_mem(bytes).ok()?;
+        document.extract_text(&document.get_pages().into_keys().collect::<Vec<_>>()).ok()
+    }
+
     fn sheets(bytes: &[u8]) -> Option<String> {
         use calamine::Reader;
         let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(bytes)).ok()?;
@@ -143,6 +148,6 @@ mod tests {
     use super::*;
 
     #[test] fn plain_and_markup_texts_are_read_and_cut_in_passages() { assert_eq!(text("a.CSV", b"\xEF\xBB\xBFcompte;libell\xC3\xA9").as_deref(), Some("compte;libellé")); assert_eq!(text("a.txt", b"caf\xE9").as_deref(), Some("café")); assert_eq!(text("a.html", b"<p>T.V.A.&nbsp;collect&#233;e</p><script>var x = '<b>';</script>&amp; plus").map(|text| text.split_whitespace().collect::<Vec<_>>().join(" ")).as_deref(), Some("T.V.A. collectée & plus")); assert!(text("a.exe", b"x").is_none() && !readable("a.bin") && readable("Notes.MD")); let long = "mot ".repeat(600); let cut = passages(&long); assert_eq!((cut.len(), cut.iter().all(|passage| passage.len() < PASSAGE)), (3, true)); }
-    #[cfg(feature = "search-documents")]
-    #[test] fn office_documents_and_bad_pdfs_are_read_or_give_nothing() { use std::io::Write; let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new())); archive.start_file("word/document.xml", zip::write::SimpleFileOptions::default()).unwrap(); archive.write_all(b"<w:document><w:body><w:p><w:t>D\xC3\xA9claration de TVA</w:t></w:p></w:body></w:document>").unwrap(); let bytes = archive.finish().unwrap().into_inner(); assert_eq!(text("d.docx", &bytes).unwrap().split_whitespace().collect::<Vec<_>>(), ["Déclaration", "de", "TVA"]); assert!(text("broken.pdf", b"%PDF-1.4 not really").is_none()); assert!(text("broken.xlsx", b"nope").is_none()); }
+    #[cfg(feature = "search-documents")] #[test] fn the_text_of_a_pdf_is_read() { use lopdf::{content::{Content, Operation}, dictionary, Document, Object, Stream}; let mut document = Document::with_version("1.5"); let pages = document.new_object_id(); let font = document.add_object(dictionary! {"Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica"}); let resources = document.add_object(dictionary! {"Font" => dictionary! {"F1" => font}}); let content = Content { operations: vec![Operation::new("BT", vec![]), Operation::new("Tf", vec!["F1".into(), 12.into()]), Operation::new("Td", vec![72.into(), 720.into()]), Operation::new("Tj", vec![Object::string_literal("TVA collectee 2022")]), Operation::new("ET", vec![])] }; let stream = document.add_object(Stream::new(dictionary! {}, content.encode().unwrap())); let page = document.add_object(dictionary! {"Type" => "Page", "Parent" => pages, "Contents" => stream}); document.objects.insert(pages, Object::Dictionary(dictionary! {"Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1, "Resources" => resources, "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()]})); let catalog = document.add_object(dictionary! {"Type" => "Catalog", "Pages" => pages}); document.trailer.set("Root", catalog); let mut bytes = Vec::new(); document.save_to(&mut bytes).unwrap(); assert_eq!(text("tva.pdf", &bytes).unwrap().split_whitespace().collect::<Vec<_>>(), ["TVA", "collectee", "2022"]); }
+    #[cfg(feature = "search-documents")] #[test] fn office_documents_and_bad_pdfs_are_read_or_give_nothing() { use std::io::Write; let mut archive = zip::ZipWriter::new(std::io::Cursor::new(Vec::new())); archive.start_file("word/document.xml", zip::write::SimpleFileOptions::default()).unwrap(); archive.write_all(b"<w:document><w:body><w:p><w:t>D\xC3\xA9claration de TVA</w:t></w:p></w:body></w:document>").unwrap(); let bytes = archive.finish().unwrap().into_inner(); assert_eq!(text("d.docx", &bytes).unwrap().split_whitespace().collect::<Vec<_>>(), ["Déclaration", "de", "TVA"]); assert!(text("broken.pdf", b"%PDF-1.4 not really").is_none()); assert!(text("broken.xlsx", b"nope").is_none()); }
 }

@@ -1,6 +1,6 @@
 //! The rows of the reads a Place repeats: the hub asks the same views again
 //! at every App opening, and every open client after an import
-//! (wip/CACHE_RESULTATS.md). A read's rows are kept under a key its caller
+//! (CACHE_RESULTATS in wip/README.md). A read's rows are kept under a key its caller
 //! builds from the prepared text, the scope and the change tokens of the
 //! collections it reads ([`super::changes`]): a write of the Place makes a new
 //! key, so kept rows are never stale, and rows nobody asks again leave after a

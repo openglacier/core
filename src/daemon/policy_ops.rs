@@ -1,4 +1,4 @@
-//! Pools and policies of the commercial mode (`OGD_ENROLLMENT_MODE=policy`, see `wip/POLICIES.md`).
+//! Pools and policies of the commercial mode (`OGD_ENROLLMENT_MODE=policy`, see POLICIES in `wip/README.md`).
 //!
 //! An identity enrolls with a token of a policy and takes that policy; a policy belongs to a pool,
 //! the client company. Every limit is optional: a key left out means no limit, or allowed. This

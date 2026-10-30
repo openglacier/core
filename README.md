@@ -10,7 +10,7 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.0.1-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
@@ -1154,7 +1154,7 @@ The observed layer (the collections that hold rows of the Place) stays `collecti
 a Place holds by its words: the distinct text values of its collections (with their row count), its files and folders
 (with their path), the text of its files in passages of about 1,000 characters, its App instances and tables. Plain text
 formats (txt, md, csv, json, html, xml …) are read with `search`; PDF, spreadsheets (xlsx, xls, ods) and office documents
-(docx, pptx, odt, odp) with `search-documents` (default and `full`; `pdf-extract`, `calamine`, `zip`). A file over 32 MB, or
+(docx, pptx, odt, odp) with `search-documents` (in `full`, not in the default build since 2.0.1; `lopdf`, `calamine`, `zip`). A file over 32 MB, or
 one its reader fails on, is found by its name only. A word of the text finds the words equal to it, starting with it, or, when
 no entry holds it as it is, one typo away; accents, case, plurals and acronyms (« T.V.A. » → `tva`) are folded. Each hit
 gives `kind` (`value`, `file`, `folder`, `passage`, `app`, `table`), `text` (for a passage, the words around what was

@@ -15,6 +15,8 @@ mod scalar;
 mod text;
 
 use crate::helpers::JsonFields;
+use crate::model::{Document, Value};
+use crate::query::{evaluate_document, parse_expression, Expression};
 use convert::{convert, Format};
 use scalar::{column_names, header_row, normalize_text, regex, Cell, HEADER_FOLLOWING, HEADER_SCAN};
 use serde_json::{json, Map, Value as JsonValue};
@@ -135,8 +137,57 @@ fn falsy(value: &JsonValue) -> bool { match value { JsonValue::Null => true, Jso
 
 fn target(field: &JsonValue) -> Option<String> { field.get("target").filter(|target| !falsy(target)).map(py_text) }
 
+/// The name a column takes in a formula expression when its own is not a name of the language: lower case, without
+/// accents, `_` for the rest (`Code article` → `code_article`, `U. Vente` → `u_vente`, `2025` → `_2025`).
+pub(crate) fn formula_name(column: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let mut out = String::new();
+    for c in column.nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c)).flat_map(char::to_lowercase) {
+        if crate::helpers::is_identifier_continue(c) { out.push(c); } else if !out.ends_with('_') { out.push('_'); }
+    }
+    let out = out.trim_matches('_').to_owned();
+    if out.starts_with(|c: char| c.is_ascii_digit()) { format!("_{out}") } else if out.is_empty() { "_".into() } else { out }
+}
+
+/// A cell as a formula expression reads it: a number when it reads as one (« 1 234,56 », « (12) »), but a code written
+/// with its leading zeros (« 01 », « 010178 ») stays text; a date of a workbook as its epoch milliseconds.
+fn formula_value(cell: &Cell) -> Value {
+    let number = |value: f64| if value.fract() == 0.0 && value.abs() < 9_007_199_254_740_992.0 { Value::signed(value as i64) } else { Value::float(value).unwrap_or(Value::Null) };
+    match cell {
+        Cell::Int(value) => Value::signed(*value),
+        Cell::Float(value) => number(*value),
+        Cell::Bool(value) => Value::Bool(*value),
+        Cell::Stamp(stamp) => Value::signed(stamp.days * 86_400_000 + stamp.nanos / 1_000_000),
+        Cell::Missing => Value::Null,
+        Cell::Text(text) => {
+            let text = scalar::py_strip(text);
+            if text.is_empty() { return Value::Null; }
+            let code = text.starts_with('0') && text[1..].starts_with(|c: char| c.is_ascii_digit());
+            match convert::number(text).filter(|_| !code) { Some(value) => number(value), None => Value::string(text) }
+        }
+        other => other.py_str().map_or(Value::Null, |text| Value::string(text.as_str())),
+    }
+}
+
+/// The value of a formula expression converted as a mapped column would be (`transform`): a date as its month (epoch
+/// milliseconds of its first day) or its day, a text read under the field's format.
+fn formula_typed(value: JsonValue, transform: Option<&str>, format: &Format) -> JsonValue {
+    use crate::query::dates::{self, DateUnit};
+    let millis = |value: &JsonValue| value.as_f64().filter(|value| value.is_finite()).map(|value| value as i64);
+    match (transform.unwrap_or(""), &value) {
+        (_, JsonValue::Null) | ("" | "string", _) => value,
+        ("month", JsonValue::Number(_)) => millis(&value).and_then(|value| dates::trunc(value, DateUnit::Month).ok()).map_or(JsonValue::Null, JsonValue::from),
+        ("date", JsonValue::Number(_)) => millis(&value).and_then(|value| dates::format(value, "%F").ok()).map_or(JsonValue::Null, JsonValue::from),
+        ("datetime", JsonValue::Number(_)) => millis(&value).map_or(JsonValue::Null, |value| dates::to_iso(value).into()),
+        ("number" | "decimal", JsonValue::Number(_)) => value,
+        (transform, JsonValue::String(text)) => convert(&Cell::Text(text.clone()), Some(transform), format),
+        (transform, other) => convert(&Cell::Text(py_text(other)), Some(transform), format),
+    }
+}
+
 /// The documents of the mapped table, one at a time to `each`: the fields converted, then the computed ones (constants,
-/// `concat`, formulas summing signed terms); returns their count.
+/// `concat`, formulas: an expression of the language on the columns of the row, or signed terms summed); returns their
+/// count. An expression that does not parse stops the import; one that fails on a row leaves its field null, told.
 fn documents(path: &Path, mapping: &JsonValue, warnings: &mut Warnings, each: &mut dyn FnMut(JsonValue) -> Result<(), String>) -> Result<usize, String> {
     let wanted = mapping.get("source").and_then(|source| source.get("sheet")).and_then(JsonValue::as_str);
     let sources: Vec<&str> = mapping.array_field("fields").into_iter().flatten().filter_map(|field| field.str_field("source")).collect();
@@ -146,15 +197,44 @@ fn documents(path: &Path, mapping: &JsonValue, warnings: &mut Warnings, each: &m
         Some((target(field)?, column(field.get("source")), field.get("source").cloned().unwrap_or(JsonValue::Null), field.str_field("transform").map(str::to_owned), Format::parse(field.get("format"))))
     }).collect();
     let computed: Vec<&JsonValue> = mapping.array_field("computed").into_iter().flatten().collect();
+    // The expressions, read once; the columns under their own names and, when these are not names of the language, as
+    // `formula_name` writes them.
+    let mut expressions: Vec<Option<(Expression, Format)>> = Vec::new();
+    for field in &computed {
+        let expression = match (field.str_field("type"), field.str_field("expression").map(str::trim).filter(|text| !text.is_empty())) {
+            (Some("formula"), Some(text)) => Some((parse_expression(text).map_err(|error| format!("formula of {}: {error}", target(field).unwrap_or_default()))?, Format::parse(field.get("format")))),
+            _ => None,
+        };
+        expressions.push(expression);
+    }
+    let names: Vec<Vec<String>> = table.columns.iter().map(|column| {
+        let own = formula_name(column);
+        let valid = column.starts_with(crate::helpers::is_identifier_start) && column.chars().all(crate::helpers::is_identifier_continue);
+        if valid && own != *column { vec![column.clone(), own] } else if valid { vec![column.clone()] } else { vec![own] }
+    }).collect();
     let mut count = 0;
     for row in &mut rows {
         let row = row?; let line = count + 1; let mut doc = Map::new();
         for (target, index, source, transform, format) in &fields {
             match index { Some(index) => { doc.insert(target.clone(), convert(&row[*index], transform.as_deref(), format)); } None => warnings.push(json!({"row": line, "field": source, "message": "source column missing"})) }
         }
-        for field in &computed {
+        let mut cells: Option<Document> = None;
+        for (field, expression) in computed.iter().zip(&expressions) {
             let Some(target) = target(field) else { continue };
             if let Some(value) = field.get("value") { doc.insert(target, value.clone()); continue; }
+            if let Some((expression, format)) = expression {
+                let cells = cells.get_or_insert_with(|| {
+                    let mut cells = Document::new();
+                    for (cell, names) in row.iter().zip(&names) { for name in names { cells.entry(name.as_str()).or_insert_with(|| formula_value(cell)); } }
+                    cells
+                });
+                let value = match evaluate_document(expression, cells) {
+                    Ok(value) => formula_typed(crate::helpers::value_to_json(&value), field.str_field("transform"), format),
+                    Err(error) => { warnings.push(json!({"row": line, "field": target, "message": format!("formula: {error}")})); JsonValue::Null }
+                };
+                doc.insert(target, value);
+                continue;
+            }
             match field.str_field("type") {
                 Some("concat") => {
                     let separator = field.get("separator").map_or_else(String::new, py_text);

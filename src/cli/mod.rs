@@ -28,6 +28,8 @@ mod complete;
 mod import;
 mod table;
 #[cfg(feature = "cli-tui")]
+mod screen;
+#[cfg(feature = "cli-tui")]
 mod tui;
 
 pub type CliResult<T> = std::result::Result<T, Box<dyn Error>>;

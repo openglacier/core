@@ -1,5 +1,5 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
-//! Search through everything a Place holds (wip/RECHERCHE_PLACE.md): its data, its files and folders, its Apps, and any
+//! Search through everything a Place holds (RECHERCHE_PLACE in wip/README.md): its data, its files and folders, its Apps, and any
 //! content to come. A source turns one kind of content into entries (a text, what it refers to, the scope keys it falls
 //! under); the index finds them by their words, globally or within a scope, whatever their source.
 //!

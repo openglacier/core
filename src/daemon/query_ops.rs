@@ -179,7 +179,7 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
     if explain {
         return Err(explain_request(engine, id, &query).into());
     }
-    // Past a storage limit, a Place takes no new documents (step 3 of wip/POLICIES.md).
+    // Past a storage limit, a Place takes no new documents (step 3 of POLICIES in wip/README.md).
     #[cfg(feature = "auth")]
     if let Some(context) = execution_context.as_ref().filter(|_| grows) {
         super::usage_ops::check_storage(engine, id, &context.place_id, 0)?;

@@ -1,6 +1,6 @@
 [package]
 name = "openglacier-core"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "An event-first, schema-less document database engine and capability runtime"
 repository = "https://github.com/openglacier/core"
@@ -54,8 +54,8 @@ path = "src/lib.rs"
 
 [features]
 # The default build is a local database node with authentication and the admin CLI.
-# Additional service families remain explicit compile-time opt-ins.
-default = ["database", "auth", "cli", "search", "search-documents"]
+# Additional service families remain explicit compile-time opt-ins (the text of documents in the search: full).
+default = ["database", "auth", "cli", "search"]
 
 # Internal implementation features. These are not published OG capabilities.
 db-engine = []
@@ -72,7 +72,7 @@ agent = []
 # Search through all a Place holds (place.search, src/search/).
 search = ["db-engine"]
 # The text of PDF, spreadsheets and office documents in the search (src/search/extract.rs).
-search-documents = ["search", "dep:pdf-extract", "dep:calamine", "dep:zip"]
+search-documents = ["search", "dep:lopdf", "dep:calamine", "dep:zip"]
 # The native data worker (`ogd data-worker`, src/import/): reads CSV, text and Excel files for data.import without
 # Python. When compiled, it is the worker; OG_DATA_WORKER=python asks for the Python one instead.
 native-import = ["dep:calamine", "dep:encoding_rs", "dep:regex", "dep:unicode-normalization", "dep:sha1"]
@@ -86,10 +86,12 @@ cuda-no-vmm = ["cuda", "llama-cpp-2/cuda-no-vmm", "og-llama-common-chat/cuda-no-
 full-cuda = ["full", "cuda"]
 
 # Infrastructure capabilities.
-fabric = ["identity", "dep:tungstenite", "dep:sha2", "dep:rustix"]
+# The node channels to the Gateway: websockets of our own (src/daemon/websocket.rs), TLS by rustls.
+fabric = ["identity", "dep:sha2", "dep:sha1", "dep:rustix", "dep:rustls", "dep:webpki-roots"]
 files-watch = ["files", "dep:notify"]
 cli = ["identity", "dep:rustyline", "dep:rpassword"]
-cli-tui = ["cli", "dep:ratatui", "dep:crossterm"]
+# The terminal workspace, drawn with crossterm alone (src/cli/screen.rs).
+cli-tui = ["cli", "dep:crossterm"]
 
 # Everything a server node can serve, with the native data worker.
 # data-import, llm, agent and mailsend are compiled but remain disabled by default unless
@@ -113,20 +115,18 @@ full = [
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
-zstd = { version = "0.13", default-features = false }
-pdf-extract = { version = "0.12", optional = true }
+zstd = { version = "0.14.3", default-features = false }
+lopdf = { version = "0.46", optional = true, default-features = false }
 calamine = { version = "0.37", optional = true, default-features = false }
 zip = { version = "9.1", optional = true, default-features = false, features = ["deflate"] }
 serde_json = "1"
 rustyline = { version = "15", optional = true }
-ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true, features = ["bracketed-paste"] }
 ed25519-dalek = { version = "2", optional = true }
 argon2 = { version = "0.5", optional = true }
 chacha20poly1305 = { version = "0.10", optional = true }
 rpassword = { version = "7", optional = true }
 notify = { version = "8", optional = true }
-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"], optional = true }
 sha2 = { version = "0.10.9", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
@@ -134,7 +134,7 @@ llama-cpp-2 = { version = "=0.1.156", optional = true }
 encoding_rs = { version = "0.8.35", optional = true }
 regex = { version = "1.13", optional = true }
 unicode-normalization = { version = "0.1.26", optional = true }
-sha1 = { version = "0.10", optional = true }
+sha1 = { version = "0.11", optional = true }
 getrandom = "0.4"
 og-llama-common-chat = {
     package = "openglacier-llama-common-chat",

@@ -23,6 +23,8 @@ mod core_ops;
 mod place_ops;
 mod file_ops;
 mod gateway;
+#[cfg(feature = "fabric")]
+mod websocket;
 #[cfg(feature = "agent")]
 mod agent;
 mod file_sync;
@@ -107,7 +109,7 @@ use sha2::{Digest, Sha256};
 use serde::{ ser::{Error as SerializeError, SerializeMap, SerializeSeq}, Deserialize, Serialize, Serializer, };
 use serde_json::Value as JsonValue;
 #[cfg(feature = "fabric")]
-use tungstenite::{connect as websocket_connect, Message as WebSocketMessage, WebSocket, stream::MaybeTlsStream};
+use websocket::{connect as websocket_connect, Error as WebSocketError, Message as WebSocketMessage, NodeStream, WebSocket};
 #[cfg(feature = "files-watch")]
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 

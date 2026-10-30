@@ -637,13 +637,15 @@ pub(super) fn handle_app_operation(writer: &mut TcpStream, settings: &Connection
             writable_place(engine, id, principal, &place_id, "data analysis requires write access to the Place")?;
             let mut response = data_worker_result(settings, engine, id, worker_result, &place_id, &files_instance_id, &file_id, "analyze", None, "data.analyze requires a data.import worker result on this database node")?;
             let fingerprint = response.str_field("fingerprint").unwrap_or_default();
-            let mappings = if fingerprint.is_empty() { Vec::new() } else { query_documents(engine, id, quoted!("on _data_mappings | where placeId == {} and fingerprint == {} and state == \"active\" | limit 5", &place_id, fingerprint))? };
+            let mappings = if fingerprint.is_empty() { Vec::new() } else { query_documents(engine, id, quoted!("on _data_mappings | where placeId == {} and fingerprint == {} and state == \"active\" | sort createdAt desc | limit 5", &place_id, fingerprint))? };
             if let Some(object) = response.as_object_mut() { object.insert("recognized".into(), JsonValue::Bool(!mappings.is_empty())); object.insert("mappings".into(), JsonValue::Array(mappings)); }
             reply(writer, id, response)?;
         }
         RoutedOperation::DataMappingSave(Routed { id, input: DataMappingSaveInput { place_id, fingerprint, name, target_app_id, target_table, definition } }) => {
             writable_place(engine, id, principal, &place_id, "saving a Mapping requires write access to the Place")?;
             let mapping_id = UuidV7Generator::new().next_id().to_string(); let now = unix_time_millis();
+            // A format mapped again into the same table: the new mapping replaces the one recognized so far.
+            query_documents(engine, id, quoted!("on _data_mappings | where placeId == {} and fingerprint == {} and targetTable == {} and state == \"active\" | set state = \"replaced\", replacedAt = {now}", &place_id, &fingerprint, &target_table))?;
             query_documents(engine, id, insert_query("_data_mappings", serde_json::json!({"mappingId": &mapping_id, "placeId": &place_id, "fingerprint": &fingerprint, "name": &name, "targetAppId": &target_app_id, "targetTable": &target_table, "definition": &definition, "createdBy": &principal_actor(principal), "state": "active", "createdAt": now})))?;
             reply(writer, id, serde_json::json!({"mappingId": mapping_id, "fingerprint": fingerprint, "name": name, "targetAppId": target_app_id, "targetTable": target_table, "definition": definition}))?;
         }
@@ -711,7 +713,7 @@ pub(super) fn data_import(engine: &Engine, principal: &Principal, delegation: Op
     // Past a storage limit, the Place takes no import (its size is known only once the rows are read).
     #[cfg(feature = "auth")]
     if !cancel { super::usage_ops::check_storage(engine, id, &place_id, 0)?; }
-    // An App its Place Owner's policy no longer includes takes no import (step 4 of wip/POLICIES.md).
+    // An App its Place Owner's policy no longer includes takes no import (step 4 of POLICIES in wip/README.md).
     #[cfg(feature = "auth")]
     if !cancel { super::policy_ops::check_instance_write(engine, id, &place_id, &target_instance_id)?; }
     let (collection, mode, declared) = match plan {
@@ -738,7 +740,7 @@ pub(super) fn data_import(engine: &Engine, principal: &Principal, delegation: Op
             (collection, mode, declared)
         }
     };
-    // What the import does to the rows already stored (wip/IMPORT_MODES.md):
+    // What the import does to the rows already stored (IMPORT_MODES in wip/README.md):
     //   append: nothing; update: a row replaces the stored one of the same key; slice: the stored rows of each slice the
     //   file holds (the same values of the slice fields) give way to it; replace_all: the table is emptied first.
     // The table declares its fields (`key`, `slice`, formerly `replace`) and may restrict the modes (`modes`) and name the

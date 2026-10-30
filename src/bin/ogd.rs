@@ -1,4 +1,24 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
+// The name, description and home page of this daemon, in its version and help.
+const NAME: &str = "ogd";
+const DESCRIPTION: &str = "the openglacier Core daemon";
+const HOMEPAGE: &str = "https://github.com/openglacier/core";
+const CODENAME: &str = "antaa palaa";
+
+fn help() -> String {
+    let worker = if cfg!(feature = "native-import") { format!("\n       {NAME} data-worker                     the native data worker, started by the Core for data.import") } else { String::new() };
+    format!(
+        "{NAME} {version} ({CODENAME}): {DESCRIPTION}\n\n\
+         usage: {NAME}                                 start the daemon, configured by its environment (OGD_*)\n       \
+         {NAME} verify-glacier <store-directory>\n       \
+         {NAME} restore-backup <backup.ogb> <new-store-directory>{worker}\n       \
+         {NAME} --version                       print the version\n       \
+         {NAME} --help                          print this help\n\n\
+         Documentation: {HOMEPAGE}",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 extern "C" {
     fn malloc_trim(pad: usize) -> i32;
@@ -25,6 +45,23 @@ fn limit_data_worker() {
 }
 
 fn main() -> std::process::ExitCode {
+    // Options first: a mistyped one must not start a daemon.
+    match std::env::args().nth(1).as_deref() {
+        None | Some("verify-glacier" | "restore-backup") => {}
+        Some("data-worker") if cfg!(feature = "native-import") => {}
+        Some("--version" | "-V" | "-v" | "-version" | "version") => {
+            println!("{NAME} {} ({CODENAME})", env!("CARGO_PKG_VERSION"));
+            return std::process::ExitCode::SUCCESS;
+        }
+        Some("--help" | "-h" | "-help" | "-?" | "help") => {
+            println!("{}", help());
+            return std::process::ExitCode::SUCCESS;
+        }
+        Some(other) => {
+            eprintln!("{NAME}: unknown argument {other:?}; see {NAME} --help");
+            return std::process::ExitCode::from(2);
+        }
+    }
     // The native data worker, started by the Core for data.import (the default when compiled; OG_DATA_WORKER=python for the Python one): a process of its own.
     #[cfg(feature = "native-import")]
     if std::env::args().nth(1).as_deref() == Some("data-worker") {
@@ -53,7 +90,7 @@ fn main() -> std::process::ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
     if args.get(1).map(String::as_str) == Some("verify-glacier") {
         let Some(path) = args.get(2) else {
-            eprintln!("usage: ogd verify-glacier <store-directory>");
+            eprintln!("usage: {NAME} verify-glacier <store-directory>");
             return std::process::ExitCode::FAILURE;
         };
         // Opening checks the manifest and the log; verify, every segment chunk.
@@ -82,7 +119,7 @@ fn main() -> std::process::ExitCode {
     }
     if args.get(1).map(String::as_str) == Some("restore-backup") {
         let (Some(backup), Some(store)) = (args.get(2), args.get(3)) else {
-            eprintln!("usage: ogd restore-backup <backup.ogb> <new-store-directory>");
+            eprintln!("usage: {NAME} restore-backup <backup.ogb> <new-store-directory>");
             return std::process::ExitCode::FAILURE;
         };
         // A backup with history restores its commits with their generations, times and authors; another, its state.

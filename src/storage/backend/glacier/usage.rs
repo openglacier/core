@@ -1,4 +1,4 @@
-//! Stored bytes per value of a field (method B of `wip/POLICIES.md`): each row group's bytes
+//! Stored bytes per value of a field (method B of POLICIES in `wip/README.md`): each row group's bytes
 //! (identifiers, versions and chunks) are shared by its rows, and the live rows are summed per
 //! value of the key field, read through its dictionary codes. A segment never changes, so its
 //! result is kept until its deleted rows change; delta rows are sized as JSON.

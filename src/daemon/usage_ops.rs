@@ -1,4 +1,4 @@
-//! Stored bytes per Place, Owner, policy and pool (step 2 of `wip/POLICIES.md`), shown and never
+//! Stored bytes per Place, Owner, policy and pool (step 2 of POLICIES in `wip/README.md`), shown and never
 //! enforced. A worker computes them every `OGD_USAGE_INTERVAL` seconds (300 by default, 0 turns
 //! it off): database bytes from the storage (`StorageEngine::usage_by("_place")`, method B on
 //! Glacier), file bytes from the sizes in `_files` and `_file_versions`. `usage.get` answers the

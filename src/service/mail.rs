@@ -4,7 +4,7 @@
 //! node from the Place providers, else from the Fabric (system) default.
 //! `OGD_MAIL_URL` is `smtps://host[:465]` (implicit TLS), `smtp://host[:587]` (STARTTLS required)
 //! or `smtp+plain://host[:25]` (no TLS, local relays only); `OGD_MAIL_FROM` is the sender mailbox,
-//! `OGD_MAIL_USER`/`OGD_MAIL_PASSWORD` enable AUTH PLAIN and `OGD_MAIL_TIMEOUT_SECS` bounds each step.
+//! `OGD_MAIL_USER`/`OGD_MAIL_PASSWORD` enable AUTH (PLAIN, else LOGIN, as the server offers) and `OGD_MAIL_TIMEOUT_SECS` bounds each step.
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
 use std::fmt;
@@ -101,17 +101,28 @@ impl MailService {
         let mut session = Session::new(self.connect()?);
         if self.security == Security::Implicit { session = session.secure(self)?; }
         session.reply(b'2', "mail.connection")?;
-        let capabilities = session.command(&format!("EHLO {domain}"), b'2', "mail.connection")?;
+        let mut capabilities = session.command(&format!("EHLO {domain}"), b'2', "mail.connection")?;
         if self.security == Security::StartTls {
             if !capabilities.lines().any(|line| line.get(4..).is_some_and(|extension| extension.trim().eq_ignore_ascii_case("STARTTLS"))) {
                 return Err(fail("mail.tls", format!("{} does not offer STARTTLS", self.host)));
             }
             session.command("STARTTLS", b'2', "mail.tls")?;
             session = session.secure(self)?;
-            session.command(&format!("EHLO {domain}"), b'2', "mail.connection")?;
+            capabilities = session.command(&format!("EHLO {domain}"), b'2', "mail.connection")?;
         }
         if let Some((user, password)) = &self.credentials {
-            session.command(&format!("AUTH PLAIN {}", encode_base64(format!("\0{user}\0{password}").as_bytes())), b'2', "mail.auth")?;
+            let mechanisms = auth_mechanisms(&capabilities);
+            if mechanisms.iter().any(|mechanism| mechanism == "PLAIN") {
+                session.command(&format!("AUTH PLAIN {}", encode_base64(format!("\0{user}\0{password}").as_bytes())), b'2', "mail.auth")?;
+            } else if mechanisms.iter().any(|mechanism| mechanism == "LOGIN") {
+                session.command("AUTH LOGIN", b'3', "mail.auth")?;
+                session.command(&encode_base64(user.as_bytes()), b'3', "mail.auth")?;
+                session.command(&encode_base64(password.as_bytes()), b'2', "mail.auth")?;
+            } else if mechanisms.is_empty() {
+                return Err(fail("mail.auth", format!("{} offers no authentication", self.host)));
+            } else {
+                return Err(fail("mail.auth", format!("{} offers AUTH {} only; PLAIN and LOGIN are supported", self.host, mechanisms.join(" "))));
+            }
         }
         session.command(&format!("MAIL FROM:<{}>", mailbox_address(&self.from).unwrap_or_default()), b'2', "mail.rejected")?;
         for mailbox in input.to.iter().chain(&input.cc).chain(&input.bcc) {
@@ -205,6 +216,17 @@ impl Write for Stream {
     }
 }
 
+/// The mechanisms of the `AUTH` extension in an EHLO reply (`250-AUTH LOGIN XOAUTH2`, or the
+/// older `250-AUTH=LOGIN`), upper-cased.
+fn auth_mechanisms(capabilities: &str) -> Vec<String> {
+    capabilities.lines()
+        .filter_map(|line| line.get(4..))
+        .filter_map(|extension| extension.get(..5).filter(|keyword| keyword.eq_ignore_ascii_case("AUTH ") || keyword.eq_ignore_ascii_case("AUTH=")).map(|_| &extension[5..]))
+        .flat_map(str::split_whitespace)
+        .map(str::to_ascii_uppercase)
+        .collect()
+}
+
 struct Session { stream: BufReader<Stream> }
 
 impl Session {
@@ -275,6 +297,12 @@ mod tests {
 
     #[test] fn sends_one_message_through_a_plain_relay() { let (port, server) = fake_server(&["250-fake\r\n250 8BITMIME\r\n", "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n", "221 bye\r\n"]); let service = MailService::new(&format!("smtp+plain://127.0.0.1:{port}"), None, "OG <noreply@og.test>".into(), Duration::from_secs(5)).unwrap(); let id = service.send(&input(None)).unwrap(); let lines = server.join().unwrap(); assert!(id.ends_with("@og.test>")); assert_eq!(&lines[..5], ["EHLO og.test", "MAIL FROM:<noreply@og.test>", "RCPT TO:<zoe@example.test>", "RCPT TO:<audit@example.test>", "DATA"]); assert_eq!(lines.last().unwrap(), "QUIT"); assert!(lines.contains(&"data:Subject: =?UTF-8?B?UmVsZXbDqSDDqXTDqQ==?=".to_owned())); assert!(lines.contains(&format!("data:{}", encode_base64("Bonjour".as_bytes())))); assert!(!lines.iter().any(|line| line.starts_with("data:") && line.contains("audit@"))); }
     #[test] fn server_rejections_keep_their_code() { let (port, server) = fake_server(&["250 fake\r\n", "550 sender refused\r\n", "221 bye\r\n"]); let service = MailService::new(&format!("smtp+plain://127.0.0.1:{port}"), None, "noreply@og.test".into(), Duration::from_secs(5)).unwrap(); let error = service.send(&input(None)).unwrap_err(); assert_eq!(error.code(), "mail.rejected"); assert!(error.to_string().contains("550 sender refused")); drop(server); }
+    /// A relay with credentials: only possible in tests, the configuration refuses them in clear.
+    fn authenticated(port: u16) -> MailService { let mut service = MailService::new(&format!("smtp+plain://127.0.0.1:{port}"), None, "noreply@og.test".into(), Duration::from_secs(5)).unwrap(); service.credentials = Some(("u".into(), "p".into())); service }
+    #[test] fn auth_plain_when_offered() { let (port, server) = fake_server(&["250-fake\r\n250 AUTH LOGIN PLAIN\r\n", "235 ok\r\n", "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n", "221 bye\r\n"]); authenticated(port).send(&input(None)).unwrap(); let lines = server.join().unwrap(); assert_eq!(lines[1], format!("AUTH PLAIN {}", encode_base64(b"\0u\0p"))); assert_eq!(lines[2], "MAIL FROM:<noreply@og.test>"); }
+    #[test] fn auth_login_when_plain_is_not_offered() { let (port, server) = fake_server(&["250-fake\r\n250-AUTH LOGIN XOAUTH2\r\n250 8BITMIME\r\n", "334 VXNlcm5hbWU6\r\n", "334 UGFzc3dvcmQ6\r\n", "235 ok\r\n", "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n", "221 bye\r\n"]); authenticated(port).send(&input(None)).unwrap(); let lines = server.join().unwrap(); assert_eq!(&lines[1..5], ["AUTH LOGIN".to_owned(), encode_base64(b"u"), encode_base64(b"p"), "MAIL FROM:<noreply@og.test>".to_owned()]); }
+    #[test] fn auth_fails_clearly_without_a_known_mechanism() { for (replies, message) in [(&["250-fake\r\n250 AUTH XOAUTH2\r\n", "221 bye\r\n"], "offers AUTH XOAUTH2 only"), (&["250 fake\r\n", "221 bye\r\n"], "offers no authentication")] { let (port, server) = fake_server(replies); let error = authenticated(port).send(&input(None)).unwrap_err(); assert_eq!(error.code(), "mail.auth"); assert!(error.to_string().contains(message), "{error}"); drop(server); } }
+    #[test] fn auth_mechanisms_read_both_forms() { assert_eq!(auth_mechanisms("250-host\r\n250-AUTH=LOGIN\r\n250-auth login plain\r\n250 SIZE 1\r\n"), ["LOGIN", "LOGIN", "PLAIN"]); assert!(auth_mechanisms("250-host\r\n250-AUTHX\r\n250 8BITMIME\r\n").is_empty()); }
     #[test] fn starttls_is_required_on_submission() { let (port, server) = fake_server(&["250 fake\r\n", "221 bye\r\n"]); let service = MailService::new(&format!("smtp://127.0.0.1:{port}"), None, "noreply@og.test".into(), Duration::from_secs(5)).unwrap(); assert_eq!(service.send(&input(None)).unwrap_err().code(), "mail.tls"); drop(server); }
     #[test] fn configuration_refuses_clear_credentials_and_bad_urls() { let credentials = Some(("u".to_owned(), "p".to_owned())); assert!(MailService::new("smtp+plain://relay", credentials.clone(), "a@b.c".into(), Duration::from_secs(1)).is_err()); assert!(MailService::new("http://relay", None, "a@b.c".into(), Duration::from_secs(1)).is_err()); assert!(MailService::new("smtps://relay", None, "not-a-mailbox".into(), Duration::from_secs(1)).is_err()); let service = MailService::new("smtps://mail.example.test", credentials, "a@b.c".into(), Duration::from_secs(1)).unwrap(); assert_eq!((service.port, service.security), (465, Security::Implicit)); }
     #[test] fn html_messages_are_multipart_alternative() { let service = MailService::new("smtps://mail.example.test", None, "a@b.c".into(), Duration::from_secs(1)).unwrap(); let message = service.message(&input(Some("<p>Bonjour</p>")), "<id@b.c>", "42", UNIX_EPOCH); assert!(message.starts_with("Date: Thu, 1 Jan 1970 00:00:00 +0000\r\n")); assert!(message.contains("To: =?UTF-8?B?Wm/DqQ==?= <zoe@example.test>\r\n")); assert!(!message.contains("audit@")); assert!(message.contains("multipart/alternative; boundary=\"og-42\"")); assert_eq!(message.matches("--og-42").count(), 3); assert!(!message.lines().any(|line| line.starts_with('.'))); }

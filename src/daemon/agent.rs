@@ -5,7 +5,7 @@ use super::*;
 
 #[cfg(all(feature = "agent", feature = "fabric"))]
 pub(super) fn connect_delegated_gateway_client( endpoint: &str, token: &str, read_timeout: Duration, write_timeout: Duration, ) -> Result<NodeWebSocket, AgentError> {
-    let (mut websocket, _) = websocket_connect(endpoint)
+    let mut websocket = websocket_connect(endpoint)
         .map_err(|error| AgentError::capability("gateway.delegation.open", error.to_string()))?;
     configure_websocket_timeouts(&mut websocket, read_timeout, write_timeout)
         .map_err(|error| AgentError::capability("gateway.delegation.open", error.to_string()))?;

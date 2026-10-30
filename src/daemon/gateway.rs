@@ -49,7 +49,7 @@ pub(super) fn gateway_endpoint(bind: &str) -> Option<String> {
 
 
 #[cfg(feature = "fabric")]
-pub(super) type NodeWebSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+pub(super) type NodeWebSocket = WebSocket<NodeStream>;
 
 #[cfg(not(feature = "fabric"))]
 #[derive(Debug)]
@@ -57,7 +57,7 @@ pub(super) struct NodeWebSocket;
 
 #[cfg(feature = "fabric")]
 pub(super) fn close_node_websocket(websocket: &mut NodeWebSocket) {
-    let _ = websocket.close(None);
+    let _ = websocket.close();
 }
 
 #[cfg(not(feature = "fabric"))]
@@ -101,7 +101,7 @@ pub(super) fn poll_node_message(websocket: &mut NodeWebSocket) -> Result<NodeMes
             Ok(WebSocketMessage::Pong(_)) => {}
             Ok(WebSocketMessage::Text(_)) => return Err("node control channel requires binary MessagePack frames".to_owned()),
             Ok(_) => {}
-            Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => { return Ok(NodeMessagePoll::Idle); }
+            Err(WebSocketError::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => { return Ok(NodeMessagePoll::Idle); }
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -145,7 +145,7 @@ pub(super) fn gateway_response_for_request(websocket: &mut NodeWebSocket, reques
 
 #[cfg(feature = "fabric")]
 pub(super) fn connect_authenticated_gateway_client( endpoint: &str, credential: &IdentityCredential, read_timeout: Duration, write_timeout: Duration, ) -> Result<NodeWebSocket, String> {
-    let (mut websocket, _) = websocket_connect(endpoint).map_err(|error| error.to_string())?;
+    let mut websocket = websocket_connect(endpoint).map_err(|error| error.to_string())?;
     configure_websocket_timeouts(&mut websocket, read_timeout, write_timeout)
         .map_err(|error| format!("cannot configure Gateway client timeouts: {error}"))?;
 
@@ -282,28 +282,14 @@ pub(super) fn forward_authority_operation( writer: &mut TcpStream, settings: &Co
 
 #[cfg(feature = "fabric")]
 pub(super) fn configure_websocket_timeouts( websocket: &mut NodeWebSocket, read_timeout: Duration, write_timeout: Duration, ) -> io::Result<()> {
-    match websocket.get_mut() {
-        MaybeTlsStream::Plain(stream) => {
-            stream.set_read_timeout(Some(read_timeout))?;
-            stream.set_write_timeout(Some(write_timeout))
-        }
-        MaybeTlsStream::Rustls(stream) => {
-            let stream = stream.get_mut();
-            stream.set_read_timeout(Some(read_timeout))?;
-            stream.set_write_timeout(Some(write_timeout))
-        }
-        _ => Ok(()),
-    }
+    let stream = websocket.get_mut().tcp();
+    stream.set_read_timeout(Some(read_timeout))?;
+    stream.set_write_timeout(Some(write_timeout))
 }
 
 #[cfg(feature = "fabric")]
 pub(super) fn configure_websocket_polling(websocket: &mut NodeWebSocket) -> io::Result<()> {
-    let timeout = Some(Duration::from_millis(25));
-    match websocket.get_mut() {
-        MaybeTlsStream::Plain(stream) => stream.set_read_timeout(timeout),
-        MaybeTlsStream::Rustls(stream) => stream.get_mut().set_read_timeout(timeout),
-        _ => Ok(()),
-    }
+    websocket.get_mut().tcp().set_read_timeout(Some(Duration::from_millis(25)))
 }
 
 #[cfg(feature = "fabric")]
@@ -327,7 +313,7 @@ pub(super) fn tcp_pair() -> io::Result<(TcpStream, TcpStream)> {
 pub(super) fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: TcpStream) -> Result<(), String> {
     use rustix::event::{poll, PollFd, PollFlags, Timespec};
     let failed = |error: io::Error| error.to_string();
-    let would_block = |error: &tungstenite::Error| matches!(error, tungstenite::Error::Io(error) if error.kind() == io::ErrorKind::WouldBlock);
+    let would_block = WebSocketError::would_block;
     local.set_nonblocking(true).map_err(failed)?;
     websocket_stream(&mut websocket)?.set_nonblocking(true).map_err(failed)?;
     let mut buffer = vec![0u8; 64 * 1024];
@@ -345,9 +331,9 @@ pub(super) fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: 
                     if taken == to_core.len() { to_core.clear(); taken = 0; }
                     to_core.extend_from_slice(&payload);
                 }
-                Ok(WebSocketMessage::Close(_)) | Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => return Ok(()),
+                Ok(WebSocketMessage::Close(_)) | Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => return Ok(()),
                 Ok(WebSocketMessage::Text(_)) => return Err("node data channel requires binary frames".to_owned()),
-                // tungstenite answers a ping itself, on the next flush.
+                // A ping is answered on the next read, write or flush.
                 Ok(_) => {}
                 Err(error) if would_block(&error) => break,
                 Err(error) => return Err(error.to_string()),
@@ -431,11 +417,7 @@ const BRIDGE_TO_GATEWAY_TURN: usize = 1024 * 1024;
 /// The TCP stream under a node websocket, plain or TLS.
 #[cfg(all(feature = "fabric", unix))]
 fn websocket_stream(websocket: &mut NodeWebSocket) -> Result<&mut TcpStream, String> {
-    match websocket.get_mut() {
-        MaybeTlsStream::Plain(stream) => Ok(stream),
-        MaybeTlsStream::Rustls(stream) => Ok(stream.get_mut()),
-        _ => Err("unsupported node channel stream".to_owned()),
-    }
+    Ok(websocket.get_mut().tcp())
 }
 
 /// Sends what the websocket still holds, then its close frame, waiting for the socket (30 s at most).
@@ -483,7 +465,7 @@ pub(super) fn bridge_websocket_channel(mut websocket: NodeWebSocket, mut local: 
                 Ok(WebSocketMessage::Pong(_)) => {}
                 Ok(WebSocketMessage::Text(_)) => return Err("node data channel requires binary frames".to_owned()),
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+                Err(WebSocketError::Io(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
                 Err(error) => return Err(error.to_string()),
             }
         }
@@ -582,6 +564,42 @@ pub(super) fn ensure_gateway_device_registration(engine: &Engine, identity_id: &
     Ok(())
 }
 
+/// Checks that an enrolled Gateway holds the key of its Device.
+#[cfg(feature = "fabric")]
+fn authenticate_enrolled_gateway( control: &mut NodeWebSocket, identity_id: &str, device_id: &str, public_key: &str, engine: Option<&Engine>, ) -> Result<(), String> {
+    // The Core that enrolled the Gateway knows it. Another Core, joining with an
+    // identity issued by the Authority, keeps the Gateway it first meets once it
+    // proves its key (below), and refuses another key or a revoked Device after;
+    // a Core without a store keeps nothing and checks the key at each connection.
+    let known = engine.is_some_and(|engine| {
+        registered_identity_matches(engine, identity_id, public_key)
+            && registered_device_matches(engine, identity_id, device_id, public_key)
+    });
+    let challenge = gateway_random_challenge()?;
+    write_node_message(control, &serde_json::json!({
+        "kind": "gateway.challenge", "version": 1,
+        "identityId": identity_id, "deviceId": device_id, "challenge": challenge,
+    }))?;
+    let proof = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.proof".to_owned())?;
+    if proof.str_field("kind") != Some("gateway.proof")
+        || proof.u64_field("version") != Some(1)
+    {
+        return Err("Gateway did not answer the Device challenge".to_owned());
+    }
+    let signature = proof.str_field("signature").unwrap_or_default();
+    let payload = gateway_identity_proof(&challenge, identity_id, device_id);
+    verify_ed25519(public_key, signature, payload.as_bytes())
+        .map_err(|error| format!("Gateway Device signature rejected: {error}"))?;
+    if let Some(engine) = engine.filter(|_| !known) {
+        ensure_gateway_device_registration(engine, identity_id, device_id, public_key)?;
+    }
+    write_node_message(control, &serde_json::json!({
+        "kind": "gateway.accepted", "version": 1,
+        "identityId": identity_id, "deviceId": device_id,
+    }))?;
+    Ok(())
+}
+
 #[cfg(feature = "fabric")]
 pub(super) fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configuration: &Configuration, engine: Option<&Engine>, ) -> Result<(), String> {
     write_node_message(control, &serde_json::json!({"kind": "gateway.probe", "version": 1}))?;
@@ -599,32 +617,7 @@ pub(super) fn authenticate_gateway_fabric( control: &mut NodeWebSocket, configur
     if state == "enrolled" {
         let identity_id = hello.str_field("identityId").unwrap_or_default();
         let device_id = hello.str_field("deviceId").unwrap_or_default();
-        let engine = engine.ok_or_else(|| "Gateway Device verification requires a local Core trust store in Step 2".to_owned())?;
-        if !registered_identity_matches(engine, identity_id, public_key)
-            || !registered_device_matches(engine, identity_id, device_id, public_key)
-        {
-            return Err(format!("Gateway Device {device_id} is unknown, revoked, or has a different key"));
-        }
-        let challenge = gateway_random_challenge()?;
-        write_node_message(control, &serde_json::json!({
-            "kind": "gateway.challenge", "version": 1,
-            "identityId": identity_id, "deviceId": device_id, "challenge": challenge,
-        }))?;
-        let proof = read_node_message(control)?.ok_or_else(|| "Gateway closed before gateway.proof".to_owned())?;
-        if proof.str_field("kind") != Some("gateway.proof")
-            || proof.u64_field("version") != Some(1)
-        {
-            return Err("Gateway did not answer the Device challenge".to_owned());
-        }
-        let signature = proof.str_field("signature").unwrap_or_default();
-        let payload = gateway_identity_proof(&challenge, identity_id, device_id);
-        verify_ed25519(public_key, signature, payload.as_bytes())
-            .map_err(|error| format!("Gateway Device signature rejected: {error}"))?;
-        write_node_message(control, &serde_json::json!({
-            "kind": "gateway.accepted", "version": 1,
-            "identityId": identity_id, "deviceId": device_id,
-        }))?;
-        return Ok(());
+        return authenticate_enrolled_gateway(control, identity_id, device_id, public_key, engine);
     }
 
     if state != "unenrolled" && state != "enrolling" {
@@ -829,7 +822,7 @@ pub(super) fn run_gateway_node( endpoint: String, configuration: &Configuration,
     loop {
         set_gateway_runtime_state(&settings, &endpoint, false, "connecting");
         debug::log(DebugTopic::Gateway, None, format!("connecting node fabric endpoint={endpoint}"));
-        let (mut control, _) = match websocket_connect(endpoint.as_str()) {
+        let mut control = match websocket_connect(endpoint.as_str()) {
             Ok(connection) => connection,
             Err(error) => {
                 set_gateway_runtime_state(&settings, &endpoint, false, "retrying");
@@ -1010,7 +1003,7 @@ pub(super) fn run_gateway_node( endpoint: String, configuration: &Configuration,
                     let pending_channel_id = channel_id.clone();
                     let open = Box::new(move |permit: ConnectionPermit| {
                         let _permit = permit;
-                        let (mut websocket, _) = match websocket_connect(endpoint.as_str()) {
+                        let mut websocket = match websocket_connect(endpoint.as_str()) {
                             Ok(connection) => connection,
                             Err(error) => { eprintln!("ogd gateway channel connect {endpoint}: {error}"); return; }
                         };
@@ -1144,7 +1137,7 @@ pub(super) fn run_gateway_node( _endpoint: String, _configuration: &Configuratio
 
 /// A frame read for one request by [`next_frame`].
 #[cfg(feature = "fabric")]
-enum Frame { Response(JsonValue), Binary(tungstenite::Bytes), Closed }
+enum Frame { Response(JsonValue), Binary(Vec<u8>), Closed }
 
 /// Sends `request` and returns its id as its responses carry it.
 #[cfg(feature = "fabric")]
@@ -1397,23 +1390,47 @@ pub(super) fn run_upstream_event_relay_session( settings: &ConnectionSettings, e
 mod bridge_tests {
     use super::*;
     use std::io::{Read, Write};
-    use tungstenite::Error as WsError;
+    use crate::daemon::websocket::{accept, test_tls, Error as WsError, Role};
 
     /// A Gateway end (a websocket server) and a Core end (the local stream) joined by a bridge.
     fn bridged() -> (WebSocket<TcpStream>, TcpStream, thread::JoinHandle<Result<(), String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let (core, bridge_end) = tcp_pair().unwrap();
-        let bridge = thread::spawn(move || { let (websocket, _) = websocket_connect(url.as_str()).map_err(|error| error.to_string())?; bridge_websocket_channel(websocket, bridge_end) });
+        let bridge = thread::spawn(move || { let websocket = websocket_connect(url.as_str()).map_err(|error| error.to_string())?; bridge_websocket_channel(websocket, bridge_end) });
         let (stream, _) = listener.accept().unwrap();
-        (tungstenite::accept(stream).unwrap(), core, bridge)
+        (accept(stream).unwrap(), core, bridge)
     }
+
+    /// A Gateway signing the challenge with `key` for the Device of `gateway`, and
+    /// a Core with `engine` checking it: what the Core answers.
+    fn meet(gateway: &IdentityCredential, key: &IdentityCredential, engine: Option<&Engine>) -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (identity_id, device_id, key) = (gateway.identity_id.clone(), gateway.device_id.clone(), key.clone());
+        let server = thread::spawn(move || {
+            let mut websocket = accept(listener.accept().unwrap().0).unwrap();
+            let Ok(WebSocketMessage::Binary(payload)) = websocket.read() else { return };
+            let challenge: JsonValue = rmp_serde::from_slice(&payload).unwrap();
+            let signature = key.sign_base64(gateway_identity_proof(challenge["challenge"].as_str().unwrap(), &identity_id, &device_id).as_bytes());
+            let proof = rmp_serde::to_vec_named(&serde_json::json!({"kind": "gateway.proof", "version": 1, "signature": signature})).unwrap();
+            let _ = websocket.send(WebSocketMessage::Binary(proof.into()));
+            let _ = websocket.read();
+        });
+        let mut control = websocket_connect(url.as_str()).unwrap();
+        let answer = authenticate_enrolled_gateway(&mut control, &gateway.identity_id, &gateway.device_id, &gateway.public_key, engine);
+        drop(control);
+        server.join().unwrap();
+        answer
+    }
+
+    #[test] fn a_core_keeps_the_enrolled_gateway_it_first_meets_and_refuses_another_key_after() { let engine = Engine::new(Arc::new(crate::storage::MemoryStorage::new())); let gateway = IdentityCredential::generate().unwrap(); let other = IdentityCredential::renew(gateway.identity_id.clone()).unwrap(); assert!(meet(&gateway, &other, Some(&engine)).unwrap_err().contains("signature rejected")); assert!(!registered_device_matches(&engine, &gateway.identity_id, &gateway.device_id, &gateway.public_key), "a failed proof keeps nothing"); meet(&gateway, &gateway, Some(&engine)).unwrap(); assert!(registered_identity_matches(&engine, &gateway.identity_id, &gateway.public_key) && registered_device_matches(&engine, &gateway.identity_id, &gateway.device_id, &gateway.public_key)); meet(&gateway, &gateway, Some(&engine)).unwrap(); assert!(meet(&other, &other, Some(&engine)).unwrap_err().contains("conflicts"), "another key for the same Gateway identity"); meet(&other, &other, None).unwrap(); }
 
     fn echo(mut core: TcpStream) -> thread::JoinHandle<()> {
         thread::spawn(move || { let mut buffer = vec![0u8; 16 * 1024]; loop { match core.read(&mut buffer) { Ok(0) | Err(_) => return, Ok(bytes) => if core.write_all(&buffer[..bytes]).is_err() { return } } } })
     }
 
-    fn read_bytes(gateway: &mut WebSocket<TcpStream>, count: usize) -> Vec<u8> {
+    fn read_bytes<S: Read + Write>(gateway: &mut WebSocket<S>, count: usize) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(count);
         while bytes.len() < count { if let WebSocketMessage::Binary(payload) = gateway.read().unwrap() { bytes.extend_from_slice(&payload); } }
         bytes
@@ -1421,9 +1438,10 @@ mod bridge_tests {
 
     #[test] fn an_exchange_crosses_the_bridge_without_waiting() { let (mut gateway, core, _bridge) = bridged(); let _echo = echo(core); let mut samples = (0..30).map(|_| { let started = Instant::now(); gateway.send(WebSocketMessage::Binary(vec![1u8; 32].into())).unwrap(); read_bytes(&mut gateway, 32); started.elapsed() }).collect::<Vec<_>>(); samples.sort(); assert!(samples[15] < Duration::from_millis(5), "median round trip {:?}", samples[15]); }
 
-    #[test] fn bytes_cross_both_ways_whole_and_in_order() { let (mut gateway, core, _bridge) = bridged(); let _echo = echo(core); let sent = (0..8 * 1024 * 1024u32).map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8).collect::<Vec<_>>(); let mut stream = gateway.get_ref().try_clone().unwrap(); stream.set_nodelay(true).unwrap(); let reader = thread::spawn(move || { let mut gateway = gateway; let bytes = read_bytes(&mut gateway, 8 * 1024 * 1024); (gateway, bytes) }); let mut writer = WebSocket::from_raw_socket(stream, tungstenite::protocol::Role::Server, None); for chunk in sent.chunks(100_000) { writer.send(WebSocketMessage::Binary(chunk.to_vec().into())).unwrap(); } let (_gateway, received) = reader.join().unwrap(); assert!(received == sent); }
+    #[test] fn bytes_cross_both_ways_whole_and_in_order() { let (mut gateway, core, _bridge) = bridged(); let _echo = echo(core); let sent = (0..8 * 1024 * 1024u32).map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8).collect::<Vec<_>>(); let mut stream = gateway.get_ref().try_clone().unwrap(); stream.set_nodelay(true).unwrap(); let reader = thread::spawn(move || { let mut gateway = gateway; let bytes = read_bytes(&mut gateway, 8 * 1024 * 1024); (gateway, bytes) }); let mut writer = WebSocket::from_stream(stream, Role::Server); for chunk in sent.chunks(100_000) { writer.send(WebSocketMessage::Binary(chunk.to_vec().into())).unwrap(); } let (_gateway, received) = reader.join().unwrap(); assert!(received == sent); }
 
     #[test] fn the_core_closing_delivers_what_it_wrote_then_closes_the_websocket() { let (mut gateway, mut core, bridge) = bridged(); let written = vec![9u8; 3 * 1024 * 1024]; core.write_all(&written).unwrap(); drop(core); assert_eq!(read_bytes(&mut gateway, written.len()).len(), written.len()); loop { match gateway.read() { Ok(WebSocketMessage::Close(_)) | Err(WsError::ConnectionClosed) => break, Ok(_) => {} Err(error) => panic!("{error}") } } assert!(bridge.join().unwrap().is_ok()); }
 
-    #[test] fn the_gateway_closing_ends_the_core_connection() { let (mut gateway, mut core, bridge) = bridged(); gateway.close(None).unwrap(); let _ = gateway.flush(); assert!(bridge.join().unwrap().is_ok()); core.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); assert_eq!(core.read(&mut [0u8; 8]).unwrap(), 0); }
+    #[test] fn the_gateway_closing_ends_the_core_connection() { let (mut gateway, mut core, bridge) = bridged(); gateway.close().unwrap(); let _ = gateway.flush(); assert!(bridge.join().unwrap().is_ok()); core.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); assert_eq!(core.read(&mut [0u8; 8]).unwrap(), 0); }
+    #[test] fn bytes_cross_a_wss_bridge_whole_and_in_order() { let listener = TcpListener::bind("127.0.0.1:0").unwrap(); let url = format!("wss://localhost:{}/node", listener.local_addr().unwrap().port()); let (core, bridge_end) = tcp_pair().unwrap(); let _bridge = thread::spawn(move || { let websocket = crate::daemon::websocket::connect_with(&url, test_tls::client()).map_err(|error| error.to_string())?; bridge_websocket_channel(websocket, bridge_end) }); let mut gateway = test_tls::accept(listener.accept().unwrap().0); let _echo = echo(core); let sent = (0..8 * 1024 * 1024u32).map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8).collect::<Vec<_>>(); for chunk in sent.chunks(1024 * 1024) { gateway.send(WebSocketMessage::Binary(chunk.to_vec())).unwrap(); assert!(read_bytes(&mut gateway, chunk.len()) == chunk); } let started = Instant::now(); gateway.send(WebSocketMessage::Binary(vec![7u8; 32])).unwrap(); read_bytes(&mut gateway, 32); assert!(started.elapsed() < Duration::from_millis(50), "round trip {:?}", started.elapsed()); }
 }

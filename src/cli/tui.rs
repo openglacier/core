@@ -14,19 +14,11 @@ use crossterm::{
     cursor::Show,
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
-    Frame, Terminal,
+    terminal::{self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use serde_json::{json, Value};
 
-use super::{complete::{common_prefix, Completer}, execute_background_line, local_command, Client, Config, Local, Output, Result, NAME};
+use super::{complete::{common_prefix, Completer}, execute_background_line, local_command, screen::{text_width, Buffer, Rect, Screen, Style}, Client, Config, Local, Output, Result, NAME};
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const MAX_BUFFER_LINES: usize = 2_000;
@@ -52,7 +44,10 @@ pub(super) fn run(mut config: Config) -> Result<ExitCode> {
             app.apply_job_event(job_event);
         }
 
-        terminal.terminal.draw(|frame| app.draw(frame))?;
+        let (width, height) = terminal::size()?;
+        let mut frame = Buffer::new(width, height);
+        app.draw(&mut frame);
+        terminal.screen.draw(frame)?;
         if app.exit {
             break;
         }
@@ -71,7 +66,7 @@ pub(super) fn run(mut config: Config) -> Result<ExitCode> {
 }
 
 struct TerminalSession {
-    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    screen: Screen,
 }
 
 impl TerminalSession {
@@ -82,23 +77,14 @@ impl TerminalSession {
             let _ = disable_raw_mode();
             return Err(error.into());
         }
-        let backend = CrosstermBackend::new(stdout);
-        match Terminal::new(backend) {
-            Ok(terminal) => Ok(Self { terminal }),
-            Err(error) => {
-                let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen, Show);
-                Err(error.into())
-            }
-        }
+        Ok(Self { screen: Screen::new(stdout) })
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste, LeaveAlternateScreen, Show);
-        let _ = self.terminal.show_cursor();
+        let _ = execute!(self.screen.out(), DisableBracketedPaste, LeaveAlternateScreen, Show);
     }
 }
 
@@ -228,17 +214,12 @@ impl Job {
         }
     }
 
-    fn text(&self) -> Text<'static> {
+    /// The lines to show: the output, or a placeholder before any.
+    fn shown_lines(&self) -> Vec<&str> {
         if self.lines.is_empty() {
-            return Text::from(Line::from("waiting for output…"));
+            return vec!["waiting for output…"];
         }
-        Text::from(
-            self.lines
-                .iter()
-                .cloned()
-                .map(Line::from)
-                .collect::<Vec<_>>(),
-        )
+        self.lines.iter().map(String::as_str).collect()
     }
 
     fn scroll_up(&mut self, amount: u16) {
@@ -710,53 +691,32 @@ impl App {
             .unwrap_or(self.input.len());
     }
 
-    fn draw(&self, frame: &mut Frame<'_>) {
-        let area = frame.area();
-        let sections = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(3),
-                Constraint::Length(1),
-                Constraint::Length(3),
-            ])
-            .split(area);
-
-        self.draw_tabs(frame, sections[0]);
-        self.draw_jobs(frame, sections[1]);
-        frame.render_widget(Paragraph::new(self.notice.as_str()), sections[2]);
-        self.draw_input(frame, sections[3]);
+    fn draw(&self, frame: &mut Buffer) {
+        let (tops, jobs, bottoms) = frame.area().rows(&[1], &[1, 3]);
+        self.draw_tabs(frame, tops[0]);
+        self.draw_jobs(frame, jobs);
+        frame.line(bottoms[0], &[(self.notice.as_str(), Style::PLAIN)]);
+        self.draw_input(frame, bottoms[1]);
     }
 
-    fn draw_tabs(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut spans = vec![Span::styled(
-            format!(" openglacier · {} ", self.view.label()),
-            Style::default().add_modifier(Modifier::BOLD),
-        )];
-        if self.jobs.is_empty() {
-            spans.push(Span::raw(" no jobs"));
-        } else {
-            for (index, job) in self.jobs.iter().enumerate() {
-                let label = format!(" {}{}:{} ", job.status.glyph(), job.id, truncate(&job.command, 18));
-                let style = if self.focused == Some(index) {
-                    Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    Style::default()
-                };
-                spans.push(Span::styled(label, style));
-            }
+    fn draw_tabs(&self, frame: &mut Buffer, area: Rect) {
+        let title = format!(" openglacier · {} ", self.view.label());
+        let labels: Vec<(String, Style)> = self.jobs.iter().enumerate().map(|(index, job)| {
+            let label = format!(" {}{}:{} ", job.status.glyph(), job.id, truncate(&job.command, 18));
+            (label, if self.focused == Some(index) { Style::SELECTED } else { Style::PLAIN })
+        }).collect();
+        let mut pieces = vec![(title.as_str(), Style::BOLD)];
+        if labels.is_empty() {
+            pieces.push((" no jobs", Style::PLAIN));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        pieces.extend(labels.iter().map(|(label, style)| (label.as_str(), *style)));
+        frame.line(area, &pieces);
     }
 
-    fn draw_jobs(&self, frame: &mut Frame<'_>, area: Rect) {
+    fn draw_jobs(&self, frame: &mut Buffer, area: Rect) {
         if self.jobs.is_empty() {
-            let welcome = Paragraph::new(
-                "No jobs yet. Type a query or .OPERATION {JSON} below and press Enter.\n\nThe TUI uses the same concurrent per-job connections as the regular REPL.",
-            )
-            .block(Block::default().borders(Borders::ALL).title("workspace"))
-            .wrap(Wrap { trim: false });
-            frame.render_widget(welcome, area);
+            frame.block(area, "workspace", Style::PLAIN);
+            frame.paragraph(area.inner(), ["No jobs yet. Type a query or .OPERATION {JSON} below and press Enter.", "", "The TUI uses the same concurrent per-job connections as the regular REPL."], true, Some(0), 0);
             return;
         }
 
@@ -767,45 +727,25 @@ impl App {
         }
     }
 
-    fn draw_job(&self, frame: &mut Frame<'_>, area: Rect, index: usize) {
+    fn draw_job(&self, frame: &mut Buffer, area: Rect, index: usize) {
         let job = &self.jobs[index];
-        let focused = self.focused == Some(index);
-        let border_style = if focused {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let visible_height = area.height.saturating_sub(2) as usize;
-        let scroll = if job.follow || job.scroll == u16::MAX {
-            job.lines.len().saturating_sub(visible_height).min(u16::MAX as usize) as u16
-        } else {
-            job.scroll
-        };
-        let paragraph = Paragraph::new(job.text())
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style)
-                    .title(job.title()),
-            )
-            .scroll((scroll, job.hscroll));
-        frame.render_widget(if job.wrap { paragraph.wrap(Wrap { trim: false }) } else { paragraph }, area);
+        let style = if self.focused == Some(index) { Style::BOLD } else { Style::PLAIN };
+        frame.block(area, &job.title(), style);
+        // Following the output: its last rows, wrapped or not.
+        let top = (!job.follow && job.scroll != u16::MAX).then_some(usize::from(job.scroll));
+        frame.paragraph(area.inner(), job.shown_lines(), job.wrap, top, usize::from(job.hscroll));
     }
 
-    fn draw_input(&self, frame: &mut Frame<'_>, area: Rect) {
-        let cursor_chars = self.input[..self.cursor].chars().count();
-        let content_width = area.width.saturating_sub(2) as usize;
-        let horizontal_scroll = cursor_chars
-            .saturating_sub(content_width.saturating_sub(1))
-            .min(u16::MAX as usize) as u16;
-        let input = Paragraph::new(self.input.as_str())
-            .block(Block::default().borders(Borders::ALL).title(""))
-            .scroll((0, horizontal_scroll));
-        frame.render_widget(input, area);
-        let visible_cursor = cursor_chars.saturating_sub(horizontal_scroll as usize).min(u16::MAX as usize) as u16;
+    fn draw_input(&self, frame: &mut Buffer, area: Rect) {
+        let cursor_columns = text_width(&self.input[..self.cursor]);
+        let content_width = usize::from(area.width.saturating_sub(2));
+        let horizontal_scroll = cursor_columns.saturating_sub(content_width.saturating_sub(1));
+        frame.block(area, "", Style::PLAIN);
+        frame.paragraph(area.inner(), [self.input.as_str()], false, Some(0), horizontal_scroll);
+        let visible_cursor = cursor_columns.saturating_sub(horizontal_scroll).min(u16::MAX as usize) as u16;
         let max_x = area.x.saturating_add(area.width.saturating_sub(2));
         let cursor_x = area.x.saturating_add(1).saturating_add(visible_cursor).min(max_x);
-        frame.set_cursor_position((cursor_x, area.y.saturating_add(1)));
+        frame.set_cursor(cursor_x, area.y.saturating_add(1));
     }
 }
 
@@ -827,27 +767,9 @@ fn tile_rects(area: Rect, count: usize) -> Vec<Rect> {
     match count {
         0 => Vec::new(),
         1 => vec![area],
-        2 => Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area)
-            .to_vec(),
+        2 => area.columns().to_vec(),
         _ => {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
-            let mut rects = Vec::with_capacity(4);
-            for row in rows.iter().take(2) {
-                rects.extend(
-                    Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(*row)
-                        .iter()
-                        .copied(),
-                );
-            }
+            let mut rects: Vec<Rect> = area.halves().into_iter().flat_map(Rect::columns).collect();
             rects.truncate(count);
             rects
         }
