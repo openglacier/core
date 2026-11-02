@@ -42,6 +42,25 @@ fn into_collection(physical: &PhysicalPlan, target: &str) -> EngineResult<Collec
     Ok(target)
 }
 
+/// The pauses before each new attempt of a write the storage refused for a conflict (another commit changed what
+/// it read or wrote first), a random part of as much again added to each: the fifth refusal is returned.
+const CONFLICT_PAUSES_MS: [u64; 4] = [5, 10, 20, 40];
+
+/// Runs the write `attempt` until it is not refused for a conflict, at most once more per pause. A refused write
+/// committed nothing and sent nothing: it runs again whole, on the state the other commit left.
+fn retrying_conflicts<T>(mut attempt: impl FnMut() -> EngineResult<T>) -> EngineResult<T> {
+    for pause in CONFLICT_PAUSES_MS {
+        match attempt() {
+            Err(error) if error.is_storage_conflict() => {
+                let random = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |since| u64::from(since.subsec_nanos())) % (pause * 1000);
+                std::thread::sleep(std::time::Duration::from_micros(pause * 1000 + random));
+            }
+            done => return done,
+        }
+    }
+    attempt()
+}
+
 fn unsupported(operator: impl Into<Arc<str>>, reason: impl Into<Arc<str>>) -> EngineError {
     EngineError::execution(ExecutionError::unsupported_operator(operator, reason))
 }
@@ -94,7 +113,7 @@ impl Engine {
             // The write is attributed to its Place, for the caches of materialized views.
             let written = into_target(physical).unwrap_or(physical.source().collection().as_str()).to_owned();
             let before = changes::Changes::changed(self.storage.as_ref(), &written);
-            let output = self.write(physical, scope, compact)?;
+            let output = retrying_conflicts(|| self.write(physical, scope, compact))?;
             self.changes.record(self.storage.as_ref(), &written, scope.map(DocumentScope::place_id), before);
             output
         } else { self.read(physical, scope)? };
@@ -165,6 +184,10 @@ impl Engine {
     /// were before the transaction. Rows given by value (`insert`) and
     /// past states are not accepted.
     pub fn execute_together(&self, plans: &[(PhysicalPlan, Option<DocumentScope>)]) -> EngineResult<CommitResult> {
+        retrying_conflicts(|| self.execute_together_once(plans))
+    }
+
+    fn execute_together_once(&self, plans: &[(PhysicalPlan, Option<DocumentScope>)]) -> EngineResult<CommitResult> {
         let memory = QueryMemory::new(&self.memory_governor);
         let (stage, mut held) = (memory.stage(), (0, 0));
         let mut transaction = self.storage.begin().map_err(storage_engine_error)?;
@@ -200,6 +223,8 @@ impl Engine {
         if let (None, Some(operator)) = (&into, prefix.iter().find(|operator| !keeps_stored_rows(operator))) {
             return Err(unsupported(operator.name(), "a write cannot follow this stage: its rows are not stored documents"));
         }
+        // The rows are read through another snapshot: what they come from is watched as if read here.
+        transaction.watch_collection(physical.source().collection());
         let read = PhysicalPlan::new(physical.source().clone(), prefix.iter().cloned()).map_err(|error| EngineError::execution(ExecutionError::evaluation(error.to_string())))?;
         if read.is_write() {
             return Err(unsupported("into", "into cannot follow a mutating stage"));

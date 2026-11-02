@@ -2160,10 +2160,11 @@ fn publish_durable_event( engine: &Engine, audience: Audience, event_type: &str,
         .next_id()
         .to_string();
     let query = insert_query("_event_outbox", serde_json::json!({"_id": &event_id, "eventId": &event_id, "type": event_type, "audience": &audience, "payload": &payload, "state": "pending", "attempts": 0, "availableAt": created_at, "createdAt": created_at}));
-    let stored = query_run(engine, 0, query).is_ok();
-    if stored {
-        event_outbox_wake().notify();
-    }
+    // A conflict with the outbox worker is run again by the engine; what still fails loses the event, said here.
+    let stored = match query_run(engine, 0, query) {
+        Ok(()) => { event_outbox_wake().notify(); true }
+        Err(response) => { eprintln!("ogd events: the event {event_type} {event_id} is lost, it could not be stored: {}", match response { QueryResponse::Error { error, .. } => error.message, other => format!("{other:?}") }); false }
+    };
     debug::log( DebugTopic::Events, None, format!( "outbox {} type={event_type} event_id={event_id}", if stored { "pending" } else { "failed" } ), );
     stored
 }

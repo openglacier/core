@@ -340,6 +340,8 @@ struct MemoryTransaction<'storage> {
     changes: Option<Vec<(CollectionId, DocumentId, Option<StoredDocument>)>>,
     /// The collections it writes.
     touched: std::collections::BTreeSet<CollectionId>,
+    /// The collections it reads, `None` once every collection was listed.
+    watched: std::cell::RefCell<Option<std::collections::BTreeSet<CollectionId>>>,
 }
 
 impl<'storage> MemoryTransaction<'storage> {
@@ -353,6 +355,13 @@ impl<'storage> MemoryTransaction<'storage> {
             deleted: 0,
             changes: storage.history.is_some().then(Vec::new),
             touched: std::collections::BTreeSet::new(),
+            watched: std::cell::RefCell::new(Some(std::collections::BTreeSet::new())),
+        }
+    }
+
+    fn watch(&self, collection: &CollectionId) {
+        if let Some(watched) = self.watched.borrow_mut().as_mut() {
+            if !watched.contains(collection) { watched.insert(collection.clone()); }
         }
     }
 
@@ -401,8 +410,14 @@ impl<'storage> MemoryTransaction<'storage> {
     }
 }
 
+/// The reads of a transaction, each collection read watched: a commit that changes it first makes the
+/// transaction conflict.
 impl StorageRead for MemoryTransaction<'_> {
-    read_collections!();
+    fn get(&self, collection: &CollectionId, id: &DocumentId) -> StorageResult<Option<StoredDocument>> { self.watch(collection); Ok(get_document(&self.collections, collection, id)) }
+    fn scan(&self, collection: &CollectionId, options: ScanOptions) -> StorageResult<Vec<StoredDocument>> { self.watch(collection); Ok(scan_collection(&self.collections, collection, options)) }
+    fn count(&self, collection: &CollectionId) -> StorageResult<u64> { self.watch(collection); Ok(self.collections.get(collection).map_or(0, |documents| documents.len() as u64)) }
+    fn collection_exists(&self, collection: &CollectionId) -> StorageResult<bool> { self.watch(collection); Ok(self.collections.contains_key(collection)) }
+    fn collections(&self) -> StorageResult<Vec<CollectionId>> { *self.watched.borrow_mut() = None; Ok(list_collections(&self.collections)) }
 }
 
 impl StorageTransaction for MemoryTransaction<'_> {
@@ -548,6 +563,7 @@ impl StorageTransaction for MemoryTransaction<'_> {
             deleted,
             changes,
             touched,
+            watched,
         } = *self;
 
         let mutation_count = inserted
@@ -562,15 +578,27 @@ impl StorageTransaction for MemoryTransaction<'_> {
 
         let mut state = storage.write_state()?;
 
-        if state.generation != base_generation {
+        // Another commit since the snapshot conflicts only if it changed a collection read or written here.
+        let changed_since = |collection: &CollectionId| state.changed.get(collection).is_some_and(|changed| *changed > base_generation);
+        let conflict = state.generation != base_generation && match watched.into_inner() {
+            None => true,
+            Some(watched) => watched.iter().chain(&touched).any(changed_since),
+        };
+        if conflict {
             return Err(StorageError::transaction_conflict(format!(
-                "snapshot generation {base_generation} is stale; current generation is {}",
+                "a collection of the transaction changed after snapshot generation {base_generation}; current generation is {}",
                 state.generation
             )));
         }
 
         let next_generation = next_generation(state.generation)?;
-        state.collections = collections;
+        let mut collections = collections;
+        for collection in &touched {
+            match collections.remove(collection) {
+                Some(documents) => { state.collections.insert(collection.clone(), documents); }
+                None => { state.collections.remove(collection); }
+            }
+        }
         state.generation = next_generation;
         state.changed.extend(touched.into_iter().map(|collection| (collection, next_generation)));
         if let Some(changes) = changes {
@@ -591,6 +619,8 @@ impl StorageTransaction for MemoryTransaction<'_> {
     fn rollback(self: Box<Self>) -> StorageResult<()> {
         Ok(())
     }
+
+    fn watch_collection(&mut self, collection: &CollectionId) { self.watch(collection); }
 }
 
 fn get_document( collections: &Collections, collection: &CollectionId, id: &DocumentId, ) -> Option<StoredDocument> {
@@ -629,6 +659,11 @@ mod tests {
         DocumentId::from_test_label(value)
     }
 
+    #[test] fn commits_to_different_collections_both_pass_and_keep_each_other() { let storage = MemoryBackend::new(); let (a, b) = (collection("a"), collection("b")); let empty = || Arc::new(Document::new()); let conflict = |error: StorageError| matches!(error.kind(), StorageErrorKind::TransactionConflict { .. }); let mut first = storage.begin().unwrap(); first.insert(&a, document_id("1"), empty()).unwrap(); let mut second = storage.begin().unwrap(); second.insert(&b, document_id("2"), empty()).unwrap(); first.commit().unwrap(); second.commit().unwrap(); let read = storage.read().unwrap(); assert!(read.get(&a, &document_id("1")).unwrap().is_some()); assert!(read.get(&b, &document_id("2")).unwrap().is_some()); assert_eq!(storage.generation().unwrap(), 2); let _ = conflict; }
+    #[test] fn a_commit_after_another_commit_to_the_same_collection_conflicts() { let storage = MemoryBackend::new(); let (a, b) = (collection("a"), collection("b")); let empty = || Arc::new(Document::new()); let conflict = |error: StorageError| matches!(error.kind(), StorageErrorKind::TransactionConflict { .. }); let mut first = storage.begin().unwrap(); first.insert(&a, document_id("1"), empty()).unwrap(); let mut second = storage.begin().unwrap(); second.insert(&a, document_id("2"), empty()).unwrap(); first.commit().unwrap(); assert!(conflict(second.commit().unwrap_err())); assert!(storage.read().unwrap().get(&a, &document_id("2")).unwrap().is_none()); let _ = b; }
+    #[test] fn a_collection_read_then_changed_by_another_commit_conflicts() { let storage = MemoryBackend::new(); let (a, b) = (collection("a"), collection("b")); let empty = || Arc::new(Document::new()); let conflict = |error: StorageError| matches!(error.kind(), StorageErrorKind::TransactionConflict { .. }); let mut second = storage.begin().unwrap(); assert!(second.get(&b, &document_id("1")).unwrap().is_none()); second.insert(&a, document_id("2"), empty()).unwrap(); let mut first = storage.begin().unwrap(); first.insert(&b, document_id("1"), empty()).unwrap(); first.commit().unwrap(); assert!(conflict(second.commit().unwrap_err())); }
+    #[test] fn a_listing_of_the_collections_conflicts_with_any_other_commit() { let storage = MemoryBackend::new(); let (a, b) = (collection("a"), collection("b")); let empty = || Arc::new(Document::new()); let conflict = |error: StorageError| matches!(error.kind(), StorageErrorKind::TransactionConflict { .. }); let mut second = storage.begin().unwrap(); second.collections().unwrap(); second.insert(&a, document_id("2"), empty()).unwrap(); let mut first = storage.begin().unwrap(); first.insert(&b, document_id("1"), empty()).unwrap(); first.commit().unwrap(); assert!(conflict(second.commit().unwrap_err())); }
+    #[test] fn a_collection_watched_for_a_read_elsewhere_conflicts_when_changed() { let storage = MemoryBackend::new(); let (a, b) = (collection("a"), collection("b")); let empty = || Arc::new(Document::new()); let conflict = |error: StorageError| matches!(error.kind(), StorageErrorKind::TransactionConflict { .. }); let mut second = storage.begin().unwrap(); second.watch_collection(&b); second.insert(&a, document_id("2"), empty()).unwrap(); let mut first = storage.begin().unwrap(); first.insert(&b, document_id("1"), empty()).unwrap(); first.commit().unwrap(); assert!(conflict(second.commit().unwrap_err())); }
     #[test] fn new_storage_is_empty() { let storage = MemoryBackend::new(); assert_eq!(storage.generation().unwrap(), 0); assert_eq!(storage.collection_count().unwrap(), 0); assert_eq!(storage.document_count().unwrap(), 0); }
     #[test] fn snapshots_share_each_collection_until_it_is_written() { let storage = MemoryBackend::new(); let write = |name: &str, id: &str| { let mut transaction = storage.begin().unwrap(); transaction.insert(&collection(name), document_id(id), Arc::new(Document::new())).unwrap(); transaction.commit().unwrap(); }; write("a", "1"); write("b", "2"); let before = MemorySnapshot::from_state(&storage.read_state().unwrap()); write("b", "3"); let after = MemorySnapshot::from_state(&storage.read_state().unwrap()); assert!(Arc::ptr_eq(&before.collections[&collection("a")], &after.collections[&collection("a")])); assert!(!Arc::ptr_eq(&before.collections[&collection("b")], &after.collections[&collection("b")])); assert_eq!((before.collections[&collection("b")].len(), after.collections[&collection("b")].len()), (1, 2)); assert_eq!((before.changed(&collection("a")).unwrap(), after.changed(&collection("b")).unwrap()), (Some(1), Some(3))); }
     #[test] fn empty_snapshot_has_no_collections() { let storage = MemoryBackend::new(); let snapshot = storage.read().unwrap(); assert!(snapshot.collections().unwrap().is_empty()); assert!(!snapshot.collection_exists(&collection("users")).unwrap()); }

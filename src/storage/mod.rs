@@ -1143,6 +1143,10 @@ pub trait StorageTransaction: StorageRead {
     /// they are; `false` when the backend keeps them in memory.
     fn spill(&mut self) -> StorageResult<bool> { Ok(false) }
 
+    /// Declares that what this transaction writes depends on `collection`, read through another snapshot: a commit
+    /// that changes it before this one makes this one conflict, as if the transaction had read it.
+    fn watch_collection(&mut self, _collection: &CollectionId) {}
+
     /// Commits all transaction changes atomically.
     fn commit(self: Box<Self>) -> StorageResult<CommitResult>;
 

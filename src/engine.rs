@@ -5515,6 +5515,14 @@ impl EngineError {
         Self::new(EngineErrorKind::PhysicalPlanning(error))
     }
 
+    /// Whether the storage refused the write because another commit changed what it read or wrote first: run
+    /// again, it reads the new state.
+    #[must_use]
+    pub fn is_storage_conflict(&self) -> bool {
+        use crate::{query::ExecutionErrorKind, storage::StorageErrorKind};
+        matches!(&self.kind, EngineErrorKind::Execution(error) if matches!(error.kind(), ExecutionErrorKind::Storage(storage) if matches!(storage.kind(), StorageErrorKind::TransactionConflict { .. } | StorageErrorKind::VersionConflict { .. })))
+    }
+
     #[must_use]
     pub const fn execution(error: ExecutionError) -> Self {
         Self::new(EngineErrorKind::Execution(error))

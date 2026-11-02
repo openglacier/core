@@ -2,11 +2,11 @@
   {
     "appId": "system.query",
     "name": "Query",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "definition": {
       "id": "system.query",
       "name": "Query",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "kind": "system.query",
       "tone": "glacier",
       "data": {},
@@ -21,6 +21,24 @@
             "description": "Native og-core query workspace."
           }
         ]
+      },
+      "store": {
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Interroger les données de cette Place.",
+          "en": "Query the data of this Place."
+        },
+        "description": {
+          "fr": "Écrire et lancer des requêtes sur les données de la Place, et définir ses vues.",
+          "en": "Write and run queries on the data of the Place, and define its views."
+        }
       }
     }
   },
@@ -56,11 +74,11 @@
   {
     "appId": "system.projects",
     "name": "Projects",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "definition": {
       "id": "system.projects",
       "name": "Projects",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "tone": "sage",
       "hub": {
         "description": "Keep ongoing work, missions and shared context together.",
@@ -81,17 +99,35 @@
             "description": "Keep ongoing work, missions and shared context together."
           }
         ]
+      },
+      "store": {
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Garder ensemble le travail en cours, les missions et leur contexte.",
+          "en": "Keep ongoing work, missions and shared context together."
+        },
+        "description": {
+          "fr": "Les missions de la Place, leur avancement et leur contexte partagé.",
+          "en": "The missions of the Place, their progress and their shared context."
+        }
       }
     }
   },
   {
     "appId": "system.ressources",
     "name": "Resources",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "definition": {
       "id": "system.ressources",
       "name": "Resources",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "tone": "glacier",
       "hub": {
         "description": "See the things, services and systems available here.",
@@ -141,17 +177,35 @@
             "description": "Live node status will be resolved through the Gateway fabric."
           }
         ]
+      },
+      "store": {
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Voir les réglages de la Place, ceux de la Fabric et les routes effectives.",
+          "en": "See Place overrides, Fabric defaults and effective routes."
+        },
+        "description": {
+          "fr": "Les réglages propres à la Place, les valeurs par défaut de la Fabric, les routes effectives et les Gateways joignables.",
+          "en": "The overrides of the Place, the Fabric defaults, the effective routes and the reachable Gateways."
+        }
       }
     }
   },
   {
     "appId": "system.calls",
     "name": "Calls",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "definition": {
       "id": "system.calls",
       "name": "Calls",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "tone": "glacier",
       "kind": "system.calls",
       "requires": {
@@ -174,6 +228,24 @@
             "description": "Peer-to-peer audio and video calls between OpenGlacier identities."
           }
         ]
+      },
+      "store": {
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Appels et réunions de cette Place.",
+          "en": "Calls and meetings of this Place."
+        },
+        "description": {
+          "fr": "Appels audio et vidéo entre les membres de la Place.",
+          "en": "Audio and video calls between the members of the Place."
+        }
       }
     }
   }

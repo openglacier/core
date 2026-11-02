@@ -1,10 +1,11 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 //! Transactions: staged writes over a snapshot, committed only if no other
-//! commit happened since the snapshot (optimistic).
+//! commit since the snapshot changed a collection they read or write
+//! (optimistic).
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, sync::Arc};
 
-use super::{column::Scratch, read::Snapshot, wal::LogEntry, Commit, GlacierBackend, Spilled, State};
+use super::{column::Scratch, read::Snapshot, wal::LogEntry, Commit, GlacierBackend, Spilled, State, Watch};
 use crate::{
     model::Document,
     storage::{
@@ -23,6 +24,8 @@ pub(super) struct Transaction<'a> {
     scratch: Scratch,
     /// Writes moved out of memory ([`StorageTransaction::spill`]).
     spilled: Option<Spilled>,
+    /// The collections read or written, `None` once every collection was listed.
+    watched: RefCell<Option<BTreeSet<CollectionId>>>,
 }
 
 impl std::fmt::Debug for Transaction<'_> {
@@ -33,7 +36,19 @@ impl std::fmt::Debug for Transaction<'_> {
 
 impl<'a> Transaction<'a> {
     pub(super) fn new(backend: &'a GlacierBackend, state: Arc<State>) -> Self {
-        Self { backend, snapshot: Snapshot::new(state), staged: BTreeMap::new(), entries: Vec::new(), counts: (0, 0, 0), closed: false, scratch: Scratch::default(), spilled: None }
+        Self { backend, snapshot: Snapshot::new(state), staged: BTreeMap::new(), entries: Vec::new(), counts: (0, 0, 0), closed: false, scratch: Scratch::default(), spilled: None, watched: RefCell::new(Some(BTreeSet::new())) }
+    }
+
+    fn watch(&self, collection: &CollectionId) {
+        if let Some(watched) = self.watched.borrow_mut().as_mut() {
+            if !watched.contains(collection) { watched.insert(collection.clone()); }
+        }
+    }
+
+    fn watched(&self) -> Watch {
+        let watched = self.watched.borrow_mut().take();
+        let all = watched.is_none();
+        Watch::of(self.snapshot.state(), watched.unwrap_or_default(), all)
     }
 
     const fn ensure_open(&self) -> StorageResult<()> {
@@ -65,11 +80,13 @@ impl<'a> Transaction<'a> {
 impl StorageRead for Transaction<'_> {
     fn get(&self, collection: &CollectionId, id: &DocumentId) -> StorageResult<Option<StoredDocument>> {
         self.ensure_open()?;
+        self.watch(collection);
         self.current(collection, id)
     }
 
     fn scan(&self, collection: &CollectionId, options: ScanOptions) -> StorageResult<Vec<StoredDocument>> {
         self.ensure_open()?;
+        self.watch(collection);
         let mut documents = self.snapshot.scan(collection, ScanOptions::default())?.into_iter().map(|stored| (*stored.id(), stored)).collect::<BTreeMap<_, _>>();
         for ((staged_collection, id), value) in &self.staged {
             if staged_collection != collection {
@@ -101,6 +118,7 @@ impl StorageRead for Transaction<'_> {
 
     fn count(&self, collection: &CollectionId) -> StorageResult<u64> {
         self.ensure_open()?;
+        self.watch(collection);
         let mut count = self.snapshot.count(collection)?;
         for ((staged_collection, id), value) in &self.staged {
             if staged_collection != collection {
@@ -119,6 +137,7 @@ impl StorageRead for Transaction<'_> {
     fn collection_exists(&self, collection: &CollectionId) -> StorageResult<bool> { Ok(self.count(collection)? > 0) }
 
     fn collections(&self) -> StorageResult<Vec<CollectionId>> {
+        *self.watched.borrow_mut() = None;
         let mut names = self.snapshot.collections()?;
         for (collection, _) in self.staged.keys() {
             if !names.contains(collection) {
@@ -140,6 +159,7 @@ impl StorageRead for Transaction<'_> {
 impl StorageTransaction for Transaction<'_> {
     fn insert(&mut self, collection: &CollectionId, id: DocumentId, document: Arc<Document>) -> StorageResult<InsertResult> {
         self.ensure_open()?;
+        self.watch(collection);
         if self.current(collection, &id)?.is_some() {
             return Err(StorageError::document_already_exists(collection.clone(), id));
         }
@@ -151,6 +171,7 @@ impl StorageTransaction for Transaction<'_> {
 
     fn replace(&mut self, collection: &CollectionId, id: &DocumentId, document: Arc<Document>, precondition: VersionPrecondition) -> StorageResult<ReplaceResult> {
         self.ensure_open()?;
+        self.watch(collection);
         let current = self.current_version(collection, id)?;
         ensure_version(collection, id, current, precondition)?;
         let stored = StoredDocument::new(*id, current.next()?, document)?;
@@ -161,6 +182,7 @@ impl StorageTransaction for Transaction<'_> {
 
     fn delete(&mut self, collection: &CollectionId, id: &DocumentId, precondition: VersionPrecondition) -> StorageResult<DeleteResult> {
         self.ensure_open()?;
+        self.watch(collection);
         let current = self.current_version(collection, id)?;
         ensure_version(collection, id, current, precondition)?;
         self.staged.insert((collection.clone(), *id), None);
@@ -168,6 +190,8 @@ impl StorageTransaction for Transaction<'_> {
         self.counts.2 += 1;
         Ok(DeleteResult::new(*id, current))
     }
+
+    fn watch_collection(&mut self, collection: &CollectionId) { self.watch(collection); }
 
     /// Writes the puts to segments of their own and marks what the writes
     /// remove; the staged map forgets them, so a later write of the same
@@ -184,21 +208,20 @@ impl StorageTransaction for Transaction<'_> {
         self.ensure_open()?;
         self.closed = true;
         let (inserted, replaced, deleted) = self.counts;
-        let (generation, result) = (self.snapshot.generation(), CommitResult::new(inserted, replaced, deleted));
+        let (result, watch) = (CommitResult::new(inserted, replaced, deleted), self.watched());
         if let Some(mut spilled) = self.spilled.take() {
             if let Err(error) = spilled.add(self.backend, self.snapshot.state(), &self.entries, &mut self.scratch) {
                 spilled.discard(self.backend);
                 return Err(error);
             }
-            let backend = self.backend;
-            drop(self);
-            return backend.commit_spilled(generation, spilled, result);
+            // The snapshot stays: what the spilled writes remove names its segments.
+            return self.backend.commit_spilled(self.snapshot.state(), &watch, spilled, result);
         }
         let (backend, entries) = (self.backend, std::mem::take(&mut self.entries));
         // Release the snapshot first: the commit can then update the state in
         // place instead of copying the shared delta.
         drop(self);
-        backend.commit(Commit { generation, entries, result })
+        backend.commit(Commit { entries, result, watch })
     }
 
     fn rollback(mut self: Box<Self>) -> StorageResult<()> {

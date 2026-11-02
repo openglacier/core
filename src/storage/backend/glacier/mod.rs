@@ -269,12 +269,39 @@ pub(super) struct State {
     collections: BTreeMap<CollectionId, Arc<Collection>>,
 }
 
-/// A commit, prepared against generation `generation`.
+/// A commit, prepared against generation `watch.generation`.
 #[derive(Debug)]
 pub(super) struct Commit {
-    generation: u64,
     entries: Vec<LogEntry>,
     result: CommitResult,
+    watch: Watch,
+}
+
+/// What a transaction read or wrote, prepared against generation `generation`: another commit since conflicts
+/// with it only if it changed one of these collections. `all` stands for every collection (a listing of them).
+#[derive(Debug, Default)]
+pub(super) struct Watch {
+    generation: u64,
+    /// Each collection, and whether it existed at `generation`.
+    collections: Vec<(CollectionId, bool)>,
+    all: bool,
+}
+
+impl Watch {
+    /// Every collection: any commit since `generation` conflicts.
+    const fn everything(generation: u64) -> Self { Self { generation, collections: Vec::new(), all: true } }
+
+    pub(super) fn of(state: &State, collections: impl IntoIterator<Item = CollectionId>, all: bool) -> Self {
+        Self { generation: state.generation, collections: collections.into_iter().map(|name| { let existed = state.collections.contains_key(&name); (name, existed) }).collect(), all }
+    }
+
+    /// Whether a commit since `generation` changed a watched collection in `current`.
+    fn conflicts(&self, current: &State) -> bool {
+        current.generation != self.generation && (self.all || self.collections.iter().any(|(name, existed)| match current.collections.get(name) {
+            Some(collection) => collection.changed > self.generation,
+            None => *existed,
+        }))
+    }
 }
 
 /// Effect of a commit on one document.
@@ -699,7 +726,7 @@ impl GlacierBackend {
         if generation > current + 1 {
             self.set_generation(generation - 1)?;
         }
-        self.commit(Commit { generation: generation - 1, entries, result: CommitResult::default() }).map(drop)
+        self.commit(Commit { entries, result: CommitResult::default(), watch: Watch::everything(generation - 1) }).map(drop)
     }
 
     /// Moves the store to `generation` through a flush, whose manifest names it.
@@ -713,17 +740,18 @@ impl GlacierBackend {
         self.flush(&mut writer, &Arc::new(next), None)
     }
 
-    /// Commits prepared entries if the store is still at `commit.generation`.
+    /// Commits prepared entries if no commit since the generation it was prepared against changed what it watches; they are planned
+    /// against the current state, where the collections they write are as the transaction saw them.
     fn commit(&self, commit: Commit) -> StorageResult<CommitResult> {
         if commit.entries.is_empty() {
             return Ok(CommitResult::default());
         }
         let mut writer = self.writer()?;
         let current = self.state()?;
-        if current.generation != commit.generation {
-            return Err(StorageError::transaction_conflict("Glacier generation changed before commit"));
+        if commit.watch.conflicts(&current) {
+            return Err(StorageError::transaction_conflict("Glacier: a collection of the transaction changed before commit"));
         }
-        let generation = next_generation(commit.generation)?;
+        let generation = next_generation(current.generation)?;
         let mut scratch = Scratch::default();
         let changes = plan(&current, &commit.entries, &mut scratch)?;
         writer.metrics.commits += 1;
@@ -760,17 +788,22 @@ impl GlacierBackend {
         Ok(commit.result)
     }
 
-    /// Installs what a transaction moved out of memory ([`Spilled`]) if the
-    /// store is still at `generation`, with the delta rows (see [`Self::flush`]).
-    fn commit_spilled(&self, generation: u64, spilled: Spilled, result: CommitResult) -> StorageResult<CommitResult> {
+    /// Installs what a transaction moved out of memory ([`Spilled`]) if no commit since `base` changed what it
+    /// watches, with the delta rows (see [`Self::flush`]). What it removes names the segments and delta rows of
+    /// `base`: each collection it writes must be exactly as in `base`, not even compacted since.
+    fn commit_spilled(&self, base: &State, watch: &Watch, spilled: Spilled, result: CommitResult) -> StorageResult<CommitResult> {
         let mut writer = self.writer()?;
         let current = self.state()?;
-        if current.generation != generation {
+        let moved = spilled.collections.keys().any(|name| match (base.collections.get(name), current.collections.get(name)) {
+            (Some(before), Some(now)) => !Arc::ptr_eq(before, now),
+            (before, now) => before.is_some() != now.is_some(),
+        });
+        if moved || watch.conflicts(&current) {
             spilled.discard(self);
-            return Err(StorageError::transaction_conflict("Glacier generation changed before commit"));
+            return Err(StorageError::transaction_conflict("Glacier: a collection of the transaction changed before commit"));
         }
         let mut next = (*current).clone();
-        next.generation = next_generation(generation)?;
+        next.generation = next_generation(current.generation)?;
         let recorded = self.inner.history.get();
         if let Some(recorded) = recorded {
             recorded.forget(next.generation);
@@ -973,7 +1006,7 @@ impl GlacierBackend {
             }
             staged.insert(key(stored.id()), stored);
         }
-        Ok((Commit { generation: state.generation, entries, result: CommitResult::new(inserted, replaced, 0) }, returned))
+        Ok((Commit { entries, result: CommitResult::new(inserted, replaced, 0), watch: Watch::of(state, [collection.clone()], false) }, returned))
     }
 }
 
