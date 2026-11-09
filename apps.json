@@ -248,5 +248,75 @@
         }
       }
     }
+  },
+  {
+    "appId": "system.settings",
+    "name": "Settings",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.settings",
+      "name": "Settings",
+      "version": "1.0.0",
+      "tone": "glacier",
+      "description": "The settings of the Place and of its Apps, to read.",
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [],
+        "full": [
+          {
+            "type": "section",
+            "kicker": {
+              "fr": "Place",
+              "en": "Place"
+            },
+            "title": {
+              "fr": "Paramètres",
+              "en": "Settings"
+            },
+            "description": {
+              "fr": "Les réglages de la Place et de ses Apps, tels qu'ils sont enregistrés.",
+              "en": "The settings of the Place and of its Apps, as they are saved."
+            }
+          },
+          {
+            "type": "input",
+            "w": 12,
+            "name": "q",
+            "label": {
+              "fr": "Rechercher",
+              "en": "Search"
+            },
+            "placeholder": {
+              "fr": "Filtrer par origine, clé ou valeur",
+              "en": "Filter by origin, key or value"
+            }
+          },
+          {
+            "type": "placesettings",
+            "w": 12,
+            "filter": "q"
+          }
+        ]
+      },
+      "store": {
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Les réglages de la Place et de ses Apps, à consulter.",
+          "en": "The settings of the Place and of its Apps, to read."
+        },
+        "description": {
+          "fr": "Toutes les propriétés de la Place et ce que ses Apps ont enregistré, sur une seule liste, dans l'esprit d'about:config : on cherche, on consulte. Rien ne s'y modifie.",
+          "en": "All the properties of the Place and what its Apps have saved, on one list, in the spirit of about:config: search and read. Nothing is changed here."
+        }
+      }
+    }
   }
 ]

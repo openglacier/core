@@ -201,7 +201,7 @@ pub fn encrypt_bytes( credential: &IdentityCredential, password: &[u8], ) -> Res
     let ciphertext = XChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| IdentityFileError::Crypto)?
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: &plaintext,
                 aad: AAD,
@@ -229,7 +229,7 @@ pub fn decrypt_bytes( bytes: &[u8], password: &[u8], ) -> Result<IdentityCredent
     let plaintext = XChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| IdentityFileError::Crypto)?
         .decrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: &ciphertext,
                 aad: AAD,

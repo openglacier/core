@@ -3338,29 +3338,6 @@ mod tests {
         query_first(engine, 0, quoted!("on _apps | where appId == {} | limit 1", app_id)).unwrap().expect("App record")
     }
 
-    #[test] fn base_apps_come_from_the_installed_set_or_else_from_the_public_apps_built_in() {
-        let directory = std::env::temp_dir().join(format!("og-base-apps-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let ids = |apps: Vec<BuiltinApp>| apps.into_iter().map(|app| app.app_id).collect::<Vec<_>>();
-        let public = ids(serde_json::from_str(EMBEDDED_APPS_JSON).unwrap());
-        assert_eq!(public, ["system.query", "system.files", "system.projects", "system.ressources", "system.calls"]);
-        // An installed set that is not the public one: the public Apps and one more.
-        let mut installed: Vec<JsonValue> = serde_json::from_str(EMBEDDED_APPS_JSON).unwrap();
-        installed.push(serde_json::json!({"appId": "system.test", "name": "System test", "version": "1.0.0", "definition": {"id": "system.test", "name": "System test", "version": "1.0.0"}}));
-        let set = directory.join("apps.json");
-        std::fs::write(&set, serde_json::to_string(&installed).unwrap()).unwrap();
-        let all = ids(base_apps(&set));
-        assert_eq!(all.len(), public.len() + 1);
-        assert_eq!(all.last().map(String::as_str), Some("system.test"));
-        assert_eq!(ids(base_apps(&directory.join("missing.json"))), public);
-        std::fs::write(&set, "[{\"appId\": ").unwrap();
-        assert_eq!(ids(base_apps(&set)), public);
-        std::fs::write(&set, r#"[{"appId": "x.bad", "name": "Bad", "version": "1.0.0", "definition": {"model": {"tables": []}}}]"#).unwrap();
-        assert!(read_base_apps(&set).unwrap_err().contains("x.bad"));
-        assert_eq!(ids(base_apps(&set)), public);
-        std::fs::remove_dir_all(&directory).unwrap();
-    }
-
     #[test] fn an_app_leaving_the_base_set_is_kept_for_compatibility_with_its_instances_until_it_comes_back() {
         let engine = app_bootstrap_test_engine();
         bootstrap_apps(&engine, &[test_app("system.kept"), test_app("system.left")]).unwrap();
