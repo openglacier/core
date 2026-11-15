@@ -10,7 +10,7 @@
 
 <p align="center">
 
-![Version](https://img.shields.io/badge/version-2.0.3-blue)
+![Version](https://img.shields.io/badge/version-2.0.4-blue)
 [![Build](https://github.com/openglacier/core/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/build.yml)
 [![Tests](https://github.com/openglacier/core/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/tests.yml)
 [![Clippy](https://github.com/openglacier/core/actions/workflows/clippy.yml/badge.svg?branch=main)](https://github.com/openglacier/core/actions/workflows/clippy.yml)
@@ -1564,7 +1564,7 @@ Important variables include:
 | `OGD_LOCAL_BIND` | Optional local bind address |
 | `OGD_STORAGE` | `memory` or `glacier` |
 | `OGD_STORAGE_PATH` | Glacier store path |
-| `OGD_MEMORY_LIMIT` | Process memory limit |
+| `OGD_MEMORY_LIMIT` | Process memory limit; unset, the control group limit or 3/4 of the machine memory; `unlimited` for none |
 | `OGD_READ_TIMEOUT_MS` | Read timeout |
 | `OGD_WRITE_TIMEOUT_MS` | Write timeout |
 | `OGD_NODE_CAPABILITIES` | Enabled service capabilities |

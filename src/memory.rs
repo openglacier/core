@@ -469,12 +469,17 @@ struct AdmissionWaiter { class: WorkloadClass, thread: std::thread::Thread, gran
 
 const ADMISSION_RECHECK: Duration = Duration::from_millis(100);
 
+/// Query bytes from which an operation gives its freed memory back to the system when it ends.
+const RELEASE_AFTER_BYTES: usize = 256 * 1024 * 1024;
+
 /// Room the operation envelope keeps for a heavy operation to start in.
 const ADMISSION_ROOM_BYTES: usize = 4 * 1024 * 1024;
 
 thread_local! {
     /// Most query bytes held at once by the operation of this thread.
     static QUERY_PEAK: Cell<usize> = const { Cell::new(0) };
+    /// The slot of the operation admitted on this thread ([`without_slot`]).
+    static SLOT: RefCell<Option<(Arc<MemoryGovernorInner>, u64, WorkloadClass)>> = const { RefCell::new(None) };
 }
 
 /// Grants free slots to the waiters in arrival order, skipping those whose
@@ -766,6 +771,7 @@ impl MemoryGovernor {
             let id = grant.load(Ordering::Acquire);
             if id != 0 {
                 QUERY_PEAK.set(0);
+                SLOT.set(Some((Arc::clone(&self.inner), id, class)));
                 return Ok(QueryMemoryPermit { inner: Arc::clone(&self.inner), id, class, key, bytes });
             }
             let now = Instant::now();
@@ -979,8 +985,34 @@ impl QueryMemoryPermit {
         self.class
     }
 }
+/// Runs `wait`, which blocks without computing (a sync of the log, another writer's), with the query slot of the
+/// operation running on this thread lent to the queue: slots bound the operations that compute at once. The
+/// operation takes its slot back without queueing, briefly one more than the slots when all are taken.
+pub fn without_slot<T>(wait: impl FnOnce() -> T) -> T {
+    struct Lent(Arc<MemoryGovernorInner>, u64, WorkloadClass);
+    impl Drop for Lent {
+        fn drop(&mut self) {
+            let mut state = lock_unpoisoned(&self.0.admission);
+            if self.2 == WorkloadClass::Streaming { state.light += 1 } else { state.records.push(QueryMemoryRecord { id: self.1, class: self.2 }) }
+        }
+    }
+    let Some((inner, id, class)) = SLOT.with_borrow(Clone::clone) else { return wait() };
+    {
+        let mut state = lock_unpoisoned(&inner.admission);
+        if class == WorkloadClass::Streaming {
+            state.light = state.light.saturating_sub(1);
+        } else if let Some(index) = state.records.iter().position(|record| record.id == id) {
+            state.records.swap_remove(index);
+        }
+        dispatch(&inner, &mut state);
+    }
+    let _lent = Lent(inner, id, class);
+    wait()
+}
+
 impl Drop for QueryMemoryPermit {
     fn drop(&mut self) {
+        SLOT.take();
         let peak = QUERY_PEAK.take();
         let mut state = lock_unpoisoned(&self.inner.admission);
         match state.records.iter().position(|r| r.id == self.id) {
@@ -993,6 +1025,9 @@ impl Drop for QueryMemoryPermit {
             *average = *average / 4 * 3 + peak / 4;
         }
         dispatch(&self.inner, &mut state);
+        drop(state);
+        // What a large operation freed goes back to the system, limit or not: the allocator keeps it otherwise.
+        if peak >= RELEASE_AFTER_BYTES { release_free_memory(); }
     }
 }
 
@@ -1207,6 +1242,21 @@ impl Drop for StageMemory<'_> {
     }
 }
 
+/// The memory the process may use when no limit is set: the limit of its control group, or three quarters of the
+/// machine's memory (the rest for the system, its page cache and the other services); `None` where neither reads.
+#[must_use]
+pub fn machine_limit_bytes() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        let group = std::fs::read_to_string("/proc/self/cgroup").ok().and_then(|groups| groups.lines().find_map(|line| line.strip_prefix("0::").map(str::to_owned)));
+        let limited = group.and_then(|group| std::fs::read_to_string(format!("/sys/fs/cgroup{}/memory.max", group.trim_end_matches('/'))).ok()).and_then(|max| max.trim().parse::<usize>().ok());
+        let total = std::fs::read_to_string("/proc/meminfo").ok().and_then(|meminfo| meminfo.lines().find_map(|line| line.strip_prefix("MemTotal:")?.trim().strip_suffix("kB")?.trim().parse::<usize>().ok())).map(|kib| kib.saturating_mul(1024) / 4 * 3);
+        match (limited, total) { (Some(limited), Some(total)) => Some(limited.min(total)), (limited, total) => limited.or(total) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 fn system_available_memory_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
@@ -1280,7 +1330,7 @@ pub fn set_allocator(allocator: Allocator) {
     let _ = ALLOCATOR.set(allocator);
 }
 
-/// Releases the allocator's free memory under process pressure, at most once
+/// Releases the allocator's free memory (under process pressure, after a large operation), at most once
 /// a second; whether it did.
 fn release_free_memory() -> bool {
     let Some(allocator) = ALLOCATOR.get() else { return false };

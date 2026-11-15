@@ -472,6 +472,11 @@ impl<'a> ColumnReader<'a> {
         Ok(true)
     }
 
+    /// Every string of the chunk, when they all come from its dictionary.
+    pub(super) fn dictionary_strings(&self) -> StorageResult<Option<&[&'a str]>> {
+        if self.strings.is_some_and(|strings| strings.dictionary_len() > 0) { self.dictionary().map(Some) } else { Ok(None) }
+    }
+
     fn dictionary(&self) -> StorageResult<&[&'a str]> {
         if let Some(dictionary) = self.dictionary.get() {
             return Ok(dictionary);

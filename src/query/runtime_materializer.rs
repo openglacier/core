@@ -1609,6 +1609,15 @@ pub struct DenseGroups {
 }
 
 impl DenseGroups {
+    /// Bytes one group holds here, its key values apart: its slots in each vector, counted twice for the room
+    /// vectors keep as they grow, and an allowance for the value a measure may own (a text, a list).
+    #[must_use]
+    pub fn group_bytes(&self) -> usize {
+        let owned = |state: &MeasureState| if matches!(state, MeasureState::Sum { .. } | MeasureState::Avg { .. } | MeasureState::Count(_)) { 0 } else { 64 };
+        let measures = self.template.states.iter().map(|state| std::mem::size_of::<MeasureState>() + owned(state)).sum::<usize>();
+        2 * (std::mem::size_of::<Option<Vec<Option<Value>>>>() + std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + measures)
+    }
+
     /// Group of a row folded into no group ([`Self::push_batch`]).
     pub const SKIP: u32 = u32::MAX;
 

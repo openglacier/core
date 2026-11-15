@@ -3,7 +3,7 @@
 //! commit since the snapshot changed a collection they read or write
 //! (optimistic).
 
-use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, sync::Arc};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet, HashMap}, sync::Arc};
 
 use super::{column::Scratch, read::Snapshot, wal::LogEntry, Commit, GlacierBackend, Spilled, State, Watch};
 use crate::{
@@ -17,7 +17,8 @@ use crate::{
 pub(super) struct Transaction<'a> {
     backend: &'a GlacierBackend,
     snapshot: Snapshot,
-    staged: BTreeMap<(CollectionId, DocumentId), Option<StoredDocument>>,
+    /// The entry of each document written, its last write: the version and document live there only.
+    staged: HashMap<(CollectionId, DocumentId), usize>,
     entries: Vec<LogEntry>,
     counts: (u64, u64, u64),
     closed: bool,
@@ -26,6 +27,8 @@ pub(super) struct Transaction<'a> {
     spilled: Option<Spilled>,
     /// The collections read or written, `None` once every collection was listed.
     watched: RefCell<Option<BTreeSet<CollectionId>>>,
+    /// The collections inserted into: those neither read nor written otherwise conflict only on their new documents.
+    inserted: BTreeSet<CollectionId>,
 }
 
 impl std::fmt::Debug for Transaction<'_> {
@@ -36,7 +39,7 @@ impl std::fmt::Debug for Transaction<'_> {
 
 impl<'a> Transaction<'a> {
     pub(super) fn new(backend: &'a GlacierBackend, state: Arc<State>) -> Self {
-        Self { backend, snapshot: Snapshot::new(state), staged: BTreeMap::new(), entries: Vec::new(), counts: (0, 0, 0), closed: false, scratch: Scratch::default(), spilled: None, watched: RefCell::new(Some(BTreeSet::new())) }
+        Self { backend, snapshot: Snapshot::new(state), staged: HashMap::new(), entries: Vec::new(), counts: (0, 0, 0), closed: false, scratch: Scratch::default(), spilled: None, watched: RefCell::new(Some(BTreeSet::new())), inserted: BTreeSet::new() }
     }
 
     fn watch(&self, collection: &CollectionId) {
@@ -47,8 +50,9 @@ impl<'a> Transaction<'a> {
 
     fn watched(&self) -> Watch {
         let watched = self.watched.borrow_mut().take();
-        let all = watched.is_none();
-        Watch::of(self.snapshot.state(), watched.unwrap_or_default(), all)
+        let (all, watched) = (watched.is_none(), watched.unwrap_or_default());
+        let inserted = self.inserted.iter().filter(|name| !watched.contains(*name)).cloned().collect::<Vec<_>>();
+        Watch::of(self.snapshot.state(), watched, inserted, all)
     }
 
     const fn ensure_open(&self) -> StorageResult<()> {
@@ -56,8 +60,8 @@ impl<'a> Transaction<'a> {
     }
 
     fn current(&self, collection: &CollectionId, id: &DocumentId) -> StorageResult<Option<StoredDocument>> {
-        match self.staged.get(&(collection.clone(), *id)) {
-            Some(staged) => Ok(staged.clone()),
+        match self.staged(collection, id)? {
+            Some(staged) => Ok(staged),
             None => self.snapshot.get(collection, id),
         }
     }
@@ -65,14 +69,26 @@ impl<'a> Transaction<'a> {
     /// Version of `id` in this transaction, its document left unread.
     fn current_version(&mut self, collection: &CollectionId, id: &DocumentId) -> StorageResult<DocumentVersion> {
         match self.staged.get(&(collection.clone(), *id)) {
-            Some(staged) => staged.as_ref().map(StoredDocument::version),
+            Some(at) => match &self.entries[*at] { LogEntry::Put { version, .. } => Some(*version), LogEntry::Delete { .. } => None },
             None => self.snapshot.version(collection, id, &mut self.scratch)?,
         }
         .ok_or_else(|| StorageError::document_not_found(collection.clone(), *id))
     }
 
+    /// The document `id` as this transaction last wrote it (`Some(None)`: deleted); `None` when it did not.
+    fn staged(&self, collection: &CollectionId, id: &DocumentId) -> StorageResult<Option<Option<StoredDocument>>> {
+        self.staged.get(&(collection.clone(), *id)).map(|at| self.entry(*at)).transpose()
+    }
+
+    fn entry(&self, at: usize) -> StorageResult<Option<StoredDocument>> {
+        match &self.entries[at] {
+            LogEntry::Put { id, version, document, .. } => StoredDocument::new(*id, *version, Arc::clone(document)).map(Some),
+            LogEntry::Delete { .. } => Ok(None),
+        }
+    }
+
     fn put(&mut self, collection: &CollectionId, stored: &StoredDocument) {
-        self.staged.insert((collection.clone(), *stored.id()), Some(stored.clone()));
+        self.staged.insert((collection.clone(), *stored.id()), self.entries.len());
         self.entries.push(LogEntry::Put { collection: collection.clone(), id: *stored.id(), version: stored.version(), document: stored.shared_document() });
     }
 }
@@ -88,12 +104,12 @@ impl StorageRead for Transaction<'_> {
         self.ensure_open()?;
         self.watch(collection);
         let mut documents = self.snapshot.scan(collection, ScanOptions::default())?.into_iter().map(|stored| (*stored.id(), stored)).collect::<BTreeMap<_, _>>();
-        for ((staged_collection, id), value) in &self.staged {
+        for ((staged_collection, id), at) in &self.staged {
             if staged_collection != collection {
                 continue;
             }
-            match value {
-                Some(stored) => { documents.insert(*id, stored.clone()); }
+            match self.entry(*at)? {
+                Some(stored) => { documents.insert(*id, stored); }
                 None => { documents.remove(id); }
             }
         }
@@ -120,12 +136,12 @@ impl StorageRead for Transaction<'_> {
         self.ensure_open()?;
         self.watch(collection);
         let mut count = self.snapshot.count(collection)?;
-        for ((staged_collection, id), value) in &self.staged {
+        for ((staged_collection, id), at) in &self.staged {
             if staged_collection != collection {
                 continue;
             }
             let before = self.snapshot.get(collection, id)?.is_some();
-            match (before, value.is_some()) {
+            match (before, matches!(self.entries[*at], LogEntry::Put { .. })) {
                 (false, true) => count += 1,
                 (true, false) => count = count.saturating_sub(1),
                 _ => {}
@@ -159,7 +175,7 @@ impl StorageRead for Transaction<'_> {
 impl StorageTransaction for Transaction<'_> {
     fn insert(&mut self, collection: &CollectionId, id: DocumentId, document: Arc<Document>) -> StorageResult<InsertResult> {
         self.ensure_open()?;
-        self.watch(collection);
+        if !self.inserted.contains(collection) { self.inserted.insert(collection.clone()); }
         if self.current(collection, &id)?.is_some() {
             return Err(StorageError::document_already_exists(collection.clone(), id));
         }
@@ -185,7 +201,7 @@ impl StorageTransaction for Transaction<'_> {
         self.watch(collection);
         let current = self.current_version(collection, id)?;
         ensure_version(collection, id, current, precondition)?;
-        self.staged.insert((collection.clone(), *id), None);
+        self.staged.insert((collection.clone(), *id), self.entries.len());
         self.entries.push(LogEntry::Delete { collection: collection.clone(), id: *id });
         self.counts.2 += 1;
         Ok(DeleteResult::new(*id, current))

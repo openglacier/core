@@ -32,12 +32,13 @@ mod read;
 mod segment;
 mod tx;
 mod usage;
+mod delta;
 mod wal;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock},
+    sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex, MutexGuard, OnceLock, RwLock},
 };
 
 use self::{
@@ -106,7 +107,7 @@ pub(super) struct Collection {
     segments: Vec<SegmentPart>,
     /// Whether two segments' identifier ranges overlap.
     overlapping: bool,
-    delta: Arc<BTreeMap<u128, DeltaRow>>,
+    delta: delta::Delta,
     live: u64,
     facts: Arc<BTreeMap<FieldName, [u64; FACTS]>>,
     /// The generation of the last commit that changed it (since the store
@@ -241,7 +242,7 @@ impl Collection {
 
     fn max_id(&self) -> Option<u128> {
         let segments = self.segments.iter().map(|part| part.segment.max_id()).max();
-        let delta = self.delta.keys().next_back().copied();
+        let delta = self.delta.last_key();
         segments.max(delta)
     }
 
@@ -279,30 +280,56 @@ pub(super) struct Commit {
 
 /// What a transaction read or wrote, prepared against generation `generation`: another commit since conflicts
 /// with it only if it changed one of these collections. `all` stands for every collection (a listing of them).
+/// A collection the transaction only inserted into (`inserted`) conflicts only if one of its new documents exists
+/// by now: inserts of different documents by concurrent writers all commit.
 #[derive(Debug, Default)]
 pub(super) struct Watch {
     generation: u64,
     /// Each collection, and whether it existed at `generation`.
     collections: Vec<(CollectionId, bool)>,
+    inserted: Vec<(CollectionId, bool)>,
     all: bool,
 }
 
 impl Watch {
     /// Every collection: any commit since `generation` conflicts.
-    const fn everything(generation: u64) -> Self { Self { generation, collections: Vec::new(), all: true } }
+    const fn everything(generation: u64) -> Self { Self { generation, collections: Vec::new(), inserted: Vec::new(), all: true } }
 
-    pub(super) fn of(state: &State, collections: impl IntoIterator<Item = CollectionId>, all: bool) -> Self {
-        Self { generation: state.generation, collections: collections.into_iter().map(|name| { let existed = state.collections.contains_key(&name); (name, existed) }).collect(), all }
+    pub(super) fn of(state: &State, collections: impl IntoIterator<Item = CollectionId>, inserted: impl IntoIterator<Item = CollectionId>, all: bool) -> Self {
+        let existing = |names: &mut dyn Iterator<Item = CollectionId>| names.map(|name| { let existed = state.collections.contains_key(&name); (name, existed) }).collect();
+        Self { generation: state.generation, collections: existing(&mut collections.into_iter()), inserted: existing(&mut inserted.into_iter()), all }
     }
 
-    /// Whether a commit since `generation` changed a watched collection in `current`.
+    fn changed<'a>(&'a self, names: &'a [(CollectionId, bool)], current: &'a State) -> impl Iterator<Item = &'a CollectionId> {
+        names.iter().filter(|(name, existed)| current.collections.get(name).map_or(*existed, |collection| collection.changed > self.generation)).map(|(name, _)| name)
+    }
+
+    /// Whether a commit since `generation` changed a watched collection in `current`, one only inserted into included.
     fn conflicts(&self, current: &State) -> bool {
-        current.generation != self.generation && (self.all || self.collections.iter().any(|(name, existed)| match current.collections.get(name) {
-            Some(collection) => collection.changed > self.generation,
-            None => *existed,
-        }))
+        current.generation != self.generation && (self.all || self.changed(&self.collections, current).chain(self.changed(&self.inserted, current)).next().is_some())
+    }
+
+    /// As [`Self::conflicts`], but a changed collection only inserted into conflicts only if it was dropped or holds
+    /// one of the documents `entries` insert.
+    fn conflicts_with(&self, current: &State, entries: &[LogEntry]) -> StorageResult<bool> {
+        if current.generation == self.generation { return Ok(false); }
+        if self.all || self.changed(&self.collections, current).next().is_some() { return Ok(true); }
+        let mut scratch = Scratch::default();
+        for name in self.changed(&self.inserted, current) {
+            let Some(collection) = current.collections.get(name) else { return Ok(true) };
+            let max_id = collection.max_id();
+            for entry in entries {
+                if let LogEntry::Put { collection: target, id, .. } = entry {
+                    let key = key(id);
+                    if target == name && max_id.is_some_and(|max| key <= max) && collection.locate(key, &mut scratch)?.is_some() { return Ok(true); }
+                }
+            }
+        }
+        Ok(false)
     }
 }
+
+fn log_unsynced() -> StorageError { StorageError::backend("Glacier: a sync of the log failed, the store takes no commit until it is reopened") }
 
 /// Effect of a commit on one document.
 #[derive(Debug)]
@@ -419,6 +446,28 @@ struct Writer {
     metrics: GlacierWriteMetrics,
 }
 
+/// Group commit: under the writer lock a commit only adds its record to `pending`; it then waits here for one
+/// write and sync of the log, which covers every record pending when it starts. A commit is visible to readers
+/// before it is durable, and returns once it is.
+#[derive(Debug, Default)]
+struct Durable {
+    /// Whether a commit leads a write and sync of the log: one at a time, the others wait on `synced_more`.
+    sync: Mutex<bool>,
+    synced_more: std::sync::Condvar,
+    /// Records not yet written to the log, in commit order, and the time and author of their commits, which
+    /// the timeline of a recorded history takes once they are durable.
+    pending: Mutex<(Vec<u8>, Vec<CommitRecord>)>,
+    /// Commits recorded (changed with `pending` locked), and those of them known durable.
+    appended: AtomicU64,
+    synced: AtomicU64,
+    /// A sync failed: what the log holds is unknown, the store refuses commits until reopened.
+    failed: AtomicBool,
+    /// Nanoseconds the last sync took, when it covered several commits (0: one commit, writers do not overlap).
+    shared_sync_nanos: AtomicU64,
+    /// Syncs of the log done for commits.
+    syncs: AtomicU64,
+}
+
 #[derive(Debug)]
 struct Inner {
     dir: PathBuf,
@@ -427,6 +476,9 @@ struct Inner {
     limits: Limits,
     state: RwLock<Arc<State>>,
     writer: Mutex<Writer>,
+    durable: Durable,
+    /// One purge of the history at a time ([`GlacierBackend::purge_history`]).
+    purging: Mutex<()>,
     /// History recording, once enabled (see [`history`]).
     history: OnceLock<history::History>,
     /// Stored bytes per key value, per segment (see [`usage`]).
@@ -508,7 +560,7 @@ impl GlacierBackend {
                 segments.push(SegmentPart { segment, dead: entry.dead.clone() });
             }
             let live = segments.iter().map(SegmentPart::live).sum();
-            let mut state_collection = Collection { segments, overlapping: false, delta: Arc::default(), live, facts: Arc::new(collection.facts.clone()), changed: manifest.generation };
+            let mut state_collection = Collection { segments, overlapping: false, delta: delta::Delta::default(), live, facts: Arc::new(collection.facts.clone()), changed: manifest.generation };
             state_collection.refresh_overlap();
             state.collections.insert(collection.name.clone(), Arc::new(state_collection));
         }
@@ -540,7 +592,7 @@ impl GlacierBackend {
             recorded.recover(state.generation);
             let _ = history.set(recorded);
         }
-        Ok(Self { inner: Arc::new(Inner { dir, _lock: lock, limits, state: RwLock::new(Arc::new(state)), writer: Mutex::new(writer), history, usage: Mutex::default() }) })
+        Ok(Self { inner: Arc::new(Inner { dir, _lock: lock, limits, state: RwLock::new(Arc::new(state)), writer: Mutex::new(writer), durable: Durable::default(), purging: Mutex::new(()), history, usage: Mutex::default() }) })
     }
 
     fn state(&self) -> StorageResult<Arc<State>> {
@@ -657,6 +709,21 @@ impl GlacierBackend {
         Ok(())
     }
 
+    /// Removes from the history the versions no read of the past needs any more, see [`history::History::purge`]:
+    /// `floor_of` gives, per Place (`_place` of a document), the time from which its past is read. Pending rows
+    /// are written to segments first; commits go on meanwhile, their events are left alone.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the store keeps no history, or when a history file cannot be read or replaced.
+    pub fn purge_history(&self, floor_of: &dyn Fn(Option<&str>) -> Option<i64>) -> StorageResult<history::HistoryPurge> {
+        let recorded = self.inner.history.get().filter(|recorded| !recorded.journal()).ok_or_else(StorageError::history_unavailable)?;
+        let _one = self.inner.purging.lock().map_err(|_| StorageError::backend("Glacier purge lock poisoned"))?;
+        self.checkpoint()?;
+        let (_, source) = self.history_source()?;
+        recorded.purge(&source, floor_of, &|| { let mut writer = self.writer()?; writer.next_file += 1; Ok(writer.next_file - 1) })
+    }
+
     /// Whether this store keeps history (a backup journal is not history).
     #[must_use]
     pub fn keeps_history(&self) -> bool { self.inner.history.get().is_some_and(|recorded| !recorded.journal()) }
@@ -667,6 +734,7 @@ impl GlacierBackend {
         let recorded = self.inner.history.get().ok_or_else(StorageError::history_unavailable)?;
         let writer = self.writer()?;
         let state = self.state()?;
+        self.settle_log(&writer)?;
         let live = wal::replay(&wal_path(&self.inner.dir, writer.wal_sequence))?.0.into_iter().filter(|record| record.0 <= state.generation).collect();
         let source = recorded.source(Arc::clone(&state), live)?;
         drop(writer);
@@ -747,8 +815,11 @@ impl GlacierBackend {
             return Ok(CommitResult::default());
         }
         let mut writer = self.writer()?;
+        if self.inner.durable.failed.load(Ordering::Acquire) {
+            return Err(log_unsynced());
+        }
         let current = self.state()?;
-        if commit.watch.conflicts(&current) {
+        if commit.watch.conflicts_with(&current, &commit.entries)? {
             return Err(StorageError::transaction_conflict("Glacier: a collection of the transaction changed before commit"));
         }
         let generation = next_generation(current.generation)?;
@@ -764,8 +835,14 @@ impl GlacierBackend {
             }
             return Ok(commit.result);
         }
-        writer.wal.append(generation, &commit.entries)?;
+        let record = writer.wal.record(generation, &commit.entries)?;
         writer.metrics.wal_commits += 1;
+        let (ticket, log) = {
+            let mut pending = self.inner.durable.pending.lock().map_err(|_| StorageError::backend("Glacier log lock poisoned"))?;
+            pending.0.extend_from_slice(&record);
+            pending.1.extend(self.inner.history.get().and_then(|recorded| recorded.commit_record(generation)));
+            (self.inner.durable.appended.fetch_add(1, Ordering::AcqRel) + 1, writer.wal.file())
+        };
         drop(current);
         let flush_due = {
             let mut guard = self.inner.state.write().map_err(|_| StorageError::backend("Glacier state lock poisoned"))?;
@@ -774,9 +851,6 @@ impl GlacierBackend {
             state.generation = generation;
             state.collections.values().map(|collection| collection.delta.len()).sum::<usize>() >= self.inner.limits.flush_rows || writer.wal.bytes() >= self.inner.limits.flush_wal_bytes
         };
-        if let Some(recorded) = self.inner.history.get() {
-            recorded.record(generation);
-        }
         if flush_due {
             // The commit is durable in the log: a failed flush is retried by
             // the next commit rather than reported as a failed commit.
@@ -785,7 +859,102 @@ impl GlacierBackend {
                 writer.metrics.flush_failures += 1;
             }
         }
+        drop(writer);
+        crate::memory::without_slot(|| self.sync_log(ticket, &log))?;
         Ok(commit.result)
+    }
+
+    /// Returns once commit `ticket`, appended to `log`, is durable: by the sync of another commit or of a log
+    /// restart, or by its own, which covers every commit appended before it starts. `log` is still the current
+    /// log when the sync runs: a restart syncs the old one first, leading as a commit does.
+    const SYNC_WAIT_STEP: std::time::Duration = std::time::Duration::from_micros(100);
+
+    fn sync_log(&self, ticket: u64, log: &std::fs::File) -> StorageResult<()> {
+        let durable = &self.inner.durable;
+        loop {
+            if durable.synced.load(Ordering::Acquire) >= ticket {
+                return Ok(());
+            }
+            if durable.failed.load(Ordering::Acquire) {
+                return Err(log_unsynced());
+            }
+            if !self.lead_sync(false)? {
+                continue;
+            }
+            // Writers overlap: the commits the last sync released are coming back. Waiting for them while they
+            // keep arriving, at most half a sync, lets this sync cover them instead of leaving them to the next.
+            let wait = std::time::Duration::from_nanos(durable.shared_sync_nanos.load(Ordering::Relaxed) / 2);
+            if wait >= Self::SYNC_WAIT_STEP {
+                let (started, mut seen) = (std::time::Instant::now(), durable.appended.load(Ordering::Acquire));
+                loop {
+                    std::thread::sleep(Self::SYNC_WAIT_STEP);
+                    let now = durable.appended.load(Ordering::Acquire);
+                    if now == seen || started.elapsed() >= wait { break; }
+                    seen = now;
+                }
+            }
+            let (before, started) = (durable.synced.load(Ordering::Acquire), std::time::Instant::now());
+            let covered = self.write_pending(log);
+            let overlap = covered.as_ref().is_ok_and(|covered| covered - before > 1 || durable.appended.load(Ordering::Acquire) > *covered);
+            durable.shared_sync_nanos.store(if overlap { u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX) } else { 0 }, Ordering::Relaxed);
+            self.end_sync();
+            covered?;
+        }
+    }
+
+    /// Takes the lead of the next write of the log: one at a time. `false` (unless `wait`) when another leads: it
+    /// was waited for, and what it made durable is to be looked at again.
+    fn lead_sync(&self, wait: bool) -> StorageResult<bool> {
+        let durable = &self.inner.durable;
+        let poisoned = |_| StorageError::backend("Glacier sync lock poisoned");
+        let mut syncing = durable.sync.lock().map_err(poisoned)?;
+        if *syncing && !wait {
+            drop(durable.synced_more.wait(syncing).map_err(poisoned)?);
+            return Ok(false);
+        }
+        while *syncing {
+            syncing = durable.synced_more.wait(syncing).map_err(poisoned)?;
+        }
+        *syncing = true;
+        Ok(true)
+    }
+
+    fn end_sync(&self) {
+        *self.inner.durable.sync.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.inner.durable.synced_more.notify_all();
+    }
+
+    /// Writes the pending records to `log`, the current one, and syncs it; the caller leads ([`Self::lead_sync`]).
+    /// Returns the commits now durable. A failure leaves commits readers saw out of the log: the store stops.
+    fn write_pending(&self, mut log: &std::fs::File) -> StorageResult<u64> {
+        use std::io::Write;
+        let durable = &self.inner.durable;
+        let ((records, commits), covered) = {
+            let mut pending = durable.pending.lock().map_err(|_| StorageError::backend("Glacier log lock poisoned"))?;
+            (std::mem::take(&mut *pending), durable.appended.load(Ordering::Acquire))
+        };
+        if !records.is_empty() {
+            if let Err(error) = log.write_all(&records).and_then(|()| log.sync_data()) {
+                durable.failed.store(true, Ordering::Release);
+                return Err(StorageError::backend(format!("Glacier: write wal: {error}")));
+            }
+            durable.syncs.fetch_add(1, Ordering::Relaxed);
+        }
+        // The timeline names durable commits only, in commit order: a log restart writes these first.
+        if let Some(recorded) = self.inner.history.get() {
+            commits.iter().for_each(|commit| recorded.append(commit));
+        }
+        durable.synced.fetch_max(covered, Ordering::AcqRel);
+        Ok(covered)
+    }
+
+    /// Makes every recorded commit durable in the current log, for a caller holding the writer lock that reads
+    /// the log file or retires it.
+    fn settle_log(&self, writer: &Writer) -> StorageResult<()> {
+        self.lead_sync(true)?;
+        let written = self.write_pending(&writer.wal.file()).map(drop);
+        self.end_sync();
+        written
     }
 
     /// Installs what a transaction moved out of memory ([`Spilled`]) if no commit since `base` changed what it
@@ -824,7 +993,7 @@ impl GlacierBackend {
                 let part = &mut collection.segments[part];
                 Arc::make_mut(part.dead.get_or_insert_with(|| Arc::new(DeadRows::with_rows(part.segment.rows())))).add(&dead);
             }
-            let delta = Arc::make_mut(&mut collection.delta);
+            let delta = &mut collection.delta;
             spill.delta.iter().for_each(|key| { delta.remove(key); });
             for number in spill.segments {
                 if let Some(recorded) = recorded {
@@ -910,7 +1079,7 @@ impl GlacierBackend {
             for number in numbers {
                 collection.segments.push(SegmentPart { segment: Segment::open(&segment_path(&self.inner.dir, number), number)?, dead: None });
             }
-            collection.delta = Arc::default();
+            collection.delta = delta::Delta::default();
             collection.refresh_overlap();
         }
         next.collections.retain(|_, collection| collection.live > 0 || !collection.segments.is_empty());
@@ -942,6 +1111,8 @@ impl GlacierBackend {
         // The next log exists, durably, before the manifest names it: a
         // failure before the manifest leaves the store as it was, writing to
         // the log the current manifest replays.
+        // The commits of the old log still waiting for their sync become durable with it.
+        self.settle_log(writer)?;
         let next_log = wal_path(&self.inner.dir, wal_sequence);
         let next_wal = Wal::open(&next_log, 0)?;
         if let Err(error) = sync_dir(&self.inner.dir).and_then(|()| manifest.store(&self.inner.dir)) {
@@ -978,6 +1149,7 @@ impl GlacierBackend {
         let mut entries = Vec::with_capacity(mutations.len());
         let mut returned = Vec::with_capacity(if keep { mutations.len() } else { 0 });
         let (mut inserted, mut replaced) = (0u64, 0u64);
+        let inserts_only = mutations.iter().all(|mutation| matches!(mutation, StorageMutation::Insert { .. }));
         for mutation in mutations {
             let stored = match mutation {
                 StorageMutation::Insert { id, document } => {
@@ -1006,7 +1178,7 @@ impl GlacierBackend {
             }
             staged.insert(key(stored.id()), stored);
         }
-        Ok((Commit { entries, result: CommitResult::new(inserted, replaced, 0), watch: Watch::of(state, [collection.clone()], false) }, returned))
+        Ok((Commit { entries, result: CommitResult::new(inserted, replaced, 0), watch: Watch::of(state, (!inserts_only).then(|| collection.clone()), inserts_only.then(|| collection.clone()), false) }, returned))
     }
 }
 
@@ -1139,7 +1311,7 @@ fn apply(state: &mut State, changes: BTreeMap<CollectionId, Planned>, generation
             }
         }
         facts.retain(|_, counts| counts.iter().any(|count| *count > 0));
-        let delta = Arc::make_mut(&mut collection.delta);
+        let delta = &mut collection.delta;
         for key in delta_removals {
             delta.remove(&key);
         }
@@ -1265,6 +1437,7 @@ impl StorageEngine for GlacierBackend {
     fn release_history(&self, generation: u64) -> StorageResult<()> {
         let Some(recorded) = self.inner.history.get() else { return Ok(()) };
         let writer = self.writer()?;
+        self.settle_log(&writer)?;
         let live_first = wal::replay(&wal_path(&self.inner.dir, writer.wal_sequence))?.0.first().map(|record| record.0);
         recorded.release(generation, live_first)
     }

@@ -11,7 +11,9 @@
 //!   after the target generation, plus the versions those documents had then.
 //!   A collection no event touched since is read straight from the current
 //!   snapshot, with all its fast paths; the cost grows with the changes made
-//!   since the target generation, not with the collection.
+//!   since the target generation, not with the collection. A backend may
+//!   instead read the past state itself ([`HistorySource::read_at`]): Glacier
+//!   builds it from its segments, with the fast paths of a live collection.
 //! - [`HistoryRead`]: one row per event of the source collection, in
 //!   generation order, with the document of the version and system fields
 //!   (`_doc_id`, `_version`, `_op`, `_generation`, `_at`, `_by`,
@@ -70,6 +72,7 @@ pub struct CommitAuthor {
 thread_local! {
     static COMMIT_AUTHOR: RefCell<Option<CommitAuthor>> = const { RefCell::new(None) };
     static COMMIT_RECORD: RefCell<Option<CommitRecord>> = const { RefCell::new(None) };
+    static HISTORY_FLOOR: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Runs `body` with `author` as the author of the commits it makes on this
@@ -83,6 +86,17 @@ pub fn with_commit_author<R>(author: Option<CommitAuthor>, body: impl FnOnce() -
         }
     }
     let _restore = Restore(COMMIT_AUTHOR.with(|current| std::mem::replace(&mut *current.borrow_mut(), author)));
+    body()
+}
+
+/// Runs `body` with temporal reads on this thread bound to the history kept since `floor` (Unix milliseconds,
+/// `None`: no bound): the daemon sets the retention of the Place a query reads ([`temporal_read`]).
+pub fn with_history_floor<R>(floor: Option<i64>, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<i64>);
+    impl Drop for Restore {
+        fn drop(&mut self) { HISTORY_FLOOR.set(self.0); }
+    }
+    let _restore = Restore(HISTORY_FLOOR.replace(floor));
     body()
 }
 
@@ -365,6 +379,10 @@ pub trait HistorySource {
 
     /// Commit times recorded so far.
     fn timeline(&self) -> StorageResult<Timeline>;
+
+    /// `collection` as it was at `generation`, when the backend reads a past state with its own paths
+    /// (`Some(None)`: no event touched it since); `None` leaves it to the merge of [`AsOfRead`].
+    fn read_at(&self, _collection: &CollectionId, _generation: u64) -> StorageResult<Option<Option<Arc<dyn StorageRead + Send + Sync>>>> { Ok(None) }
 }
 
 /// Writes recorded history into a store that has none yet (a backup
@@ -388,7 +406,7 @@ pub trait HistoryWriter {
 #[derive(Debug, Default)]
 pub struct TemporalCache {
     resolved: Mutex<Option<u64>>,
-    deltas: Mutex<HashMap<(CollectionId, u64), Arc<AsOfDelta>>>,
+    deltas: Mutex<HashMap<(CollectionId, u64), At>>,
     timeline: Mutex<Option<Arc<Timeline>>>,
 }
 
@@ -433,6 +451,23 @@ impl TemporalCache {
         let loaded = Arc::new(source.timeline()?);
         *timeline = Some(Arc::clone(&loaded));
         Ok(loaded)
+    }
+}
+
+/// How a collection is read at one generation.
+#[derive(Clone)]
+enum At {
+    /// As in the current snapshot: no event touched it since.
+    Same,
+    /// The current snapshot merged with the versions of the documents touched since.
+    Merged(Arc<AsOfDelta>),
+    /// Read by the backend itself ([`HistorySource::read_at`]).
+    Native(Arc<dyn StorageRead + Send + Sync>),
+}
+
+impl fmt::Debug for At {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self { Self::Same => "Same", Self::Merged(_) => "Merged", Self::Native(_) => "Native" })
     }
 }
 
@@ -525,21 +560,25 @@ impl<'a> AsOfRead<'a> {
     #[must_use]
     pub const fn generation(&self) -> u64 { self.generation }
 
-    fn delta(&self, collection: &CollectionId) -> StorageResult<Arc<AsOfDelta>> {
+    /// How `collection` is read, computed once per query.
+    fn at(&self, collection: &CollectionId) -> StorageResult<At> {
         let key = (collection.clone(), self.source.generation());
-        if let Some(delta) = self.cache.deltas.lock().map_err(|_| StorageError::backend("history cache lock poisoned"))?.get(&key) {
-            return Ok(Arc::clone(delta));
+        if let Some(at) = self.cache.deltas.lock().map_err(|_| StorageError::backend("history cache lock poisoned"))?.get(&key) {
+            return Ok(at.clone());
         }
-        let delta = Arc::new(AsOfDelta::build(self.source.as_ref(), collection, self.generation)?);
-        self.cache.deltas.lock().map_err(|_| StorageError::backend("history cache lock poisoned"))?.insert(key, Arc::clone(&delta));
-        Ok(delta)
+        let at = match self.source.read_at(collection, self.generation)? {
+            Some(native) => native.map_or(At::Same, At::Native),
+            None => {
+                let delta = AsOfDelta::build(self.source.as_ref(), collection, self.generation)?;
+                if delta.is_empty() { At::Same } else { At::Merged(Arc::new(delta)) }
+            }
+        };
+        self.cache.deltas.lock().map_err(|_| StorageError::backend("history cache lock poisoned"))?.insert(key, at.clone());
+        Ok(at)
     }
 
-    /// The delta when it is not empty: the collection then needs the merged path.
-    fn changed(&self, collection: &CollectionId) -> StorageResult<Option<Arc<AsOfDelta>>> {
-        let delta = self.delta(collection)?;
-        Ok((!delta.is_empty()).then_some(delta))
-    }
+    /// Whether no event touched `collection` since: its facts and samples are those of the current snapshot.
+    fn same(&self, collection: &CollectionId) -> StorageResult<bool> { Ok(matches!(self.at(collection)?, At::Same)) }
 }
 
 /// Merged reads of a changed collection: native ordered scan and lookups,
@@ -631,9 +670,10 @@ impl StorageRead for Merged<'_, '_> {
 /// change since the generation, to the merged reader otherwise.
 macro_rules! as_of_dispatch {
     ($view:expr, $collection:expr, |$read:ident| $body:expr) => {{
-        match $view.changed($collection)? {
-            None => { let $read: &dyn StorageRead = $view.current.as_ref(); $body }
-            Some(delta) => { let merged = Merged { view: $view, delta }; let $read: &dyn StorageRead = &merged; $body }
+        match $view.at($collection)? {
+            At::Same => { let $read: &dyn StorageRead = $view.current.as_ref(); $body }
+            At::Merged(delta) => { let merged = Merged { view: $view, delta }; let $read: &dyn StorageRead = &merged; $body }
+            At::Native(native) => { let $read: &dyn StorageRead = native.as_ref(); $body }
         }
     }};
 }
@@ -642,24 +682,15 @@ impl StorageRead for AsOfRead<'_> {
     fn support(&self, capability: StorageReadCapability) -> StorageSupport { self.current.support(capability) }
 
     fn top_level_fields(&self, collection: &CollectionId) -> StorageResult<Option<Vec<String>>> {
-        match self.changed(collection)? {
-            None => self.current.top_level_fields(collection),
-            Some(_) => Ok(None),
-        }
+        if self.same(collection)? { self.current.top_level_fields(collection) } else { Ok(None) }
     }
 
     fn field_facts(&self, collection: &CollectionId) -> StorageResult<Option<FieldFacts>> {
-        match self.changed(collection)? {
-            None => self.current.field_facts(collection),
-            Some(_) => Ok(None),
-        }
+        if self.same(collection)? { self.current.field_facts(collection) } else { Ok(None) }
     }
 
     fn field_bounds(&self, collection: &CollectionId) -> StorageResult<Option<BTreeMap<String, FieldBounds>>> {
-        match self.changed(collection)? {
-            None => self.current.field_bounds(collection),
-            Some(_) => Ok(None),
-        }
+        if self.same(collection)? { self.current.field_bounds(collection) } else { Ok(None) }
     }
 
     fn visit_row_ids(&self, collection: &CollectionId, visitor: &mut dyn FnMut(DocumentId, DocumentVersion) -> StorageResult<bool>) -> StorageResult<()> {
@@ -685,16 +716,14 @@ impl StorageRead for AsOfRead<'_> {
     fn supports_projected_blocks(&self) -> bool { self.current.supports_projected_blocks() }
 
     fn sample_row_ids(&self, collection: &CollectionId, count: usize, seed: u64) -> StorageResult<Option<(u64, Vec<(DocumentId, DocumentVersion)>)>> {
-        match self.changed(collection)? {
-            None => self.current.sample_row_ids(collection, count, seed),
-            Some(_) => Ok(None),
-        }
+        if self.same(collection)? { self.current.sample_row_ids(collection, count, seed) } else { Ok(None) }
     }
 
     fn scan_projected_blocks_each(&self, collection: &CollectionId, options: ScanOptions, fields: &[FieldPath], skip: &dyn Fn(&[Option<GroupFacts<'_>>]) -> bool, gate: Option<BlockGate<'_>>, visitor: &mut dyn for<'r> FnMut(&ProjectedBlock<'_, 'r>) -> StorageResult<bool>) -> StorageResult<()> {
-        match self.changed(collection)? {
-            None => self.current.scan_projected_blocks_each(collection, options, fields, skip, gate, visitor),
-            Some(delta) => Merged { view: self, delta }.scan_projected_blocks_each(collection, options, fields, skip, gate, visitor),
+        match self.at(collection)? {
+            At::Same => self.current.scan_projected_blocks_each(collection, options, fields, skip, gate, visitor),
+            At::Merged(delta) => Merged { view: self, delta }.scan_projected_blocks_each(collection, options, fields, skip, gate, visitor),
+            At::Native(native) => native.scan_projected_blocks_each(collection, options, fields, skip, gate, visitor),
         }
     }
 
@@ -740,6 +769,8 @@ pub struct HistoryRead<'a> {
     source: Box<dyn HistorySource + 'a>,
     collection: CollectionId,
     timeline: Timeline,
+    /// Generations up to this one are left out (0: none), see [`temporal_read`].
+    from: u64,
     /// Documents deleted at least once: their last version is kept while
     /// streaming so a delete row carries the document it removed.
     deleted: Mutex<Option<Arc<HashSet<DocumentId>>>>,
@@ -759,7 +790,7 @@ impl<'a> HistoryRead<'a> {
     /// Fails when the source cannot read its timeline.
     pub fn new(current: Box<dyn StorageRead + 'a>, source: Box<dyn HistorySource + 'a>, collection: CollectionId) -> StorageResult<Self> {
         let timeline = source.timeline()?;
-        Ok(Self { current, source, collection, timeline, deleted: Mutex::new(None) })
+        Ok(Self { current, source, collection, timeline, from: 0, deleted: Mutex::new(None) })
     }
 
     fn deleted(&self) -> StorageResult<Arc<HashSet<DocumentId>>> {
@@ -800,6 +831,7 @@ impl<'a> HistoryRead<'a> {
 
     /// Streams the rows of generations `(after, upto]` in generation order.
     fn stream(&self, after: u64, upto: u64, visitor: &mut dyn FnMut(StoredDocument) -> StorageResult<bool>) -> StorageResult<()> {
+        let after = after.max(self.from);
         let deleted = self.deleted()?;
         // Last version of each deleted document, as the stream reaches it.
         let mut last = HashMap::<DocumentId, StoredDocument>::new();
@@ -900,7 +932,7 @@ impl StorageRead for HistoryRead<'_> {
             return self.current.count(collection);
         }
         let mut count = 0u64;
-        self.source.events(&self.collection, 0, self.source.generation(), None, false, &mut |_| {
+        self.source.events(&self.collection, self.from, self.source.generation(), None, false, &mut |_| {
             count += 1;
             Ok(true)
         })?;
@@ -912,7 +944,7 @@ impl StorageRead for HistoryRead<'_> {
             return self.current.collection_exists(collection);
         }
         let mut any = false;
-        self.source.events(&self.collection, 0, self.source.generation(), None, false, &mut |_| {
+        self.source.events(&self.collection, self.from, self.source.generation(), None, false, &mut |_| {
             any = true;
             Ok(false)
         })?;
@@ -970,16 +1002,33 @@ impl super::StorageEngine for TemporalStorage {
 /// # Errors
 ///
 /// Fails when the point in time cannot be resolved.
+///
+/// Under a floor ([`with_history_floor`]), an `as of` whose state ended before the floor is refused (a time: the
+/// time asked; a generation: the commit after it), and `history` leaves out the versions written before it.
 pub fn temporal_read<'a>(current: Box<dyn StorageRead + 'a>, source: Box<dyn HistorySource + 'a>, temporal: &Temporal, cache: &Arc<TemporalCache>) -> StorageResult<Box<dyn StorageRead + 'a>> {
+    let floor = HISTORY_FLOOR.get();
     match temporal {
         Temporal::AsOf(as_of) => {
             let view = AsOfRead::new(current, source, *as_of, Arc::clone(cache))?;
             if view.generation == view.source.generation() {
                 return Ok(view.current);
             }
+            if let Some(floor) = floor {
+                let ended = match as_of {
+                    AsOf::Time(millis) => Some(*millis),
+                    AsOf::Generation(generation) => view.source.timeline()?.time_of(generation + 1),
+                };
+                if ended.is_some_and(|ended| ended < floor) {
+                    return Err(StorageError::backend(format!("history: {as_of} is earlier than the history this Place keeps, which starts at {}", crate::query::dates::to_iso(floor))));
+                }
+            }
             Ok(Box::new(view))
         }
-        Temporal::History { collection } => Ok(Box::new(HistoryRead::new(current, source, collection.clone())?)),
+        Temporal::History { collection } => {
+            let mut view = HistoryRead::new(current, source, collection.clone())?;
+            view.from = floor.map_or(0, |floor| view.timeline.entries().iter().take_while(|entry| entry.millis < floor).last().map_or(0, |entry| entry.generation));
+            Ok(Box::new(view))
+        }
     }
 }
 

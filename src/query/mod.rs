@@ -100,7 +100,7 @@ pub use executor::{
     CustomOperatorResult, DocumentScope, ExecutionError, ExecutionErrorKind, ExecutionOutput,
     ExecutionResult, ExecutionRow, ExecutionRowOrigin, ExecutionStatistics, ExecutionStrategies,
     ExecutionStrategy, IncrementalGroupAccumulator, IncrementalPivotAccumulator, PivotRun,
-    PreparedInsertDocument, Reservoir, StreamingLoadMutation, SyntheticDocument,
+    PreparedInsertDocument, Reservoir, RowSpool, StreamingLoadMutation, SyntheticDocument,
 };
 
 pub(crate) use executor::{

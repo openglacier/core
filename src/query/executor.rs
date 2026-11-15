@@ -384,7 +384,7 @@ pub(crate) fn execute_insert( storage: &dyn StorageEngine, runtime: &QueryRuntim
     let mut row = ExecutionRow::from_stored(result.into_stored());
     row.document = Arc::new(row.evaluation_document());
     let commit = transaction.commit().map_err(ExecutionError::storage)?;
-    Ok(ExecutionOutput { rows: vec![row], statistics: ExecutionStatistics::default().with_commit(1, Some(commit)), commit: Some(commit) })
+    Ok(ExecutionOutput::new(vec![row], ExecutionStatistics::default().with_commit(1, Some(commit)), Some(commit)))
 }
 
 /// Imports the chunks of a streaming `load` in one atomic batch; a `compact`
@@ -408,32 +408,122 @@ pub(crate) fn execute_streaming_load( storage: &dyn StorageEngine, runtime: &Que
         (stored.into_iter().map(ExecutionRow::from_stored).collect::<Vec<_>>(), commit)
     };
     let statistics = ExecutionStatistics::default().with_commit(usize_to_u64(rows.len())?, Some(commit));
-    Ok(ExecutionOutput { rows, statistics, commit: Some(commit) })
+    Ok(ExecutionOutput::new(rows, statistics, Some(commit)))
+}
+
+/// Rows kept encoded ([`encode_execution_row_into`]), in order: in memory, and in spill files once moved out of it.
+/// A write keeps the rows it returns this way until its reply: a quarter of their decoded size, and none of it
+/// past the query's memory.
+#[derive(Debug, Default)]
+pub struct RowSpool {
+    /// Records: length (`u64`, little endian), then the encoded row, as in a spill run.
+    memory: Vec<u8>,
+    runs: Vec<crate::spill::SpillRun>,
+    rows: usize,
+    scratch: Vec<u8>,
+}
+
+impl RowSpool {
+    /// Keeps `row`; returns the bytes the spool grew by in memory (its buffer doubles, so up to twice the row).
+    pub(crate) fn push(&mut self, row: &ExecutionRow) -> ExecutionResult<usize> {
+        encode_execution_row_into(row, &mut self.scratch)?;
+        let before = self.memory.capacity();
+        self.memory.extend_from_slice(&(self.scratch.len() as u64).to_le_bytes());
+        self.memory.extend_from_slice(&self.scratch);
+        self.rows += 1;
+        Ok(self.memory.capacity() - before)
+    }
+
+    /// Moves the rows held in memory to a spill file.
+    pub(crate) fn spill(&mut self, spill: &crate::spill::SpillEngine) -> ExecutionResult<()> {
+        if self.memory.is_empty() { return Ok(()); }
+        let io = |error: std::io::Error| ExecutionError::evaluation(format!("rows of the write: {error}"));
+        let mut run = spill.create_run().map_err(io)?;
+        for record in records(&self.memory) { run.append(record).map_err(io)?; }
+        self.runs.push(run.finish().map_err(io)?);
+        self.memory = Vec::new();
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize { self.rows }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool { self.rows == 0 }
+
+    fn each(&self, visit: &mut dyn FnMut(ExecutionRow) -> ExecutionResult<()>) -> ExecutionResult<()> {
+        let io = |error: std::io::Error| ExecutionError::evaluation(format!("rows of the write: {error}"));
+        for run in &self.runs {
+            let mut reader = run.reader().map_err(io)?;
+            while let Some(record) = reader.next_record().map_err(io)? { visit(decode_execution_row(&record)?)?; }
+        }
+        records(&self.memory).try_for_each(|record| visit(decode_execution_row(record)?))
+    }
+}
+
+/// The records of a [`RowSpool`]'s memory.
+fn records(mut bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::from_fn(move || {
+        let (len, rest) = bytes.split_first_chunk::<8>()?;
+        let (record, rest) = rest.split_at(u64::from_le_bytes(*len) as usize);
+        bytes = rest;
+        Some(record)
+    })
 }
 
 /// Complete execution output.
 #[derive(Clone, Debug)]
 pub struct ExecutionOutput {
     rows: Vec<ExecutionRow>,
+    /// The rows of a write, kept encoded ([`RowSpool`]); `decoded` once [`Self::rows`] asked for them.
+    spool: Option<Arc<RowSpool>>,
+    decoded: std::sync::OnceLock<Vec<ExecutionRow>>,
     statistics: ExecutionStatistics,
     commit: Option<CommitResult>,
 }
 
 impl ExecutionOutput {
     pub(crate) const fn new(rows: Vec<ExecutionRow>, statistics: ExecutionStatistics, commit: Option<CommitResult>) -> Self {
-        Self { rows, statistics, commit }
+        Self { rows, spool: None, decoded: std::sync::OnceLock::new(), statistics, commit }
     }
 
-    /// Returns emitted rows.
+    pub(crate) fn spooled(spool: RowSpool, statistics: ExecutionStatistics, commit: Option<CommitResult>) -> Self {
+        Self { spool: Some(Arc::new(spool)), ..Self::new(Vec::new(), statistics, commit) }
+    }
+
+    /// Returns emitted rows (decoded all at once for a write's: [`Self::each_row`] reads them one at a time).
+    ///
+    /// # Panics
+    ///
+    /// When the rows a write moved to a spill file cannot be read back.
     #[must_use]
     pub fn rows(&self) -> &[ExecutionRow] {
-        &self.rows
+        match &self.spool {
+            None => &self.rows,
+            Some(spool) => self.decoded.get_or_init(|| {
+                let mut rows = Vec::with_capacity(spool.len());
+                spool.each(&mut |row| { rows.push(row); Ok(()) }).unwrap_or_else(|error| panic!("rows kept by a write: {error}"));
+                rows
+            }),
+        }
+    }
+
+    /// Visits the emitted rows in order, a write's decoded one at a time.
+    ///
+    /// # Errors
+    ///
+    /// The first error of `visit`, or a spill file that cannot be read back.
+    pub fn each_row(&self, visit: &mut dyn FnMut(&ExecutionRow) -> ExecutionResult<()>) -> ExecutionResult<()> {
+        match (&self.spool, self.decoded.get()) {
+            (Some(spool), None) => spool.each(&mut |row| visit(&row)),
+            _ => self.rows().iter().try_for_each(visit),
+        }
     }
 
     /// Consumes the output and returns emitted rows.
     #[must_use]
     pub fn into_rows(self) -> Vec<ExecutionRow> {
-        self.rows
+        if self.spool.is_some() { self.rows().to_vec() } else { self.rows }
     }
 
     /// Returns execution statistics.
@@ -457,15 +547,15 @@ impl ExecutionOutput {
     /// Returns whether no row was emitted.
     #[must_use]
     #[inline]
-    pub const fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Returns the number of emitted rows.
     #[must_use]
     #[inline]
-    pub const fn len(&self) -> usize {
-        self.rows.len()
+    pub fn len(&self) -> usize {
+        self.spool.as_ref().map_or(self.rows.len(), |spool| spool.len())
     }
 }
 

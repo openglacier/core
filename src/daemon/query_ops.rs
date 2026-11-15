@@ -196,6 +196,15 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
             }
         }
     }
+    // The past a Place reads is bound by its pool (`historyDays`); only a query naming `as of` or `history` pays
+    // for the lookup.
+    #[cfg(feature = "auth")]
+    let history_floor = match execution_context.as_ref().filter(|_| settings.enrollment_mode.is_policy() && reads_past(&query)) {
+        Some(context) => super::policy_ops::history_floor(engine, id, &context.place_id)?,
+        None => None,
+    };
+    #[cfg(not(feature = "auth"))]
+    let history_floor = None;
     let request = QueryRequest::new(id, query);
     *compact = request.query.contains("LOAD") || request.query.contains("load");
     event_engine.publish_global(
@@ -232,7 +241,7 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
         None => (None, "none"),
     };
     let mut capture = lead.as_ref().map(|_| Rows::new(true));
-    let streaming = try_write_streaming_request(engine, writer, &request, scope.as_ref(), &mut capture);
+    let streaming = crate::storage::history::with_history_floor(history_floor, || try_write_streaming_request(engine, writer, &request, scope.as_ref(), &mut capture));
     match streaming {
         Ok(true) => {
             if let Some(lead) = lead {
@@ -248,22 +257,26 @@ pub(super) fn handle_query_operation(connection: &mut Connection, settings: &Con
             // Commits made by this query are recorded with its author
             // (`_by` / `_by_device` in `history`), when history is kept.
             let author = commit_author(execution_context.as_ref().map_or_else(|| delegation.map_or(principal, |value| &value.principal), |context| &context.principal));
-            let response = crate::storage::history::with_commit_author(author, || execute_request_scoped(
-                engine,
-                request,
-                execution_context.as_ref(),
-            ));
-            let ok = response.is_ok();
-            if let Some(lead) = lead {
-                lead.finish(match &response {
-                    QueryResponse::Ok { documents, statistics, .. } => {
-                        let (mut rows, limit) = (Rows::new(false), engine.results().entry_limit());
-                        documents.iter().all(|document| rows.push_value(document.clone(), limit)).then(|| rows.with_statistics(statistics.clone()))
-                    }
-                    QueryResponse::Error { .. } => None,
-                });
-            }
-            write_response(writer, &response)?;
+            let ok = match lead {
+                // Rows the result cache keeps are listed whole.
+                Some(lead) => {
+                    let response = crate::storage::history::with_history_floor(history_floor, || crate::storage::history::with_commit_author(author, || execute_request_scoped(engine, request, execution_context.as_ref())));
+                    lead.finish(match &response {
+                        QueryResponse::Ok { documents, statistics, .. } => {
+                            let (mut rows, limit) = (Rows::new(false), engine.results().entry_limit());
+                            documents.iter().all(|document| rows.push_value(document.clone(), limit)).then(|| rows.with_statistics(statistics.clone()))
+                        }
+                        QueryResponse::Error { .. } => None,
+                    });
+                    write_response(writer, &response)?;
+                    response.is_ok()
+                }
+                // Otherwise sent one row at a time, the operation holding its memory until the last one.
+                None => match crate::storage::history::with_history_floor(history_floor, || crate::storage::history::with_commit_author(author, || run_request(engine, request, execution_context.as_ref()))) {
+                    Ok(run) => { run.write(writer, id)?; true }
+                    Err(response) => { write_response(writer, &response)?; false }
+                },
+            };
             trace(cache, ok);
             let event_type = if ok { "query.finished" } else { "query.failed" };
             event_engine.publish_global(
@@ -354,6 +367,16 @@ fn trace(settings: &ConnectionSettings, started: &(Instant, i64), prepare_us: u6
 }
 
 /// The commit author of a principal (`None` when anonymous).
+/// Whether the text may hold a temporal source (`as of …`, `history`), in any pipeline: the words, whatever
+/// separates them. A text that only looks like it costs a lookup, nothing else.
+fn reads_past(query: &str) -> bool {
+    let mut words = query.split(|character: char| !character.is_ascii_alphanumeric() && character != '_').filter(|word| !word.is_empty()).peekable();
+    while let Some(word) = words.next() {
+        if word == "history" || word == "as" && words.peek() == Some(&"of") { return true; }
+    }
+    false
+}
+
 fn commit_author(principal: &Principal) -> Option<crate::storage::history::CommitAuthor> {
     match principal {
         Principal::Anonymous => None,
@@ -362,4 +385,9 @@ fn commit_author(principal: &Principal) -> Option<crate::storage::history::Commi
             device: (!device_id.is_empty()).then(|| std::sync::Arc::from(device_id.as_str())),
         }),
     }
+}
+
+#[cfg(test)]
+mod past_tests {
+    #[test] fn temporal_sources_are_spotted_by_their_words() { for query in ["on c as of 12", "on c as  of \"2026-01-01\"", "on c history", "on a | union | on c\thistory| end", "on a | lookup c as\nof 3 as o on o.x == x"] { assert!(super::reads_past(query), "{query}"); } for query in ["on c | select a as b", "on c | where office == \"as\"", "on c_history | count", "on c | derive historyDays = 1, of = 2"] { assert!(!super::reads_past(query), "{query}"); } }
 }

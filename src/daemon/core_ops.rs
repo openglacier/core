@@ -359,6 +359,23 @@ pub(super) fn handle_database_operation(writer: &mut TcpStream, settings: &Conne
             };
             reply(writer, id, data)?;
         }
+        // Maintenance of the store, run nightly like a backup: pending rows go to segments, then the history
+        // gives back the versions no Place reads any more (`historyDays` of its pool, wip/HISTORIQUE_RETENTION.md).
+        RoutedOperation::StorageCompact(Routed { id, .. }) => {
+            let Some(storage) = settings.glacier_storage.as_ref() else { reject!(id, "storage.compact_unsupported", "storage.compact needs the glacier storage") };
+            storage.checkpoint().map_err(failed(id, "storage.compact_failed"))?;
+            let history = if storage.keeps_history() {
+                #[cfg(feature = "auth")]
+                let floors = super::policy_ops::history_floors(engine, id)?;
+                #[cfg(not(feature = "auth"))]
+                let floors = std::collections::HashMap::<String, i64>::new();
+                let purged = storage.purge_history(&|place| place.and_then(|place| floors.get(place).copied())).map_err(failed(id, "storage.compact_failed"))?;
+                serde_json::json!({"places": floors.len(), "versions": purged.versions, "files": purged.files, "bytes": purged.bytes})
+            } else {
+                JsonValue::Null
+            };
+            reply(writer, id, serde_json::json!({"backend": "glacier", "history": history, "store": storage.stats().unwrap_or_default()}))?;
+        }
         RoutedOperation::BackupCreate(Routed { id, input: BackupCreateInput { name, parent, history } }) => {
             let path = backup_path(settings, id, &name)?;
             let metadata = backup_metadata(&settings.instance_id);

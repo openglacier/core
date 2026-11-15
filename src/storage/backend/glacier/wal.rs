@@ -42,11 +42,12 @@ pub(super) fn wal_path(dir: &Path, sequence: u64) -> PathBuf { dir.join(wal_file
 #[must_use]
 pub(super) fn wal_file_name(sequence: u64) -> String { format!("wal-{sequence:08}.log") }
 
-/// Appends records and syncs them.
+/// The log file. Commits encode their records ([`Wal::record`]); the store writes and syncs those of several
+/// commits at once ([`super::GlacierBackend::sync_log`]).
 #[derive(Debug)]
 pub(super) struct Wal {
     path: PathBuf,
-    file: File,
+    file: Arc<File>,
     bytes: u64,
 }
 
@@ -54,21 +55,49 @@ impl Wal {
     pub(super) fn open(path: &Path, valid_len: u64) -> StorageResult<Self> {
         let file = OpenOptions::new().create(true).read(true).write(true).truncate(false).open(path).map_err(io_error("open wal", path))?;
         file.set_len(valid_len).map_err(io_error("truncate wal", path))?;
-        let mut wal = Self { path: path.to_owned(), file, bytes: valid_len };
+        let mut wal = Self { path: path.to_owned(), file: Arc::new(file), bytes: valid_len };
         wal.seek_end()?;
         Ok(wal)
     }
 
     fn seek_end(&mut self) -> StorageResult<()> {
         use std::io::Seek;
-        self.file.seek(std::io::SeekFrom::Start(self.bytes)).map_err(io_error("seek wal", &self.path))?;
+        (&*self.file).seek(std::io::SeekFrom::Start(self.bytes)).map_err(io_error("seek wal", &self.path))?;
         Ok(())
     }
 
     #[must_use]
     pub(super) const fn bytes(&self) -> u64 { self.bytes }
 
+    /// The log file, to sync it without the writer lock.
+    #[must_use]
+    pub(super) fn file(&self) -> Arc<File> { Arc::clone(&self.file) }
+
+
+    /// Writes and syncs the record of a commit at once (a log no commit waits on).
     pub(super) fn append(&mut self, generation: u64, entries: &[LogEntry]) -> StorageResult<()> {
+        let (before, record) = (self.bytes, self.record(generation, entries)?);
+        if let Err(error) = (&*self.file).write_all(&record).and_then(|()| self.file.sync_data()) {
+            // Drop the partial record so the log stays a valid prefix.
+            self.bytes = before;
+            let _ = self.file.set_len(self.bytes);
+            let _ = self.seek_end();
+            return Err(io_error("append wal", &self.path)(error));
+        }
+        Ok(())
+    }
+
+    /// The record of a commit, counted in [`Self::bytes`]: the caller hands it to the store's pending writes.
+    pub(super) fn record(&mut self, generation: u64, entries: &[LogEntry]) -> StorageResult<Vec<u8>> {
+        let record = encode_record(generation, entries)?;
+        self.bytes += record.len() as u64;
+        Ok(record)
+    }
+}
+
+/// The record of one commit, as a log holds it.
+pub(super) fn encode_record(generation: u64, entries: &[LogEntry]) -> StorageResult<Vec<u8>> {
+    {
         let mut payload = Vec::with_capacity(64 + entries.len() * 128);
         put_u64(&mut payload, generation);
         put_var(&mut payload, entries.len() as u64);
@@ -93,14 +122,7 @@ impl Wal {
         put_u32(&mut record, u32::try_from(payload.len()).map_err(|_| corrupt("wal record too large"))?);
         put_u64(&mut record, checksum(&payload));
         record.extend_from_slice(&payload);
-        if let Err(error) = self.file.write_all(&record).and_then(|()| self.file.sync_data()) {
-            // Drop the partial record so the log stays a valid prefix.
-            let _ = self.file.set_len(self.bytes);
-            let _ = self.seek_end();
-            return Err(io_error("append wal", &self.path)(error));
-        }
-        self.bytes += record.len() as u64;
-        Ok(())
+        Ok(record)
     }
 }
 

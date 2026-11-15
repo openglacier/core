@@ -498,6 +498,26 @@ impl Segment {
         Ok(self.group(index)?.ids.find(id, scratch).map(|row| self.groups[index].first_row + row as u64))
     }
 
+    /// Visits the rows whose identifier is in `sorted` (ascending, distinct) with its position there; a group whose
+    /// range holds none of them is not read.
+    pub(super) fn rows_among(&self, sorted: &[u128], visit: &mut dyn FnMut(u64, usize)) -> StorageResult<()> {
+        let (mut ids, mut scratch) = (Vec::new(), Scratch::default());
+        for (index, meta) in self.groups.iter().enumerate() {
+            let (mut at, end) = (sorted.partition_point(|id| *id < meta.min_id), sorted.partition_point(|id| *id <= meta.max_id));
+            let group = if at == end { continue } else { self.group(index)? };
+            for block in 0..group.rows.div_ceil(super::column::BLOCK) {
+                group.ids.decode_block(block, &mut ids, &mut scratch);
+                for (offset, id) in ids.iter().enumerate() {
+                    while at < end && sorted[at] < *id { at += 1; }
+                    if at == end { break; }
+                    if sorted[at] == *id { visit(meta.first_row + (block * super::column::BLOCK + offset) as u64, at); at += 1; }
+                }
+                if at == end { break; }
+            }
+        }
+        Ok(())
+    }
+
     /// Group whose identifier range holds `id`, if any.
     #[must_use]
     pub(super) fn group_holding(&self, id: u128) -> Option<usize> {

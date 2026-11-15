@@ -13,7 +13,8 @@ use crate::operation::{IdentityListInput, IdentityPolicySetInput, IdentityStateS
 const TOKEN_PREFIX: &str = "ogp_";
 
 /// Allowed keys of each section, and the kind of their values.
-const POOL_LIMITS: &[&str] = &["users", "storage", "places"];
+/// `historyDays`: the days of history (`as of`, `history`) the Places of the pool read ([`history_floor`]).
+const POOL_LIMITS: &[&str] = &["users", "storage", "places", "historyDays"];
 const POLICY_LIMITS: &[&str] = &["users", "storage", "places"];
 const PER_USER: &[&str] = &["devices", "storage", "places"];
 const RIGHTS: &[&str] = &["createPlace", "publicSharing", "externalSharing"];
@@ -195,6 +196,37 @@ fn policy_chain(engine: &Engine, id: RequestId, identity_id: &str) -> Result<Opt
     let Some(policy) = query_first(engine, id, quoted!("on _policies | where policyId == {} and state == \"active\" | limit 1", &policy_id))? else { return Ok(None) };
     let pool = query_first(engine, id, quoted!("on _pools | where poolId == {} and state == \"active\" | limit 1", &policy.string_field("poolId")))?;
     Ok(Some((policy, pool)))
+}
+
+/// The time from which a query of `place_id` reads the past (`as of`, `history`), from `historyDays` of the pool
+/// of its Owner: `None` without a pool or without the limit. A limit of 0 refuses the query.
+pub(super) fn history_floor(engine: &Engine, id: RequestId, place_id: &str) -> Result<Option<i64>, Stop> {
+    let Some(place) = query_first(engine, id, quoted!("on _places | where placeId == {} and state == \"active\" | limit 1", place_id))? else { return Ok(None) };
+    let Some((_, Some(pool))) = policy_chain(engine, id, &place.string_field("ownerIdentityId"))? else { return Ok(None) };
+    match limit(&pool, "limits", "historyDays") {
+        Some(0) => reject!(id, "pool.history_limit", format!("the pool {:?} keeps no history: `as of` and `history` are not available", pool.string_field("label"))),
+        Some(days) => Ok(Some(crate::helpers::now_millis().saturating_sub(i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400_000)))),
+        None => Ok(None),
+    }
+}
+
+/// For the purge of the history: the Places of the pools bound by `historyDays` (deleted Places included, their
+/// history goes the same way), each with the time its past is read from. A Place of no such pool keeps its past.
+pub(super) fn history_floors(engine: &Engine, id: RequestId) -> Result<std::collections::HashMap<String, i64>, Stop> {
+    let (now, mut floors) = (crate::helpers::now_millis(), std::collections::HashMap::new());
+    for pool in query_documents(engine, id, "on _pools | where state? == \"active\"")? {
+        let Some(days) = limit(&pool, "limits", "historyDays") else { continue };
+        // No day kept: everything goes, and the purge takes the bytes off the disk (`i64::MAX`).
+        let floor = if days == 0 { i64::MAX } else { now.saturating_sub(i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400_000)) };
+        for policy in query_documents(engine, id, quoted!("on _policies | where poolId? == {} | select policyId", &pool.string_field("poolId")))? {
+            for identity in query_documents(engine, id, quoted!("on _identities | where policyId? == {} | select identityId", &policy.string_field("policyId")))? {
+                for place in query_documents(engine, id, quoted!("on _places | where ownerIdentityId? == {} | select placeId", &identity.string_field("identityId")))? {
+                    floors.insert(place.string_field("placeId"), floor);
+                }
+            }
+        }
+    }
+    Ok(floors)
 }
 
 /// A right of the policy: absent means allowed.
@@ -606,6 +638,8 @@ mod tests {
         query_run(&engine, id, insert_query("_identities", serde_json::json!({"identityId": "b", "policyId": "std", "state": "active"}))).unwrap();
         assert!(enrollment_seat(&engine, id, "std").is_err());
     }
+
+    #[test] fn the_past_a_place_reads_follows_the_history_days_of_its_owners_pool() { let engine = Engine::new(Arc::new(crate::storage::MemoryStorage::new()) as Arc<dyn StorageEngine>); let id = RequestId::Number(1); assert!(section("limits", &serde_json::json!({"historyDays": 30}), POOL_LIMITS, Kind::Count).is_ok()); for (collection, document) in [("_pools", serde_json::json!({"poolId": "month", "label": "Month", "limits": {"historyDays": 30}, "state": "active"})), ("_pools", serde_json::json!({"poolId": "free", "label": "Free", "limits": {"historyDays": 0}, "state": "active"})), ("_pools", serde_json::json!({"poolId": "open", "label": "Open", "limits": {"users": 2}, "state": "active"})), ("_policies", serde_json::json!({"policyId": "m", "poolId": "month", "label": "M", "state": "active"})), ("_policies", serde_json::json!({"policyId": "f", "poolId": "free", "label": "F", "state": "active"})), ("_policies", serde_json::json!({"policyId": "o", "poolId": "open", "label": "O", "state": "active"})), ("_identities", serde_json::json!({"identityId": "ada", "policyId": "m", "state": "active"})), ("_identities", serde_json::json!({"identityId": "bob", "policyId": "f", "state": "active"})), ("_identities", serde_json::json!({"identityId": "cy", "policyId": "o", "state": "active"})), ("_identities", serde_json::json!({"identityId": "admin", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-ada", "ownerIdentityId": "ada", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-bob", "ownerIdentityId": "bob", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-cy", "ownerIdentityId": "cy", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-admin", "ownerIdentityId": "admin", "state": "active"}))] { query_run(&engine, id, insert_query(collection, document)).unwrap(); } let (before, floor) = (crate::helpers::now_millis(), history_floor(&engine, id, "p-ada").ok().flatten().unwrap()); assert!((before - 30 * 86_400_000..=crate::helpers::now_millis() - 30 * 86_400_000).contains(&floor)); assert!(history_floor(&engine, id, "p-bob").is_err(), "a pool of 0 day keeps no history"); for unbound in ["p-cy", "p-admin", "p-unknown"] { assert_eq!(history_floor(&engine, id, unbound).ok(), Some(None), "{unbound}"); } /* The purge takes the Places of the bound pools, deleted ones included. */ query_run(&engine, id, insert_query("_places", serde_json::json!({"placeId": "p-ada-old", "ownerIdentityId": "ada", "state": "deleted"}))).unwrap(); let floors = history_floors(&engine, id).ok().unwrap(); let mut places = floors.keys().map(String::as_str).collect::<Vec<_>>(); places.sort_unstable(); assert_eq!(places, ["p-ada", "p-ada-old", "p-bob"]); assert!(floors["p-bob"] == i64::MAX && floors["p-ada"] == floors["p-ada-old"] && floors["p-ada"] <= crate::helpers::now_millis() - 30 * 86_400_000); }
 
     #[test] fn tokens_are_prefixed_random_and_hashed() {
         let (a, b) = (new_token().unwrap(), new_token().unwrap());

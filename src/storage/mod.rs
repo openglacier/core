@@ -450,6 +450,14 @@ pub struct GroupFacts<'a> {
     /// Kinds of the values present.
     pub kinds: Vec<crate::model::PhysicalKind>,
     pub bounds: &'a FieldBounds,
+    /// The strings of the group, when the storage can list them (a dictionary).
+    pub strings: Option<&'a dyn GroupStrings>,
+}
+
+/// Every string a field takes in a row group, deleted rows included: never fewer than its visible ones.
+pub trait GroupStrings: std::fmt::Debug {
+    /// Whether some string of the group passes `test`; `None` when they cannot be listed.
+    fn any(&self, test: &mut dyn FnMut(&str) -> bool) -> Option<bool>;
 }
 
 /// Bounds of the values one top-level field takes, per kind: every visible

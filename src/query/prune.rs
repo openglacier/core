@@ -137,7 +137,12 @@ fn never_scoped(facts: &GroupFacts<'_>, value: &str) -> bool {
     if !facts.kinds.contains(&PhysicalKind::String) {
         return true;
     }
-    facts.bounds.string.as_ref().is_some_and(|(low, high)| value < low.as_ref() || value > high.as_ref())
+    facts.bounds.string.as_ref().is_some_and(|(low, high)| value < low.as_ref() || value > high.as_ref()) || no_string(facts, &mut |string| string == value)
+}
+
+/// Whether the group's strings are listed ([`crate::storage::GroupStrings`]) and none passes `test`.
+fn no_string(facts: &GroupFacts<'_>, test: &mut dyn FnMut(&str) -> bool) -> bool {
+    facts.strings.and_then(|strings| strings.any(test)) == Some(false)
 }
 
 /// `a < b`, `None` when comparing fails.
@@ -186,7 +191,27 @@ fn never_true(test: &Test<'_>, facts: &GroupFacts<'_>) -> bool {
             return false;
         }
     }
-    ranges.iter().all(|(low, high)| outside(test, low, high) == Some(true))
+    if ranges.iter().all(|(low, high)| outside(test, low, high) == Some(true)) {
+        return true;
+    }
+    // Within the bounds, yet no string of the group may pass: each one is its own range.
+    family == PhysicalKind::String && no_string(facts, &mut |string| may_hold(test, string))
+}
+
+/// Whether `test` may be true for `string`: strings order as [`str`] does, as their bounds do.
+fn may_hold(test: &Test<'_>, string: &str) -> bool {
+    fn text(value: &Value) -> Option<&str> { match value { Value::String(text) => Some(text.as_ref()), _ => None } }
+    match test {
+        Test::Compare(operator, value) => text(value).is_none_or(|value| match operator {
+            BinaryOperator::Equal => string == value,
+            BinaryOperator::LessThan => string < value,
+            BinaryOperator::LessThanOrEqual => string <= value,
+            BinaryOperator::GreaterThan => string > value,
+            BinaryOperator::GreaterThanOrEqual => string >= value,
+            _ => true,
+        }),
+        Test::Between(from, to) => text(from).zip(text(to)).is_none_or(|(from, to)| from <= string && string <= to),
+    }
 }
 
 /// Whether `test` is false for every value within `low..=high` (one kind).
@@ -219,8 +244,13 @@ mod tests {
     }
 
     fn facts<'a>(missing: bool, kinds: &[PhysicalKind], bounds: &'a FieldBounds) -> Option<GroupFacts<'a>> {
-        Some(GroupFacts { missing, kinds: kinds.to_vec(), bounds })
+        Some(GroupFacts { missing, kinds: kinds.to_vec(), bounds, strings: None })
     }
 
     #[test] fn groups_are_left_out_only_when_every_row_is_dropped_without_error() { use PhysicalKind::{Null, Number, String}; let (period, floats) = (strings("01-2025", "01-2025"), FieldBounds { float: Some((-5.0, 20.0)), ..FieldBounds::default() }); let big = FieldBounds { signed: Some((0, 9_007_199_254_740_993)), ..FieldBounds::default() }; let no_bounds = FieldBounds::default(); let p = |missing, kinds: &[PhysicalKind], bounds| [facts(missing, kinds, bounds), facts(false, &[Number], &floats)]; let cases: &[(&[&str], [Option<GroupFacts<'_>>; 2], bool)] = &[(&["p == \"12-2025\""], p(false, &[String], &period), true), (&["p == \"01-2025\""], p(false, &[String], &period), false), /* A row lacking the field fails the comparison. */ (&["p == \"12-2025\""], p(true, &[String], &period), false), /* `null` and booleans equal no string. */ (&["p == \"12-2025\""], p(false, &[String, Null], &period), true), /* A number against a string goes through a coercion that may fail. */ (&["p == \"12-2025\""], p(false, &[String, Number], &period), false), (&["\"12-2025\" == p"], p(false, &[String], &period), true), (&["p > \"06-2025\""], p(false, &[String], &period), true), (&["p < \"06-2025\""], p(false, &[String], &period), false), (&["p != \"12-2025\""], p(false, &[String], &period), false), /* Ordering needs one kind. */ (&["p > \"06-2025\""], p(false, &[String, Null], &period), false), /* Unknown string bounds. */ (&["p == \"12-2025\""], p(false, &[String], &no_bounds), false), (&["x > 100"], p(false, &[String], &period), true), (&["x >= 20"], p(false, &[String], &period), false), (&["x between 21 and 30"], p(false, &[String], &period), true), (&["x between 0 and 30"], p(false, &[String], &period), false), (&["100 < x"], p(false, &[String], &period), true), /* Conjuncts in order: one before must be total on the group. */ (&["p == \"01-2025\" and x > 100"], p(false, &[String], &period), true), (&["p == \"01-2025\"", "x > 100"], p(false, &[String], &period), true), (&["len(p) > 3 and x > 100"], p(false, &[String], &period), false), (&["upper(p) == \"X\"", "x > 100"], p(false, &[String], &period), false), (&["p > \"06-2025\" and x > 100"], p(false, &[String, Null], &period), false), /* Unknown facts end the proof. */ (&["x > 100"], [None, facts(false, &[Number], &floats)], true), (&["p == \"12-2025\""], [None, facts(false, &[Number], &floats)], false)]; for (predicates, facts, skip) in cases { assert_eq!(pruning(predicates).skip(facts), *skip, "{predicates:?}"); } /* Integers beyond 2^53 compared with a float may lose precision. */ assert!(!pruning(&["x > 0.5"]).skip(&[None, facts(false, &[Number], &big)])); let small = FieldBounds { signed: Some((0, 10)), ..FieldBounds::default() }; assert!(!pruning(&["x > 9007199254740993"]).skip(&[None, facts(false, &[Number], &small)])); assert!(pruning(&["x > 1000"]).skip(&[None, facts(false, &[Number], &small)])); /* Nothing to prove false: no pruning at all. */ assert!(GroupPruning::new(&[PhysicalOperator::Filter { predicate: parse_expression("len(p) > 3").unwrap() }], &[FieldPath::parse("p").unwrap()]).is_none()); }
+
+    #[derive(Debug)] struct Listed(Option<&'static [&'static str]>);
+    impl crate::storage::GroupStrings for Listed { fn any(&self, test: &mut dyn FnMut(&str) -> bool) -> Option<bool> { self.0.map(|strings| strings.iter().any(|string| test(string))) } }
+
+    #[test] fn groups_within_bounds_are_left_out_when_none_of_their_listed_strings_passes() { use PhysicalKind::{Null, String}; let bounds = strings("A", "M"); let skip = |predicate: &str, kinds: &[PhysicalKind], listed: &Listed| pruning(&[predicate]).skip(&[Some(GroupFacts { missing: false, kinds: kinds.to_vec(), bounds: &bounds, strings: Some(listed) }), None]); let (listed, unknown) = (Listed(Some(&["A", "C", "M"])), Listed(None)); for (predicate, kinds, left_out) in [("p == \"B\"", &[String][..], true), ("p == \"C\"", &[String][..], false), ("p == \"B\"", &[String, Null][..], true), ("p > \"C\" and p < \"M\"", &[String][..], false), ("p > \"C\" and p < \"D\"", &[String][..], false), ("p > \"D\" and p < \"L\"", &[String][..], false), ("p >= \"N\"", &[String][..], true), ("p == 3", &[String][..], false)] { assert_eq!(skip(predicate, kinds, &listed), left_out, "{predicate}"); assert!(!skip(predicate, kinds, &unknown) || predicate.contains('N'), "{predicate}: unknown strings"); } }
 }

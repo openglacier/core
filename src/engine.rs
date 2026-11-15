@@ -436,6 +436,9 @@ struct BatchGroups<'a> {
     /// Bounded group: kept groups by encoded key.
     ordered: BTreeMap<Arc<[u8]>, u32>,
     estimated_bytes: usize,
+    /// Bytes an unbounded group holds, its key values apart (they stay in `table`, which counts them): its
+    /// measures ([`crate::query::DenseGroups::group_bytes`]) and its slots in `groups`, `group_keys`, `key_groups`.
+    group_bytes: usize,
     exceeded: bool,
     key_buffer: Vec<u8>,
     batch_keys: Vec<u32>,
@@ -556,6 +559,7 @@ impl<'a> BatchGroups<'a> {
             key_groups: Vec::new(),
             groups: Vec::new(),
             group_keys: Vec::new(),
+            group_bytes: dense.group_bytes() + 2 * (std::mem::size_of::<Option<Arc<[u8]>>>() + 2 * std::mem::size_of::<u32>()),
             dense,
             ordered: BTreeMap::new(),
             estimated_bytes: 0,
@@ -770,8 +774,8 @@ impl<'a> BatchGroups<'a> {
     /// group) or the working set is exceeded.
     fn create(&mut self, key: u32) -> Result<u32, StorageError> {
         debug_assert!(self.limit.is_some() || key as usize == self.group_keys.len(), "unbounded keys are their groups");
-        // An unbounded group's key values stay in `table`, which counts them.
-        let state_estimate = group_state_estimate(if self.limit.is_some() { self.key_buffer.len() } else { 0 }, self.keys.len());
+        // A bounded group also keeps its key values and its encoded key.
+        let state_estimate = if self.limit.is_some() { group_state_estimate(self.key_buffer.len(), self.keys.len()) } else { self.group_bytes };
         if let Some(limit) = self.limit {
             if self.ordered.len() >= limit {
                 let (largest, evicted) = self.ordered.last_key_value().expect("bounded group frontier exists");
@@ -913,8 +917,9 @@ impl Iterator for GroupRows {
 ///
 /// Leading filters that read only some fields see each block's columns of
 /// those first ([`crate::query::BatchProgram::head`]): a block none of whose
-/// rows passes them is not decoded further, its rows dropped by the filters;
-/// they stop deciding first once they refuse fewer than one block in eight.
+/// rows passes them is not decoded further, its rows dropped by the filters, and of an admitted block only the
+/// rows they keep are loaded; they stop deciding first once they refuse fewer than one block in eight and keep
+/// more than one row in two.
 /// `consumer` may refuse blocks too, from its own columns, its rows then
 /// only read.
 #[allow(clippy::too_many_arguments)]
@@ -962,27 +967,38 @@ fn scan_batched(
         let (tried, refusals) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
         let fields = (0..storage_fields.len()).map(|field| head.as_ref().is_some_and(|(_, reads)| reads[field]) || consumer.as_ref().is_some_and(|gate| gate.fields[field])).collect();
         let gated = head.is_some() || consumer.is_some();
+        // The rows of the admitted block the leading filters keep (`None`: not decided, every row is loaded).
+        let kept = std::cell::RefCell::new(None::<Vec<u32>>);
+        let (rows_tried, rows_kept) = (std::cell::Cell::new(0usize), std::cell::Cell::new(0usize));
         let mut admit = |block: &crate::storage::ProjectedBlock<'_, '_>| -> Result<bool, StorageError> {
-            if let Some((stages, _)) = head.as_ref().filter(|_| tried.get() < 32 || refusals.get() * 8 >= tried.get()) {
+            let mut selected = None;
+            if let Some((stages, _)) = head.as_ref().filter(|_| tried.get() < 32 || refusals.get() * 8 >= tried.get() || rows_kept.get() * 2 <= rows_tried.get()) {
                 tried.set(tried.get() + 1);
-                let mut passes = false;
+                let mut rows = Some(Vec::new());
                 for from in (0..block.rows).step_by(crate::query::BATCH_ROWS) {
                     head_runner.push_rows(&[], block.columns, block.codes, from, crate::query::BATCH_ROWS.min(block.rows - from));
                     // An aborted batch is decided row by row, with its errors.
-                    passes |= head_runner.run_stages(*stages).is_err() || !head_runner.selection().is_empty();
+                    match (head_runner.run_stages(*stages), rows.as_mut()) {
+                        (Ok(()), Some(rows)) => rows.extend(head_runner.selection().iter().map(|row| from as u32 + row)),
+                        _ => rows = None,
+                    }
                     head_runner.clear();
                 }
-                if !passes {
+                rows_tried.set(rows_tried.get() + block.rows);
+                rows_kept.set(rows_kept.get() + rows.as_ref().map_or(block.rows, Vec::len));
+                if rows.as_ref().is_some_and(Vec::is_empty) {
                     refusals.set(refusals.get() + 1);
                     refused.set(refused.get() + block.rows);
                     dropped.set(dropped.get() + block.rows);
                     return Ok(false);
                 }
+                selected = rows;
             }
             let admitted = match consumer.as_mut() { Some(gate) => (gate.admit)(block)?, None => true };
             if !admitted {
                 refused.set(refused.get() + block.rows);
             }
+            *kept.borrow_mut() = selected.filter(|_| admitted);
             Ok(admitted)
         };
         let gate = gated.then(|| crate::storage::BlockGate { fields, admit: &mut admit });
@@ -991,16 +1007,33 @@ fn scan_batched(
         // counts rows before those filters.
         let pruning = pruning.filter(|_| options.limit().is_none());
         read.scan_projected_blocks_each(collection, options, storage_fields, &|facts| pruning.is_some_and(|pruning| pruning.skip(facts)), gate, &mut |block| {
-            runner.skip(dropped.take());
             let (ids, columns) = (block.ids, block.columns);
-            let mut from = 0;
-            while from < block.rows {
-                let count = (crate::query::BATCH_ROWS - runner.len()).min(block.rows - from);
-                runner.push_rows(ids, columns, block.codes, from, count);
-                from += count;
-                if runner.is_full() && !flush(&mut runner)? {
-                    stopped = true;
-                    return Ok(false);
+            // Only the rows the leading filters kept are loaded, by runs; the others count as refused blocks do.
+            let kept = kept.borrow_mut().take();
+            if let Some(kept) = &kept {
+                refused.set(refused.get() + block.rows - kept.len());
+                dropped.set(dropped.get() + block.rows - kept.len());
+            }
+            runner.skip(dropped.take());
+            let mut next = 0;
+            while next < kept.as_ref().map_or(1, Vec::len) {
+                let (mut from, end) = match &kept {
+                    Some(kept) => {
+                        let from = kept[next] as usize;
+                        let run = kept[next..].iter().enumerate().take_while(|(offset, row)| **row as usize == from + offset).count();
+                        next += run;
+                        (from, from + run)
+                    }
+                    None => { next = 1; (0, block.rows) }
+                };
+                while from < end {
+                    let count = (crate::query::BATCH_ROWS - runner.len()).min(end - from);
+                    runner.push_rows(ids, columns, block.codes, from, count);
+                    from += count;
+                    if runner.is_full() && !flush(&mut runner)? {
+                        stopped = true;
+                        return Ok(false);
+                    }
                 }
             }
             Ok(true)

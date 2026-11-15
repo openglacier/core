@@ -2334,12 +2334,84 @@ fn query_has_rows(engine: &Engine, request_id: impl Into<RequestId>, query: impl
 }
 
 fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Option<&ExecutionContext>, ) -> QueryResponse {
+    let id = request.id;
+    let run = match run_request(engine, request, context) {
+        Ok(run) => run,
+        Err(response) => return response,
+    };
+    let started = Instant::now();
+    let mut documents = Vec::with_capacity(run.output.len());
+    match run.output.each_row(&mut |row| { documents.push(execution_row_to_json(row, run.exposes_id)); Ok(()) }) {
+        Ok(()) => QueryResponse::success(id, documents, Some(run.statistics(elapsed_micros(started)))),
+        Err(error) => QueryResponse::request_error(id, "query.execution_failed", error.to_string()),
+    }
+}
+
+/// A request run, the memory permit of its operation held until its rows are sent.
+struct RequestRun {
+    output: crate::query::ExecutionOutput,
+    /// A streaming load: no row is sent back.
+    compact: bool,
+    exposes_id: bool,
+    /// Start, then parse, plan and execute times (µs).
+    timings: (Instant, u64, u64, u64),
+    _permit: Option<crate::memory::QueryMemoryPermit>,
+}
+
+impl RequestRun {
+    fn statistics(&self, materialize_us: u64) -> JsonValue {
+        let (statistics, (started, parse_us, plan_us, execute_us)) = (self.output.statistics(), self.timings);
+        serde_json::json!({
+            "scanned": statistics.scanned(),
+            "filtered": statistics.filtered(),
+            "returned": statistics.returned(),
+            "inserted": statistics.inserted(),
+            "replaced": statistics.replaced(),
+            "deleted": statistics.deleted(),
+            "strategies": statistics.strategies().iter().map(|strategy| strategy.as_str()).collect::<Vec<_>>(),
+            "committed": self.output.committed(),
+            "compact": self.compact,
+            "timings_us": {
+                "parse": parse_us,
+                "plan": plan_us,
+                "execute": execute_us,
+                "materialize_response": materialize_us,
+                "total_before_wire_encode": elapsed_micros(started),
+            },
+        })
+    }
+
+    /// Sends the rows one at a time as they are read back (a write keeps them encoded), then the statistics: no
+    /// whole reply is built.
+    fn write(self, writer: &mut TcpStream, id: RequestId) -> Result<(), ConnectionError> {
+        let started = Instant::now();
+        let (mut frames, mut failed) = (frames::FrameWriter::new(writer), None);
+        let listed = self.output.each_row(&mut |row| {
+            let sent = if self.exposes_id && !matches!(row.origin(), crate::query::ExecutionRowOrigin::Synthetic) {
+                frames.push(&BorrowedDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id, data: BorrowedDocumentWithId { id: row.id(), document: row.document() } })
+            } else {
+                frames.push(&BorrowedPlainDocumentResponse { kind: "response", status: "partial", version: PROTOCOL_VERSION, id, data: BorrowedDocument(row.document()) })
+            };
+            sent.map_err(|error| { let message = error.to_string(); failed = Some(error); crate::query::ExecutionError::evaluation(message) })
+        });
+        if let Some(error) = failed { return Err(error); }
+        let last = match listed {
+            Ok(()) => StreamResponse::complete(id, Some(self.statistics(elapsed_micros(started)))),
+            Err(error) => StreamResponse::error(Some(id), WireError::new("query.execution_failed", error.to_string())),
+        };
+        frames.finish(&last)?;
+        writer.flush().map_err(ConnectionError::Write)
+    }
+}
+
+/// Runs a request up to its output, or the error response.
+fn run_request( engine: &Engine, request: QueryRequest, context: Option<&ExecutionContext>, ) -> Result<RequestRun, QueryResponse> {
     let started = Instant::now();
     let parse_started = Instant::now();
     let pipeline = match parse_pipeline(&request.query) {
         Ok(pipeline) => pipeline,
         Err(error) => {
-            return QueryResponse::request_error(request.id, "query.invalid", error.to_string());
+            return Err(QueryResponse::request_error(request.id, "query.invalid", error.to_string()));
         }
     };
     let parse_us = elapsed_micros(parse_started);
@@ -2348,11 +2420,11 @@ fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Opti
     let planned = match engine.plan_cached(&request.query, &pipeline) {
         Ok(planned) => planned,
         Err(error) => {
-            return QueryResponse::request_error(
+            return Err(QueryResponse::request_error(
                 request.id,
                 "query.execution_failed",
                 error.to_string(),
-            );
+            ));
         }
     };
     let plan_us = elapsed_micros(plan_started);
@@ -2374,11 +2446,11 @@ fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Opti
     let _operation_permit = match (!system_query).then(|| engine.memory_governor().admit(workload, &request.query)).transpose() {
         Ok(permit) => permit,
         Err(error) => {
-            return QueryResponse::request_error(
+            return Err(QueryResponse::request_error(
                 request.id,
                 "query.memory_admission_rejected",
                 error.to_string(),
-            )
+            ))
         }
     };
 
@@ -2393,53 +2465,15 @@ fn execute_request_scoped( engine: &Engine, request: QueryRequest, context: Opti
     let execute_us = elapsed_micros(execute_started);
 
     match execution {
-        Ok(output) => {
-            let encode_started = Instant::now();
-            let documents = if compact {
-                Vec::new()
-            } else {
-                output
-                    .rows()
-                    .iter()
-                    .map(|row| execution_row_to_json(row, planned.physical()))
-                    .collect::<Vec<_>>()
-            };
-            let materialize_us = elapsed_micros(encode_started);
-            let statistics = output.statistics();
-
-            QueryResponse::success(
-                request.id,
-                documents,
-                Some(serde_json::json!({
-                    "scanned": statistics.scanned(),
-                    "filtered": statistics.filtered(),
-                    "returned": statistics.returned(),
-                    "inserted": statistics.inserted(),
-                    "replaced": statistics.replaced(),
-                    "deleted": statistics.deleted(),
-                    "strategies": statistics.strategies().iter().map(|strategy| strategy.as_str()).collect::<Vec<_>>(),
-                    "committed": output.committed(),
-                    "compact": compact,
-                    "timings_us": {
-                        "parse": parse_us,
-                        "plan": plan_us,
-                        "execute": execute_us,
-                        "materialize_response": materialize_us,
-                        "total_before_wire_encode": elapsed_micros(started),
-                    },
-                })),
-            )
-        }
-        Err(error) => {
-            QueryResponse::request_error(request.id, "query.execution_failed", error.to_string())
-        }
+        Ok(output) => Ok(RequestRun { output, compact, exposes_id: exposes_document_id(planned.physical()), timings: (started, parse_us, plan_us, execute_us), _permit: _operation_permit }),
+        Err(error) => Err(QueryResponse::request_error(request.id, "query.execution_failed", error.to_string())),
     }
 }
 
 #[inline]
-fn execution_row_to_json( row: &crate::query::ExecutionRow, plan: &crate::query::PhysicalPlan, ) -> JsonValue {
+fn execution_row_to_json( row: &crate::query::ExecutionRow, exposes_id: bool, ) -> JsonValue {
     let mut value = document_to_json(row.document());
-    if exposes_document_id(plan)
+    if exposes_id
         && !matches!(row.origin(), crate::query::ExecutionRowOrigin::Synthetic)
     {
         if let JsonValue::Object(object) = &mut value {
@@ -2811,7 +2845,13 @@ impl Configuration {
         let classic_auth_enabled = boolean_from_environment("OGD_CLASSIC_AUTH_ENABLED", false)?;
         let allow_public = boolean_from_environment("OGD_ALLOW_PUBLIC", true)?;
         let classic_auth_email = boolean_from_environment("OGD_CLASSIC_AUTH_EMAIL", false)?;
-        let memory_limit_bytes = optional_bytes_from_environment("OGD_MEMORY_LIMIT")?;
+        // Unset, the machine's ([`crate::memory::machine_limit_bytes`]): its spills and pressure handling apply;
+        // `unlimited` sizes the budgets from the memory available at start, with no process limit.
+        let memory_limit_bytes = match env_text("OGD_MEMORY_LIMIT") {
+            Some(value) if value.trim() == "unlimited" => None,
+            Some(_) => optional_bytes_from_environment("OGD_MEMORY_LIMIT")?,
+            None => crate::memory::machine_limit_bytes(),
+        };
         let memory_profile = memory_limit_bytes.map_or_else( MemoryProfileConfig::unlimited, MemoryProfileConfig::for_limit, );
         // Queries run at most one per hardware thread; the others wait their turn.
         let query_slots = count_from_environment("OGD_QUERY_SLOTS", thread::available_parallelism().map_or(4, usize::from))?;

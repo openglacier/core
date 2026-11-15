@@ -58,6 +58,15 @@ impl DeadRows {
         }
     }
 
+    /// The other rows of a segment of `rows` rows.
+    #[must_use]
+    pub(super) fn others(&self, rows: u64) -> Self {
+        let mut words = self.words.iter().map(|word| !word).collect::<Vec<_>>();
+        words.resize(rows.div_ceil(64) as usize, u64::MAX);
+        if let Some(last) = words.last_mut().filter(|_| rows % 64 != 0) { *last &= (1 << (rows % 64)) - 1; }
+        Self { words, count: rows - self.count }
+    }
+
     /// The bitmap words, little endian (for the history baseline).
     #[must_use]
     pub(super) fn to_bytes(&self) -> Vec<u8> { self.words.iter().flat_map(|word| word.to_le_bytes()).collect() }

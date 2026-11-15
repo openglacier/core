@@ -519,7 +519,8 @@ pub struct MachineAccessReportInput {
     pub table: Option<String>,
     pub message: Option<String>,
 }
-/// A pool: one client company, the totals its policies share (`limits`: `users`, `storage`, `places`).
+/// A pool: one client company, the totals its policies share (`limits`: `users`, `storage`, `places`) and
+/// `historyDays`, the days of history (`as of`, `history`) its Places read: absent, all the history kept; 0, none.
 /// A section left out is not changed by `pool.update`; `{}` clears it.
 pub struct PoolCreateInput {
     pub label: String,

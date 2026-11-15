@@ -281,6 +281,17 @@ struct SegmentCursor<'s> {
     at: usize,
 }
 
+/// The strings of one chunk, from its dictionary ([`crate::storage::GroupStrings`]).
+#[derive(Debug)]
+struct ChunkStrings<'s> { segment: &'s Segment, group: usize, field: usize }
+
+impl crate::storage::GroupStrings for ChunkStrings<'_> {
+    fn any(&self, test: &mut dyn FnMut(&str) -> bool) -> Option<bool> {
+        let column = self.segment.column(self.group, self.field).ok()??;
+        Some(column.dictionary_strings().ok()??.iter().any(|string| test(string)))
+    }
+}
+
 /// Facts of one chunk, from its statistics.
 fn group_facts(stats: &super::column::ChunkStats) -> GroupFacts<'_> {
     let has = |kind: u8| stats.kinds & (1 << kind) != 0;
@@ -297,7 +308,7 @@ fn group_facts(stats: &super::column::ChunkStats) -> GroupFacts<'_> {
             kinds.push(kind);
         }
     }
-    GroupFacts { missing: has(K_MISSING), kinds, bounds: &stats.bounds }
+    GroupFacts { missing: has(K_MISSING), kinds, bounds: &stats.bounds, strings: None }
 }
 
 fn blocks_in(segment: &Segment, group: usize) -> StorageResult<usize> { Ok(segment.group_rows(group).1.div_ceil(BLOCK)) }
@@ -341,18 +352,17 @@ impl<'s> SegmentCursor<'s> {
             }
         }
         let empty = FieldBounds::default();
-        let mut facts = Vec::with_capacity(layout.paths.len());
         let skipped = (0..segment.group_count()).map(|group| {
-            facts.clear();
-            facts.extend(layout.paths.iter().zip(&leaves).map(|((slot, rest), leaf)| {
-                // Statistics describe the whole value of a column: a leaf's
-                // are its path's, a top-level field's are not a nested path's.
+            // Statistics describe the whole value of a column: a leaf's
+            // are its path's, a top-level field's are not a nested path's.
+            let chunks = layout.paths.iter().zip(&leaves).map(|((slot, rest), leaf)| {
                 let (field, rest) = match leaf { Some(leaf) => (fields[*leaf], &[][..]), None => (fields[*slot], *rest) };
-                match field {
-                    Some(field) if segment.has_column(group, field) => segment.stats(group, field).filter(|_| rest.is_empty()).map(group_facts),
-                    _ => Some(GroupFacts { missing: true, kinds: Vec::new(), bounds: &empty }),
-                }
-            }));
+                (field.filter(|field| segment.has_column(group, *field)).map(|field| ChunkStrings { segment, group, field }), rest.is_empty())
+            }).collect::<Vec<_>>();
+            let facts = chunks.iter().map(|(chunk, whole)| match chunk {
+                Some(chunk) => segment.stats(group, chunk.field).filter(|_| *whole).map(|stats| GroupFacts { strings: Some(chunk), ..group_facts(stats) }),
+                None => Some(GroupFacts { missing: true, kinds: Vec::new(), bounds: &empty, strings: None }),
+            }).collect::<Vec<_>>();
             skip(&facts)
         }).collect::<Vec<_>>();
         let groups = segment.group_count();
@@ -607,8 +617,8 @@ fn walk<'s>(collection: &'s Collection, columns: Columns, layout: Option<&Layout
     let ids = ids || order != Order::Any;
     // Sources: `Some(segment index)`, or `None` for the delta.
     let mut sources = (0..collection.segments.len()).map(|index| (collection.segments[index].segment.min_id(), collection.segments[index].segment.max_id(), Some(index))).collect::<Vec<_>>();
-    if let (Some(first), Some(last)) = (collection.delta.keys().next(), collection.delta.keys().next_back()) {
-        sources.push((*first, *last, None));
+    if let (Some(first), Some(last)) = (collection.delta.first_key(), collection.delta.last_key()) {
+        sources.push((first, last, None));
     }
     let open = |source: Option<usize>| -> StorageResult<Cursor<'s>> {
         Ok(match source {
@@ -657,7 +667,7 @@ fn walk<'s>(collection: &'s Collection, columns: Columns, layout: Option<&Layout
 /// Visits the live rows of the segment parts `parts` and of `delta` in identifier order, for compaction: one row
 /// at a time, where reading each segment whole first held all of them in memory.
 pub(super) fn visit_live(parts: Vec<SegmentPart>, delta: BTreeMap<u128, DeltaRow>, emit: &mut dyn FnMut(u128, u64, Arc<Document>) -> StorageResult<()>) -> StorageResult<()> {
-    let collection = Collection { segments: parts, delta: Arc::new(delta), ..Collection::default() };
+    let collection = Collection { segments: parts, delta: delta.into(), ..Collection::default() };
     walk(&collection, Columns::All, None, Order::Id(ScanDirection::Forward), true, true, &mut |row| {
         emit(super::key(&row.id()), row.version().get(), row.document(None, None)?)?;
         Ok(true)

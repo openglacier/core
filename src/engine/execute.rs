@@ -10,7 +10,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 use super::*;
 use super::changes;
-use crate::query::{execute_insert, execute_streaming_load, insert_document, into_target, streaming_load_specification, DocumentScope};
+use crate::query::{execute_insert, execute_streaming_load, insert_document, into_target, streaming_load_specification, DocumentScope, RowSpool};
 use crate::storage::{CommitResult, UuidV7Generator, VersionPrecondition};
 
 /// What a transaction keeps of each pending write besides a written document (its staged entry, its log entry,
@@ -176,7 +176,7 @@ impl Engine {
         // An `into` that inserts nothing commits nothing.
         let commit = if into_target(physical).is_some() && written == 0 { None } else { Some(transaction.commit().map_err(storage_engine_error)?) };
         let statistics = statistics.with_commit(usize_to_u64_saturating(rows.len()), commit);
-        Ok(ExecutionOutput::new(rows, statistics, commit))
+        Ok(ExecutionOutput::spooled(rows, statistics, commit))
     }
 
     /// Runs the writes `plans`, each in its scope, in one transaction: all
@@ -211,7 +211,7 @@ impl Engine {
     /// the bytes its pending writes and returned rows hold: past the query's
     /// memory, the transaction moves its pending writes out of memory, or
     /// the write fails.
-    fn write_in(&self, transaction: &mut dyn StorageTransaction, stage: &StageMemory<'_>, held: &mut (usize, usize), physical: &PhysicalPlan, scope: Option<&DocumentScope>) -> EngineResult<(Vec<ExecutionRow>, ExecutionStatistics, u64)> {
+    fn write_in(&self, transaction: &mut dyn StorageTransaction, stage: &StageMemory<'_>, held: &mut (usize, usize), physical: &PhysicalPlan, scope: Option<&DocumentScope>) -> EngineResult<(RowSpool, ExecutionStatistics, u64)> {
         let operators = physical.operators();
         let into = into_target(physical).map(|target| into_collection(physical, target)).transpose()?;
         let first = if into.is_some() { operators.len() - 1 } else { operators.iter().position(|operator| operator.execution_properties().writes()).expect("a write plan writes") };
@@ -233,13 +233,17 @@ impl Engine {
         let collection = into.as_ref().unwrap_or(physical.source().collection());
         let ids = UuidV7Generator::new();
         let mut chain = StreamingRowChain::new(suffix);
-        let (mut rows, mut written, failure) = (Vec::new(), 0u64, std::cell::Cell::new(None));
+        let (mut rows, mut written, failure, spill) = (RowSpool::default(), 0u64, std::cell::Cell::new(None), crate::spill::SpillEngine::default());
         let name = if into.is_some() { "into" } else { operators[first].name() };
         let mut write = |mut row: ExecutionRow| -> Result<(), StorageError> {
-            let bytes = if delete { PENDING_RECORD_BYTES } else { execution_row_encoded_len(&row).saturating_mul(2).saturating_add(PENDING_RECORD_BYTES) };
-            held.0 = held.0.saturating_add(bytes);
-            if !stage.fits(held.0 + held.1) && transaction.spill()? {
-                held.0 = 0;
+            held.0 = held.0.saturating_add(if delete { PENDING_RECORD_BYTES } else { execution_row_encoded_len(&row).saturating_mul(2).saturating_add(PENDING_RECORD_BYTES) });
+            // Past the query's memory, the pending writes and the rows to return move to disk.
+            if !stage.fits(held.0 + held.1) {
+                if transaction.spill()? { held.0 = 0; }
+                if held.1 > 0 {
+                    rows.spill(&spill).map_err(|error| { failure.set(Some(EngineError::execution(error))); StorageError::backend(name) })?;
+                    held.1 = 0;
+                }
             }
             if !stage.holds(held.0 + held.1) {
                 failure.set(Some(EngineError::execution(ExecutionError::evaluation(format!("{name}: the written rows exceed the governed query working set")))));
@@ -264,9 +268,8 @@ impl Engine {
                 let document = enforce(&row)?;
                 row.committed(transaction.replace(collection, row.id(), document, precondition)?.into_stored());
             }
-            // The returned rows stay in memory.
-            held.1 += bytes;
-            rows.push(row);
+            // The returned rows are kept encoded until the reply.
+            held.1 += rows.push(&row).map_err(|error| { failure.set(Some(EngineError::execution(error))); StorageError::backend(name) })?;
             Ok(())
         };
         let statistics = self.stream_rows(&read, scope, |row| {
