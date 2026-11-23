@@ -74,13 +74,6 @@ impl DocumentId {
         Ok(Self(bytes))
     }
 
-    #[must_use]
-    pub fn timestamp_ms(self) -> u64 {
-        self.0[..6]
-            .iter()
-            .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
-    }
-
     /// Builds a deterministic, valid UUID v7 for engine-produced rows such as
     /// grouped or pivoted results. This is not used for persisted documents.
     #[must_use]
@@ -134,9 +127,9 @@ impl fmt::Display for DocumentId {
         f.write_str(std::str::from_utf8(&self.hyphenated()).map_err(|_| fmt::Error)?)
     }
 }
-impl TryFrom<&str> for DocumentId {
-    type Error = StorageError;
-    fn try_from(v: &str) -> Result<Self, Self::Error> {
+impl std::str::FromStr for DocumentId {
+    type Err = StorageError;
+    fn from_str(v: &str) -> Result<Self, Self::Err> {
         Self::parse(v)
     }
 }

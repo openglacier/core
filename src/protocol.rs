@@ -48,7 +48,6 @@ where
     serializer.serialize_f64(*value as f64)
 }
 
-
 /// Maximum UTF-8 byte length accepted for a string request identifier.
 pub const MAX_REQUEST_ID_BYTES: usize = 128;
 
@@ -117,9 +116,9 @@ impl TryFrom<String> for RequestId {
     type Error = &'static str;
     fn try_from(value: String) -> Result<Self, Self::Error> { Self::string(&value) }
 }
-impl TryFrom<&str> for RequestId {
-    type Error = &'static str;
-    fn try_from(value: &str) -> Result<Self, Self::Error> { Self::string(value) }
+impl std::str::FromStr for RequestId {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> { Self::string(value) }
 }
 impl Display for RequestId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
@@ -257,21 +256,6 @@ impl WireError {
 
 pub use crate::error::{MessageKind, ProtocolError};
 
-/// Encodes a request as one length-prefixed `MessagePack` message.
-pub fn encode_request(request: &QueryRequest) -> Result<Vec<u8>, ProtocolError> {
-    request.validate()?;
-    encode_message(request, MessageKind::Request, MAX_REQUEST_BYTES)
-}
-
-/// Decodes and validates one `MessagePack` request payload.
-pub fn decode_request(payload: &[u8]) -> Result<QueryRequest, ProtocolError> {
-    ensure_payload_size(MessageKind::Request, payload.len(), MAX_REQUEST_BYTES)?;
-    let request: QueryRequest = rmp_serde::from_slice(payload)
-        .map_err(ProtocolError::InvalidMessagePackDecode)?;
-    request.validate()?;
-    Ok(request)
-}
-
 /// Encodes one streamed response as length-prefixed `MessagePack`.
 pub fn encode_stream_response(response: &StreamResponse) -> Result<Vec<u8>, ProtocolError> {
     encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
@@ -299,20 +283,6 @@ pub fn decode_stream_response(payload: &[u8]) -> Result<StreamResponse, Protocol
             received: response.kind().to_owned(),
         });
     }
-    Ok(response)
-}
-
-/// Encodes a complete response as length-prefixed `MessagePack`.
-pub fn encode_response(response: &QueryResponse) -> Result<Vec<u8>, ProtocolError> {
-    encode_message(response, MessageKind::Response, MAX_RESPONSE_BYTES)
-}
-
-/// Decodes one complete `MessagePack` response payload.
-pub fn decode_response(payload: &[u8]) -> Result<QueryResponse, ProtocolError> {
-    ensure_payload_size(MessageKind::Response, payload.len(), MAX_RESPONSE_BYTES)?;
-    let response: QueryResponse = rmp_serde::from_slice(payload)
-        .map_err(ProtocolError::InvalidMessagePackDecode)?;
-    validate_response_version(&response)?;
     Ok(response)
 }
 
@@ -390,31 +360,13 @@ pub const fn ensure_payload_size( kind: MessageKind, actual: usize, maximum: usi
     Ok(())
 }
 
-const fn validate_response_version(response: &QueryResponse) -> Result<(), ProtocolError> {
-    let version = match response {
-        QueryResponse::Ok { version, .. } | QueryResponse::Error { version, .. } => *version,
-    };
-    if version != PROTOCOL_VERSION {
-        return Err(ProtocolError::UnsupportedVersion {
-            received: version,
-            supported: PROTOCOL_VERSION,
-        });
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn request_round_trip() { let request = QueryRequest::new(42, "from users | where active == true"); let encoded = encode_request(&request).expect("request encodes"); let decoded = decode_request(&encoded[LENGTH_PREFIX_BYTES..]).expect("request decodes"); assert_eq!(decoded, request); }
-    #[test] fn success_response_round_trip() { let response = QueryResponse::success( 7, vec![serde_json::json!({ "name": "Ada", "active": true })], Some(serde_json::json!({ "scanned": 1, "returned": 1 })), ); let encoded = encode_response(&response).expect("response encodes"); let decoded = decode_response(&encoded[LENGTH_PREFIX_BYTES..]).expect("response decodes"); assert_eq!(decoded, response); assert!(decoded.is_ok()); assert_eq!(decoded.id(), Some(RequestId::Number(7))); }
-    #[test] fn error_response_round_trip() { let response = QueryResponse::request_error(9, "query.invalid", "invalid query"); let encoded = encode_response(&response).expect("response encodes"); let decoded = decode_response(&encoded[LENGTH_PREFIX_BYTES..]).expect("response decodes"); assert_eq!(decoded, response); assert!(!decoded.is_ok()); assert_eq!(decoded.id(), Some(RequestId::Number(9))); }
-    #[test] fn rejects_empty_query() { let error = decode_request(&rmp_serde::to_vec_named(&QueryRequest::new(1, "   ")).unwrap()).expect_err("empty query must fail"); assert!(matches!(error, ProtocolError::EmptyQuery)); }
-    #[test] fn rejects_unknown_request_fields() { let error = decode_request(&[0xc1]).expect_err("invalid MessagePack must fail"); assert!(matches!(error, ProtocolError::InvalidMessagePackDecode(_))); }
-    #[test] fn rejects_unsupported_request_version() { let payload = rmp_serde::to_vec_named(&QueryRequest { version: 2, id: RequestId::Number(1), query: "from users".to_owned() }).unwrap(); let error = decode_request(&payload).expect_err("unsupported version must fail"); assert!(matches!( error, ProtocolError::UnsupportedVersion { received: 2, supported: PROTOCOL_VERSION } )); }
-    #[test] fn rejects_empty_message_payload() { let error = decode_request(&[]).expect_err("empty payload must fail"); assert!(matches!(error, ProtocolError::InvalidPayloadLength { length: 0 })); }
-    #[test] fn rejects_invalid_messagepack() { let error = decode_request(&[0xc1]).expect_err("MessagePack must fail"); assert!(matches!(error, ProtocolError::InvalidMessagePackDecode(_))); }
-    #[test] fn rejects_oversized_request_before_messagepack_decode() { let oversized = vec![b'x'; MAX_REQUEST_BYTES + 1]; let error = decode_request(&oversized).expect_err("oversized request must fail"); assert!(matches!( error, ProtocolError::MessageTooLarge { kind: MessageKind::Request, actual, maximum: MAX_REQUEST_BYTES } if actual == MAX_REQUEST_BYTES + 1 )); }
+    #[test] fn rejects_empty_query() { assert!(matches!(QueryRequest::new(1, "   ").validate(), Err(ProtocolError::EmptyQuery))); }
+    #[test] fn rejects_unsupported_request_version() { let request = QueryRequest { version: 2, id: RequestId::Number(1), query: "from users".to_owned() }; assert!(matches!(request.validate(), Err(ProtocolError::UnsupportedVersion { received: 2, supported: PROTOCOL_VERSION }))); }
+    #[test] fn rejects_empty_message_payload() { let error = ensure_payload_size(MessageKind::Request, 0, MAX_REQUEST_BYTES).expect_err("empty payload must fail"); assert!(matches!(error, ProtocolError::InvalidPayloadLength { length: 0 })); }
+    #[test] fn rejects_oversized_request() { let error = ensure_payload_size(MessageKind::Request, MAX_REQUEST_BYTES + 1, MAX_REQUEST_BYTES).expect_err("oversized request must fail"); assert!(matches!( error, ProtocolError::MessageTooLarge { kind: MessageKind::Request, actual, maximum: MAX_REQUEST_BYTES } if actual == MAX_REQUEST_BYTES + 1 )); }
     #[test] fn streamed_responses_are_named_messagepack_messages() { let response = StreamResponse::partial(7, serde_json::json!({"name": "Alice"})); let encoded = encode_stream_response(&response).expect("response encodes"); let value: serde_json::Value = rmp_serde::from_slice(&encoded[LENGTH_PREFIX_BYTES..]).expect("response decodes as map"); assert_eq!(value["kind"], "response"); assert_eq!(value["status"], "partial"); assert_eq!(value["version"], PROTOCOL_VERSION); assert_eq!(value["id"], 7); }
     #[test] fn response_numbers_that_require_int64_are_encoded_as_javascript_numbers() { let response = StreamResponse::partial( RequestId::string("query-1").unwrap(), serde_json::json!({ "created_at": 1_785_680_802_608_u64, "nested": { "ts": 1_785_680_802_609_u64 }, "array": [1_785_680_802_610_u64], "small": 42_u64 }), ); let encoded = encode_stream_response(&response).expect("response encodes"); let decoded: serde_json::Value = rmp_serde::from_slice(&encoded[LENGTH_PREFIX_BYTES..]).unwrap(); assert!(decoded["data"]["created_at"].is_f64()); assert!(decoded["data"]["nested"]["ts"].is_f64()); assert!(decoded["data"]["array"][0].is_f64()); assert!(decoded["data"]["small"].is_u64()); }
     #[test] fn response_rejects_integers_above_javascript_safe_range() { let response = StreamResponse::partial(1, serde_json::json!({ "too_large": JS_MAX_SAFE_INTEGER + 1 })); let error = encode_stream_response(&response).expect_err("unsafe integer must fail"); assert!(matches!(error, ProtocolError::UnsafeJavaScriptInteger { .. })); }

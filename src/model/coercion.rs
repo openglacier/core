@@ -37,11 +37,6 @@ impl CoercionPolicy {
     pub const fn allows_string_to_number(self) -> bool {
         matches!(self, Self::Implicit)
     }
-
-    #[must_use]
-    pub const fn is_strict(self) -> bool {
-        matches!(self, Self::Strict)
-    }
 }
 
 impl fmt::Display for CoercionPolicy {
@@ -69,26 +64,6 @@ impl CoercionFailure {
             Self::OutOfRange => "out_of_range",
             Self::PrecisionLoss => "precision_loss",
         }
-    }
-
-    #[must_use]
-    pub const fn is_forbidden_by_policy(self) -> bool {
-        matches!(self, Self::ForbiddenByPolicy)
-    }
-
-    #[must_use]
-    pub const fn is_incompatible_value(self) -> bool {
-        matches!(self, Self::IncompatibleValue)
-    }
-
-    #[must_use]
-    pub const fn is_out_of_range(self) -> bool {
-        matches!(self, Self::OutOfRange)
-    }
-
-    #[must_use]
-    pub const fn is_precision_loss(self) -> bool {
-        matches!(self, Self::PrecisionLoss)
     }
 }
 
@@ -214,29 +189,9 @@ impl CoercedNumberPair {
     }
 
     #[must_use]
-    pub const fn into_tuple(self) -> (CoercedNumber, CoercedNumber) {
-        (self.left, self.right)
-    }
-
-    #[must_use]
     #[inline]
     pub const fn kind(self) -> NumberKind {
         self.left.kind()
-    }
-
-    #[must_use]
-    pub const fn has_common_kind(self) -> bool {
-        matches!(
-            (self.left, self.right),
-            (CoercedNumber::Signed(_), CoercedNumber::Signed(_))
-                | (CoercedNumber::Unsigned(_), CoercedNumber::Unsigned(_))
-                | (CoercedNumber::Float(_), CoercedNumber::Float(_))
-        )
-    }
-
-    #[must_use]
-    pub const fn into_numbers(self) -> (Number, Number) {
-        (self.left.into_number(), self.right.into_number())
     }
 }
 
@@ -431,6 +386,7 @@ const fn classify_float_parse_error(_error: ParseFloatError) -> CoercionFailure 
 
 #[cfg(test)]
 mod tests {
+    impl super::CoercedNumberPair { pub(crate) const fn into_tuple(self) -> (CoercedNumber, CoercedNumber) { (self.left, self.right) } }
     use super::*;
 
     #[test] fn policy_names_are_stable() { assert_eq!(CoercionPolicy::Strict.as_str(), "strict"); assert_eq!(CoercionPolicy::Numeric.as_str(), "numeric"); assert_eq!(CoercionPolicy::Implicit.as_str(), "implicit"); }
@@ -473,8 +429,6 @@ mod tests {
     #[test] fn value_pair_supports_implicit_string_to_number() { let left = Value::from(18_i64); let right = Value::from("18"); let pair = coerce_value_pair_to_numbers(&left, &right, CoercionPolicy::Implicit) .expect("the string must be interpreted as a number"); assert_eq!( pair.into_tuple(), (CoercedNumber::Signed(18), CoercedNumber::Signed(18),) ); }
     #[test] fn value_pair_rejects_string_under_numeric_policy() { let left = Value::from(18_i64); let right = Value::from("18"); assert_eq!( coerce_value_pair_to_numbers(&left, &right, CoercionPolicy::Numeric,), Err(CoercionFailure::ForbiddenByPolicy) ); }
     #[test] fn coerced_number_converts_back_to_number() { assert_eq!(CoercedNumber::Signed(-1).into_number(), Number::Signed(-1)); assert_eq!( CoercedNumber::Unsigned(1).into_number(), Number::Unsigned(1) ); assert_eq!(CoercedNumber::Float(1.5).into_number(), Number::Float(1.5)); }
-    #[test] fn policy_and_failure_predicates_are_consistent() { assert!(CoercionPolicy::Strict.is_strict()); assert!(!CoercionPolicy::Numeric.is_strict()); assert!(!CoercionPolicy::Implicit.is_strict()); assert!(CoercionFailure::ForbiddenByPolicy.is_forbidden_by_policy()); assert!(CoercionFailure::IncompatibleValue.is_incompatible_value()); assert!(CoercionFailure::OutOfRange.is_out_of_range()); assert!(CoercionFailure::PrecisionLoss.is_precision_loss()); }
     #[test] fn coerced_number_reports_its_category_and_finiteness() { assert!(CoercedNumber::Signed(-1).is_integer()); assert!(CoercedNumber::Unsigned(1).is_integer()); assert!(!CoercedNumber::Float(1.5).is_integer()); assert!(CoercedNumber::Float(1.5).is_float()); assert!(CoercedNumber::Float(1.5).is_finite()); assert!(!CoercedNumber::Float(f64::INFINITY).is_finite()); }
-    #[test] fn coerced_pair_exposes_common_kind_and_physical_numbers() { let pair = CoercedNumberPair::new(CoercedNumber::Signed(18), CoercedNumber::Signed(20)); assert!(pair.has_common_kind()); assert_eq!( pair.into_numbers(), (Number::Signed(18), Number::Signed(20)), ); let heterogeneous = CoercedNumberPair::new(CoercedNumber::Signed(18), CoercedNumber::Float(18.0)); assert!(!heterogeneous.has_common_kind()); }
     #[test] fn number_convenience_helpers_delegate_to_core_coercion() { let pair = coerce_numbers( Number::Signed(18), Number::Unsigned(20), CoercionPolicy::Numeric, ) .expect("the numeric policy must reconcile compatible integers"); assert_eq!( pair.into_tuple(), (CoercedNumber::Signed(18), CoercedNumber::Signed(20)), ); assert_eq!(parse_number_value("18.5"), Ok(Number::Float(18.5)),); }
 }

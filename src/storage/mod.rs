@@ -144,10 +144,10 @@ impl fmt::Display for CollectionId {
     }
 }
 
-impl TryFrom<&str> for CollectionId {
-    type Error = StorageError;
+impl std::str::FromStr for CollectionId {
+    type Err = StorageError;
 
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         Self::parse(value)
     }
 }

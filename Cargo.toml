@@ -1,6 +1,6 @@
 [package]
 name = "openglacier-core"
-version = "2.0.4"
+version = "2.0.5"
 edition = "2021"
 description = "An event-first, schema-less document database engine and capability runtime"
 repository = "https://github.com/openglacier/core"
@@ -23,30 +23,24 @@ include = [
 ]
 
 [lints.clippy]
-# Lints de documentation trop verbeux
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-
-# Lints de performance / API à décider au cas par cas
-missing_const_for_fn = "allow"          # breaking change une fois ajouté
-result_large_err = "allow"              # nécessite un refactor
-too_many_lines = "allow"                # monter la limite via clippy.toml est une alternative
-
-# Lints de cast acceptables dans ce codebase (metrics, codecs, tailles internes)
-cast_precision_loss = "allow"
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-cast_possible_wrap = "allow"
-
-# Lints de style trop subjectifs
-module_name_repetitions = "allow"
-struct_excessive_bools = "allow"
-option_option = "allow"
+# The groups, then the lints the code still triggers (the only lint configuration of the crate: src/lib.rs keeps the rustc denies).
+all = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+result_large_err = "allow"
 type_complexity = "allow"
 too_many_arguments = "allow"
-
-# Lints de dépendances (à traiter séparément via cargo update)
 multiple_crate_versions = "allow"
+chunks_exact_to_as_chunks = "allow"
+useless_conversion = "allow"
+unnecessary_sort_by = "allow"
+manual_is_multiple_of = "allow"
+drop_non_drop = "allow"
+while_let_loop = "allow"
+needless_return = "allow"
+unnecessary_lazy_evaluations = "allow"
+should_implement_trait = "allow"
+misnamed_getters = "allow"
+match_single_binding = "allow"
 
 [lib]
 name = "og_core"
@@ -75,7 +69,7 @@ search = ["db-engine"]
 search-documents = ["search", "dep:lopdf", "dep:calamine", "dep:zip"]
 # The native data worker (`ogd data-worker`, src/import/): reads CSV, text and Excel files for data.import without
 # Python. When compiled, it is the worker; OG_DATA_WORKER=python asks for the Python one instead.
-native-import = ["dep:calamine", "dep:encoding_rs", "dep:regex", "dep:unicode-normalization", "dep:sha1"]
+native-import = ["dep:calamine", "dep:encoding_rs", "dep:unicode-normalization", "dep:sha1"]
 # SMTP/SMTPS submission through a remote server (mail.send), routed like any Place provider.
 mailsend = ["dep:rustls", "dep:webpki-roots"]
 
@@ -87,11 +81,11 @@ full-cuda = ["full", "cuda"]
 
 # Infrastructure capabilities.
 # The node channels to the Gateway: websockets of our own (src/daemon/websocket.rs), TLS by rustls.
-fabric = ["identity", "dep:sha2", "dep:sha1", "dep:rustix", "dep:rustls", "dep:webpki-roots"]
+fabric = ["identity", "dep:sha2", "dep:sha1", "dep:rustls", "dep:webpki-roots"]
 files-watch = ["files", "dep:notify"]
-cli = ["identity", "dep:rustyline", "dep:rpassword"]
-# The terminal workspace, drawn with crossterm alone (src/cli/screen.rs).
-cli-tui = ["cli", "dep:crossterm"]
+cli = ["identity"]
+# The terminal workspace (src/cli/tui.rs), on the terminal layer of src/cli/term.rs (Unix).
+cli-tui = ["cli"]
 
 # Everything a server node can serve, with the native data worker.
 # data-import, llm, agent and mailsend are compiled but remain disabled by default unless
@@ -120,19 +114,15 @@ lopdf = { version = "0.47", optional = true, default-features = false }
 calamine = { version = "0.38", optional = true, default-features = false }
 zip = { version = "9.1", optional = true, default-features = false, features = ["deflate"] }
 serde_json = "1"
-rustyline = { version = "19", optional = true }
-crossterm = { version = "0.29", optional = true, features = ["bracketed-paste"] }
 ed25519-dalek = { version = "3", optional = true }
 argon2 = { version = "0.6", optional = true }
 chacha20poly1305 = { version = "0.11", optional = true }
-rpassword = { version = "7", optional = true }
 notify = { version = "8", optional = true }
 sha2 = { version = "0.11.1", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = { version = "1", optional = true }
 llama-cpp-2 = { version = "=0.1.156", optional = true }
 encoding_rs = { version = "0.8.35", optional = true }
-regex = { version = "1.13", optional = true }
 unicode-normalization = { version = "0.1.26", optional = true }
 sha1 = { version = "0.11", optional = true }
 getrandom = "0.4"
@@ -142,15 +132,14 @@ og-llama-common-chat = {
     optional = true,
 }
 
-[target.'cfg(all(target_pointer_width = "64", target_family = "unix"))'.dependencies]
-mmap-guard = "=0.2.2"
-
-# poll(2) for the node channel bridge (fabric).
+# mmap(2) of glacier segments, poll(2) for the node channel bridge (fabric), the terminal of ogcli (cli).
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", optional = true, default-features = false, features = ["std", "event"] }
+rustix = { version = "1", default-features = false, features = ["std", "event", "mm", "termios"] }
 
 [dev-dependencies]
 proptest = "1"
+# Oracle of the import patterns (src/import/pattern.rs).
+regex = "1.13"
 
 
 [profile.release]

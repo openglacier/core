@@ -6,7 +6,7 @@ pub mod document;
 pub mod field_path;
 pub mod value;
 pub use capability::{
-    capabilities_of, capabilities_of_number, Capabilities, Capability, ValueCapabilities,
+    capabilities_of, capabilities_of_number, Capabilities, Capability,
 };
 pub use coercion::{
     coerce_number_pair, coerce_numbers, coerce_value_pair_to_numbers, coerce_value_to_number,

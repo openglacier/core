@@ -250,6 +250,225 @@
     }
   },
   {
+    "appId": "system.notes",
+    "name": "Notes",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.notes",
+      "name": "Notes",
+      "version": "1.0.0",
+      "tone": "sage",
+      "runtime": "notes",
+      "description": "Markdown pages of the Place, kept as files of the App.",
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [
+          {
+            "type": "metric",
+            "label": {
+              "fr": "Notes",
+              "en": "Notes"
+            },
+            "value": {
+              "fr": "Pages",
+              "en": "Pages"
+            },
+            "detail": {
+              "fr": "Le wiki de la Place",
+              "en": "The wiki of the Place"
+            }
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": {
+              "fr": "Place",
+              "en": "Place"
+            },
+            "title": {
+              "fr": "Notes",
+              "en": "Notes"
+            },
+            "description": {
+              "fr": "Des pages en Markdown pour les procédures, les comptes rendus et tout ce que l'équipe doit retrouver",
+              "en": "Markdown pages for procedures, minutes and whatever the team must find again"
+            }
+          }
+        ]
+      },
+      "store": {
+        "tags": [
+          "base",
+          "notes"
+        ],
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Les pages partagées de la Place, en Markdown.",
+          "en": "The shared pages of the Place, in Markdown."
+        },
+        "description": {
+          "fr": "Des pages en Markdown pour les procédures, les comptes rendus et tout ce que l'équipe doit retrouver : recherche par titre, liens entre pages, versions et corbeille. Chaque page est un fichier de l'App : Files la montre sous Apps, WebDAV et LINK360 la synchronisent.",
+          "en": "Markdown pages for procedures, minutes and whatever the team must find again: search by title, links between pages, versions and trash. Each page is a file of the App: Files shows it under Apps, WebDAV and LINK360 sync it."
+        }
+      }
+    }
+  },
+  {
+    "appId": "system.history",
+    "name": "History",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.history",
+      "name": "History",
+      "version": "1.0.0",
+      "tone": "glacier",
+      "runtime": "history",
+      "description": "Who changed what and when in the data of the Place.",
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [
+          {
+            "type": "metric",
+            "label": {
+              "fr": "Historique",
+              "en": "History"
+            },
+            "value": {
+              "fr": "Qui, quoi, quand",
+              "en": "Who, what, when"
+            },
+            "detail": {
+              "fr": "Les changements des données",
+              "en": "Changes to the data"
+            }
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": {
+              "fr": "Place",
+              "en": "Place"
+            },
+            "title": {
+              "fr": "Historique",
+              "en": "History"
+            },
+            "description": {
+              "fr": "Les ajouts, modifications et suppressions de chaque collection de la Place, avec leur auteur et leur heure, et pour une modification les champs avant et après. La durée d'historique dépend de l'offre",
+              "en": "The additions, changes and deletions of each collection of the Place, with their author and time, and for a change the fields before and after. How far back depends on the plan"
+            }
+          }
+        ]
+      },
+      "store": {
+        "tags": [
+          "base",
+          "audit"
+        ],
+        "category": {
+          "fr": "Plateforme",
+          "en": "Platform"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Qui a changé quoi, et quand, dans les données de la Place.",
+          "en": "Who changed what, and when, in the data of the Place."
+        },
+        "description": {
+          "fr": "Les ajouts, modifications et suppressions de chaque collection de la Place, avec leur auteur et leur heure, et pour une modification les champs avant et après. La durée d'historique dépend de l'offre : 24 heures en Free.",
+          "en": "The additions, changes and deletions of each collection of the Place, with their author and time, and for a change the fields before and after. How far back depends on the plan: 24 hours on Free."
+        }
+      }
+    }
+  },
+  {
+    "appId": "system.calculators",
+    "name": "Calculators",
+    "version": "1.0.0",
+    "definition": {
+      "id": "system.calculators",
+      "name": "Calculators",
+      "version": "1.0.0",
+      "tone": "amber",
+      "runtime": "calculators",
+      "description": "Everyday business calculators, computed in the browser.",
+      "data": {},
+      "actions": {},
+      "views": {
+        "tile": [
+          {
+            "type": "metric",
+            "label": {
+              "fr": "Calculatrices",
+              "en": "Calculators"
+            },
+            "value": {
+              "fr": "6 calculs",
+              "en": "6 calculations"
+            },
+            "detail": {
+              "fr": "Seuil, BFR, TVA, emprunt…",
+              "en": "Break-even, WCR, VAT, loan…"
+            }
+          }
+        ],
+        "full": [
+          {
+            "type": "section",
+            "kicker": {
+              "fr": "Outils",
+              "en": "Tools"
+            },
+            "title": {
+              "fr": "Calculatrices",
+              "en": "Calculators"
+            },
+            "description": {
+              "fr": "Six calculatrices de gestion",
+              "en": "Six business calculators"
+            }
+          }
+        ]
+      },
+      "store": {
+        "tags": [
+          "base",
+          "finance"
+        ],
+        "category": {
+          "fr": "Outils",
+          "en": "Tools"
+        },
+        "publisher": {
+          "fr": "Standard",
+          "en": "Standard"
+        },
+        "tagline": {
+          "fr": "Seuil de rentabilité, BFR, TVA, emprunt, coût salarié, marge.",
+          "en": "Break-even, working capital, VAT, loan, employee cost, margin."
+        },
+        "description": {
+          "fr": "Six calculatrices de gestion : seuil de rentabilité et point mort, besoin en fonds de roulement, TVA dans les deux sens, emprunt avec tableau d'amortissement, coût employeur estimé, taux de marge et de marque. Tout se calcule dans le navigateur, rien n'est lu ni enregistré dans la Place.",
+          "en": "Six business calculators: break-even point, working capital requirement, VAT both ways, loan with its schedule, estimated employer cost, margin rate and markup. Everything is computed in the browser, nothing is read from or saved to the Place."
+        }
+      }
+    }
+  },
+  {
     "appId": "system.settings",
     "name": "Settings",
     "version": "1.0.0",

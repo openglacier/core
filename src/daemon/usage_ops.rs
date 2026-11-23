@@ -86,11 +86,12 @@ fn compute(engine: &Engine) -> Result<Usage, String> {
         usage.places.insert(place_id, (place.string_field("name"), place.string_field("ownerIdentityId"), bytes));
     }
     for bytes in per_place.into_values() { usage.unattributed.add(bytes); }
+    // Pools and policies as they apply: restricted by the settings of the pool admins.
     for pool in documents(engine, "on _pools | where state == \"active\"") {
-        usage.pools.insert(pool.string_field("poolId"), (pool, Owned::default()));
+        usage.pools.insert(pool.string_field("poolId"), (super::policy_ops::restricted(engine, pool), Owned::default()));
     }
     for policy in documents(engine, "on _policies | where state == \"active\"") {
-        usage.policies.insert(policy.string_field("policyId"), (policy, Owned::default()));
+        usage.policies.insert(policy.string_field("policyId"), (super::policy_ops::restricted(engine, policy), Owned::default()));
     }
     let policy_of: BTreeMap<String, String> = documents(engine, "on _identities").into_iter().map(|identity| (identity.string_field("identityId"), identity.string_field("policyId"))).collect();
     for (_, owner, bytes) in usage.places.values() {

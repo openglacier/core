@@ -136,11 +136,6 @@ impl ExecutionProperties<'_> {
     }
 
     #[must_use]
-    pub const fn defers_materialization(self) -> bool {
-        matches!(self.materialization, Materialization::Deferred)
-    }
-
-    #[must_use]
     pub const fn reuses_projection(self) -> bool {
         matches!(self.projection_reuse, ProjectionReuse::Reusable)
     }
@@ -169,19 +164,6 @@ impl ExecutionProperties<'_> {
             Bound::AtMost(value) | Bound::Exact(value) => Some(value),
             Bound::Unknown => None,
         }
-    }
-
-    /// Returns a generic downstream row bound when this stage is a pure,
-    /// streaming, order/field-preserving linear reducer.
-    ///
-    /// Today `Limit` is the only operator that satisfies this contract. The
-    /// executor no longer needs to know its identity to consume the bound.
-    #[must_use]
-    pub const fn linear_bound(self) -> Option<usize> {
-        if !matches!(self.fields, Fields::Preserved) || !matches!(self.bound, Bound::AtMost(_)) {
-            return None;
-        }
-        self.stream_row_bound()
     }
 
     /// Returns how many rows a blocking stage retains at most (`sample n`).

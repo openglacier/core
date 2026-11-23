@@ -168,17 +168,8 @@ impl<'source> TokenStream<'source> {
     }
 
     /// Itère sur les tokens, token terminal inclus.
-    #[must_use]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Token> + '_ {
         self.tokens.iter().copied()
-    }
-
-    /// Itère sur les tokens significatifs, sans le token terminal.
-    #[must_use]
-    pub fn significant_tokens( &self, ) -> impl DoubleEndedIterator<Item = Token> + ExactSizeIterator + '_ {
-        self.tokens[..self.tokens.len().saturating_sub(1)]
-            .iter()
-            .copied()
     }
 
     /// Retourne la séquence des catégories de tokens.
@@ -187,7 +178,6 @@ impl<'source> TokenStream<'source> {
     /// lexicale de la requête. Elle ne doit pas être utilisée comme identité
     /// logique définitive : deux requêtes ayant les mêmes catégories peuvent
     /// désigner des champs ou stages différents.
-    #[must_use]
     pub fn kinds(&self) -> impl ExactSizeIterator<Item = TokenKind> + '_ {
         self.tokens.iter().map(|token| token.kind())
     }
@@ -613,6 +603,7 @@ pub fn lex(source: &str) -> LexResult<TokenStream<'_>> {
 
 #[cfg(test)]
 mod tests {
+    impl<'source> super::TokenStream<'source> { pub(crate) fn significant_tokens( &self, ) -> impl DoubleEndedIterator<Item = Token> + ExactSizeIterator + '_ { self.tokens[..self.tokens.len().saturating_sub(1)] .iter() .copied() } }
     use super::*;
 
     fn kinds(source: &str) -> Vec<TokenKind> {

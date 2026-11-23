@@ -129,7 +129,6 @@ fn complete_path(word: &str) -> Vec<String> {
 }
 
 /// The longest prefix shared by every candidate.
-#[cfg(any(test, feature = "cli-tui"))]
 pub(super) fn common_prefix(candidates: &[String]) -> &str {
     let Some(first) = candidates.first() else { return "" };
     let mut end = first.len();

@@ -571,10 +571,42 @@ pub struct UsageGetInput {
 pub struct PolicyIdInput {
     pub policy_id: String,
 }
-/// An enrollment token of a policy, shown once.
+/// An enrollment token of a policy, shown once. `singleUse`: consumed by its first enrollment, and until then
+/// it holds a seat; `expiresInDays`: refused after; `admin`: the identity it enrolls becomes an admin of the pool.
 pub struct PolicyTokenCreateInput {
     pub policy_id: String,
     pub name: Option<String>,
+    pub single_use: Option<bool>,
+    pub expires_in_days: Option<u64>,
+    pub admin: Option<bool>,
+}
+/// An admin of the pool invites one person: a single-use token of a policy of the pool (the only one when it
+/// has one), valid 7 days, holding a seat until used. With `email`, the Core mails the link
+/// `<linkBase>/join/<token>`, `linkBase` being the address of the Hub (`https://…`).
+pub struct PoolInviteInput {
+    pub pool_id: String,
+    pub policy_id: Option<String>,
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub link_base: Option<String>,
+    pub language: Option<String>,
+}
+/// Makes an identity of the pool one of its admins (`admin: true`), or no longer.
+pub struct PoolAdminSetInput {
+    pub pool_id: String,
+    pub identity_id: String,
+    pub admin: bool,
+}
+/// Settings of an admin of the pool: the shape of the pool (`limits`) or, with `policyId`, of one of its
+/// policies (`limits`, `perUser`, `rights`, `apps`). They only restrict what the pool or the policy allows;
+/// every section left out is cleared.
+pub struct PoolSettingsSetInput {
+    pub pool_id: String,
+    pub policy_id: Option<String>,
+    pub limits: Option<serde_json::Value>,
+    pub per_user: Option<serde_json::Value>,
+    pub rights: Option<serde_json::Value>,
+    pub apps: Option<serde_json::Value>,
 }
 pub struct PolicyTokenRevokeInput {
     pub token_id: String,
@@ -1064,6 +1096,22 @@ validate_fields!(PolicyCreateInput => pool_id: "poolId", label: "label");
 validate_fields!(PolicyIdInput => policy_id: "policyId");
 validate_fields!(PolicyTokenCreateInput => policy_id: "policyId");
 validate_fields!(PolicyTokenRevokeInput => token_id: "tokenId");
+validate_fields!(PoolAdminSetInput => pool_id: "poolId", identity_id: "identityId");
+impl OperationPayload for PoolInviteInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "poolId", &self.pool_id)?;
+        if let Some(policy_id) = self.policy_id.as_ref() { non_empty(operation, "policyId", policy_id)?; }
+        if let Some(email) = self.email.as_ref() { non_empty(operation, "email", email)?; }
+        Ok(())
+    }
+}
+impl OperationPayload for PoolSettingsSetInput {
+    fn validate(&mut self, operation: &str) -> Result<()> {
+        non_empty(operation, "poolId", &self.pool_id)?;
+        if let Some(policy_id) = self.policy_id.as_ref() { non_empty(operation, "policyId", policy_id)?; }
+        Ok(())
+    }
+}
 validate_fields!(IdentityStateSetInput => identity_id: "identityId", state: "state");
 impl OperationPayload for PoolUpdateInput {
     fn validate(&mut self, operation: &str) -> Result<()> {

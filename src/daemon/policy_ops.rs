@@ -7,7 +7,8 @@
 
 use super::*;
 use super::serve::{failed, reply, Handled, Stop};
-use crate::operation::{IdentityListInput, IdentityPolicySetInput, IdentityStateSetInput, PolicyCreateInput, PolicyIdInput, PolicyListInput, PolicyTokenCreateInput, PolicyTokenRevokeInput, PolicyUpdateInput, PoolCreateInput, PoolIdInput, PoolUpdateInput};
+use super::serve::{authorization_denied, permission_granted};
+use crate::operation::{IdentityListInput, IdentityPolicySetInput, IdentityStateSetInput, PolicyCreateInput, PolicyIdInput, PolicyListInput, PolicyTokenCreateInput, PolicyTokenRevokeInput, PolicyUpdateInput, PoolAdminSetInput, PoolCreateInput, PoolIdInput, PoolInviteInput, PoolSettingsSetInput, PoolUpdateInput};
 
 /// Enrollment tokens of a policy: `ogp_` and 64 hex digits (256 random bits), kept as their SHA-256.
 const TOKEN_PREFIX: &str = "ogp_";
@@ -19,6 +20,9 @@ const POLICY_LIMITS: &[&str] = &["users", "storage", "places"];
 const PER_USER: &[&str] = &["devices", "storage", "places"];
 const RIGHTS: &[&str] = &["createPlace", "publicSharing", "externalSharing"];
 const APPS: &[&str] = &["included", "addons"];
+/// An invitation of a pool admin (`pool.invite`) is valid this long.
+const INVITATION_DAYS: u64 = 7;
+const DAY_MS: u64 = 86_400_000;
 
 #[derive(Clone, Copy)]
 enum Kind { Count, Flag, Ids }
@@ -105,23 +109,163 @@ fn pool_users(engine: &Engine, id: RequestId, pool_id: &str) -> Result<u64, Stop
     Ok(total)
 }
 
+/// Seats held by invitations not used yet (single-use tokens, active and not expired) of a policy, but `except`.
+fn reserved(engine: &Engine, id: RequestId, policy_id: &str, except: Option<&str>) -> Result<u64, Stop> {
+    let now = unix_time_millis();
+    let tokens = query_documents(engine, id, quoted!("on _policy_tokens | where policyId == {} and state == \"active\" and singleUse? == true", policy_id))?;
+    Ok(tokens.iter().filter(|token| token.u64_field("expiresAt").is_none_or(|expires| expires > now) && token.str_field("tokenId") != except).count() as u64)
+}
+
+/// The same for every active policy of a pool.
+fn pool_reserved(engine: &Engine, id: RequestId, pool_id: &str, except: Option<&str>) -> Result<u64, Stop> {
+    let mut total = 0u64;
+    for policy in query_documents(engine, id, quoted!("on _policies | where poolId == {} and state == \"active\" | select policyId", pool_id))? {
+        total = total.saturating_add(reserved(engine, id, &policy.string_field("policyId"), except)?);
+    }
+    Ok(total)
+}
+
 fn limit(document: &JsonValue, section: &str, key: &str) -> Option<u64> {
     document.get(section).and_then(|section| section.get(key)).and_then(JsonValue::as_u64)
 }
 
-/// Whether one more identity fits in `policy` and its pool. `already` is an identity already counted
-/// in the policy (moving it again takes no seat).
-fn check_seat(engine: &Engine, id: RequestId, policy: &JsonValue, already: bool) -> Result<(), Stop> {
-    if already { return Ok(()); }
-    let policy_id = policy.string_field("policyId");
-    if let Some(max) = limit(policy, "limits", "users") {
-        let users = policy_users(engine, id, &policy_id)?;
-        if users >= max { reject!(id, "policy.users_limit", format!("the policy {:?} holds {users} active users, its limit is {max}", policy.string_field("label"))); }
+// ---- Settings of the pool admins (`_pool_settings`): the shape of a pool or a policy, which only restricts it ----
+
+/// `contract` (a pool or a policy) restricted by `settings` of the same shape: the smaller count, a right both
+/// allow, the Apps both include. A setting never widens the contract.
+fn restrict(contract: &JsonValue, settings: &JsonValue) -> JsonValue {
+    let mut effective = contract.clone();
+    for section in ["limits", "perUser"] {
+        for (key, value) in settings[section].as_object().into_iter().flatten() {
+            let Some(value) = value.as_u64() else { continue };
+            effective[section][key] = limit(contract, section, key).map_or(value, |contract| contract.min(value)).into();
+        }
     }
-    let pool = active_pool(engine, id, &policy.string_field("poolId"))?;
+    for (key, value) in settings["rights"].as_object().into_iter().flatten() {
+        if value.as_bool() == Some(false) { effective["rights"][key] = false.into(); }
+    }
+    let ids = |document: &JsonValue, key: &str| document["apps"][key].as_array().map(|list| list.iter().filter_map(JsonValue::as_str).map(str::to_owned).collect::<Vec<_>>());
+    for key in APPS {
+        let Some(kept) = ids(settings, key) else { continue };
+        // Without a selection in the contract (the whole store), included Apps are the settings' own; add-ons need one.
+        let allowed = match ids(contract, key) { Some(contract) => kept.into_iter().filter(|app| contract.contains(app)).collect(), None if *key == "included" => kept, None => continue };
+        effective["apps"][*key] = allowed.into();
+    }
+    effective
+}
+
+/// The settings of a pool (`policy_id` `None`) or of one of its policies: `{}` when none.
+fn pool_settings(engine: &Engine, id: RequestId, pool_id: &str, policy_id: Option<&str>) -> Result<JsonValue, Stop> {
+    let target = policy_id.map_or_else(|| "policyId? == null".to_owned(), |policy_id| format!("policyId == {}", query_string(policy_id)));
+    Ok(query_first(engine, id, format!("on _pool_settings | where poolId == {} and {target} | limit 1", query_string(pool_id)))?.map_or_else(|| serde_json::json!({}), |row| row["values"].clone()))
+}
+
+/// A pool or a policy as it applies: restricted by its settings. A settings read that fails leaves the contract.
+pub(super) fn restricted(engine: &Engine, document: JsonValue) -> JsonValue {
+    let (pool_id, policy_id) = match document.str_field("policyId") {
+        Some(policy_id) => (document.string_field("poolId"), Some(policy_id.to_owned())),
+        None => (document.string_field("poolId"), None),
+    };
+    match pool_settings(engine, 0.into(), &pool_id, policy_id.as_deref()) {
+        Ok(settings) if settings.as_object().is_some_and(|settings| !settings.is_empty()) => restrict(&document, &settings),
+        _ => document,
+    }
+}
+
+/// Refuses settings that would widen `contract`: a count above it, a right it refuses, an App it does not offer.
+fn within(id: RequestId, contract: &JsonValue, settings: &JsonValue) -> Result<(), Stop> {
+    let effective = restrict(contract, settings);
+    for section in ["limits", "perUser"] {
+        for (key, value) in settings[section].as_object().into_iter().flatten() {
+            if limit(&effective, section, key) != value.as_u64() { reject!(id, "pool.settings_beyond_contract", format!("{section}.{key} is above what the subscription allows ({})", limit(contract, section, key).unwrap_or_default())); }
+        }
+    }
+    for (key, value) in settings["rights"].as_object().into_iter().flatten() {
+        if value.as_bool() == Some(true) && !right(contract, key) { reject!(id, "pool.settings_beyond_contract", format!("rights.{key} is not allowed by the subscription")); }
+    }
+    for key in APPS {
+        if settings["apps"][*key].as_array().is_some_and(|kept| Some(kept.len()) != effective["apps"][*key].as_array().map(Vec::len)) {
+            reject!(id, "pool.settings_beyond_contract", format!("apps.{key} names an App the subscription does not offer"));
+        }
+    }
+    Ok(())
+}
+
+// ---- Pool admins (`_pool_admins`) ----
+
+/// Who runs a delegated admin operation: the platform (the operation's permission) or the admins of some pools,
+/// inside them only.
+enum Scope { Platform, Pools(Vec<String>) }
+
+impl Scope {
+    fn allows(&self, pool_id: &str) -> bool { match self { Self::Platform => true, Self::Pools(pools) => pools.iter().any(|pool| pool == pool_id) } }
+    fn require(&self, id: RequestId, pool_id: &str) -> Result<(), Stop> {
+        if self.allows(pool_id) { Ok(()) } else { reject!(id, "pool.admin_required", "only an admin of this pool may do this") }
+    }
+}
+
+fn scope(settings: &ConnectionSettings, engine: &Engine, principal: &Principal, id: RequestId, action: AuthorizationAction, resource: &str) -> Result<Scope, Stop> {
+    if permission_granted(settings, engine, principal, action, resource) { return Ok(Scope::Platform); }
+    let pools = match principal_identity_id(principal) { Some(identity_id) => admin_pools(engine, id, identity_id)?, None => Vec::new() };
+    if pools.is_empty() { return Err(authorization_denied(id, principal, action, resource).into()); }
+    Ok(Scope::Pools(pools))
+}
+
+/// The active pools `identity_id` administers.
+fn admin_pools(engine: &Engine, id: RequestId, identity_id: &str) -> Result<Vec<String>, Stop> {
+    let mut pools = Vec::new();
+    for row in query_documents(engine, id, quoted!("on _pool_admins | where identityId == {}", identity_id))? {
+        let pool_id = row.string_field("poolId");
+        if count(engine, id, quoted!("on _pools | where poolId == {} and state == \"active\"", &pool_id))? > 0 { pools.push(pool_id); }
+    }
+    Ok(pools)
+}
+
+/// The admins of a pool.
+fn pool_admins(engine: &Engine, id: RequestId, pool_id: &str) -> Result<Vec<String>, Stop> {
+    Ok(query_documents(engine, id, quoted!("on _pool_admins | where poolId == {} | sort createdAt", pool_id))?.iter().map(|row| row.string_field("identityId")).collect())
+}
+
+/// The pool an identity belongs to, through its policy; `None` without a policy.
+fn identity_pool(engine: &Engine, id: RequestId, identity: &JsonValue) -> Result<Option<String>, Stop> {
+    let policy_id = identity.string_field("policyId");
+    if policy_id.is_empty() { return Ok(None); }
+    Ok(query_first(engine, id, quoted!("on _policies | where policyId == {} | limit 1", &policy_id))?.map(|policy| policy.string_field("poolId")))
+}
+
+/// What the pool admins are told of (invitations, admins, settings): the events, at their simplest.
+fn tell_admins(engine: &Engine, id: RequestId, pool_id: &str, event: &str, payload: JsonValue) {
+    if let Ok(admins) = pool_admins(engine, id, pool_id) { publish_durable_event(engine, Audience::identities(admins), event, payload); }
+}
+
+fn invitation_mail(to: &str, pool: &str, link: &str, expires_at: u64, language: Option<&str>) -> MailSendInput {
+    let french = language.is_some_and(|language| language.to_ascii_lowercase().starts_with("fr"));
+    let (year, month, day) = crate::query::dates::civil_from_days(i64::try_from(expires_at / DAY_MS).unwrap_or_default());
+    let day = if french { format!("{day:02}/{month:02}/{year}") } else { format!("{year}-{month:02}-{day:02}") };
+    let (subject, text) = if french {
+        (format!("Invitation à rejoindre {pool}"), format!("Bonjour,\n\nVous êtes invité à rejoindre {pool}. Créez votre compte en ouvrant ce lien :\n\n{link}\n\nCe lien sert une seule fois et expire le {day}. Si vous ne vous attendiez pas à cette invitation, ignorez ce message.\n"))
+    } else {
+        (format!("Invitation to join {pool}"), format!("Hello,\n\nYou are invited to join {pool}. Create your account by opening this link:\n\n{link}\n\nThe link works once and expires on {day}. If you did not expect this invitation, ignore this message.\n"))
+    };
+    MailSendInput { context: RequestedExecutionContext { place_id: String::new(), app_instance_id: None, as_profile: None }, to: vec![to.to_owned()], cc: Vec::new(), bcc: Vec::new(), reply_to: None, subject, text, html: None }
+}
+
+/// Whether one more identity fits in `policy` and its pool, under the settings of the pool's admins. `already`
+/// is an identity already counted in the policy (moving it again takes no seat). Invitations not used yet hold
+/// their seat, but `token`, the one being used.
+fn check_seat(engine: &Engine, id: RequestId, policy: &JsonValue, already: bool, token: Option<&str>) -> Result<(), Stop> {
+    if already { return Ok(()); }
+    let policy = restricted(engine, policy.clone());
+    let policy_id = policy.string_field("policyId");
+    if let Some(max) = limit(&policy, "limits", "users") {
+        let users = policy_users(engine, id, &policy_id)?.saturating_add(reserved(engine, id, &policy_id, token)?);
+        if users >= max { reject!(id, "policy.users_limit", format!("the policy {:?} holds {users} users and invitations, its limit is {max}", policy.string_field("label"))); }
+    }
+    let pool = restricted(engine, active_pool(engine, id, &policy.string_field("poolId"))?);
     if let Some(max) = limit(&pool, "limits", "users") {
-        let users = pool_users(engine, id, &pool.string_field("poolId"))?;
-        if users >= max { reject!(id, "pool.users_limit", format!("the pool {:?} holds {users} active users, its limit is {max}", pool.string_field("label"))); }
+        let pool_id = pool.string_field("poolId");
+        let users = pool_users(engine, id, &pool_id)?.saturating_add(pool_reserved(engine, id, &pool_id, token)?);
+        if users >= max { reject!(id, "pool.users_limit", format!("the pool {:?} holds {users} users and invitations, its limit is {max}", pool.string_field("label"))); }
     }
     Ok(())
 }
@@ -136,10 +280,61 @@ fn new_token() -> Result<String, String> {
     Ok(format!("{TOKEN_PREFIX}{}", crate::helpers::hex(&random)))
 }
 
+/// A new token of `policy_id` and its record (to insert): `single_use` until its first enrollment, `days` valid.
+fn new_token_record(id: RequestId, policy_id: &str, name: Option<String>, single_use: bool, days: Option<u64>) -> Result<(String, JsonValue), Stop> {
+    let name = name.map(|name| name.trim().to_owned()).unwrap_or_default();
+    if name.len() > 80 { reject!(id, "policy.invalid_name", "a token name holds at most 80 bytes"); }
+    let token = new_token().map_err(failed(id, "policy.token_failed"))?;
+    let now = unix_time_millis();
+    let mut record = serde_json::json!({
+        "tokenId": UuidV7Generator::new().next_id().to_string(), "policyId": policy_id, "name": name,
+        "tokenHash": token_hash(&token), "tokenHint": &token[..TOKEN_PREFIX.len() + 6], "state": "active", "createdAt": now,
+    });
+    if single_use { record["singleUse"] = true.into(); }
+    if let Some(days) = days.filter(|days| *days > 0) { record["expiresAt"] = now.saturating_add(days.min(365).saturating_mul(DAY_MS)).into(); }
+    Ok((token, record))
+}
+
+/// `text` for a URL query: unreserved bytes kept, the others as `%XX`.
+/// The link of an invitation; with an address, it carries it as the login, in the mail as in the reply to the admin
+/// (who may share the link by hand).
+fn invitation_link(base: &str, token: &str, email: Option<&str>) -> String {
+    match email {
+        Some(email) => format!("{base}/join/{token}?login={}", query_component(email)),
+        None => format!("{base}/join/{token}"),
+    }
+}
+
+fn query_component(text: &str) -> String {
+    text.bytes().map(|byte| if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) { char::from(byte).to_string() } else { format!("%{byte:02X}") }).collect()
+}
+
+/// Whether `identity_id` is the last active admin of the pool.
+fn last_admin(engine: &Engine, id: RequestId, pool_id: &str, identity_id: &str) -> Result<bool, Stop> {
+    let admins = pool_admins(engine, id, pool_id)?;
+    if !admins.iter().any(|admin| admin == identity_id) { return Ok(false); }
+    for other in admins.iter().filter(|admin| *admin != identity_id) {
+        if count(engine, id, quoted!("on _identities | where identityId == {} and state == \"active\"", other))? > 0 { return Ok(false); }
+    }
+    Ok(true)
+}
+
+/// Takes away the Places shared with a deactivated identity (its `place.access` entries).
+fn remove_place_access(engine: &Engine, id: RequestId, identity_id: &str) -> Result<(), Stop> {
+    for sharing in query_documents(engine, id, quoted!("on _sharings | where target == {} | select sharingId", identity_id))? {
+        let sharing_id = sharing.string_field("sharingId");
+        let Some(place_id) = sharing_id.strip_prefix("place-access:").and_then(|rest| rest.strip_suffix(&format!(":{identity_id}"))) else { continue };
+        let audience = place_audience(engine, id, place_id).ok();
+        query_documents(engine, id, quoted!("on _sharings | where sharingId == {} | delete", &sharing_id))?;
+        if let Some(audience) = audience { publish_durable_event(engine, audience, "place.access.removed", serde_json::json!({"placeId": place_id, "identityId": identity_id})); }
+    }
+    Ok(())
+}
+
 /// A token as an admin sees it: never the token nor its hash.
 fn token_json(record: &JsonValue) -> JsonValue {
     let mut token = serde_json::Map::new();
-    for field in ["tokenId", "policyId", "name", "tokenHint", "state", "createdAt", "revokedAt"] {
+    for field in ["tokenId", "policyId", "name", "tokenHint", "state", "createdAt", "revokedAt", "singleUse", "expiresAt", "admin", "email", "invitedBy", "usedBy", "usedAt"] {
         if let Some(value) = record.get(field) { token.insert(field.to_owned(), value.clone()); }
     }
     JsonValue::Object(token)
@@ -147,25 +342,51 @@ fn token_json(record: &JsonValue) -> JsonValue {
 
 // ---- Checks called by the enrollment and device paths ----
 
-/// The policy an enrollment token belongs to, once the token, its policy and its pool are active and
-/// a seat is free. Refusals do not tell an unknown token from a revoked one.
-pub(super) fn enrollment_policy(engine: &Engine, id: RequestId, token: &str) -> Result<String, Stop> {
+/// The policy an enrollment token belongs to and the token's id, once the token (not expired), its policy and its
+/// pool are active and a seat is free. Refusals do not tell an unknown token from a revoked or used one.
+pub(super) fn enrollment_policy(engine: &Engine, id: RequestId, token: &str) -> Result<(String, String), Stop> {
     if !token.starts_with(TOKEN_PREFIX) || token.len() > 200 { reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed"); }
     let Some(record) = query_first(engine, id, quoted!("on _policy_tokens | where tokenHash == {} and state == \"active\" | limit 1", &token_hash(token)))? else {
         reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed");
     };
-    let policy_id = record.string_field("policyId");
+    if record.u64_field("expiresAt").is_some_and(|expires| expires <= unix_time_millis()) { reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed"); }
+    let (policy_id, token_id) = (record.string_field("policyId"), record.string_field("tokenId"));
     let Some(policy) = query_first(engine, id, quoted!("on _policies | where policyId == {} and state == \"active\" | limit 1", &policy_id))? else {
         reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed");
     };
-    check_seat(engine, id, &policy, false)?;
-    Ok(policy_id)
+    check_seat(engine, id, &policy, false, Some(&token_id))?;
+    Ok((policy_id, token_id))
 }
 
 /// Checked again when the enrollment completes: another enrollment may have taken the last seat.
-pub(super) fn enrollment_seat(engine: &Engine, id: RequestId, policy_id: &str) -> Result<(), Stop> {
+pub(super) fn enrollment_seat(engine: &Engine, id: RequestId, policy_id: &str, token_id: &str) -> Result<(), Stop> {
     let policy = active_policy(engine, id, policy_id)?;
-    check_seat(engine, id, &policy, false)
+    check_seat(engine, id, &policy, false, Some(token_id))
+}
+
+/// Takes a single-use token for `identity_id`: the `set` only matches while it is active, so of two enrollments
+/// with it, the second finds nothing and is refused. A token of several uses is left as it is.
+pub(super) fn take_token(engine: &Engine, id: RequestId, token_id: &str, identity_id: &str) -> Result<(), Stop> {
+    let single = query_first(engine, id, quoted!("on _policy_tokens | where tokenId == {} | limit 1", token_id))?.is_some_and(|token| token.bool_field("singleUse") == Some(true));
+    if !single { return Ok(()); }
+    let taken = query_documents(engine, id, format!("on _policy_tokens | where tokenId == {} and state == \"active\" | set state = \"used\", usedBy = {}, usedAt = {}", query_string(token_id), query_string(identity_id), unix_time_millis()))?;
+    if taken.is_empty() { reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed"); }
+    Ok(())
+}
+
+/// An enrollment that failed after [`take_token`] gives its token back.
+pub(super) fn give_token_back(engine: &Engine, id: RequestId, token_id: &str) {
+    let _ = query_run(engine, id, quoted!("on _policy_tokens | where tokenId == {} and state == \"used\" | set state = \"active\", usedBy = null, usedAt = null", token_id));
+}
+
+/// After an enrollment: a token marked `admin` (the subscriber's, from the billing) makes the identity an admin of
+/// the pool of its policy.
+pub(super) fn token_admin(engine: &Engine, id: RequestId, token_id: &str, identity_id: &str, now: u64) -> Result<(), Stop> {
+    let Some(token) = query_first(engine, id, quoted!("on _policy_tokens | where tokenId == {} | limit 1", token_id))? else { return Ok(()) };
+    if token.bool_field("admin") != Some(true) { return Ok(()); }
+    let pool_id = active_policy(engine, id, &token.string_field("policyId"))?.string_field("poolId");
+    query_run(engine, id, insert_query("_pool_admins", serde_json::json!({"poolId": pool_id, "identityId": identity_id, "createdAt": now})))?;
+    Ok(())
 }
 
 /// Whether `identity_id` may hold one more active device under its policy (`perUser.devices`).
@@ -174,7 +395,7 @@ pub(super) fn check_new_device(engine: &Engine, id: RequestId, identity_id: &str
     let identity = query_first(engine, id, quoted!("on _identities | where identityId == {} | limit 1", identity_id))?;
     let Some(policy_id) = identity.as_ref().and_then(|identity| identity.str_field("policyId")).filter(|policy_id| !policy_id.is_empty()) else { return Ok(()) };
     let Some(policy) = query_first(engine, id, quoted!("on _policies | where policyId == {} | limit 1", policy_id))? else { return Ok(()) };
-    let Some(max) = limit(&policy, "perUser", "devices") else { return Ok(()) };
+    let Some(max) = limit(&restricted(engine, policy), "perUser", "devices") else { return Ok(()) };
     let devices = count(engine, id, quoted!("on _devices | where identityId == {} and state == \"active\"", identity_id))?;
     if devices >= max { reject!(id, "policy.devices_limit", format!("{devices} active devices, the limit of the policy is {max}: revoke one first")); }
     Ok(())
@@ -195,7 +416,7 @@ fn policy_chain(engine: &Engine, id: RequestId, identity_id: &str) -> Result<Opt
     let Some(policy_id) = identity.as_ref().map(|identity| identity.string_field("policyId")).filter(|policy_id| !policy_id.is_empty()) else { return Ok(None) };
     let Some(policy) = query_first(engine, id, quoted!("on _policies | where policyId == {} and state == \"active\" | limit 1", &policy_id))? else { return Ok(None) };
     let pool = query_first(engine, id, quoted!("on _pools | where poolId == {} and state == \"active\" | limit 1", &policy.string_field("poolId")))?;
-    Ok(Some((policy, pool)))
+    Ok(Some((restricted(engine, policy), pool.map(|pool| restricted(engine, pool)))))
 }
 
 /// The time from which a query of `place_id` reads the past (`as of`, `history`), from `historyDays` of the pool
@@ -215,6 +436,7 @@ pub(super) fn history_floor(engine: &Engine, id: RequestId, place_id: &str) -> R
 pub(super) fn history_floors(engine: &Engine, id: RequestId) -> Result<std::collections::HashMap<String, i64>, Stop> {
     let (now, mut floors) = (crate::helpers::now_millis(), std::collections::HashMap::new());
     for pool in query_documents(engine, id, "on _pools | where state? == \"active\"")? {
+        let pool = restricted(engine, pool);
         let Some(days) = limit(&pool, "limits", "historyDays") else { continue };
         // No day kept: everything goes, and the purge takes the bytes off the disk (`i64::MAX`).
         let floor = if days == 0 { i64::MAX } else { now.saturating_sub(i64::try_from(days).unwrap_or(i64::MAX).saturating_mul(86_400_000)) };
@@ -431,42 +653,68 @@ pub(super) fn check_collection_write(engine: &Engine, id: RequestId, place_id: &
 }
 
 // ---- Admin operations (permission `policy.manage`; `identity.state.set`: `identity.manage`) ----
+// The delegated ones (`DynamicPermission`) also serve the admins of a pool, inside it (`Scope`).
 
-pub(super) fn handle_policy_operation(writer: &mut TcpStream, engine: &Engine, principal: &Principal, operation: RoutedOperation) -> Handled {
+/// An identity, refused unless the scope covers its pool. Returns it and its pool.
+fn scoped_identity(engine: &Engine, id: RequestId, scope: &Scope, identity_id: &str) -> Result<(JsonValue, Option<String>), Stop> {
+    let Some(identity) = query_first(engine, id, quoted!("on _identities | where identityId == {} | limit 1", identity_id))? else {
+        reject!(id, "identity.not_found", "no identity has this identityId");
+    };
+    let pool = identity_pool(engine, id, &identity)?;
+    if !matches!(scope, Scope::Platform) { scope.require(id, pool.as_deref().unwrap_or_default())?; }
+    Ok((identity, pool))
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn handle_policy_operation(writer: &mut TcpStream, settings: &ConnectionSettings, engine: &Engine, principal: &Principal, operation: RoutedOperation) -> Handled {
+    let policies = |id| scope(settings, engine, principal, id, AuthorizationAction::PolicyManage, "_policies");
     match operation {
         RoutedOperation::IdentityStateSet(Routed { id, input: IdentityStateSetInput { identity_id, state } }) => {
+            let scope = scope(settings, engine, principal, id, AuthorizationAction::IdentityManage, "_identities")?;
             if state != "active" && state != "inactive" { reject!(id, "identity.invalid_state", "an identity state is active or inactive"); }
             if principal_identity_id(principal) == Some(identity_id.as_str()) { reject!(id, "identity.self_state", "an identity cannot change its own state"); }
-            let Some(identity) = query_first(engine, id, quoted!("on _identities | where identityId == {} | limit 1", &identity_id))? else {
-                reject!(id, "identity.not_found", "no identity has this identityId");
-            };
+            let (identity, pool) = scoped_identity(engine, id, &scope, &identity_id)?;
             // Coming back takes a seat again in the policy and its pool.
             let policy_id = identity.string_field("policyId");
             if state == "active" && identity.str_field("state") != Some("active") && !policy_id.is_empty() {
                 let policy = active_policy(engine, id, &policy_id)?;
-                check_seat(engine, id, &policy, false)?;
+                check_seat(engine, id, &policy, false, None)?;
+            }
+            // A pool admin never leaves the pool without an active admin.
+            if let (Scope::Pools(_), Some(pool_id), "inactive") = (&scope, pool.as_deref(), state.as_str()) {
+                if last_admin(engine, id, pool_id, &identity_id)? { reject!(id, "pool.last_admin", "the pool needs another active admin first"); }
             }
             let now = unix_time_millis();
             let stamp = if state == "inactive" { format!(", deactivatedAt = {now}") } else { String::new() };
             query_documents(engine, id, format!("on _identities | where identityId == {} | set state = {}, updatedAt = {now}{stamp}", query_string(&identity_id), query_string(&state)))?;
+            // A deactivated member loses the Places shared with it; coming back, it is given them again.
+            if state == "inactive" { remove_place_access(engine, id, &identity_id)?; }
             // Connections already signed in keep their session until they reconnect.
             publish_durable_event(engine, Audience::identities([identity_id.clone()]), "identity.state.updated", serde_json::json!({"identityId": identity_id, "state": state, "updatedAt": now}));
             Ok(reply(writer, id, serde_json::json!({"identityId": identity_id, "state": state, "updatedAt": now}))?)
         }
         // Identities for the admin screen: those of one policy, else all (people and gateways), with
-        // their classic login if any and their active devices.
+        // their classic login if any and their active devices. A pool admin sees the identities of its pools.
         RoutedOperation::IdentityList(Routed { id, input: IdentityListInput { policy_id } }) => {
+            let scope = policies(id)?;
+            if let Some(policy_id) = policy_id.as_deref() { scope.require(id, &active_policy(engine, id, policy_id)?.string_field("poolId"))?; }
             let query = match policy_id.as_deref() {
                 Some(policy_id) => quoted!("on _identities | where policyId? == {} | sort createdAt", policy_id),
                 None => "on _identities | sort createdAt".to_owned(),
             };
+            let mut pools: HashMap<String, String> = HashMap::new();
             let mut identities = Vec::new();
             for identity in query_documents(engine, id, query)? {
+                if let Scope::Pools(_) = scope {
+                    let policy_id = identity.string_field("policyId");
+                    if !pools.contains_key(&policy_id) { let pool = identity_pool(engine, id, &identity)?.unwrap_or_default(); pools.insert(policy_id.clone(), pool); }
+                    if !scope.allows(&pools[&policy_id]) { continue; }
+                }
                 let identity_id = identity.string_field("identityId");
                 let login = query_first(engine, id, quoted!("on _credentials | where identityId == {} | limit 1", &identity_id))?.map(|credential| credential.string_field("login"));
                 let devices = count(engine, id, quoted!("on _devices | where identityId == {} and state == \"active\"", &identity_id))?;
                 let mut entry = serde_json::json!({"identityId": identity_id, "login": login, "devices": devices, "current": principal_identity_id(principal) == Some(identity_id.as_str())});
-                for field in ["policyId", "state", "kind", "createdAt", "deactivatedAt"] {
+                for field in ["policyId", "state", "kind", "createdAt", "deactivatedAt", "tokenId"] {
                     if let Some(value) = identity.get(field) { entry[field] = value.clone(); }
                 }
                 identities.push(entry);
@@ -496,13 +744,20 @@ pub(super) fn handle_policy_operation(writer: &mut TcpStream, engine: &Engine, p
             query_documents(engine, id, format!("on _pools | where poolId == {} and state == \"active\" | set {}", query_string(&pool_id), assignments.join(", ")))?;
             Ok(reply(writer, id, serde_json::json!({"pool": active_pool(engine, id, &pool_id)?}))?)
         }
+        // The pools, with their seats and their admins; a pool admin sees its own, as they apply (`effective`).
         RoutedOperation::PoolList(Routed { id, .. }) => {
+            let scope = policies(id)?;
             let mut pools = query_documents(engine, id, "on _pools | where state == \"active\" | sort label")?;
+            pools.retain(|pool| scope.allows(&pool.string_field("poolId")));
             for pool in &mut pools {
-                let users = pool_users(engine, id, &pool.string_field("poolId"))?;
-                pool["users"] = users.into();
+                let pool_id = pool.string_field("poolId");
+                pool["users"] = pool_users(engine, id, &pool_id)?.into();
+                pool["reserved"] = pool_reserved(engine, id, &pool_id, None)?.into();
+                pool["admins"] = pool_admins(engine, id, &pool_id)?.into();
+                pool["effective"] = restricted(engine, pool.clone())["limits"].clone();
             }
-            Ok(reply(writer, id, serde_json::json!({"pools": pools}))?)
+            let scope = if matches!(scope, Scope::Platform) { "platform" } else { "pool" };
+            Ok(reply(writer, id, serde_json::json!({"pools": pools, "scope": scope}))?)
         }
         RoutedOperation::PoolDelete(Routed { id, input: PoolIdInput { pool_id } }) => {
             active_pool(engine, id, &pool_id)?;
@@ -530,11 +785,15 @@ pub(super) fn handle_policy_operation(writer: &mut TcpStream, engine: &Engine, p
             Ok(reply(writer, id, serde_json::json!({"policy": active_policy(engine, id, &policy_id)?}))?)
         }
         RoutedOperation::PolicyList(Routed { id, input: PolicyListInput { pool_id } }) => {
+            let scope = policies(id)?;
+            if let Some(pool_id) = pool_id.as_deref() { scope.require(id, pool_id)?; }
             let filter = pool_id.map(|pool_id| format!(" and poolId == {}", query_string(&pool_id))).unwrap_or_default();
             let mut policies = query_documents(engine, id, format!("on _policies | where state == \"active\"{filter} | sort label"))?;
+            policies.retain(|policy| scope.allows(&policy.string_field("poolId")));
             for policy in &mut policies {
-                let users = policy_users(engine, id, &policy.string_field("policyId"))?;
-                policy["users"] = users.into();
+                let policy_id = policy.string_field("policyId");
+                policy["users"] = policy_users(engine, id, &policy_id)?.into();
+                policy["reserved"] = reserved(engine, id, &policy_id, None)?.into();
             }
             Ok(reply(writer, id, serde_json::json!({"policies": policies}))?)
         }
@@ -548,43 +807,133 @@ pub(super) fn handle_policy_operation(writer: &mut TcpStream, engine: &Engine, p
             query_documents(engine, id, format!("on _policies | where policyId == {} | set state = \"deleted\", deletedAt = {deleted_at}", query_string(&policy_id)))?;
             Ok(reply(writer, id, serde_json::json!({"policyId": policy_id, "state": "deleted", "deletedAt": deleted_at}))?)
         }
-        RoutedOperation::PolicyTokenCreate(Routed { id, input: PolicyTokenCreateInput { policy_id, name } }) => {
-            active_policy(engine, id, &policy_id)?;
-            let name = name.map(|name| name.trim().to_owned()).unwrap_or_default();
-            if name.len() > 80 { reject!(id, "policy.invalid_name", "a token name holds at most 80 bytes"); }
-            let token = new_token().map_err(failed(id, "policy.token_failed"))?;
-            let record = serde_json::json!({
-                "tokenId": UuidV7Generator::new().next_id().to_string(), "policyId": policy_id, "name": name,
-                "tokenHash": token_hash(&token), "tokenHint": &token[..TOKEN_PREFIX.len() + 6], "state": "active", "createdAt": unix_time_millis(),
-            });
+        RoutedOperation::PolicyTokenCreate(Routed { id, input: PolicyTokenCreateInput { policy_id, name, single_use, expires_in_days, admin } }) => {
+            let policy = active_policy(engine, id, &policy_id)?;
+            if single_use == Some(true) { check_seat(engine, id, &policy, false, None)?; }
+            let mut record = new_token_record(id, &policy_id, name, single_use == Some(true), expires_in_days)?;
+            if admin == Some(true) { record.1["admin"] = true.into(); }
+            let (token, record) = record;
             query_documents(engine, id, insert_query("_policy_tokens", &record))?;
             // The token is shown once: only its hash is kept.
             Ok(reply(writer, id, serde_json::json!({"token": token, "record": token_json(&record)}))?)
         }
+        RoutedOperation::PoolInvite(Routed { id, input: PoolInviteInput { pool_id, policy_id, name, email, link_base, language } }) => {
+            policies(id)?.require(id, &pool_id)?;
+            let pool = active_pool(engine, id, &pool_id)?;
+            let policy = match policy_id {
+                Some(policy_id) => active_policy(engine, id, &policy_id)?,
+                None => {
+                    let mut all = query_documents(engine, id, quoted!("on _policies | where poolId == {} and state == \"active\"", &pool_id))?;
+                    if all.len() != 1 { reject!(id, "pool.invite_policy_required", "the pool has several policies: choose the one of the invitation"); }
+                    all.remove(0)
+                }
+            };
+            if policy.string_field("poolId") != pool_id { reject!(id, "policy.not_found", "no active policy of this pool has this policyId"); }
+            let email = email.map(|email| email.trim().to_owned()).filter(|email| !email.is_empty());
+            if email.as_deref().is_some_and(|email| !email_address_valid(email)) { reject!(id, "pool.invalid_email", "the invitation needs a valid email address"); }
+            let link_base = link_base.map(|base| base.trim().trim_end_matches('/').to_owned()).filter(|base| !base.is_empty());
+            if link_base.as_deref().is_some_and(|base| !(base.starts_with("https://") || base.starts_with("http://")) || base.len() > 200 || base.contains(char::is_whitespace)) {
+                reject!(id, "pool.invalid_link", "linkBase is the http(s) address of the Hub");
+            }
+            if email.is_some() && (link_base.is_none() || !settings.mail_enabled()) { reject!(id, "pool.invite_mail_unavailable", "this Core does not send mail: share the link instead"); }
+            check_seat(engine, id, &policy, false, None)?;
+            let (token, mut record) = new_token_record(id, &policy.string_field("policyId"), name.or_else(|| email.clone()), true, Some(INVITATION_DAYS))?;
+            if let Some(email) = email.as_deref() { record["email"] = email.into(); }
+            if let Some(inviter) = principal_identity_id(principal) { record["invitedBy"] = inviter.into(); }
+            query_documents(engine, id, insert_query("_policy_tokens", &record))?;
+            let link = link_base.map(|base| invitation_link(&base, &token, email.as_deref()));
+            let mailed = match (email.as_deref(), link.as_deref()) {
+                (Some(email), Some(link)) => {
+                    settings.send_mail_detached(invitation_mail(email, &pool.string_field("label"), link, record.u64_field("expiresAt").unwrap_or_default(), language.as_deref()));
+                    true
+                }
+                _ => false,
+            };
+            tell_admins(engine, id, &pool_id, "pool.invited", serde_json::json!({"poolId": pool_id, "token": token_json(&record)}));
+            Ok(reply(writer, id, serde_json::json!({"token": token, "link": link, "mailed": mailed, "record": token_json(&record)}))?)
+        }
+        RoutedOperation::PoolAdminSet(Routed { id, input: PoolAdminSetInput { pool_id, identity_id, admin } }) => {
+            let scope = policies(id)?;
+            scope.require(id, &pool_id)?;
+            active_pool(engine, id, &pool_id)?;
+            let (identity, pool) = scoped_identity(engine, id, &Scope::Platform, &identity_id)?;
+            let is_admin = pool_admins(engine, id, &pool_id)?.contains(&identity_id);
+            if admin && !is_admin {
+                if pool.as_deref() != Some(pool_id.as_str()) || identity.str_field("state") != Some("active") { reject!(id, "pool.not_member", "only an active member of the pool can be one of its admins"); }
+                query_documents(engine, id, insert_query("_pool_admins", serde_json::json!({"poolId": pool_id, "identityId": identity_id, "createdAt": unix_time_millis()})))?;
+            } else if !admin && is_admin {
+                if matches!(scope, Scope::Pools(_)) && last_admin(engine, id, &pool_id, &identity_id)? { reject!(id, "pool.last_admin", "the pool needs another active admin first"); }
+                query_documents(engine, id, quoted!("on _pool_admins | where poolId == {} and identityId == {} | delete", &pool_id, &identity_id))?;
+            }
+            let admins = pool_admins(engine, id, &pool_id)?;
+            tell_admins(engine, id, &pool_id, "pool.admins.updated", serde_json::json!({"poolId": pool_id, "admins": admins}));
+            Ok(reply(writer, id, serde_json::json!({"poolId": pool_id, "admins": admins}))?)
+        }
+        // The contract of the pool and of its policies, the admins' settings, and what applies.
+        RoutedOperation::PoolSettingsGet(Routed { id, input: PoolIdInput { pool_id } }) => {
+            policies(id)?.require(id, &pool_id)?;
+            let pool = active_pool(engine, id, &pool_id)?;
+            let mut entries = Vec::new();
+            for policy in query_documents(engine, id, quoted!("on _policies | where poolId == {} and state == \"active\" | sort label", &pool_id))? {
+                let settings = pool_settings(engine, id, &pool_id, policy.str_field("policyId"))?;
+                entries.push(serde_json::json!({"policyId": policy.string_field("policyId"), "label": policy.string_field("label"), "effective": restrict(&policy, &settings), "contract": policy, "settings": settings}));
+            }
+            let settings = pool_settings(engine, id, &pool_id, None)?;
+            Ok(reply(writer, id, serde_json::json!({"poolId": pool_id, "label": pool.string_field("label"), "pool": {"effective": restrict(&pool, &settings), "contract": pool, "settings": settings}, "policies": entries}))?)
+        }
+        RoutedOperation::PoolSettingsSet(Routed { id, input: PoolSettingsSetInput { pool_id, policy_id, limits, per_user, rights, apps } }) => {
+            policies(id)?.require(id, &pool_id)?;
+            let contract = match policy_id.as_deref() {
+                Some(policy_id) => { let policy = active_policy(engine, id, policy_id)?; if policy.string_field("poolId") != pool_id { reject!(id, "policy.not_found", "no active policy of this pool has this policyId"); } policy }
+                None => {
+                    if per_user.is_some() || rights.is_some() || apps.is_some() { reject!(id, "policy.invalid_setting", "the settings of a pool hold its limits only"); }
+                    active_pool(engine, id, &pool_id)?
+                }
+            };
+            let mut values = serde_json::json!({});
+            if policy_id.is_some() {
+                for (field, value) in policy_sections(id, limits.as_ref(), per_user.as_ref(), rights.as_ref(), apps.as_ref())? { values[field] = value; }
+            } else if let Some(limits) = limits.as_ref() {
+                match section("limits", limits, POOL_LIMITS, Kind::Count) { Ok(limits) => values["limits"] = limits, Err(message) => reject!(id, "policy.invalid_setting", message) }
+            }
+            within(id, &contract, &values)?;
+            let target = policy_id.as_deref().map_or_else(|| "policyId? == null".to_owned(), |policy_id| format!("policyId == {}", query_string(policy_id)));
+            query_documents(engine, id, format!("on _pool_settings | where poolId == {} and {target} | delete", query_string(&pool_id)))?;
+            let empty = values.as_object().is_none_or(|values| values.values().all(|section| section.as_object().is_none_or(serde_json::Map::is_empty)));
+            if !empty { query_documents(engine, id, insert_query("_pool_settings", serde_json::json!({"poolId": pool_id, "policyId": policy_id, "values": values, "updatedBy": principal_identity_id(principal), "updatedAt": unix_time_millis()})))?; }
+            tell_admins(engine, id, &pool_id, "pool.settings.updated", serde_json::json!({"poolId": pool_id, "policyId": policy_id, "settings": values}));
+            Ok(reply(writer, id, serde_json::json!({"poolId": pool_id, "policyId": policy_id, "settings": values, "effective": restrict(&contract, &values)}))?)
+        }
         RoutedOperation::PolicyTokenList(Routed { id, input: PolicyIdInput { policy_id } }) => {
+            policies(id)?.require(id, &active_policy(engine, id, &policy_id)?.string_field("poolId"))?;
             let tokens = query_documents(engine, id, quoted!("on _policy_tokens | where policyId == {} | sort createdAt desc", &policy_id))?.iter().map(token_json).collect::<Vec<_>>();
             Ok(reply(writer, id, serde_json::json!({"policyId": policy_id, "tokens": tokens}))?)
         }
         RoutedOperation::PolicyTokenRevoke(Routed { id, input: PolicyTokenRevokeInput { token_id } }) => {
+            let scope = policies(id)?;
             let selected = quoted!("on _policy_tokens | where tokenId == {} and state == \"active\"", &token_id);
-            if count(engine, id, selected.clone())? == 0 { reject!(id, "policy.token_not_found", "no active token has this tokenId"); }
+            let Some(token) = query_first(engine, id, format!("{selected} | limit 1"))? else { reject!(id, "policy.token_not_found", "no active token has this tokenId") };
+            let pool = query_first(engine, id, quoted!("on _policies | where policyId == {} | limit 1", &token.string_field("policyId")))?.map(|policy| policy.string_field("poolId")).unwrap_or_default();
+            scope.require(id, &pool)?;
             let revoked_at = unix_time_millis();
             query_documents(engine, id, format!("{selected} | set state = \"revoked\", revokedAt = {revoked_at}"))?;
             Ok(reply(writer, id, serde_json::json!({"tokenId": token_id, "state": "revoked", "revokedAt": revoked_at}))?)
         }
         RoutedOperation::IdentityPolicySet(Routed { id, input: IdentityPolicySetInput { identity_id, policy_id } }) => {
-            let Some(identity) = query_first(engine, id, quoted!("on _identities | where identityId == {} | limit 1", &identity_id))? else {
-                reject!(id, "identity.not_found", "no identity has this identityId");
-            };
+            let scope = policies(id)?;
+            let (identity, pool) = scoped_identity(engine, id, &scope, &identity_id)?;
             let current = identity.string_field("policyId");
             let assignment = match policy_id.as_deref() {
                 Some(policy_id) => {
                     let policy = active_policy(engine, id, policy_id)?;
+                    // A pool admin moves its members between the policies of the pool, never out of it.
+                    if matches!(scope, Scope::Pools(_)) && pool.as_deref() != Some(policy.str_field("poolId").unwrap_or_default()) { reject!(id, "pool.admin_required", "only an admin of this pool may do this"); }
                     let active = identity.str_field("state") == Some("active");
-                    check_seat(engine, id, &policy, !active || current == policy_id)?;
+                    check_seat(engine, id, &policy, !active || current == policy_id, None)?;
                     format!("policyId = {}", query_string(policy_id))
                 }
-                None => "policyId = null".to_owned(),
+                None if matches!(scope, Scope::Platform) => "policyId = null".to_owned(),
+                None => reject!(id, "pool.admin_required", "only the platform takes an identity out of every policy"),
             };
             query_documents(engine, id, format!("on _identities | where identityId == {} | set {assignment}, updatedAt = {}", query_string(&identity_id), unix_time_millis()))?;
             Ok(reply(writer, id, serde_json::json!({"identityId": identity_id, "policyId": policy_id}))?)
@@ -632,11 +981,11 @@ mod tests {
         ] { query_run(&engine, id, query).unwrap(); }
         assert_eq!(policy_users(&engine, id, "std").ok(), Some(1));
         assert_eq!(pool_users(&engine, id, "pool").ok(), Some(1));
-        assert!(enrollment_seat(&engine, id, "std").is_ok());
+        assert!(enrollment_seat(&engine, id, "std", "").is_ok());
         assert!(check_new_device(&engine, id, "a").is_err());
         assert!(check_new_device(&engine, id, "admin").is_ok());
         query_run(&engine, id, insert_query("_identities", serde_json::json!({"identityId": "b", "policyId": "std", "state": "active"}))).unwrap();
-        assert!(enrollment_seat(&engine, id, "std").is_err());
+        assert!(enrollment_seat(&engine, id, "std", "").is_err());
     }
 
     #[test] fn the_past_a_place_reads_follows_the_history_days_of_its_owners_pool() { let engine = Engine::new(Arc::new(crate::storage::MemoryStorage::new()) as Arc<dyn StorageEngine>); let id = RequestId::Number(1); assert!(section("limits", &serde_json::json!({"historyDays": 30}), POOL_LIMITS, Kind::Count).is_ok()); for (collection, document) in [("_pools", serde_json::json!({"poolId": "month", "label": "Month", "limits": {"historyDays": 30}, "state": "active"})), ("_pools", serde_json::json!({"poolId": "free", "label": "Free", "limits": {"historyDays": 0}, "state": "active"})), ("_pools", serde_json::json!({"poolId": "open", "label": "Open", "limits": {"users": 2}, "state": "active"})), ("_policies", serde_json::json!({"policyId": "m", "poolId": "month", "label": "M", "state": "active"})), ("_policies", serde_json::json!({"policyId": "f", "poolId": "free", "label": "F", "state": "active"})), ("_policies", serde_json::json!({"policyId": "o", "poolId": "open", "label": "O", "state": "active"})), ("_identities", serde_json::json!({"identityId": "ada", "policyId": "m", "state": "active"})), ("_identities", serde_json::json!({"identityId": "bob", "policyId": "f", "state": "active"})), ("_identities", serde_json::json!({"identityId": "cy", "policyId": "o", "state": "active"})), ("_identities", serde_json::json!({"identityId": "admin", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-ada", "ownerIdentityId": "ada", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-bob", "ownerIdentityId": "bob", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-cy", "ownerIdentityId": "cy", "state": "active"})), ("_places", serde_json::json!({"placeId": "p-admin", "ownerIdentityId": "admin", "state": "active"}))] { query_run(&engine, id, insert_query(collection, document)).unwrap(); } let (before, floor) = (crate::helpers::now_millis(), history_floor(&engine, id, "p-ada").ok().flatten().unwrap()); assert!((before - 30 * 86_400_000..=crate::helpers::now_millis() - 30 * 86_400_000).contains(&floor)); assert!(history_floor(&engine, id, "p-bob").is_err(), "a pool of 0 day keeps no history"); for unbound in ["p-cy", "p-admin", "p-unknown"] { assert_eq!(history_floor(&engine, id, unbound).ok(), Some(None), "{unbound}"); } /* The purge takes the Places of the bound pools, deleted ones included. */ query_run(&engine, id, insert_query("_places", serde_json::json!({"placeId": "p-ada-old", "ownerIdentityId": "ada", "state": "deleted"}))).unwrap(); let floors = history_floors(&engine, id).ok().unwrap(); let mut places = floors.keys().map(String::as_str).collect::<Vec<_>>(); places.sort_unstable(); assert_eq!(places, ["p-ada", "p-ada-old", "p-bob"]); assert!(floors["p-bob"] == i64::MAX && floors["p-ada"] == floors["p-ada-old"] && floors["p-ada"] <= crate::helpers::now_millis() - 30 * 86_400_000); }
@@ -680,4 +1029,14 @@ mod tests {
         assert_eq!(app_collections(&app).into_iter().collect::<Vec<_>>(), vec!["sales_rows".to_owned(), "stock_rows".to_owned()]);
         assert!(app_collections(&serde_json::json!({"definition": {}})).is_empty());
     }
+
+    fn pool_engine(rows: &[(&str, JsonValue)]) -> Engine { let engine = Engine::new(Arc::new(crate::storage::MemoryStorage::new()) as Arc<dyn StorageEngine>); for (collection, row) in rows { query_run(&engine, 1, insert_query(collection, row)).unwrap(); } engine }
+
+    #[test] fn settings_only_restrict_the_contract() { let contract = serde_json::json!({"limits": {"users": 5}, "perUser": {"devices": 3}, "rights": {"externalSharing": false}, "apps": {"included": ["a", "b"], "addons": ["c"]}}); let effective = restrict(&contract, &serde_json::json!({"limits": {"users": 9, "places": 1}, "perUser": {"devices": 2}, "rights": {"publicSharing": false, "externalSharing": true}, "apps": {"included": ["b", "z"]}})); assert_eq!(effective["limits"], serde_json::json!({"users": 5, "places": 1})); assert_eq!(effective["perUser"]["devices"], 2); assert_eq!(effective["rights"], serde_json::json!({"externalSharing": false, "publicSharing": false})); assert_eq!(effective["apps"], serde_json::json!({"included": ["b"], "addons": ["c"]})); assert_eq!(restrict(&serde_json::json!({}), &serde_json::json!({"apps": {"included": ["a"], "addons": ["c"]}}))["apps"], serde_json::json!({"included": ["a"]})); let id = RequestId::Number(1); assert!(within(id, &contract, &serde_json::json!({"limits": {"users": 4}, "rights": {"publicSharing": false}, "apps": {"included": ["a"]}})).is_ok()); for wider in [serde_json::json!({"limits": {"users": 6}}), serde_json::json!({"rights": {"externalSharing": true}}), serde_json::json!({"apps": {"included": ["z"]}}), serde_json::json!({"apps": {"addons": ["a"]}})] { assert!(within(id, &contract, &wider).is_err(), "{wider}"); } }
+    #[test] fn invitations_hold_a_seat_until_used_or_expired() { let (now, id) = (unix_time_millis(), RequestId::Number(1)); let engine = pool_engine(&[("_pools", serde_json::json!({"poolId": "pool", "label": "P", "limits": {"users": 3}, "state": "active"})), ("_policies", serde_json::json!({"policyId": "std", "poolId": "pool", "label": "Std", "state": "active"})), ("_identities", serde_json::json!({"identityId": "a", "policyId": "std", "state": "active"})), ("_policy_tokens", serde_json::json!({"tokenId": "t1", "policyId": "std", "singleUse": true, "expiresAt": now + DAY_MS, "state": "active"})), ("_policy_tokens", serde_json::json!({"tokenId": "old", "policyId": "std", "singleUse": true, "expiresAt": now - 1, "state": "active"})), ("_policy_tokens", serde_json::json!({"tokenId": "many", "policyId": "std", "state": "active"}))]); assert_eq!(reserved(&engine, id, "std", None).ok(), Some(1)); assert_eq!(pool_reserved(&engine, id, "pool", Some("t1")).ok(), Some(0)); assert!(enrollment_seat(&engine, id, "std", "t1").is_ok()); query_run(&engine, id, insert_query("_policy_tokens", serde_json::json!({"tokenId": "t2", "policyId": "std", "singleUse": true, "state": "active"}))).unwrap(); assert!(enrollment_seat(&engine, id, "std", "many").is_err(), "a, t1 and t2 fill the 3 seats"); assert!(enrollment_seat(&engine, id, "std", "t2").is_ok(), "t2 uses its own seat"); }
+    #[test] fn a_single_use_token_enrolls_once_and_comes_back_on_failure() { let id = RequestId::Number(1); let engine = pool_engine(&[("_pools", serde_json::json!({"poolId": "pool", "label": "P", "state": "active"})), ("_policies", serde_json::json!({"policyId": "std", "poolId": "pool", "label": "Std", "state": "active"})), ("_policy_tokens", serde_json::json!({"tokenId": "one", "policyId": "std", "singleUse": true, "admin": true, "state": "active"})), ("_policy_tokens", serde_json::json!({"tokenId": "many", "policyId": "std", "state": "active"}))]); assert!(take_token(&engine, id, "one", "ada").is_ok()); assert!(take_token(&engine, id, "one", "bob").is_err()); give_token_back(&engine, id, "one"); assert!(take_token(&engine, id, "one", "bob").is_ok()); let used = query_first(&engine, id, r#"on _policy_tokens | where tokenId == "one""#).unwrap().unwrap(); assert_eq!((used.str_field("state"), used.str_field("usedBy")), (Some("used"), Some("bob"))); for _ in 0..2 { assert!(take_token(&engine, id, "many", "cy").is_ok()); } assert!(token_admin(&engine, id, "many", "cy", 1).is_ok()); assert!(token_admin(&engine, id, "one", "bob", 1).is_ok()); assert_eq!(pool_admins(&engine, id, "pool").ok(), Some(vec!["bob".to_owned()])); assert_eq!(admin_pools(&engine, id, "bob").ok(), Some(vec!["pool".to_owned()])); }
+    #[test] fn the_last_active_admin_stays() { let id = RequestId::Number(1); let engine = pool_engine(&[("_pool_admins", serde_json::json!({"poolId": "pool", "identityId": "ada", "createdAt": 1})), ("_pool_admins", serde_json::json!({"poolId": "pool", "identityId": "bob", "createdAt": 2})), ("_identities", serde_json::json!({"identityId": "ada", "state": "active"})), ("_identities", serde_json::json!({"identityId": "bob", "state": "inactive"}))]); assert_eq!(last_admin(&engine, id, "pool", "ada").ok(), Some(true)); assert_eq!(last_admin(&engine, id, "pool", "bob").ok(), Some(false)); assert_eq!(last_admin(&engine, id, "pool", "cy").ok(), Some(false)); query_run(&engine, id, r#"on _identities | where identityId == "bob" | set state = "active""#).unwrap(); assert_eq!(last_admin(&engine, id, "pool", "ada").ok(), Some(false)); }
+    #[test] fn the_checks_apply_the_settings_of_the_pool_admins() { let id = RequestId::Number(1); let engine = pool_engine(&[("_pools", serde_json::json!({"poolId": "pool", "label": "P", "limits": {"users": 5}, "state": "active"})), ("_policies", serde_json::json!({"policyId": "std", "poolId": "pool", "label": "Std", "perUser": {"devices": 3}, "state": "active"})), ("_identities", serde_json::json!({"identityId": "a", "policyId": "std", "state": "active"})), ("_devices", serde_json::json!({"deviceId": "a1", "identityId": "a", "state": "active"}))]); assert!(check_new_device(&engine, id, "a").is_ok() && enrollment_seat(&engine, id, "std", "").is_ok()); for (policy, values) in [(Some("std"), serde_json::json!({"perUser": {"devices": 1}, "rights": {"createPlace": false}})), (None, serde_json::json!({"limits": {"users": 1}}))] { query_run(&engine, id, insert_query("_pool_settings", serde_json::json!({"poolId": "pool", "policyId": policy, "values": values}))).unwrap(); } assert!(check_new_device(&engine, id, "a").is_err()); assert!(enrollment_seat(&engine, id, "std", "").is_err()); assert!(check_place_create(&engine, id, "a", false).is_err()); assert_eq!(restricted(&engine, active_pool(&engine, id, "pool").ok().unwrap())["limits"]["users"], 1); }
+    #[test] fn an_invitation_link_carries_the_address_as_login() { assert_eq!(invitation_link("https://h", "ogp_x", Some("bob@acme.fr")), "https://h/join/ogp_x?login=bob%40acme.fr"); assert_eq!(invitation_link("https://h", "ogp_x", None), "https://h/join/ogp_x"); }
+    #[test] fn invitation_links_escape_the_login() { assert_eq!(query_component("ada.l+x@acme.fr"), "ada.l%2Bx%40acme.fr"); assert!(invitation_mail("a@b.fr", "Acme", "https://h/join/ogp_x", 86_400_000 * 20_000, Some("fr")).text.contains("04/10/2024")); }
 }

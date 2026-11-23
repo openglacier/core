@@ -248,22 +248,6 @@ pub enum QueryParseError {
 
 impl QueryParseError {
     #[must_use]
-    pub const fn as_lex_error(&self) -> Option<&LexError> {
-        match self {
-            Self::Lex(error) => Some(error),
-            Self::Parse(_) => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn as_parse_error(&self) -> Option<&ParseError> {
-        match self {
-            Self::Lex(_) => None,
-            Self::Parse(error) => Some(error),
-        }
-    }
-
-    #[must_use]
     #[inline]
     pub const fn span(&self) -> Span {
         match self {
@@ -897,6 +881,7 @@ const fn is_stage_name(kind: TokenKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    impl super::QueryParseError { pub(crate) const fn as_parse_error(&self) -> Option<&ParseError> { match self { Self::Lex(_) => None, Self::Parse(error) => Some(error), } } pub(crate) const fn as_lex_error(&self) -> Option<&LexError> { match self { Self::Lex(error) => Some(error), Self::Parse(_) => None, } } }
     use super::*;
 
     fn parse_ok(source: &str) -> PipelineAst {

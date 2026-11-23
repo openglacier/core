@@ -43,9 +43,6 @@ impl Value {
     pub const fn is_null(&self) -> bool { matches!(self, Self::Null) }
 
     #[must_use]
-    pub const fn is_bool(&self) -> bool { matches!(self, Self::Bool(_)) }
-
-    #[must_use]
     pub const fn is_number(&self) -> bool { matches!(self, Self::Number(_)) }
 
     #[must_use]
@@ -71,9 +68,6 @@ impl Value {
 
     #[must_use]
     pub fn as_array(&self) -> Option<&[Self]> { match self { Self::Array(v) => Some(v), _ => None } }
-
-    #[must_use]
-    pub fn into_array(self) -> Option<Arc<[Self]>> { match self { Self::Array(v) => Some(v), _ => None } }
 
     #[must_use]
     pub fn object(document: Document) -> Self { Self::Object(Arc::new(document)) }
@@ -148,12 +142,6 @@ impl Number {
 
     #[must_use]
     pub const fn is_integer(self) -> bool { matches!(self, Self::Signed(_) | Self::Unsigned(_)) }
-
-    #[must_use]
-    pub const fn is_signed(self) -> bool { matches!(self, Self::Signed(_)) }
-
-    #[must_use]
-    pub const fn is_unsigned(self) -> bool { matches!(self, Self::Unsigned(_)) }
 
     #[must_use]
     pub const fn is_float(self) -> bool { matches!(self, Self::Float(_)) }
@@ -275,9 +263,9 @@ mod tests {
     #[test] fn vector_converts_to_array() { let value = Value::from(vec![Value::from(true), Value::from(false)]); assert_eq!(value.as_array(), Some([Value::Bool(true), Value::Bool(false)].as_slice())); }
     #[test] fn cloned_string_values_share_their_allocation() { let original = Value::string("shared"); let cloned = original.clone(); let (Value::String(original), Value::String(cloned)) = (original, cloned) else { panic!("expected string values") }; assert!(Arc::ptr_eq(&original, &cloned)); }
     #[test] fn cloned_array_values_share_their_allocation() { let original = Value::array([Value::from(1_i64), Value::from(2_i64)]); let cloned = original.clone(); let (Value::Array(original), Value::Array(cloned)) = (original, cloned) else { panic!("expected array values") }; assert!(Arc::ptr_eq(&original, &cloned)); }
-    #[test] fn value_predicates_match_physical_variants() { assert!(Value::Null.is_null()); assert!(Value::Bool(true).is_bool()); assert!(Value::from(1_i64).is_number()); assert!(Value::from("text").is_string()); assert!(Value::array([]).is_array()); assert!(Value::from(Document::new()).is_object()); assert!(!Value::Null.is_object()); assert!(!Value::from("text").is_number()); }
-    #[test] fn owned_accessors_preserve_shared_allocations() { let string: Arc<str> = Arc::from("shared"); let value = Value::from(string.clone()); let extracted = value.into_string().expect("expected string"); assert!(Arc::ptr_eq(&string, &extracted)); let array: Arc<[Value]> = Arc::from([Value::from(1_i64)]); let value = Value::from(array.clone()); let extracted = value.into_array().expect("expected array"); assert!(Arc::ptr_eq(&array, &extracted)); let object = Arc::new(Document::from_fields([("a", Value::from(1_i64))])); let value = Value::from(object.clone()); let extracted = value.into_object().expect("expected object"); assert!(Arc::ptr_eq(&object, &extracted)); }
-    #[test] fn number_helpers_preserve_physical_representation() { assert!(Number::Signed(-1).is_integer()); assert!(Number::Signed(-1).is_signed()); assert!(Number::Unsigned(1).is_unsigned()); assert!(Number::Float(1.5).is_float()); assert_eq!(Number::Unsigned(1).into_value(), Value::Number(Number::Unsigned(1))); assert_eq!(Value::Number(Number::Signed(-1)).into_number(), Some(Number::Signed(-1))); }
+    #[test] fn value_predicates_match_physical_variants() { assert!(Value::Null.is_null()); assert!(Value::from(1_i64).is_number()); assert!(Value::from("text").is_string()); assert!(Value::array([]).is_array()); assert!(Value::from(Document::new()).is_object()); assert!(!Value::Null.is_object()); assert!(!Value::from("text").is_number()); }
+    #[test] fn owned_accessors_preserve_shared_allocations() { let string: Arc<str> = Arc::from("shared"); let value = Value::from(string.clone()); let extracted = value.into_string().expect("expected string"); assert!(Arc::ptr_eq(&string, &extracted)); let object = Arc::new(Document::from_fields([("a", Value::from(1_i64))])); let value = Value::from(object.clone()); let extracted = value.into_object().expect("expected object"); assert!(Arc::ptr_eq(&object, &extracted)); }
+    #[test] fn number_helpers_preserve_physical_representation() { assert!(Number::Signed(-1).is_integer()); assert!(Number::Float(1.5).is_float()); assert_eq!(Number::Unsigned(1).into_value(), Value::Number(Number::Unsigned(1))); assert_eq!(Value::Number(Number::Signed(-1)).into_number(), Some(Number::Signed(-1))); }
     #[test] fn kind_helpers_distinguish_scalar_and_composite_values() { assert!(PhysicalKind::Null.is_scalar()); assert!(PhysicalKind::String.is_scalar()); assert!(PhysicalKind::Array.is_composite()); assert!(PhysicalKind::Object.is_composite()); assert!(NumberKind::Signed.is_integer()); assert!(NumberKind::Unsigned.is_integer()); assert!(NumberKind::Float.is_float()); }
     #[test] fn borrowed_document_converts_by_cloning() { let document = Document::from_fields([("name", Value::from("Tom"))]); let value = Value::from(&document); assert_eq!(value.as_object(), Some(&document)); }
     #[test] fn physical_kind_names_are_stable() { assert_eq!(PhysicalKind::Null.as_str(), "null"); assert_eq!(PhysicalKind::Bool.as_str(), "bool"); assert_eq!(PhysicalKind::Number.as_str(), "number"); assert_eq!(PhysicalKind::String.as_str(), "string"); assert_eq!(PhysicalKind::Array.as_str(), "array"); }

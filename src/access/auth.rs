@@ -53,6 +53,7 @@ struct PendingEnrollment {
     expires_at: u64,
     /// Policy of the enrollment token, in policy enrollment mode.
     policy_id: Option<String>,
+    token_id: Option<String>,
 }
 
 /// Enrollment data proven by one Ed25519 device signature.
@@ -66,6 +67,9 @@ pub struct EnrollmentIdentity {
     /// Policy the identity takes, bound by [`ConnectionAuth::bind_enrollment_policy`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_id: Option<String>,
+    /// The token it enrolled with (`_policy_tokens.tokenId`), consumed at completion when single-use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<String>,
 }
 
 /// Authentication state owned by one socket connection.
@@ -187,6 +191,7 @@ impl ConnectionAuth {
             bytes,
             expires_at,
             policy_id: None,
+            token_id: None,
         });
         Ok(AuthChallenge {
             challenge_id: id,
@@ -214,12 +219,13 @@ impl ConnectionAuth {
             device_id: pending.device_id,
             device_public_key: pending.device_public_key,
             policy_id: pending.policy_id,
+            token_id: pending.token_id,
         })
     }
 
-    /// Binds the pending enrollment to the policy of its token: the identity takes it at completion.
-    pub fn bind_enrollment_policy(&mut self, policy_id: String) {
-        if let Some(pending) = self.enrollment.as_mut() { pending.policy_id = Some(policy_id); }
+    /// Binds the pending enrollment to its token and the token's policy: the identity takes it at completion.
+    pub fn bind_enrollment_policy(&mut self, policy_id: String, token_id: String) {
+        if let Some(pending) = self.enrollment.as_mut() { pending.policy_id = Some(policy_id); pending.token_id = Some(token_id); }
     }
 
     /// Verifies the signature and promotes the connection principal.

@@ -119,7 +119,7 @@ impl Engine {
         } else { self.read(physical, scope)? };
         // A streaming read observes itself.
         if !physical.is_memory_streaming() {
-            self.indexing.observe(QueryObservation::from_execution(physical, output.statistics(), started.elapsed()));
+            self.observe(physical, output.statistics(), started);
         }
         Ok(output)
     }

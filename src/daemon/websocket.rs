@@ -229,8 +229,6 @@ impl<S: Read + Write> WebSocket<S> {
         Self { stream, role, input: Vec::new(), start: 0, output: Vec::new(), written: 0, partial: None, sent_close: false, received_close: false }
     }
 
-    pub(super) fn get_ref(&self) -> &S { &self.stream }
-
     pub(super) fn get_mut(&mut self) -> &mut S { &mut self.stream }
 
     /// The next message; a ping is returned once answered (on the way out), a close once echoed.
@@ -479,6 +477,7 @@ xaORxQQFiuxBM9CKCiveMnWZDTdI3f8ExHtlfXgSYdFHXXwbYgH25UeD
 
 #[cfg(test)]
 mod tests {
+    impl<S: Read + Write> super::WebSocket<S> { pub(crate) fn get_ref(&self) -> &S { &self.stream } }
     use super::*;
     use std::{net::{Shutdown, TcpListener}, thread, time::{Duration, Instant}};
 

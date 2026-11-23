@@ -11,7 +11,7 @@ mod sync;
 mod version;
 
 pub use model::{
-    FileCapabilities, FileEntry, FileId, FileKind, FileMetadata, FileModelError, StoreId,
+    FileCapabilities, FileEntry, FileId, FileKind, FileMetadata, StoreId,
     FILES_COLLECTION,
 };
 pub use native::NativeFileStore;

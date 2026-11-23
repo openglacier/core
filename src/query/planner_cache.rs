@@ -117,13 +117,6 @@ impl PlannerCache {
         s.lru.push_back(key);
     }
 
-    pub fn invalidate_all(&self) {
-        let mut s = crate::helpers::lock_unpoisoned(&self.state);
-        s.map.clear();
-        s.lru.clear();
-        s.current_bytes = 0;
-    }
-
     pub fn stats(&self) -> PlannerCacheStats {
         self.state
             .lock()

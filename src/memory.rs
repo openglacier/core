@@ -158,7 +158,6 @@ pub struct MemoryEventSnapshot {
 struct ClassCounters {
     current_bytes: AtomicUsize,
     peak_bytes: AtomicUsize,
-    observed_bytes: AtomicUsize,
     active_reservations: AtomicUsize,
     failed_reservations: AtomicU64,
 }
@@ -172,8 +171,6 @@ pub struct MemoryClassSnapshot {
     pub current_bytes: usize,
     /// Highest number of simultaneously reserved bytes.
     pub peak_bytes: usize,
-    /// Best-effort resident bytes observed for this class but not governed.
-    pub observed_bytes: usize,
     /// Number of live RAII reservations.
     pub active_reservations: usize,
     /// Number of rejected reservation attempts.
@@ -564,18 +561,6 @@ impl MemoryGovernor {
         )
     }
 
-    /// Creates an unlimited governor with a custom event-journal capacity.
-    #[must_use]
-    pub fn unlimited_with_event_capacity(event_capacity: usize) -> Self {
-        Self::new_inner(None, event_capacity)
-    }
-
-    /// Creates a limited governor with a custom event-journal capacity.
-    #[must_use]
-    pub fn with_limit_and_event_capacity(limit_bytes: usize, event_capacity: usize) -> Self {
-        Self::new_inner(Some(limit_bytes), event_capacity)
-    }
-
     fn new_inner(limit_bytes: Option<usize>, event_capacity: usize) -> Self {
         let profile = match limit_bytes {
             Some(limit) => MemoryProfileConfig {
@@ -655,15 +640,6 @@ impl MemoryGovernor {
         })
     }
 
-    /// Reports best-effort resident bytes owned by a memory class but not
-    /// governed by reservations. This is diagnostic-only accounting and does
-    /// not affect admission or hard-limit decisions.
-    pub fn set_observed_bytes(&self, class: MemoryClass, bytes: usize) {
-        self.inner.classes[class.index()]
-            .observed_bytes
-            .store(bytes, Ordering::Release);
-    }
-
     /// Returns current global and per-class counters.
     #[must_use]
     pub fn snapshot(&self) -> MemorySnapshot {
@@ -676,7 +652,6 @@ impl MemoryGovernor {
                     class,
                     current_bytes: counters.current_bytes.load(Ordering::Acquire),
                     peak_bytes: counters.peak_bytes.load(Ordering::Acquire),
-                    observed_bytes: counters.observed_bytes.load(Ordering::Acquire),
                     active_reservations: counters.active_reservations.load(Ordering::Acquire),
                     failed_reservations: counters.failed_reservations.load(Ordering::Acquire),
                 }
@@ -1378,9 +1353,9 @@ const fn classify_process_pressure( limit_bytes: usize, process: ProcessMemorySn
 
 #[cfg(test)]
 mod tests {
+    impl super::MemoryGovernor { pub(crate) fn with_limit_and_event_capacity(limit_bytes: usize, event_capacity: usize) -> Self { Self::new_inner(Some(limit_bytes), event_capacity) } pub(crate) fn unlimited_with_event_capacity(event_capacity: usize) -> Self { Self::new_inner(None, event_capacity) } }
     use super::*;
-    
-    
+
     #[test] fn stage_memory_grows_on_demand_within_the_query_limit() { let mib = 1024 * 1024; let governor = MemoryGovernor::with_limit(64 * mib); let query = QueryMemory::with_limit(&governor, 10 * mib); let first = query.stage(); assert_eq!(governor.reserved_bytes(), 0); assert!(first.fits(1)); assert_eq!(first.held_bytes(), mib / 4); assert!(first.fits(9 * mib)); assert_eq!(first.held_bytes(), 9 * mib); assert!(!first.fits(11 * mib)); let second = query.stage(); assert!(!second.fits(2 * mib)); assert_eq!(query.held_bytes(), 9 * mib); drop(first); assert!(second.fits(2 * mib)); assert_eq!(governor.reserved_bytes(), 2 * mib); drop(second); assert_eq!((governor.reserved_bytes(), query.held_bytes()), (0, 0)); }
 
     #[test] fn stage_memory_takes_what_the_governor_has_left() { let mib = 1024 * 1024; let governor = MemoryGovernor::with_limit(6 * mib); let query = QueryMemory::with_limit(&governor, 100 * mib); let stage = query.stage(); assert!(stage.fits(5 * mib)); assert!(stage.fits(5 * mib + 1)); assert_eq!(stage.held_bytes(), 5 * mib + 1); assert!(!stage.fits(7 * mib)); assert_eq!(governor.reserved_bytes(), 5 * mib + 1); }
@@ -1390,7 +1365,6 @@ mod tests {
     #[test] fn reservation_is_released_on_drop() { let governor = MemoryGovernor::with_limit(128); { let reservation = governor.reserve(MemoryClass::Query, 64).unwrap(); assert_eq!(reservation.bytes(), 64); assert_eq!(governor.snapshot().current_bytes, 64); } let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!(snapshot.active_reservations, 0); assert_eq!(snapshot.peak_bytes, 64); }
     #[test] fn hard_limit_rejects_without_changing_current_usage() { let governor = MemoryGovernor::with_limit(100); let _held = governor.reserve(MemoryClass::PageCache, 80).unwrap(); let error = governor .reserve(MemoryClass::Query, 21) .expect_err("reservation must exceed the limit"); assert_eq!(error.class, MemoryClass::Query); assert_eq!(error.requested_bytes, 21); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 80); assert_eq!(snapshot.failed_reservations, 1); }
     #[test] fn classes_are_accounted_independently() { let governor = MemoryGovernor::with_limit(1_000); let _cache = governor.reserve(MemoryClass::PageCache, 300).unwrap(); let _query = governor.reserve(MemoryClass::Query, 200).unwrap(); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 500); assert_eq!( snapshot.classes[MemoryClass::PageCache.index()].current_bytes, 300 ); assert_eq!( snapshot.classes[MemoryClass::Query.index()].current_bytes, 200 ); }
-    #[test] fn observed_bytes_are_diagnostic_only() { let governor = MemoryGovernor::with_limit(128); governor.set_observed_bytes(MemoryClass::Indexing, 1_000_000); let snapshot = governor.snapshot(); assert_eq!(snapshot.current_bytes, 0); assert_eq!( snapshot.classes[MemoryClass::Indexing.index()].observed_bytes, 1_000_000 ); assert!(governor.reserve(MemoryClass::Query, 64).is_ok()); }
     #[test] fn zero_byte_reservation_has_no_accounting_effect() { let governor = MemoryGovernor::with_limit(0); let reservation = governor.reserve(MemoryClass::Network, 0).unwrap(); assert_eq!(reservation.bytes(), 0); assert_eq!(governor.snapshot().current_bytes, 0); }
     #[test] fn zero_byte_reservation_is_independent_from_process_pressure() { let governor = MemoryGovernor::with_limit(0); assert!(governor.reserve(MemoryClass::Network, 0).is_ok()); }
     #[test] fn process_pressure_error_uses_rss_wording_not_reserved_wording() { let error = ProcessMemoryPressureError { class: MemoryClass::Network, requested_bytes: 1024, rss_bytes: 300, soft_limit_bytes: 225, hard_limit_bytes: 250, }; let rendered = error.to_string(); assert!(rendered.contains("RSS is 300 bytes")); assert!(!rendered.contains("already reserved")); }

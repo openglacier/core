@@ -21,15 +21,16 @@ use crate::{
         StreamResponse, LENGTH_PREFIX_BYTES, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
     },
 };
-use rustyline::{error::ReadlineError, history::DefaultHistory, CompletionType, Editor, ExternalPrinter};
 use serde_json::{json, Map, Value};
 
 mod complete;
 mod import;
 mod table;
-#[cfg(feature = "cli-tui")]
+#[cfg(all(feature = "cli-tui", unix))]
 mod screen;
-#[cfg(feature = "cli-tui")]
+#[cfg(unix)]
+mod term;
+#[cfg(all(feature = "cli-tui", unix))]
 mod tui;
 
 pub type CliResult<T> = std::result::Result<T, Box<dyn Error>>;
@@ -45,7 +46,7 @@ pub fn run() -> CliResult<ExitCode> {
         Action::Version => println!("{NAME} {VERSION}"),
         Action::Run(Some(line)) => return run_line(&mut config, line),
         Action::Run(None) => {
-            #[cfg(feature = "cli-tui")]
+            #[cfg(all(feature = "cli-tui", unix))]
             if config.tui {
                 return tui::run(config);
             }
@@ -86,7 +87,7 @@ fn local_command(line: &str) -> Result<Option<Local>> {
 fn repl(mut config: Config) -> Result<ExitCode> {
     let mut exit = ExitCode::SUCCESS;
 
-    if !io::stdin().is_terminal() {
+    if !io::stdin().is_terminal() || cfg!(not(unix)) {
         let mut client = Client::connect(&config)?;
         for line in io::stdin().lock().lines() {
             if handle_line(&mut config, &mut client, line?.trim(), &mut exit)? {
@@ -105,86 +106,51 @@ fn repl(mut config: Config) -> Result<ExitCode> {
     println!("Connected to {}. Type help for commands; Tab completes.", config.address);
     println!("Interactive requests run concurrently; output is printed above the prompt.");
 
-    let completer = Arc::new(complete::Completer::new(config.clone()));
-    let mut editor: Editor<ReplHelper, DefaultHistory> = Editor::with_config(rustyline::Config::builder().completion_type(CompletionType::List).build())?;
-    editor.set_helper(Some(ReplHelper(Arc::clone(&completer))));
-    let mut external_printer = editor.create_external_printer()?;
-    let (output_tx, output_rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        while let Ok(mut message) = output_rx.recv() {
-            while let Ok(next) = output_rx.try_recv() {
-                message.push('\n');
-                message.push_str(&next);
-            }
-            if external_printer.print(message).is_err() {
-                break;
-            }
-        }
-    });
+    #[cfg(unix)]
+    return interactive(config);
+    #[cfg(not(unix))]
+    Ok(exit)
+}
 
+/// The REPL on a terminal: lines edited by `term::read_line`, each request run as a background job whose output is
+/// written above the prompt.
+#[cfg(unix)]
+fn interactive(mut config: Config) -> Result<ExitCode> {
+    let completer = complete::Completer::new(config.clone());
+    let (mut editor, mut keys) = (term::Line::default(), term::Keys::default());
+    let (output_tx, output_rx) = mpsc::channel::<String>();
     let failed = Arc::new(AtomicBool::new(false));
     let mut next_job_id = 1_u64;
     let exit_code = |failed: &AtomicBool| if failed.load(Ordering::Relaxed) { ExitCode::FAILURE } else { ExitCode::SUCCESS };
 
     loop {
-        match editor.readline("openglacier> ") {
-            Ok(line) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let _ = editor.add_history_entry(line);
-                match local_command(line) {
-                    Ok(Some(Local::Quit)) => return Ok(exit_code(&failed)),
-                    Ok(Some(Local::Help)) => { print_repl_help(); continue; }
-                    Ok(Some(Local::Format(output))) => { config.output = output; println!("format: {}", output.label()); continue; }
-                    Ok(Some(Local::Reconnect)) => {
-                        completer.invalidate();
-                        match Client::connect(&config) {
-                            Ok(_) => println!("Connection to {} verified.", config.address),
-                            Err(error) => {
-                                eprintln!("{NAME}: {error}");
-                                failed.store(true, Ordering::Relaxed);
-                            }
-                        }
-                        continue;
-                    }
-                    Err(error) => { eprintln!("{NAME}: {error}"); continue; }
-                    Ok(None) => {}
-                }
-
-                let job_id = next_job_id;
-                next_job_id = next_job_id.wrapping_add(1);
-                spawn_background_line(
-                    config.clone(),
-                    line.to_owned(),
-                    job_id,
-                    output_tx.clone(),
-                    Arc::clone(&failed),
-                );
-            }
-            Err(ReadlineError::Interrupted) => continue,
-            Err(ReadlineError::Eof) => {
-                println!();
-                return Ok(exit_code(&failed));
-            }
-            Err(error) => return Err(error.into()),
+        let Some(line) = term::read_line("openglacier> ", &mut editor, &mut keys, &completer, &output_rx)? else { return Ok(exit_code(&failed)) };
+        if line.is_empty() {
+            continue;
         }
+        match local_command(&line) {
+            Ok(Some(Local::Quit)) => return Ok(exit_code(&failed)),
+            Ok(Some(Local::Help)) => { print_repl_help(); continue; }
+            Ok(Some(Local::Format(output))) => { config.output = output; println!("format: {}", output.label()); continue; }
+            Ok(Some(Local::Reconnect)) => {
+                completer.invalidate();
+                match Client::connect(&config) {
+                    Ok(_) => println!("Connection to {} verified.", config.address),
+                    Err(error) => {
+                        eprintln!("{NAME}: {error}");
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                }
+                continue;
+            }
+            Err(error) => { eprintln!("{NAME}: {error}"); continue; }
+            Ok(None) => {}
+        }
+        let job_id = next_job_id;
+        next_job_id = next_job_id.wrapping_add(1);
+        spawn_background_line(config.clone(), line, job_id, output_tx.clone(), Arc::clone(&failed));
     }
 }
-
-/// Plugs the shared completer into rustyline; hints, highlighting and
-/// validation keep their defaults.
-struct ReplHelper(Arc<complete::Completer>);
-
-impl rustyline::completion::Completer for ReplHelper {
-    type Candidate = String;
-    fn complete(&self, line: &str, pos: usize, _: &rustyline::Context<'_>) -> rustyline::Result<(usize, Vec<String>)> { Ok(self.0.complete(line, pos)) }
-}
-impl rustyline::hint::Hinter for ReplHelper { type Hint = String; }
-impl rustyline::highlight::Highlighter for ReplHelper {}
-impl rustyline::validate::Validator for ReplHelper {}
-impl rustyline::Helper for ReplHelper {}
 
 fn spawn_background_line( config: Config, line: String, job_id: u64, output: mpsc::Sender<String>, failed: Arc<AtomicBool>, ) {
     thread::spawn(move || {
@@ -549,7 +515,7 @@ impl Config {
                 .as_deref()
                 .is_none_or(|value| value.is_empty());
         if needs_prompt && io::stdin().is_terminal() {
-            self.password = Some(rpassword::prompt_password("Identity password: ")?);
+            self.password = Some(prompt_password("Identity password: ")?);
         }
         Ok(())
     }
@@ -567,7 +533,7 @@ impl Config {
             return Ok(value.as_bytes().to_vec());
         }
         if io::stdin().is_terminal() {
-            return Ok(rpassword::prompt_password("Identity password: ")?.into_bytes());
+            return Ok(prompt_password("Identity password: ")?.into_bytes());
         }
         Err(io::Error::new(io::ErrorKind::PermissionDenied, "identity password required").into())
     }
@@ -654,6 +620,29 @@ fn query_payload(query: &str, params: &Map<String, Value>) -> Value {
     } else {
         json!({"query": query, "params": params})
     }
+}
+
+/// Reads a line from the terminal with echo off (Unix), the prompt on stderr.
+fn prompt_password(prompt: &str) -> io::Result<String> {
+    eprint!("{prompt}");
+    io::stderr().flush()?;
+    let stdin = io::stdin();
+    #[cfg(unix)]
+    let saved = {
+        use rustix::termios::{tcgetattr, tcsetattr, LocalModes, OptionalActions};
+        let saved = tcgetattr(&stdin)?;
+        let mut quiet = saved.clone();
+        quiet.local_modes.remove(LocalModes::ECHO);
+        quiet.local_modes.insert(LocalModes::ECHONL);
+        tcsetattr(&stdin, OptionalActions::Now, &quiet)?;
+        saved
+    };
+    let mut line = String::new();
+    let read = stdin.read_line(&mut line);
+    #[cfg(unix)]
+    rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &saved)?;
+    read?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_owned())
 }
 
 fn duration(value: &str, zero_is_none: bool) -> Result<Option<Duration>> {

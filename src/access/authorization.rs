@@ -129,15 +129,11 @@ impl QueryAccess {
             },
         })
     }
-
-    #[must_use]
-    pub fn request_for(&self, principal: &Principal) -> Option<AuthorizationRequest> {
-        AuthorizationRequest::from_principal(principal, self.action, self.collection.clone())
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    impl super::QueryAccess { pub(crate) fn request_for(&self, principal: &Principal) -> Option<AuthorizationRequest> { AuthorizationRequest::from_principal(principal, self.action, self.collection.clone()) } }
     use super::*;
     #[test] fn read_only_query_is_classified_as_query_read() { let access = QueryAccess::analyze("on users | where active == true | limit 1").unwrap(); assert_eq!(access.collection, "users"); assert_eq!(access.action, AuthorizationAction::QueryRead); }
     #[test] fn mutating_query_is_classified_as_query_write() { for query in [ "on users | insert {name: Alice}", "on users | set active = true", "on users | delete", "on users | load []", ] { let access = QueryAccess::analyze(query).unwrap(); assert_eq!(access.action, AuthorizationAction::QueryWrite, "{query}"); } }

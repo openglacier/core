@@ -10,6 +10,7 @@
 //! ideas/data-import-rust.md.
 mod convert;
 mod excel;
+pub(crate) mod pattern;
 mod profile;
 mod scalar;
 mod text;
@@ -18,7 +19,8 @@ use crate::helpers::JsonFields;
 use crate::model::{Document, Value};
 use crate::query::{evaluate_document, parse_expression, Expression};
 use convert::{convert, Format};
-use scalar::{column_names, header_row, normalize_text, regex, Cell, HEADER_FOLLOWING, HEADER_SCAN};
+use pattern::pattern;
+use scalar::{column_names, header_row, normalize_text, Cell, HEADER_FOLLOWING, HEADER_SCAN};
 use serde_json::{json, Map, Value as JsonValue};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -68,8 +70,8 @@ fn footer(row: &[Cell]) -> bool {
     let Some(Cell::Text(first)) = row.iter().find(|cell| !cell.is_empty()) else { return false };
     if !scalar::py_strip(first).starts_with(|c: char| c.is_alphabetic() || c == '*') { return false; }
     let first = scalar::casefold(&normalize_text(first));
-    regex!(r"^(?:total|totaux|sous[- ]?totaux?|sub[- ]?totals?|grand[- ]total|totale?s? général)\b").is_match(&first)
-        || row.iter().filter(|cell| !cell.is_empty()).count() <= 2 && regex!(r"^(?:sources?|notes?|remarques?|n\.\s?b\b|nb\s?:|\*)").is_match(&first)
+    pattern!(r"^(?:total|totaux|sous[- ]?totaux?|sub[- ]?totals?|grand[- ]total|totale?s? général)\b").is_match(&first)
+        || row.iter().filter(|cell| !cell.is_empty()).count() <= 2 && pattern!(r"^(?:sources?|notes?|remarques?|n\.\s?b\b|nb\s?:|\*)").is_match(&first)
 }
 
 /// The table of a text file (named after the file): its rows streamed, its header among the first 40.

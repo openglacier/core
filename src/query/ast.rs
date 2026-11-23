@@ -164,7 +164,6 @@ pub enum ObjectKeyAst {
 }
 
 impl ObjectKeyAst {
-
     #[must_use]
     pub const fn is_string(self) -> bool {
         matches!(self, Self::String(_))
@@ -433,11 +432,6 @@ impl ObjectFieldAst {
     }
 
     #[must_use]
-    pub fn key_text<'source>(&self, source: &'source str) -> Option<&'source str> {
-        self.key.text(source)
-    }
-
-    #[must_use]
     pub fn into_parts(self) -> (ObjectKeyAst, ValueAst) {
         (self.key, self.value)
     }
@@ -551,7 +545,6 @@ impl ObjectAst {
     pub fn iter(&self) -> slice::Iter<'_, ObjectFieldAst> {
         self.fields.iter()
     }
-
 }
 
 impl Spanned for ObjectAst {
@@ -1086,11 +1079,6 @@ impl StageAst {
     }
 
     #[must_use]
-    pub const fn has_arguments(&self) -> bool {
-        !self.arguments_span.is_empty()
-    }
-
-    #[must_use]
     pub const fn header_span(&self) -> Span {
         self.header_span
     }
@@ -1160,15 +1148,6 @@ impl PipelineAst {
     }
 
     #[must_use]
-    pub fn source_only(source: SourceAst) -> Self {
-        Self {
-            span: source.span(),
-            source,
-            stages: Vec::new(),
-        }
-    }
-
-    #[must_use]
     #[inline]
     pub const fn source(&self) -> SourceAst {
         self.source
@@ -1187,11 +1166,6 @@ impl PipelineAst {
     #[must_use]
     pub const fn stage_count(&self) -> usize {
         self.stages.len()
-    }
-
-    #[must_use]
-    pub const fn is_source_only(&self) -> bool {
-        self.stages.is_empty()
     }
 
     pub fn iter_stages(&self) -> slice::Iter<'_, StageAst> {
@@ -1227,6 +1201,9 @@ impl<'ast> IntoIterator for &'ast PipelineAst {
 
 #[cfg(test)]
 mod tests {
+    impl super::PipelineAst { pub(crate) const fn is_source_only(&self) -> bool { self.stages.is_empty() } pub(crate) fn source_only(source: SourceAst) -> Self { Self { span: source.span(), source, stages: Vec::new(), } } }
+    impl super::StageAst { pub(crate) const fn has_arguments(&self) -> bool { !self.arguments_span.is_empty() } }
+    impl super::ObjectFieldAst { pub(crate) fn key_text<'source>(&self, source: &'source str) -> Option<&'source str> { self.key.text(source) } }
     use super::*;
 
     #[inline]

@@ -520,12 +520,6 @@ impl ExecutionOutput {
         }
     }
 
-    /// Consumes the output and returns emitted rows.
-    #[must_use]
-    pub fn into_rows(self) -> Vec<ExecutionRow> {
-        if self.spool.is_some() { self.rows().to_vec() } else { self.rows }
-    }
-
     /// Returns execution statistics.
     #[must_use]
     pub const fn statistics(&self) -> ExecutionStatistics {
@@ -895,7 +889,6 @@ pub struct ExecutionStatistics {
 }
 
 impl ExecutionStatistics {
-
     /// Builds statistics for a streamed read-only pipeline.
     #[must_use]
     pub fn streamed_pipeline( scanned: u64, filtered: u64, returned: u64, strategy: ExecutionStrategy, ) -> Self {
@@ -965,12 +958,6 @@ impl ExecutionStatistics {
     #[must_use]
     pub const fn deleted(self) -> u64 {
         self.deleted
-    }
-
-    /// Total committed mutations.
-    #[must_use]
-    pub const fn mutated(self) -> u64 {
-        self.inserted + self.replaced + self.deleted
     }
 
     /// Physical strategies used during execution.
@@ -1375,7 +1362,6 @@ impl ProjectedTopNWinner {
     pub(crate) const fn version(&self) -> DocumentVersion {
         self.version
     }
-
 }
 
 /// Bounded ordering selector over a projected-value vector.
@@ -1649,6 +1635,7 @@ fn usize_to_u64(value: usize) -> ExecutionResult<u64> {
 
 #[cfg(test)]
 mod tests {
+    impl super::ExecutionStatistics { pub(crate) const fn mutated(self) -> u64 { self.inserted + self.replaced + self.deleted } }
     use super::*;
     use crate::{query::PhysicalSubPipeline, storage::{ScanOptions, StorageRead, StorageTransaction}};
     use crate::{

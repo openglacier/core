@@ -40,7 +40,7 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
                 reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed");
             }
             // Commercial mode: the token names the policy the identity takes, if it has a free seat.
-            let policy_id = match (settings.enrollment_mode.is_policy(), token.as_deref()) {
+            let policy = match (settings.enrollment_mode.is_policy(), token.as_deref()) {
                 (true, Some(token)) => Some(super::policy_ops::enrollment_policy(engine, id, token)?),
                 _ => None,
             };
@@ -51,23 +51,30 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
                 device_public_key,
                 DEFAULT_CHALLENGE_TTL,
             ).map_err(auth_failed(id))?;
-            if let Some(policy_id) = policy_id { authentication.bind_enrollment_policy(policy_id); }
+            if let Some((policy_id, token_id)) = policy { authentication.bind_enrollment_policy(policy_id, token_id); }
             reply(writer, id, serde_json::to_value(challenge).expect("challenge serializes"))?;
         }
         RoutedOperation::AuthEnrollComplete(Routed { id, input: ChallengeSignatureInput { challenge_id, signature } }) => {
             let enrollment = authentication.complete_enrollment(&challenge_id, &signature).map_err(auth_failed(id))?;
             if settings.enrollment_mode.is_policy() && enrollment.policy_id.is_none() { reject!(id, "auth.enrollment_denied", "identity enrollment is not allowed"); }
-            if let Some(policy_id) = enrollment.policy_id.as_deref() { super::policy_ops::enrollment_seat(engine, id, policy_id)?; }
+            let token_id = enrollment.token_id.as_deref().unwrap_or_default();
+            if let Some(policy_id) = enrollment.policy_id.as_deref() { super::policy_ops::enrollment_seat(engine, id, policy_id, token_id)?; }
+            // A single-use token is taken here, before anything is written: of two enrollments with it, one only goes on.
+            if enrollment.policy_id.is_some() { super::policy_ops::take_token(engine, id, token_id, &enrollment.identity_id)?; }
             let created_at = unix_time_millis();
             let mut identity = serde_json::json!({"identityId": &enrollment.identity_id, "publicKey": &enrollment.identity_public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at});
-            if let Some(policy_id) = enrollment.policy_id.as_deref() { identity["policyId"] = policy_id.into(); }
+            if let Some(policy_id) = enrollment.policy_id.as_deref() { identity["policyId"] = policy_id.into(); identity["tokenId"] = token_id.into(); }
             let identity_query = insert_query("_identities", identity);
-            query_documents(engine, id, identity_query)?;
+            if let Err(response) = query_documents(engine, id, identity_query) {
+                if enrollment.policy_id.is_some() { super::policy_ops::give_token_back(engine, id, token_id); }
+                return Err(response.into());
+            }
             // Each failed step rolls back the records written before it.
             let rollback_identity = quoted!("on _identities | where identityId == {} | delete", &enrollment.identity_id);
             let device_query = insert_query("_devices", serde_json::json!({"deviceId": &enrollment.device_id, "identityId": &enrollment.identity_id, "publicKey": &enrollment.device_public_key, "algorithm": "ed25519", "encoding": "spki-der", "state": "active", "createdAt": created_at}));
             if let Err(response) = query_documents(engine, id, device_query) {
                 let _ = query_run(engine, id, rollback_identity);
+                if enrollment.policy_id.is_some() { super::policy_ops::give_token_back(engine, id, token_id); }
                 return Err(response.into());
             }
 
@@ -79,8 +86,11 @@ pub(super) fn handle_authentication_operation(connection: &mut Connection, setti
                 let rollback_device = quoted!("on _devices | where deviceId == {} | delete", &enrollment.device_id);
                 let _ = query_run(engine, id, rollback_device);
                 let _ = query_run(engine, id, rollback_identity);
+                if enrollment.policy_id.is_some() { super::policy_ops::give_token_back(engine, id, token_id); }
                 return Err(response.into());
             }
+            // A token of the pool's admin (the subscriber's) makes the new identity one of its admins.
+            if enrollment.policy_id.is_some() { super::policy_ops::token_admin(engine, id, token_id, &enrollment.identity_id, created_at)?; }
 
             debug::log( DebugTopic::Permission, Some(connection_id), format!( "grant identity={} action=events.subscribe resource=* source=enrollment", enrollment.identity_id ), );
             publish_durable_event(
@@ -282,10 +292,11 @@ pub(super) fn handle_identity_operation(writer: &mut TcpStream, settings: &Conne
     match operation {
         operation @ (RoutedOperation::PoolCreate(_) | RoutedOperation::PoolUpdate(_) | RoutedOperation::PoolList(_) | RoutedOperation::PoolDelete(_)
             | RoutedOperation::PolicyCreate(_) | RoutedOperation::PolicyUpdate(_) | RoutedOperation::PolicyList(_) | RoutedOperation::PolicyDelete(_)
-            | RoutedOperation::PolicyTokenCreate(_) | RoutedOperation::PolicyTokenList(_) | RoutedOperation::PolicyTokenRevoke(_) | RoutedOperation::IdentityPolicySet(_) | RoutedOperation::IdentityStateSet(_) | RoutedOperation::IdentityList(_)) => {
+            | RoutedOperation::PolicyTokenCreate(_) | RoutedOperation::PolicyTokenList(_) | RoutedOperation::PolicyTokenRevoke(_) | RoutedOperation::IdentityPolicySet(_) | RoutedOperation::IdentityStateSet(_) | RoutedOperation::IdentityList(_)
+            | RoutedOperation::PoolInvite(_) | RoutedOperation::PoolAdminSet(_) | RoutedOperation::PoolSettingsGet(_) | RoutedOperation::PoolSettingsSet(_)) => {
             // A limit, a policy or a seat may have changed: the storage headroom is computed again.
-            let changes = matches!(operation, RoutedOperation::PoolUpdate(_) | RoutedOperation::PolicyUpdate(_) | RoutedOperation::IdentityPolicySet(_) | RoutedOperation::IdentityStateSet(_));
-            let handled = super::policy_ops::handle_policy_operation(writer, engine, principal, operation);
+            let changes = matches!(operation, RoutedOperation::PoolUpdate(_) | RoutedOperation::PolicyUpdate(_) | RoutedOperation::IdentityPolicySet(_) | RoutedOperation::IdentityStateSet(_) | RoutedOperation::PoolSettingsSet(_));
+            let handled = super::policy_ops::handle_policy_operation(writer, settings, engine, principal, operation);
             if changes && handled.is_ok() { super::usage_ops::refresh(); }
             handled
         }

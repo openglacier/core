@@ -253,15 +253,6 @@ impl Expression {
         matches!(self.kind, ExpressionKind::Group(_))
     }
 
-    /// Returns the unary operator and operand when applicable.
-    #[must_use]
-    pub fn as_unary(&self) -> Option<(UnaryOperator, &Self)> {
-        match &self.kind {
-            ExpressionKind::Unary { operator, operand } => Some((*operator, operand.as_ref())),
-            _ => None,
-        }
-    }
-
     /// Returns the binary operands and operator when applicable.
     #[must_use]
     pub fn as_binary(&self) -> Option<(&Self, BinaryOperator, &Self)> {
@@ -271,15 +262,6 @@ impl Expression {
                 operator,
                 right,
             } => Some((left.as_ref(), *operator, right.as_ref())),
-            _ => None,
-        }
-    }
-
-    /// Returns the inner expression of an explicit group.
-    #[must_use]
-    pub fn as_group(&self) -> Option<&Self> {
-        match &self.kind {
-            ExpressionKind::Group(expression) => Some(expression.as_ref()),
             _ => None,
         }
     }
@@ -511,24 +493,6 @@ pub enum Literal {
 }
 
 impl Literal {
-    /// Returns the exact numeric spelling.
-    #[must_use]
-    pub fn as_number_text(&self) -> Option<&str> {
-        match self {
-            Self::Number(value) => Some(value.as_ref()),
-            Self::Null | Self::Bool(_) | Self::String(_) | Self::Json(_) => None,
-        }
-    }
-
-    /// Returns the decoded string value.
-    #[must_use]
-    pub fn as_string(&self) -> Option<&str> {
-        match self {
-            Self::String(value) => Some(value.as_ref()),
-            Self::Null | Self::Bool(_) | Self::Number(_) | Self::Json(_) => None,
-        }
-    }
-
     /// Returns the boolean value.
     #[must_use]
     pub const fn as_bool(&self) -> Option<bool> {
@@ -1661,6 +1625,8 @@ pub enum ExpressionErrorKind {
 
 #[cfg(test)]
 mod tests {
+    impl super::Literal { pub(crate) fn as_string(&self) -> Option<&str> { match self { Self::String(value) => Some(value.as_ref()), Self::Null | Self::Bool(_) | Self::Number(_) | Self::Json(_) => None, } } pub(crate) fn as_number_text(&self) -> Option<&str> { match self { Self::Number(value) => Some(value.as_ref()), Self::Null | Self::Bool(_) | Self::String(_) | Self::Json(_) => None, } } }
+    impl super::Expression { pub(crate) fn as_group(&self) -> Option<&Self> { match &self.kind { ExpressionKind::Group(expression) => Some(expression.as_ref()), _ => None, } } pub(crate) fn as_unary(&self) -> Option<(UnaryOperator, &Self)> { match &self.kind { ExpressionKind::Unary { operator, operand } => Some((*operator, operand.as_ref())), _ => None, } } }
     use super::*;
 
     #[test] fn parses_null_literal() { let expression = parse_expression("null").unwrap(); assert_eq!(expression.kind(), &ExpressionKind::Literal(Literal::Null),); assert_eq!(expression.span(), Span::new(0, 4)); }

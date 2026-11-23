@@ -1,6 +1,7 @@
 #![cfg_attr(rustfmt, rustfmt_skip)]
 //! Cells and their text as the Python worker wrote them (`magixlib.normalize_scalar`, `str()`, `repr()`): the column
 //! fingerprints that find a saved mapping again, and the values of an import, depend on it to the byte.
+use super::pattern::{collapse, pattern};
 use sha1::{Digest, Sha1};
 use unicode_normalization::UnicodeNormalization;
 
@@ -116,26 +117,24 @@ pub(crate) fn casefold(text: &str) -> String {
     if lower.contains(['ß', 'ς', 'ŉ']) { lower.replace('ß', "ss").replace('ς', "σ").replace('ŉ', "ʼn") } else { lower }
 }
 
-macro_rules! regex { ($pattern:expr) => {{ static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new($pattern).expect("valid pattern")); &*RE }} }
-pub(crate) use regex;
 
 /// `magixlib.normalize_string_scalar`: NFKC, collapsed blanks, null words, booleans, numbers through `Decimal`, ISO dates.
 pub(crate) fn normalize_text(text: &str) -> String {
     let text: String = if text.is_ascii() { text.to_owned() } else { text.nfkc().collect() };
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    let text = regex!("[ \t]+").replace_all(&text, " "); let text = py_strip(&text);
+    let text = collapse(&text, |c| c == ' ' || c == '\t', " "); let text = py_strip(&text);
     if text.is_empty() { return String::new(); }
     match casefold(text).as_str() { "nan" | "na" | "n/a" | "null" | "none" | "<na>" => return String::new(), "true" | "vrai" => return "true".into(), "false" | "faux" => return "false".into(), _ => {} }
     let compact = text.replace(['\u{a0}', ' '], "");
-    let numeric = if regex!("^[+-]?[0-9]+,[0-9]+$").is_match(&compact) { compact.replace(',', ".") } else if regex!(r"^[+-]?[0-9]{1,3}(?:[.,][0-9]{3})+(?:[.,][0-9]+)?$").is_match(&compact) { String::new() } else { compact };
-    if regex!(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$").is_match(&numeric) {
+    let numeric = if pattern!("^[+-]?[0-9]+,[0-9]+$").is_match(&compact) { compact.replace(',', ".") } else if pattern!(r"^[+-]?[0-9]{1,3}(?:[.,][0-9]{3})+(?:[.,][0-9]+)?$").is_match(&compact) { String::new() } else { compact };
+    if pattern!(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$").is_match(&numeric) {
         if let Some(number) = decimal(&numeric) { return number; }
     }
     let candidate = text.replace('Z', "+00:00");
-    if regex!("^[0-9]{4}-[0-9]{2}-[0-9]{2}$").is_match(&candidate) {
+    if pattern!("^[0-9]{4}-[0-9]{2}-[0-9]{2}$").is_match(&candidate) {
         let parts: Vec<i64> = candidate.split('-').map(|part| part.parse().unwrap_or(0)).collect();
         if valid_date(parts[0], parts[1] as u32, parts[2] as u32) { return candidate; }
-    } else if let Some(found) = regex!(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]+))?)?(?:([+-])([0-9]{2}):([0-9]{2}))?$").captures(&candidate) {
+    } else if let Some(found) = pattern!(r"^([0-9]{4})-([0-9]{2})-([0-9]{2})[T ]([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]+))?)?(?:([+-])([0-9]{2}):([0-9]{2}))?$").captures(&candidate) {
         let number = |index: usize| found.get(index).map_or(0, |part| part.as_str().parse::<i64>().unwrap_or(0));
         let micros = found.get(7).map_or(0, |part| format!("{:0<6}", &part.as_str()[..part.len().min(6)]).parse::<i64>().unwrap_or(0));
         let offset = found.get(8).map(|sign| format!("{}{:02}:{:02}", sign.as_str(), number(9), number(10)));
@@ -185,7 +184,7 @@ fn column_name(normalized: &str, index: usize) -> String { if normalized.is_empt
 pub(crate) fn schema_fingerprint(columns: &[String]) -> String {
     let schema: std::collections::BTreeSet<String> = columns.iter().enumerate().map(|(index, column)| {
         let name: String = column_name(&normalize_text(column), index + 1).nfkc().collect();
-        casefold(py_strip(&regex!("[ \t]+").replace_all(&name, " ")))
+        casefold(py_strip(&collapse(&name, |c| c == ' ' || c == '\t', " ")))
     }).filter(|name| !name.is_empty()).collect();
     sha1_hex(format!("{}\n", serde_json::to_string(&schema).expect("strings serialize")).as_bytes())
 }

@@ -13,6 +13,7 @@ const DEFAULT_PLANNER_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 mod execute;
 mod changes;
+mod grouped;
 pub mod results;
 use crate::query::codec::{encode_bytes, encode_varint, Decoder};
 mod sinks;
@@ -30,7 +31,7 @@ use crate::{
         ExecutionOutput, ExecutionRow, ExecutionStatistics, QueryRuntime, ExecutionStrategies,
         ExecutionStrategy, Order, PhysicalOperator,
         PhysicalPlan, PhysicalPlanError, PhysicalSubPipeline, Planner,
-        PlannerCache, PlannerCacheStats, PlannerError, PlannerPipeline, ProjectedRowLocator,
+        PlannerCache, PlannerError, PlannerPipeline, ProjectedRowLocator,
         ProjectedValueLayout, ProjectedValuePipeline, SortKey, vcollections,
     },
     spill::{RunMerge, SpillEngine, SpillRun, SpillRunReader},
@@ -894,6 +895,15 @@ struct GroupRows {
     sorted: bool,
 }
 
+impl GroupRows {
+    /// The groups of an unbounded `group`, to read as a collection; `None`
+    /// for a bounded one, whose groups already hold their keys.
+    fn into_groups(self) -> Option<grouped::Groups> {
+        let (table, keys) = self.keys?;
+        Some(grouped::Groups::new(self.dense, table, keys, self.groups.map(|(_, group)| group).collect()))
+    }
+}
+
 impl Iterator for GroupRows {
     type Item = EngineResult<ExecutionRow>;
 
@@ -1572,6 +1582,13 @@ impl Engine {
         Ok(Some(self.view(Arc::new(crate::storage::history::TemporalStorage::new(Arc::clone(&self.storage), temporal.clone())))))
     }
 
+    /// Notes that `physical` ran, for the index advice, unless it read the groups of a `group` ([`grouped`]).
+    fn observe(&self, physical: &PhysicalPlan, statistics: ExecutionStatistics, started: Instant) {
+        if physical.source().collection().as_str() != grouped::GROUPS {
+            self.indexing.observe(QueryObservation::from_execution(physical, statistics, started.elapsed()));
+        }
+    }
+
     /// The same components over `storage`.
     fn view(&self, storage: Arc<dyn StorageEngine>) -> Self {
         Self {
@@ -1755,13 +1772,6 @@ impl Engine {
         Ok(document)
     }
 
-    pub fn planner_cache_stats(&self) -> PlannerCacheStats {
-        self.planner_cache.stats()
-    }
-    pub fn invalidate_planner_cache(&self) {
-        self.planner_cache.invalidate_all();
-    }
-
     /// Returns the shared memory governor.
     #[must_use]
     pub const fn memory_governor(&self) -> &MemoryGovernor {
@@ -1818,11 +1828,7 @@ impl Engine {
             emit_streaming_count(visitor, alias, count)?;
             let statistics =
                 ExecutionStatistics::streamed_pipeline(0, 0, 1, ExecutionStrategy::DirectCount);
-            self.indexing.observe(QueryObservation::from_execution(
-                physical,
-                statistics,
-                started.elapsed(),
-            ));
+            self.observe(physical, statistics, started);
             return Ok(Some(statistics));
         }
 
@@ -1871,11 +1877,7 @@ impl Engine {
                             .with(ExecutionStrategy::CollectionScan)
                             .with(ExecutionStrategy::StreamingCount),
                     );
-                    self.indexing.observe(QueryObservation::from_execution(
-                        physical,
-                        statistics,
-                        started.elapsed(),
-                    ));
+                    self.observe(physical, statistics, started);
                     return Ok(Some(statistics));
                 }
             }
@@ -1911,11 +1913,7 @@ impl Engine {
             } else {
                 ExecutionStatistics::streamed_pipeline(0, 0, 0, strategy)
             };
-            self.indexing.observe(QueryObservation::from_execution(
-                physical,
-                statistics,
-                started.elapsed(),
-            ));
+            self.observe(physical, statistics, started);
             return Ok(Some(statistics));
         }
 
@@ -2027,7 +2025,7 @@ impl Engine {
                             .map_err(storage_engine_error)?;
                             (filtered, returned) = (filtered_cell.get(), returned_cell.get());
                             let statistics = ExecutionStatistics::streamed_pipeline(scanned, filtered, returned, ExecutionStrategy::CollectionScan);
-                            self.indexing.observe(QueryObservation::from_execution(physical, statistics, started.elapsed()));
+                            self.observe(physical, statistics, started);
                             return Ok(Some(statistics));
                         }
                     }
@@ -2300,11 +2298,7 @@ impl Engine {
         } else {
             ExecutionStatistics::streamed_with_strategies(scanned, filtered, returned, strategies)
         };
-        self.indexing.observe(QueryObservation::from_execution(
-            physical,
-            statistics,
-            started.elapsed(),
-        ));
+        self.observe(physical, statistics, started);
         Ok(Some(statistics))
     }
 
@@ -3604,7 +3598,6 @@ impl Engine {
         Ok(self.try_batch_group(prefix, keys, &grouping_keys, &required_input_fields, memory, group_limit, top)?.flatten())
     }
 
-
     /// Streams a governed blocking read plan without materializing its full input or output.
     ///
     /// Executes supported governed blocking shapes after a fully streaming prefix.
@@ -3633,12 +3626,29 @@ impl Engine {
         let mut delivered = 0u64;
         let mut open = !chain.has_empty_bound();
         let shared = if shape.tail.is_empty() && shape.rest.is_empty() && shape.count_alias.is_some() { self.try_shared_union_count(physical, &shape)? } else { None };
+        let visitor = std::cell::RefCell::new(visitor);
+        // The stages after a `group` run on its groups read as a collection ([`grouped`]).
+        let grouped = std::cell::Cell::new(false);
+        let groups_source = crate::query::PhysicalSource::collection_scan(CollectionId::parse(grouped::GROUPS).map_err(storage_engine_error)?);
+        let rest = Some(&physical.operators()[shape.core_end..]).filter(|after| !after.is_empty())
+            .and_then(|after| PhysicalPlan::new(groups_source, after.iter().cloned()).ok())
+            .filter(|rest| rest.is_memory_streaming() || self.supports_governed_blocking_streaming(rest));
+        let mut after_groups = |groups: grouped::Groups| -> EngineResult<ExecutionStatistics> {
+            grouped.set(true);
+            let rest = rest.as_ref().expect("stages after the group");
+            // The stages after the `group` run as a query of their own: what the `group` used stays noted.
+            let partial = take_partial_documents_used();
+            let statistics = self.view(Arc::new(grouped::GroupedStorage { store: Arc::clone(&self.storage), groups })).stream_rows(rest, None, |row| (visitor.borrow_mut())(row));
+            PARTIAL_DOCUMENTS_USED.with(|used| used.set(used.get() || partial));
+            statistics
+        };
+        let after = rest.is_some().then_some(&mut after_groups as &mut dyn FnMut(grouped::Groups) -> EngineResult<ExecutionStatistics>);
         let mut last = |row: ExecutionRow| -> EngineResult<()> {
             if shape.count_alias.is_some() {
                 counted = counted.saturating_add(1);
                 return Ok(());
             }
-            visitor(row)?;
+            (visitor.borrow_mut())(row)?;
             delivered = delivered.saturating_add(1);
             Ok(())
         };
@@ -3666,7 +3676,10 @@ impl Engine {
                 };
                 Ok(())
             };
-            let statistics = self.stream_governed_core(physical, &shape, &memory, &mut tail_visitor)?;
+            let statistics = self.stream_governed_core(physical, &shape, &memory, after, &mut tail_visitor)?;
+            if grouped.get() {
+                return Ok(statistics.map(|statistics| if take_partial_documents_used() { ExecutionStatistics::streamed_with_strategies(statistics.scanned(), statistics.filtered(), statistics.returned(), statistics.strategies().with(ExecutionStrategy::PartialDocuments)) } else { statistics }));
+            }
             if statistics.is_some() {
                 self.finish_later(&mut stages, None, &mut last)?;
             }
@@ -3691,7 +3704,7 @@ impl Engine {
             let document = Arc::new(Document::from_fields([(alias, Value::from(counted))]));
             let stored = StoredDocument::new(DocumentId::synthetic(0x0063_6f75_6e74, 1), DocumentVersion::INITIAL, document)
                 .map_err(storage_engine_error)?;
-            visitor(ExecutionRow::from_stored(stored))?;
+            (visitor.borrow_mut())(ExecutionRow::from_stored(stored))?;
             delivered = 1;
         }
         if shape.tail.is_empty() && shape.rest.is_empty() && shape.count_alias.is_none() {
@@ -3840,7 +3853,10 @@ impl Engine {
 
     /// Runs the streaming prefix and the blocking core of a governed plan,
     /// emitting up to `shape.output_limit` rows to `visitor`.
-    fn stream_governed_core( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, memory: &QueryMemory, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
+    /// Under `after`, a lone unbounded `group` whose groups fit in memory hands
+    /// them to it, which runs every stage after the `group` and returns their
+    /// statistics; `visitor` then sees no row.
+    fn stream_governed_core( &self, physical: &PhysicalPlan, shape: &GovernedShape<'_>, memory: &QueryMemory, after: Option<&mut dyn FnMut(grouped::Groups) -> EngineResult<ExecutionStatistics>>, visitor: &mut dyn FnMut(ExecutionRow) -> EngineResult<()>, ) -> EngineResult<Option<ExecutionStatistics>> {
         let blocking_index = shape.blocking_index;
         let core = &physical.operators()[blocking_index..shape.core_end];
         let output_limit = shape.output_limit;
@@ -4624,6 +4640,18 @@ impl Engine {
                     // Emitted groups pass to the stages after the core, which
                     // count them.
                     stage.release();
+                    let strategies = ExecutionStrategies::default().with(source_strategy).with(ExecutionStrategy::InMemoryGroup);
+                    let grouped = match (after, output_limit, shape.core_end - shape.blocking_index) {
+                        (Some(after), None, 1) => match grouped.into_groups() {
+                            Some(groups) => {
+                                let rest = after(groups)?;
+                                let strategies = rest.strategies().iter().filter(|strategy| !matches!(strategy, ExecutionStrategy::CollectionScan | ExecutionStrategy::DirectCount)).fold(strategies, ExecutionStrategies::with);
+                                return Ok(Some(ExecutionStatistics::streamed_with_strategies(prefix_stats.scanned(), prefix_stats.filtered().saturating_add(rest.filtered()), rest.returned(), strategies)));
+                            }
+                            None => unreachable!("an unbounded group"),
+                        },
+                        _ => grouped,
+                    };
                     let returned = visit_each(visitor, grouped.take(output_limit.unwrap_or(usize::MAX)))?;
                     let strategies = ExecutionStrategies::default()
                         .with(source_strategy)
@@ -4687,7 +4715,6 @@ impl Engine {
         let storage = MemoryStorage::new();
         let collection = CollectionId::parse(vcollections::MEMORY).map_err(storage_engine_error)?;
         let snapshot = self.memory_governor.snapshot();
-        let observed_bytes = snapshot.classes.iter().fold(0usize, |total, class| total.saturating_add(class.observed_bytes));
         let event_snapshot = self.memory_governor.event_snapshot();
         let spill = crate::spill::stats_snapshot();
         let process = snapshot.process;
@@ -4718,7 +4745,6 @@ impl Engine {
             ("limit_bytes", optional_usize_value(snapshot.limit_bytes)),
             ("current_bytes", usize_value(snapshot.current_bytes)),
             ("peak_bytes", usize_value(snapshot.peak_bytes)),
-            ("observed_bytes", usize_value(observed_bytes)),
             ("available_bytes", optional_usize_value(snapshot.available_bytes)),
             ("active_reservations", usize_value(snapshot.active_reservations)),
             ("failed_reservations", Value::from(snapshot.failed_reservations)),
@@ -4764,7 +4790,6 @@ impl Engine {
                 ("class", Value::from(class.class.as_str())),
                 ("current_bytes", usize_value(class.current_bytes)),
                 ("peak_bytes", usize_value(class.peak_bytes)),
-                ("observed_bytes", usize_value(class.observed_bytes)),
                 ("active_reservations", usize_value(class.active_reservations)),
                 ("failed_reservations", Value::from(class.failed_reservations)),
             ]);
@@ -5609,6 +5634,8 @@ pub enum EngineErrorKind {
 
 #[cfg(test)]
 mod tests {
+    impl super::Engine { pub(crate) fn planner_cache_stats(&self) -> PlannerCacheStats { self.planner_cache.stats() } }
+    use crate::query::PlannerCacheStats;
     use super::*;
     use crate::{
         query::PhysicalSource,
@@ -5619,7 +5646,6 @@ mod tests {
     #[test] fn governed_streaming_accepts_group_followed_by_sort_and_limit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let group_field = crate::query::ExpressionFieldPath::new(["Article_Code"]).expect("valid group field"); let sort_field = crate::query::ExpressionFieldPath::new(["CA"]).expect("valid sort field"); let plan = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse("data").unwrap()), [ PhysicalOperator::group([group_field]).unwrap(), PhysicalOperator::sort([crate::query::SortKey::descending(sort_field)]).unwrap(), PhysicalOperator::limit(10), ], ) .unwrap(); assert!(engine.supports_governed_blocking_streaming(&plan)); }
     #[test] fn engine_debug_does_not_require_trait_objects_to_be_debug() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let debug = format!("{:?}", Engine::new(storage)); assert!(debug.starts_with("Engine")); }
     #[test] fn plan_cached_records_a_miss_then_a_hit() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 0, misses: 1, evictions: 0, } ); engine.plan_cached(source, &pipeline).expect("cached plan"); assert_eq!( engine.planner_cache_stats(), PlannerCacheStats { hits: 1, misses: 1, evictions: 0, } ); }
-    #[test] fn invalidating_planner_cache_forces_replanning() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let engine = Engine::new(storage); let source = "from users"; let ast = crate::query::parse(source).expect("query parses"); let pipeline = PlannerPipeline::from_ast(source, &ast).expect("pipeline lowers"); engine.plan_cached(source, &pipeline).expect("first plan"); engine.invalidate_planner_cache(); engine.plan_cached(source, &pipeline).expect("replanned"); let stats = engine.planner_cache_stats(); assert_eq!(stats.hits, 0); assert_eq!(stats.misses, 2); }
     #[test] fn engine_public_types_are_send_and_sync() { fn assert_send_and_sync<T: Send + Sync>() {} assert_send_and_sync::<Engine>(); assert_send_and_sync::<PlannedQuery>(); assert_send_and_sync::<QueryOutput>(); assert_send_and_sync::<EngineError>(); }
     #[test] fn memory_system_collection_exposes_global_and_class_rows() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit(1_024); let _held = governor .reserve(crate::memory::MemoryClass::Query, 128) .unwrap(); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 8); assert!(output.rows().iter().any(|row| { row.document().get("scope") == Some(&Value::from("global")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); assert!(output.rows().iter().any(|row| { row.document().get("class") == Some(&Value::from("query")) && row.document().get("current_bytes") == Some(&Value::from(128_u64)) })); }
     #[test] fn memory_events_system_collection_exposes_bounded_journal() { let storage: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new()); let governor = MemoryGovernor::with_limit_and_event_capacity(8 * 1024 * 1024, 8); let reservation = governor .reserve( crate::memory::MemoryClass::Import, crate::memory::MEMORY_EVENT_MIN_BYTES, ) .unwrap(); drop(reservation); let engine = Engine::new(storage).with_memory_governor(governor); let physical = PhysicalPlan::new( PhysicalSource::collection_scan(CollectionId::parse(vcollections::MEMORY_EVENTS).unwrap()), [], ) .unwrap(); let output = engine.execute_physical(&physical).unwrap(); assert_eq!(output.len(), 2); let kinds = output .rows() .iter() .filter_map(|row| row.document().get("kind")) .cloned() .collect::<Vec<_>>(); assert!(kinds.contains(&Value::from("reserved"))); assert!(kinds.contains(&Value::from("released"))); }

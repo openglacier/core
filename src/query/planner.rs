@@ -1866,12 +1866,11 @@ impl StageLocation {
 
 impl fmt::Display for StageLocation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for depth in 0..self.depth() {
+        for (depth, index) in self.path[..self.depth()].iter().enumerate() {
             if depth > 0 {
                 formatter.write_str(".")?;
             }
-
-            write!(formatter, "{}", self.path[depth])?;
+            write!(formatter, "{index}")?;
         }
 
         Ok(())

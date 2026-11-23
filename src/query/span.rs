@@ -74,12 +74,6 @@ impl Span {
         Self::new(min(self.start, other.start), max(self.end, other.end))
     }
 
-    /// Extend to span end
-    #[must_use]
-    pub const fn with_end(self, end: usize) -> Self {
-        Self::new(self.start, end)
-    }
-
     /// Move offset using n bytes
     #[must_use]
     pub const fn offset(self, amount: usize) -> Self {
@@ -149,6 +143,7 @@ const fn max(left: usize, right: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    impl super::Span { pub(crate) const fn with_end(self, end: usize) -> Self { Self::new(self.start, end) } }
     use super::*;
 
     #[test] fn creates_span() { let span = Span::new(2, 8); assert_eq!(span.start(), 2); assert_eq!(span.end(), 8); assert_eq!(span.len(), 6); assert!(!span.is_empty()); }

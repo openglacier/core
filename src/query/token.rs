@@ -117,21 +117,6 @@ impl TokenKind {
         )
     }
 
-    /// Indique si le token introduit un stage composé.
-    ///
-    /// `lookup`, `union` et `load` partagent la même mécanique syntaxique :
-    /// leur corps est un sous-pipeline fermé par le mot-clé `end`.
-    #[must_use]
-    pub const fn is_compound_stage_keyword(self) -> bool {
-        matches!(self, Self::Lookup | Self::Join | Self::Union | Self::Load)
-    }
-
-    /// Indique si le token représente un mode de chargement.
-    #[must_use]
-    pub const fn is_load_mode_keyword(self) -> bool {
-        matches!(self, Self::Replace | Self::Update | Self::Merge)
-    }
-
     /// Indique si le token est le mot-clé syntaxique `end`.
     ///
     /// Cette catégorie est distincte de [`TokenKind::End`], qui représente la
@@ -146,57 +131,6 @@ impl TokenKind {
         matches!(
             self,
             Self::String | Self::Number | Self::True | Self::False | Self::Null
-        )
-    }
-
-    #[must_use]
-    pub const fn can_start_value(self) -> bool {
-        matches!(
-            self,
-            Self::Identifier
-                | Self::String
-                | Self::Number
-                | Self::True
-                | Self::False
-                | Self::Null
-                | Self::LeftParen
-                | Self::LeftBrace
-                | Self::LeftBracket
-        )
-    }
-
-    #[must_use]
-    pub const fn is_comparison_operator(self) -> bool {
-        matches!(
-            self,
-            Self::EqualEqual
-                | Self::NotEqual
-                | Self::Less
-                | Self::LessEqual
-                | Self::Greater
-                | Self::GreaterEqual
-        )
-    }
-
-    #[must_use]
-    pub const fn is_logical_operator(self) -> bool {
-        matches!(self, Self::And | Self::Or | Self::Not)
-    }
-
-    #[must_use]
-    pub const fn is_punctuation(self) -> bool {
-        matches!(
-            self,
-            Self::Pipe
-                | Self::Dot
-                | Self::Colon
-                | Self::Comma
-                | Self::LeftParen
-                | Self::RightParen
-                | Self::LeftBrace
-                | Self::RightBrace
-                | Self::LeftBracket
-                | Self::RightBracket
         )
     }
 
@@ -334,17 +268,10 @@ mod tests {
     #[test] fn keywords_are_case_sensitive() { assert_eq!(TokenKind::from_keyword("From"), None); assert_eq!(TokenKind::from_keyword("WHERE"), None); assert_eq!(TokenKind::from_keyword("True"), None); }
     #[test] fn unknown_word_is_not_keyword() { assert_eq!(TokenKind::from_keyword("users"), None); assert_eq!(TokenKind::from_keyword("country"), None); assert_eq!(TokenKind::from_keyword("enabled"), None); }
     #[test] fn classifies_keywords() { assert!(TokenKind::From.is_keyword()); assert!(TokenKind::Where.is_keyword()); assert!(TokenKind::Lookup.is_keyword()); assert!(TokenKind::Join.is_keyword()); assert!(TokenKind::Union.is_keyword()); assert!(TokenKind::Load.is_keyword()); assert!(TokenKind::EndKeyword.is_keyword()); assert!(TokenKind::True.is_keyword()); assert!(TokenKind::And.is_keyword()); assert!(!TokenKind::Identifier.is_keyword()); assert!(!TokenKind::Number.is_keyword()); assert!(!TokenKind::EqualEqual.is_keyword()); }
-    #[test] fn classifies_compound_stage_keywords() { assert!(TokenKind::Lookup.is_compound_stage_keyword()); assert!(TokenKind::Join.is_compound_stage_keyword()); assert!(TokenKind::Union.is_compound_stage_keyword()); assert!(TokenKind::Load.is_compound_stage_keyword()); assert!(!TokenKind::Where.is_compound_stage_keyword()); assert!(!TokenKind::EndKeyword.is_compound_stage_keyword()); assert!(!TokenKind::End.is_compound_stage_keyword()); }
-    #[test] fn classifies_load_mode_keywords() { assert!(TokenKind::Replace.is_load_mode_keyword()); assert!(TokenKind::Update.is_load_mode_keyword()); assert!(TokenKind::Merge.is_load_mode_keyword()); assert!(!TokenKind::Load.is_load_mode_keyword()); assert!(!TokenKind::With.is_load_mode_keyword()); }
     #[test] fn distinguishes_end_keyword_from_end_of_input() { assert!(TokenKind::EndKeyword.is_end_keyword()); assert!(!TokenKind::End.is_end_keyword()); assert_eq!(TokenKind::EndKeyword.display_name(), "`end`"); assert_eq!(TokenKind::End.display_name(), "end of input"); }
     #[test] fn classifies_literals() { assert!(TokenKind::String.is_literal()); assert!(TokenKind::Number.is_literal()); assert!(TokenKind::True.is_literal()); assert!(TokenKind::False.is_literal()); assert!(TokenKind::Null.is_literal()); assert!(!TokenKind::Identifier.is_literal()); assert!(!TokenKind::From.is_literal()); }
-    #[test] fn classifies_value_starters() { assert!(TokenKind::Identifier.can_start_value()); assert!(TokenKind::String.can_start_value()); assert!(TokenKind::Number.can_start_value()); assert!(TokenKind::Null.can_start_value()); assert!(TokenKind::LeftParen.can_start_value()); assert!(TokenKind::LeftBrace.can_start_value()); assert!(TokenKind::LeftBracket.can_start_value()); assert!(!TokenKind::Pipe.can_start_value()); assert!(!TokenKind::RightParen.can_start_value()); assert!(!TokenKind::End.can_start_value()); }
-    #[test] fn classifies_comparison_operators() { assert!(TokenKind::EqualEqual.is_comparison_operator()); assert!(TokenKind::NotEqual.is_comparison_operator()); assert!(TokenKind::Less.is_comparison_operator()); assert!(TokenKind::LessEqual.is_comparison_operator()); assert!(TokenKind::Greater.is_comparison_operator()); assert!(TokenKind::GreaterEqual.is_comparison_operator()); assert!(!TokenKind::Equal.is_comparison_operator()); assert!(!TokenKind::And.is_comparison_operator()); }
-    #[test] fn classifies_logical_operators() { assert!(TokenKind::And.is_logical_operator()); assert!(TokenKind::Or.is_logical_operator()); assert!(TokenKind::Not.is_logical_operator()); assert!(!TokenKind::EqualEqual.is_logical_operator()); assert!(!TokenKind::Identifier.is_logical_operator()); }
-    #[test] fn classifies_punctuation() { assert!(TokenKind::Pipe.is_punctuation()); assert!(TokenKind::Dot.is_punctuation()); assert!(TokenKind::Colon.is_punctuation()); assert!(TokenKind::Comma.is_punctuation()); assert!(TokenKind::LeftParen.is_punctuation()); assert!(TokenKind::RightParen.is_punctuation()); assert!(TokenKind::LeftBrace.is_punctuation()); assert!(TokenKind::RightBrace.is_punctuation()); assert!(TokenKind::LeftBracket.is_punctuation()); assert!(TokenKind::RightBracket.is_punctuation()); assert!(!TokenKind::Equal.is_punctuation()); assert!(!TokenKind::Identifier.is_punctuation()); }
     #[test] fn exposes_display_names() { assert_eq!(TokenKind::Identifier.display_name(), "identifier"); assert_eq!(TokenKind::String.display_name(), "string"); assert_eq!(TokenKind::From.display_name(), "`from`"); assert_eq!(TokenKind::Lookup.display_name(), "`lookup`"); assert_eq!(TokenKind::Join.display_name(), "`join`"); assert_eq!(TokenKind::Union.display_name(), "`union`"); assert_eq!(TokenKind::Load.display_name(), "`load`"); assert_eq!(TokenKind::EndKeyword.display_name(), "`end`"); assert_eq!(TokenKind::Pipe.display_name(), "`|`"); assert_eq!(TokenKind::Colon.display_name(), "`:`"); assert_eq!(TokenKind::LeftBrace.display_name(), "`{`"); assert_eq!(TokenKind::RightBrace.display_name(), "`}`"); assert_eq!(TokenKind::LeftBracket.display_name(), "`[`"); assert_eq!(TokenKind::RightBracket.display_name(), "`]`"); assert_eq!(TokenKind::EqualEqual.display_name(), "`==`"); assert_eq!(TokenKind::End.display_name(), "end of input"); }
     #[test] fn structured_value_delimiters_are_not_literals() { assert!(!TokenKind::LeftBrace.is_literal()); assert!(!TokenKind::RightBrace.is_literal()); assert!(!TokenKind::LeftBracket.is_literal()); assert!(!TokenKind::RightBracket.is_literal()); assert!(!TokenKind::Colon.is_literal()); }
-    #[test] fn structured_value_openers_can_start_values() { assert!(TokenKind::LeftBrace.can_start_value()); assert!(TokenKind::LeftBracket.can_start_value()); assert!(!TokenKind::RightBrace.can_start_value()); assert!(!TokenKind::RightBracket.can_start_value()); assert!(!TokenKind::Colon.can_start_value()); }
     #[test] fn displays_token_kind() { assert_eq!(TokenKind::Identifier.to_string(), "identifier"); assert_eq!(TokenKind::Where.to_string(), "`where`"); assert_eq!(TokenKind::GreaterEqual.to_string(), "`>=`"); }
     #[test] fn creates_token() { let token = Token::new(TokenKind::Identifier, Span::new(5, 10)); assert_eq!(token.kind(), TokenKind::Identifier); assert_eq!(token.span(), Span::new(5, 10)); assert!(token.is(TokenKind::Identifier)); assert!(!token.is(TokenKind::String)); assert!(!token.is_end()); }
     #[test] fn creates_end_token() { let token = Token::end(10); assert_eq!(token.kind(), TokenKind::End); assert_eq!(token.span(), Span::at(10)); assert!(token.is_end()); assert!(!token.is_end_keyword()); }

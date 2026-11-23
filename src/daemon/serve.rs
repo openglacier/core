@@ -114,8 +114,14 @@ pub(super) fn ensure_permission(settings: &ConnectionSettings, engine: &Engine, 
     ensure_authorized(settings, engine, principal, id, action, resource)
 }
 
+/// Whether this connection holds `action` on `resource`, without refusing: the admin operations a pool admin may
+/// also run check it first (`policy_ops::Scope`).
+pub(super) fn permission_granted(settings: &ConnectionSettings, engine: &Engine, principal: &Principal, action: AuthorizationAction, resource: &str) -> bool {
+    !settings.authorization_mode.is_enforced() || authorize_connection(engine, principal, action, resource)
+}
+
 fn ensure_authorized(settings: &ConnectionSettings, engine: &Engine, principal: &Principal, id: RequestId, action: AuthorizationAction, resource: &str) -> Handled {
-    if !settings.authorization_mode.is_enforced() || authorize_connection(engine, principal, action, resource) {
+    if permission_granted(settings, engine, principal, action, resource) {
         return Ok(());
     }
     Err(authorization_denied(id, principal, action, resource).into())

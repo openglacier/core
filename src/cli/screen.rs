@@ -1,16 +1,23 @@
 //! What the terminal workspace (`tui.rs`) draws with: a frame is drawn into a `Buffer` of cells (text, bordered
 //! blocks, paragraphs wrapped or scrolled sideways), then `Screen` writes to the terminal the cells that differ from
-//! the frame before, with crossterm.
+//! the frame before, in ANSI sequences (`term.rs`).
 #![cfg_attr(rustfmt, rustfmt_skip)]
 
 use std::io::{self, Write};
 
-use crossterm::{
-    cursor::{Hide, MoveTo, Show},
-    queue,
-    style::{Attribute, Print, SetAttribute},
-    terminal::{Clear, ClearType},
-};
+use super::term::{char_width, text_width};
+
+const HIDE: &str = "\x1b[?25l";
+const SHOW: &str = "\x1b[?25h";
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const REVERSE: &str = "\x1b[7m";
+const CLEAR: &str = "\x1b[2J";
+/// The alternate screen with bracketed paste, and back.
+pub(super) const WORKSPACE_ON: &str = "\x1b[?1049h\x1b[?2004h";
+pub(super) const WORKSPACE_OFF: &str = "\x1b[?2004l\x1b[?1049l\x1b[?25h";
+
+fn move_to(x: u16, y: u16) -> String { format!("\x1b[{};{}H", y + 1, x + 1) }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Rect { pub x: u16, pub y: u16, pub width: u16, pub height: u16 }
@@ -64,20 +71,6 @@ impl Cell {
     const TAIL: Self = Self { symbol: '\0', style: Style::PLAIN };
 }
 
-/// The columns a character takes: 0 for marks and controls, 2 for East Asian wide ones and emoji, else 1.
-pub(super) fn char_width(character: char) -> usize {
-    match u32::from(character) {
-        0..=0x1F | 0x7F..=0x9F | 0x200B..=0x200F | 0xFE00..=0xFE0F => 0,
-        0x0300..=0x036F | 0x0483..=0x0489 | 0x0591..=0x05BD | 0x0610..=0x061A | 0x064B..=0x065F | 0x0E31 | 0x0E34..=0x0E3A
-            | 0x1AB0..=0x1AFF | 0x1DC0..=0x1DFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F => 0,
-        0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA000..=0xA4CF | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x1F300..=0x1F64F | 0x1F900..=0x1F9FF
-            | 0x20000..=0x2FFFD | 0x30000..=0x3FFFD => 2,
-        _ => 1,
-    }
-}
-
-pub(super) fn text_width(text: &str) -> usize { text.chars().map(char_width).sum() }
 
 /// `line` in rows of `width` columns, broken after a space where it can.
 fn wrap(line: &str, width: usize) -> Vec<String> {
@@ -187,20 +180,20 @@ impl Buffer {
 }
 
 /// The terminal and the frame it shows.
-pub(super) struct Screen { out: io::Stdout, shown: Option<Buffer> }
+pub(super) struct Screen { out: io::BufWriter<io::Stdout>, shown: Option<Buffer> }
 
 impl Screen {
-    pub fn new(out: io::Stdout) -> Self { Self { out, shown: None } }
+    pub fn new(out: io::Stdout) -> Self { Self { out: io::BufWriter::new(out), shown: None } }
 
-    pub fn out(&mut self) -> &mut io::Stdout { &mut self.out }
+    pub fn out(&mut self) -> &mut impl Write { &mut self.out }
 
     /// Writes the cells of `frame` that differ from the frame shown (all of them after a resize).
     pub fn draw(&mut self, frame: Buffer) -> io::Result<()> {
         let shown = self.shown.take().filter(|shown| shown.width == frame.width && shown.height == frame.height);
-        if shown.is_none() { queue!(self.out, SetAttribute(Attribute::Reset), Clear(ClearType::All))?; }
+        if shown.is_none() { write!(self.out, "{RESET}{CLEAR}")?; }
         let mut style = Style::PLAIN;
         let mut at: Option<(u16, u16)> = None;
-        queue!(self.out, Hide, SetAttribute(Attribute::Reset))?;
+        write!(self.out, "{HIDE}{RESET}")?;
         for y in 0..frame.height {
             for x in 0..frame.width {
                 let index = usize::from(y) * usize::from(frame.width) + usize::from(x);
@@ -209,19 +202,17 @@ impl Screen {
                 if cell == Cell::TAIL || shown.as_ref().is_some_and(|shown| shown.cells[index] == cell) {
                     continue;
                 }
-                if at != Some((x, y)) { queue!(self.out, MoveTo(x, y))?; }
+                if at != Some((x, y)) { write!(self.out, "{}", move_to(x, y))?; }
                 if cell.style != style {
-                    queue!(self.out, SetAttribute(Attribute::Reset))?;
-                    if cell.style.bold { queue!(self.out, SetAttribute(Attribute::Bold))?; }
-                    if cell.style.reversed { queue!(self.out, SetAttribute(Attribute::Reverse))?; }
+                    write!(self.out, "{RESET}{}{}", if cell.style.bold { BOLD } else { "" }, if cell.style.reversed { REVERSE } else { "" })?;
                     style = cell.style;
                 }
-                queue!(self.out, Print(cell.symbol))?;
+                write!(self.out, "{}", cell.symbol)?;
                 at = Some((x + char_width(cell.symbol).max(1) as u16, y));
             }
         }
-        queue!(self.out, SetAttribute(Attribute::Reset))?;
-        if let Some((x, y)) = frame.cursor { queue!(self.out, MoveTo(x, y), Show)?; }
+        write!(self.out, "{RESET}")?;
+        if let Some((x, y)) = frame.cursor { write!(self.out, "{}{SHOW}", move_to(x, y))?; }
         self.out.flush()?;
         self.shown = Some(frame);
         Ok(())

@@ -10,15 +10,10 @@ use std::{
     time::Duration,
 };
 
-use crossterm::{
-    cursor::Show,
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
-    execute,
-    terminal::{self, disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-};
 use serde_json::{json, Value};
 
-use super::{complete::{common_prefix, Completer}, execute_background_line, local_command, screen::{text_width, Buffer, Rect, Screen, Style}, Client, Config, Local, Output, Result, NAME};
+use super::{complete::Completer, execute_background_line, local_command, screen::{Buffer, Rect, Screen, Style, WORKSPACE_OFF, WORKSPACE_ON}, term::{self, text_width, Event, Key, Keys, Line, Raw}, Client, Config, Local, Output, Result, NAME};
+use std::io::Write;
 
 const EVENT_POLL: Duration = Duration::from_millis(50);
 const MAX_BUFFER_LINES: usize = 2_000;
@@ -44,7 +39,7 @@ pub(super) fn run(mut config: Config) -> Result<ExitCode> {
             app.apply_job_event(job_event);
         }
 
-        let (width, height) = terminal::size()?;
+        let (width, height) = term::size()?;
         let mut frame = Buffer::new(width, height);
         app.draw(&mut frame);
         terminal.screen.draw(frame)?;
@@ -52,39 +47,36 @@ pub(super) fn run(mut config: Config) -> Result<ExitCode> {
             break;
         }
 
-        if event::poll(EVENT_POLL)? {
-            match event::read()? {
-                Event::Key(key) => app.handle_key(key),
-                Event::Paste(text) => app.insert_str(&text),
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
+        match terminal.keys.next(EVENT_POLL)? {
+            Some(Event::Key(key)) => app.handle_key(key),
+            Some(Event::Paste(text)) => app.line.insert(&text),
+            None => {}
         }
     }
 
     Ok(if app.failed { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
+/// The alternate screen in raw mode while it lives (the mode is restored after the screen, field order).
 struct TerminalSession {
     screen: Screen,
+    keys: Keys,
+    _raw: Raw,
 }
 
 impl TerminalSession {
     fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
-            let _ = disable_raw_mode();
-            return Err(error.into());
-        }
-        Ok(Self { screen: Screen::new(stdout) })
+        let raw = Raw::enter()?;
+        let mut screen = Screen::new(io::stdout());
+        write!(screen.out(), "{}", WORKSPACE_ON)?;
+        Ok(Self { screen, keys: Keys::default(), _raw: raw })
     }
 }
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.screen.out(), DisableBracketedPaste, LeaveAlternateScreen, Show);
+        let _ = write!(self.screen.out(), "{}", WORKSPACE_OFF);
+        let _ = self.screen.out().flush();
     }
 }
 
@@ -258,11 +250,7 @@ struct App {
     jobs: Vec<Job>,
     focused: Option<usize>,
     next_job_id: u64,
-    input: String,
-    cursor: usize,
-    /// Submitted lines, oldest first, and the one ↑/↓ show while browsing.
-    history: Vec<String>,
-    history_at: Option<usize>,
+    line: Line,
     view: ViewMode,
     notice: String,
     exit: bool,
@@ -278,10 +266,7 @@ impl App {
             jobs: Vec::new(),
             focused: None,
             next_job_id: 1,
-            input: String::new(),
-            cursor: 0,
-            history: Vec::new(),
-            history_at: None,
+            line: Line::default(),
             view: ViewMode::Tiles,
             notice: "Enter: run · Alt-Enter: run in focused job · Ctrl-O: edit · Ctrl-R: rerun · ↑/↓: history · Tab: complete/focus · Ctrl-W: close · :help".into(),
             exit: false,
@@ -309,96 +294,35 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('c') => {
-                    self.exit = true;
-                    return;
-                }
-                KeyCode::Char('t') => {
-                    self.view = self.view.toggled();
-                    self.notice = format!("layout: {}", self.view.label());
-                    return;
-                }
-                KeyCode::Char('w') => {
-                    self.close_focused();
-                    return;
-                }
-                KeyCode::Char('x') => {
-                    self.cancel_focused();
-                    return;
-                }
-                KeyCode::Char('o') => {
-                    self.edit_focused();
-                    return;
-                }
-                KeyCode::Char('r') => {
-                    self.rerun_focused();
-                    return;
-                }
-                KeyCode::Char('a') => {
-                    self.cursor = 0;
-                    return;
-                }
-                KeyCode::Char('e') => {
-                    self.cursor = self.input.len();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        if key.modifiers.contains(KeyModifiers::ALT) {
-            if let KeyCode::Char(character @ '1'..='9') = key.code {
-                let index = (character as usize) - ('1' as usize);
-                if index < self.jobs.len() {
-                    self.focused = Some(index);
-                }
-                return;
-            }
-        }
-
-        match key.code {
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.submit_input(true),
-            KeyCode::Enter => self.submit_input(false),
-            KeyCode::Tab if !self.input.trim().is_empty() => self.complete(),
-            KeyCode::Tab => self.focus_next(),
-            KeyCode::BackTab => self.focus_previous(),
-            KeyCode::PageUp => self.scroll_focused_up(10),
-            KeyCode::PageDown => self.scroll_focused_down(10),
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_focused_up(1),
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.scroll_focused_down(1),
-            KeyCode::Up => self.history_back(),
-            KeyCode::Down => self.history_forward(),
-            KeyCode::Left if self.input.is_empty() => self.scroll_focused_sideways(-8),
-            KeyCode::Right if self.input.is_empty() => self.scroll_focused_sideways(8),
-            KeyCode::Left => self.move_cursor_left(),
-            KeyCode::Right => self.move_cursor_right(),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
-            KeyCode::Esc => {
-                self.input.clear();
-                self.cursor = 0;
-            }
-            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => self.insert(character),
-            _ => {}
+    fn handle_key(&mut self, key: Key) {
+        match key {
+            Key::Ctrl('c') => self.exit = true,
+            Key::Ctrl('t') => { self.view = self.view.toggled(); self.notice = format!("layout: {}", self.view.label()); }
+            Key::Ctrl('w') => self.close_focused(),
+            Key::Ctrl('x') => self.cancel_focused(),
+            Key::Ctrl('o') => self.edit_focused(),
+            Key::Ctrl('r') => self.rerun_focused(),
+            Key::Alt(character @ '1'..='9') => { let index = (character as usize) - ('1' as usize); if index < self.jobs.len() { self.focused = Some(index); } }
+            Key::AltEnter => self.submit_input(true),
+            Key::Enter => self.submit_input(false),
+            Key::Tab if !self.line.text.trim().is_empty() => self.complete(),
+            Key::Tab => self.focus_next(),
+            Key::BackTab => self.focus_previous(),
+            Key::PageUp => self.scroll_focused_up(10),
+            Key::PageDown => self.scroll_focused_down(10),
+            Key::ShiftUp => self.scroll_focused_up(1),
+            Key::ShiftDown => self.scroll_focused_down(1),
+            Key::Left if self.line.text.is_empty() => self.scroll_focused_sideways(-8),
+            Key::Right if self.line.text.is_empty() => self.scroll_focused_sideways(8),
+            key => { self.line.edit(key); }
         }
     }
 
     /// Runs the input line; `in_place` reuses the focused job's view.
     fn submit_input(&mut self, in_place: bool) {
-        let line = self.input.trim().to_owned();
-        self.input.clear();
-        self.cursor = 0;
-        self.history_at = None;
+        let line = self.line.submit();
         if line.is_empty() {
             return;
-        }
-        if self.history.last() != Some(&line) {
-            self.history.push(line.clone());
         }
         if line.starts_with(':') {
             return self.handle_tui_command(&line);
@@ -425,16 +349,7 @@ impl App {
     /// Completes the word before the cursor: the single candidate, or the
     /// prefix every candidate shares, with the candidates in the notice line.
     fn complete(&mut self) {
-        let (start, candidates) = self.completer.complete(&self.input, self.cursor);
-        let replacement = match &candidates[..] {
-            [] => { self.notice = "no completion".into(); return }
-            [only] => { self.notice.clear(); only.clone() }
-            many => { self.notice = truncate(&many.join("  "), 400); common_prefix(many).to_owned() }
-        };
-        if replacement.len() > self.cursor - start || candidates.len() == 1 {
-            self.input.replace_range(start..self.cursor, &replacement);
-            self.cursor = start + replacement.len();
-        }
+        self.notice = match &self.line.complete(&self.completer)[..] { [] => "no completion".into(), [_] => String::new(), many => truncate(&many.join("  "), 400) };
     }
 
     fn handle_tui_command(&mut self, line: &str) {
@@ -513,9 +428,7 @@ impl App {
     fn edit_focused(&mut self) {
         match self.focused.and_then(|index| self.jobs.get(index)) {
             Some(job) => {
-                self.input = job.command.clone();
-                self.cursor = self.input.len();
-                self.history_at = None;
+                self.line.set(job.command.clone());
                 self.notice = "Enter: new job · Alt-Enter: run in this job".into();
             }
             None => self.notice = "no focused job".into(),
@@ -530,30 +443,6 @@ impl App {
             }
             None => self.notice = "no focused job".into(),
         }
-    }
-
-    /// ↑: an older line, from an empty input or while browsing. Browsing
-    /// stops once the shown line is edited.
-    fn history_back(&mut self) {
-        let browsing = self.history_at.filter(|at| self.history.get(*at) == Some(&self.input));
-        let at = match browsing {
-            Some(at) => at.saturating_sub(1),
-            None if self.input.is_empty() && !self.history.is_empty() => self.history.len() - 1,
-            None => return,
-        };
-        self.show_history(Some(at));
-    }
-
-    /// ↓: a newer line, then back to an empty input.
-    fn history_forward(&mut self) {
-        let Some(at) = self.history_at.filter(|at| self.history.get(*at) == Some(&self.input)) else { return };
-        self.show_history((at + 1 < self.history.len()).then_some(at + 1));
-    }
-
-    fn show_history(&mut self, at: Option<usize>) {
-        self.history_at = at;
-        self.input = at.map_or_else(String::new, |at| self.history[at].clone());
-        self.cursor = self.input.len();
     }
 
     fn cancel_focused(&mut self) {
@@ -634,63 +523,6 @@ impl App {
         }
     }
 
-    fn insert(&mut self, character: char) {
-        self.input.insert(self.cursor, character);
-        self.cursor += character.len_utf8();
-    }
-
-    fn insert_str(&mut self, value: &str) {
-        self.input.insert_str(self.cursor, value);
-        self.cursor += value.len();
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let previous = self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-        self.input.drain(previous..self.cursor);
-        self.cursor = previous;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        let next = self.input[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| self.cursor + index)
-            .unwrap_or(self.input.len());
-        self.input.drain(self.cursor..next);
-    }
-
-    fn move_cursor_left(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        self.cursor = self.input[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map(|(index, _)| index)
-            .unwrap_or(0);
-    }
-
-    fn move_cursor_right(&mut self) {
-        if self.cursor >= self.input.len() {
-            return;
-        }
-        self.cursor = self.input[self.cursor..]
-            .char_indices()
-            .nth(1)
-            .map(|(index, _)| self.cursor + index)
-            .unwrap_or(self.input.len());
-    }
-
     fn draw(&self, frame: &mut Buffer) {
         let (tops, jobs, bottoms) = frame.area().rows(&[1], &[1, 3]);
         self.draw_tabs(frame, tops[0]);
@@ -737,11 +569,11 @@ impl App {
     }
 
     fn draw_input(&self, frame: &mut Buffer, area: Rect) {
-        let cursor_columns = text_width(&self.input[..self.cursor]);
+        let cursor_columns = text_width(&self.line.text[..self.line.cursor]);
         let content_width = usize::from(area.width.saturating_sub(2));
         let horizontal_scroll = cursor_columns.saturating_sub(content_width.saturating_sub(1));
         frame.block(area, "", Style::PLAIN);
-        frame.paragraph(area.inner(), [self.input.as_str()], false, Some(0), horizontal_scroll);
+        frame.paragraph(area.inner(), [self.line.text.as_str()], false, Some(0), horizontal_scroll);
         let visible_cursor = cursor_columns.saturating_sub(horizontal_scroll).min(u16::MAX as usize) as u16;
         let max_x = area.x.saturating_add(area.width.saturating_sub(2));
         let cursor_x = area.x.saturating_add(1).saturating_add(visible_cursor).min(max_x);
@@ -798,6 +630,6 @@ mod tests {
     use super::*;
 
     #[test] fn run_metadata_is_extracted() { assert_eq!( parse_run_metadata(r#"{"runId":7,"state":"queued","type":"run"}"#), Some((7, Some("queued".to_owned()))) ); assert_eq!(parse_run_metadata(r#"{"text":"x"}"#), None); }
-    #[test] fn edits_reruns_in_place_and_browses_history() { let (mut config, _) = super::super::Args::parse(Vec::<String>::new()).unwrap(); (config.address, config.identity) = ("127.0.0.1:1".into(), None); let mut app = App::new(config, mpsc::channel().0); for line in ["on a", "on b"] { app.insert_str(line); app.submit_input(false); } assert_eq!(app.jobs.len(), 2); app.edit_focused(); assert_eq!(app.input, "on b"); app.insert_str(" | limit 1"); app.submit_input(true); assert_eq!((app.jobs.len(), app.jobs[1].command.as_str(), app.jobs[1].id), (2, "on b | limit 1", 3)); app.rerun_focused(); assert_eq!((app.jobs.len(), app.jobs[1].id), (2, 4)); app.history_back(); assert_eq!(app.input, "on b | limit 1"); app.history_back(); app.history_back(); app.history_back(); assert_eq!(app.input, "on a"); app.history_forward(); assert_eq!(app.input, "on b"); app.insert('x'); app.history_forward(); assert_eq!(app.input, "on bx"); }
+    #[test] fn edits_reruns_in_place_and_browses_history() { let (mut config, _) = super::super::Args::parse(Vec::<String>::new()).unwrap(); (config.address, config.identity) = ("127.0.0.1:1".into(), None); let mut app = App::new(config, mpsc::channel().0); for line in ["on a", "on b"] { app.line.insert(line); app.submit_input(false); } assert_eq!(app.jobs.len(), 2); app.edit_focused(); assert_eq!(app.line.text, "on b"); app.line.insert(" | limit 1"); app.submit_input(true); assert_eq!((app.jobs.len(), app.jobs[1].command.as_str(), app.jobs[1].id), (2, "on b | limit 1", 3)); app.rerun_focused(); assert_eq!((app.jobs.len(), app.jobs[1].id), (2, 4)); app.line.back(); assert_eq!(app.line.text, "on b | limit 1"); app.line.back(); app.line.back(); app.line.back(); assert_eq!(app.line.text, "on a"); app.line.forward(); assert_eq!(app.line.text, "on b"); app.line.insert("x"); app.line.forward(); assert_eq!(app.line.text, "on bx"); }
     #[test] fn tiles_follow_groups_of_four() { assert_eq!(visible_job_indexes(7, 0, ViewMode::Tiles), vec![0, 1, 2, 3]); assert_eq!(visible_job_indexes(7, 5, ViewMode::Tiles), vec![4, 5, 6]); assert_eq!(visible_job_indexes(7, 5, ViewMode::Tabs), vec![5]); }
 }

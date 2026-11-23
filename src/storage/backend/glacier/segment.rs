@@ -277,26 +277,62 @@ impl SegmentWriter {
     }
 }
 
+/// Segment bytes: mapped read-only on 64-bit Unix (segments are immutable once flushed), read otherwise.
 #[derive(Debug)]
 enum Bytes {
     #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
-    Mapped(mmap_guard::FileData),
-    #[cfg_attr(all(target_pointer_width = "64", target_family = "unix"), allow(dead_code))]
+    Mapped(*const u8, usize),
     Owned(Vec<u8>),
 }
 
+// SAFETY: the mapping is private, read-only and only unmapped on drop.
+#[allow(unsafe_code)]
+unsafe impl Send for Bytes {}
+#[allow(unsafe_code)]
+unsafe impl Sync for Bytes {}
+
+#[allow(unsafe_code)]
+impl Bytes {
+    fn load(path: &Path) -> std::io::Result<Self> {
+        #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
+        {
+            let file = std::fs::File::open(path)?;
+            let len = usize::try_from(file.metadata()?.len()).map_err(std::io::Error::other)?;
+            if len > 0 {
+                use rustix::mm::{mmap, MapFlags, ProtFlags};
+                // SAFETY: fresh mapping of a file the engine wrote and never rewrites in place.
+                let ptr = unsafe { mmap(std::ptr::null_mut(), len, ProtFlags::READ, MapFlags::PRIVATE, &file, 0) }?;
+                return Ok(Self::Mapped(ptr.cast::<u8>().cast_const(), len));
+            }
+        }
+        std::fs::read(path).map(Self::Owned)
+    }
+}
+
+#[allow(unsafe_code)]
+impl Drop for Bytes {
+    fn drop(&mut self) {
+        #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
+        if let Self::Mapped(ptr, len) = *self {
+            // SAFETY: `ptr..ptr+len` is the mapping made in `load`, unmapped once.
+            let _ = unsafe { rustix::mm::munmap(ptr.cast_mut().cast(), len) };
+        }
+    }
+}
+
+#[allow(unsafe_code)]
 impl std::ops::Deref for Bytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
             #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
-            Self::Mapped(data) => data,
+            // SAFETY: the mapping lives as long as `self`.
+            Self::Mapped(ptr, len) => unsafe { std::slice::from_raw_parts(*ptr, *len) },
             Self::Owned(data) => data,
         }
     }
 }
 
-/// An open, immutable segment.
 #[derive(Debug)]
 pub(super) struct Segment {
     number: u64,
@@ -322,10 +358,7 @@ pub(super) struct Group<'a> {
 
 impl Segment {
     pub(super) fn open(path: &Path, number: u64) -> StorageResult<Arc<Self>> {
-        #[cfg(all(target_pointer_width = "64", target_family = "unix"))]
-        let bytes = Bytes::Mapped(mmap_guard::map_file(path).map_err(io_error("map segment", path))?);
-        #[cfg(not(all(target_pointer_width = "64", target_family = "unix")))]
-        let bytes = Bytes::Owned(std::fs::read(path).map_err(io_error("read segment", path))?);
+        let bytes = Bytes::load(path).map_err(io_error("map segment", path))?;
         if bytes.len() < MAGIC.len() + TRAILER_BYTES || bytes[..8] != MAGIC || bytes[bytes.len() - 8..] != TRAILER_MAGIC {
             return Err(corrupt("segment magic"));
         }

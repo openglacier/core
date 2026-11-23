@@ -2,7 +2,8 @@
 //! What a mapping makes of a cell (`_convert` of the Python worker): text, number, date, date and time, month, boolean.
 //! Dates read as pandas did, with two corrections: a date starting with its year is always year-month-day, and a number
 //! in a date column is an Excel serial date (pandas read it as nanoseconds since 1970).
-use super::scalar::{casefold, py_strip, regex, Cell, Stamp};
+use super::pattern::{pattern, Pattern};
+use super::scalar::{casefold, py_strip, Cell, Stamp};
 use serde_json::Value as JsonValue;
 
 /// The order of a date written « a/b/c »: day first (the default), month first, or year first (ISO).
@@ -62,7 +63,7 @@ pub(crate) fn number(text: &str) -> Option<f64> {
     if commas == 1 && dots >= 1 && text.rfind(',') > text.rfind('.') { text = text.replace('.', ""); } else if commas >= 1 && dots == 1 && text.rfind('.') > text.rfind(',') { text = text.replace(',', ""); }
     let text = text.replace(',', ".");
     // Python's float() also takes « 1_000 », and gives infinities and NaN, which no JSON holds.
-    let text = if regex!("^[+-]?[0-9]+(_[0-9]+)+(\\.[0-9]+)?$").is_match(&text) { text.replace('_', "") } else { text };
+    let text = if pattern!("^[+-]?[0-9]+(_[0-9]+)+(\\.[0-9]+)?$").is_match(&text) { text.replace('_', "") } else { text };
     let value: f64 = text.parse().ok().filter(|value: &f64| value.is_finite())?;
     let value = if negative { -value } else { value };
     Some(if percent { value / 100.0 } else { value })
@@ -82,7 +83,7 @@ pub(crate) fn date(cell: &Cell, format: &Format) -> Option<Stamp> {
                     [text.split(' ').next(), text.split('T').next()].into_iter().flatten().find_map(|candidate| strptime(candidate, date_part))
                 }),
                 Format::Order(order) => loose(text, *order),
-                Format::Auto => loose(text, if regex!(r"^[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4}\b").is_match(text) { Order::DayFirst } else { Order::Iso }),
+                Format::Auto => loose(text, if pattern!(r"^[0-9]{1,2}[-/.][0-9]{1,2}[-/.][0-9]{2,4}\b").is_match(text) { Order::DayFirst } else { Order::Iso }),
             }
         }
         _ => None,
@@ -93,8 +94,8 @@ pub(crate) fn date(cell: &Cell, format: &Format) -> Option<Stamp> {
 pub(crate) fn month(cell: &Cell, format: &Format) -> Option<i64> {
     let text = cell.py_str()?; let text = py_strip(&text);
     let (year, month) = if let (Format::Pattern(_), _) | (_, Cell::Stamp(_)) = (format, cell) { let (year, month, _) = date(cell, format)?.ymd(); (year, month) }
-        else if let Some(found) = regex!("^([0-9]{1,2})[-/. ]([0-9]{4})$").captures(text) { (found[2].parse().ok()?, found[1].parse().ok()?) }
-        else if let Some(found) = regex!("^([0-9]{4})[-/. ]?([0-9]{2})$").captures(text) { (found[1].parse().ok()?, found[2].parse().ok()?) }
+        else if let Some(found) = pattern!("^([0-9]{1,2})[-/. ]([0-9]{4})$").captures(text) { (found[2].parse().ok()?, found[1].parse().ok()?) }
+        else if let Some(found) = pattern!("^([0-9]{4})[-/. ]?([0-9]{2})$").captures(text) { (found[1].parse().ok()?, found[2].parse().ok()?) }
         else { let (year, month, _) = date(cell, format)?.ymd(); (year, month) };
     (1..=12).contains(&month).then(|| crate::query::dates::days_from_civil(year, month, 1) * 86_400_000)
 }
@@ -127,7 +128,7 @@ fn full_year(year: i64, digits: usize) -> i64 {
 /// A time of day after a date: `HH:MM[:SS[.fraction]]`, with an offset (`Z`, `+02:00`).
 fn clock(text: &str) -> Option<(i64, Option<String>)> {
     if text.is_empty() { return Some((0, None)); }
-    let found = regex!(r"^[T ]?([0-9]{1,2})(?::?([0-9]{2})(?::?([0-9]{2})(?:[.,]([0-9]{1,9}))?)?)?\s*(Z|[+-][0-9]{2}:?[0-9]{2})?$").captures(text)?;
+    let found = pattern!(r"^[T ]?([0-9]{1,2})(?::?([0-9]{2})(?::?([0-9]{2})(?:[.,]([0-9]{1,9}))?)?)?\s*(Z|[+-][0-9]{2}:?[0-9]{2})?$").captures(text)?;
     let part = |index: usize| found.get(index).map_or(0, |part| part.as_str().parse::<i64>().unwrap_or(0));
     let (hour, minute, second) = (part(1), part(2), part(3));
     if hour > 23 || minute > 59 || second > 59 { return None; }
@@ -143,12 +144,12 @@ fn stamp(year: i64, month: u32, day: u32, time: &str) -> Option<Stamp> {
 /// A date written without a pattern, `order` saying which of day and month comes first in « a/b/c »; a day and a month
 /// that only fit the other way round are swapped, as pandas does.
 pub(crate) fn loose(text: &str, order: Order) -> Option<Stamp> {
-    if let Some(found) = regex!(r"^([0-9]{4})(?:-([0-9]{1,2})(?:-([0-9]{1,2}))?|([0-9]{2})([0-9]{2}))?((?:[T ][0-9].*)?)$").captures(text) {
+    if let Some(found) = pattern!(r"^([0-9]{4})(?:-([0-9]{1,2})(?:-([0-9]{1,2}))?|([0-9]{2})([0-9]{2}))?((?:[T ][0-9].*)?)$").captures(text) {
         let part = |index: usize, default: u32| found.get(index).map_or(Some(default), |part| part.as_str().parse().ok());
         let (month, day) = if found.get(4).is_some() { (part(4, 1)?, part(5, 1)?) } else { (part(2, 1)?, part(3, 1)?) };
         return stamp(found[1].parse().ok()?, month, day, found.get(6).map_or("", |time| time.as_str()));
     }
-    if let Some(found) = regex!(r"^([0-9]{1,4})([-/. ])([0-9]{1,2})([-/. ])([0-9]{1,4})((?:[T ][0-9].*)?)$").captures(text) {
+    if let Some(found) = pattern!(r"^([0-9]{1,4})([-/. ])([0-9]{1,2})([-/. ])([0-9]{1,4})((?:[T ][0-9].*)?)$").captures(text) {
         if found[2] != found[4] { return None; }
         let (first, second, third): (i64, u32, i64) = (found[1].parse().ok()?, found[3].parse().ok()?, found[5].parse().ok()?);
         let time = found.get(6).map_or("", |time| time.as_str());
@@ -157,7 +158,7 @@ pub(crate) fn loose(text: &str, order: Order) -> Option<Stamp> {
         let (day, month) = if order == Order::DayFirst { (first, second) } else { (second, first) };
         return stamp(year, month, day, time).or_else(|| stamp(year, day, month, time));
     }
-    if let Some(found) = regex!(r"^([0-9]{1,2})[-/]([0-9]{4})$").captures(text) { return stamp(found[2].parse().ok()?, found[1].parse().ok()?, 1, ""); }
+    if let Some(found) = pattern!(r"^([0-9]{1,2})[-/]([0-9]{4})$").captures(text) { return stamp(found[2].parse().ok()?, found[1].parse().ok()?, 1, ""); }
     // Month names: « 15 Jan 2025 », « Jan 15, 2025 », « January 2025 » (its first day).
     let words: Vec<&str> = text.split(|c: char| c.is_whitespace() || c == ',' || c == '-' || c == '/' || c == '.').filter(|word| !word.is_empty()).collect();
     let month = words.iter().find_map(|word| month_name(word))?;
@@ -169,7 +170,7 @@ pub(crate) fn loose(text: &str, order: Order) -> Option<Stamp> {
 
 /// `datetime.strptime` for the codes a format uses: %Y %y %m %d %H %M %S %f %b %B and %%; blanks match any blanks.
 pub(crate) fn strptime(text: &str, pattern: &str) -> Option<Stamp> {
-    thread_local! { static CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<regex::Regex>>> = Default::default(); }
+    thread_local! { static CACHE: std::cell::RefCell<std::collections::HashMap<String, Option<std::rc::Rc<Pattern>>>> = Default::default(); }
     let compiled = CACHE.with(|cache| cache.borrow_mut().entry(pattern.to_owned()).or_insert_with(|| {
         let (mut out, mut chars) = (String::from("(?i)^"), pattern.chars().peekable());
         while let Some(c) = chars.next() {
@@ -179,11 +180,11 @@ pub(crate) fn strptime(text: &str, pattern: &str) -> Option<Stamp> {
                     'H' => "(?P<H>2[0-3]|[01][0-9]|[0-9])", 'M' => "(?P<M>[0-5][0-9]|[0-9])", 'S' => "(?P<S>6[01]|[0-5][0-9]|[0-9])", 'f' => "(?P<f>[0-9]{1,6})",
                     'b' | 'B' | 'h' => "(?P<b>[a-z]+)", '%' => "%", _ => return None,
                 };
-            } else if c.is_whitespace() { out += r"\s+"; } else { out += &regex::escape(&c.to_string()); }
+            } else if c.is_whitespace() { out += r"\s+"; } else { if !c.is_alphanumeric() { out.push('\\'); } out.push(c); }
         }
-        regex::Regex::new(&(out + "$")).ok()
-    }).clone());
-    let found = compiled?.captures(text)?;
+        Pattern::new(&(out + "$")).ok().map(std::rc::Rc::new)
+    }).clone())?;
+    let found = compiled.captures(text)?;
     let part = |name: &str| found.name(name).map(|part| part.as_str().trim().parse::<i64>().ok());
     let year = match (part("Y"), part("y")) { (Some(year), _) => year?, (None, Some(year)) => { let year = year?; if year < 69 { 2000 + year } else { 1900 + year } } _ => 1900 };
     let month = match found.name("b") { Some(name) => month_name(name.as_str())?, None => part("m").unwrap_or(Some(1))? as u32 };

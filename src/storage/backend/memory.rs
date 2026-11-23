@@ -125,11 +125,6 @@ impl MemoryBackend {
         Ok(self.read_state()?.generation)
     }
 
-    /// Returns the number of committed collections.
-    pub fn collection_count(&self) -> StorageResult<usize> {
-        Ok(self.read_state()?.collections.len())
-    }
-
     /// Returns the number of committed documents across all collections.
     pub fn document_count(&self) -> StorageResult<usize> {
         let state = self.read_state()?;
@@ -255,7 +250,6 @@ impl MemorySnapshot {
             changed: state.changed.clone(),
         }
     }
-
 }
 
 /// History of a [`MemoryBackend`] at one snapshot generation.
@@ -648,6 +642,7 @@ fn list_collections(collections: &Collections) -> Vec<CollectionId> {
 
 #[cfg(test)]
 mod tests {
+    impl super::MemoryBackend { pub(crate) fn collection_count(&self) -> StorageResult<usize> { Ok(self.read_state()?.collections.len()) } }
     use super::super::super::StorageErrorKind;
     use super::*;
 

@@ -112,12 +112,6 @@ impl PlaceAccess {
         }
     }
 
-    /// Every grant allows reading Place-scoped data.
-    #[must_use]
-    pub const fn can_read(self) -> bool {
-        true
-    }
-
     /// Whether the write action is granted.
     #[must_use]
     pub const fn can_write(self) -> bool {
@@ -262,6 +256,6 @@ mod tests {
 
     #[test] fn place_role_rights_are_monotonic() { assert!(PlaceRole::Owner.can_manage()); assert!(PlaceRole::Owner.can_write()); assert!(!PlaceRole::Resident.can_manage()); assert!(PlaceRole::Resident.can_write()); assert!(!PlaceRole::Member.can_manage()); assert!(!PlaceRole::Member.can_write()); }
     #[test] fn public_access_maps_to_place_capabilities() { assert!(!PublicAccess::Readonly.can_write()); assert!(PublicAccess::Readwrite.can_write()); }
-    #[test] fn place_access_keeps_role_and_public_policy_distinct() { let public_rw = PlaceAccess::Public(PublicAccess::Readwrite); assert!(public_rw.can_read()); assert!(public_rw.can_write()); assert!(!public_rw.can_manage()); assert_eq!(public_rw.role(), None); assert_eq!(public_rw.public_access(), Some(PublicAccess::Readwrite)); let public_ro = PlaceAccess::Public(PublicAccess::Readonly); assert!(public_ro.can_read()); assert!(!public_ro.can_write()); let member = PlaceAccess::Role(PlaceRole::Member); assert!(!member.can_write()); assert_eq!(member.public_access(), None); assert!(PlaceAccess::Role(PlaceRole::Owner).can_manage()); assert_eq!(public_ro.as_str(), "public:readonly"); }
+    #[test] fn place_access_keeps_role_and_public_policy_distinct() { let public_rw = PlaceAccess::Public(PublicAccess::Readwrite); assert!(public_rw.can_write()); assert!(!public_rw.can_manage()); assert_eq!(public_rw.role(), None); assert_eq!(public_rw.public_access(), Some(PublicAccess::Readwrite)); let public_ro = PlaceAccess::Public(PublicAccess::Readonly); assert!(!public_ro.can_write()); let member = PlaceAccess::Role(PlaceRole::Member); assert!(!member.can_write()); assert_eq!(member.public_access(), None); assert!(PlaceAccess::Role(PlaceRole::Owner).can_manage()); assert_eq!(public_ro.as_str(), "public:readonly"); }
     #[test] fn sharing_tokens_round_trip() { let token = sharing_permission("workshop", PlaceRole::Resident); assert_eq!(token, "place:workshop:resident"); assert_eq!( parse_sharing_permission(&token), Some(("workshop", PlaceRole::Resident)) ); let owner_token = sharing_permission("workshop", PlaceRole::Owner); assert_eq!(owner_token, "place:workshop:owner"); assert_eq!( parse_sharing_permission(&owner_token), Some(("workshop", PlaceRole::Owner)) ); assert!(parse_sharing_permission("files.read").is_none()); }
 }

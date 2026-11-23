@@ -139,7 +139,7 @@ mod runtime_materializer;
 mod window;
 pub use window::{FillSpec, WindowSpec};
 
-pub(crate) use runtime_materializer::{compact_group_item, describe_group_fields, group_field_layout, path_value, split_derive_assignments};
+pub(crate) use runtime_materializer::{compact_group_item, describe_group_fields, group_field_layout, group_row_id, path_value, split_derive_assignments};
 pub(crate) use planner::{group_key_marker, group_measure_marker};
 pub use runtime_materializer::{
     CompiledStage, DenseGroups, QueryRuntime, RuntimeMaterializer, SlotExpansion,

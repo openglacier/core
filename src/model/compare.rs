@@ -13,7 +13,6 @@ pub enum Comparison {
 }
 
 impl Comparison {
-
     #[must_use]
     pub const fn from_ordering(ordering: Ordering) -> Self {
         match ordering {
@@ -84,21 +83,6 @@ pub enum CompareFailure {
     Coercion(CoercionFailure),
 }
 
-impl CompareFailure {
-    #[must_use]
-    pub const fn is_incompatible_values(self) -> bool {
-        matches!(self, Self::IncompatibleValues)
-    }
-
-    #[must_use]
-    pub const fn coercion_failure(self) -> Option<CoercionFailure> {
-        match self {
-            Self::Coercion(failure) => Some(failure),
-            Self::IncompatibleValues => None,
-        }
-    }
-}
-
 impl fmt::Display for CompareFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -119,7 +103,6 @@ impl From<CoercionFailure> for CompareFailure {
 }
 
 pub type CompareResult<T> = std::result::Result<T, CompareFailure>;
-
 
 pub fn compare(left: &Value, right: &Value, policy: CoercionPolicy) -> CompareResult<Comparison> {
     match (left, right) {
@@ -267,5 +250,4 @@ mod tests {
     #[test] fn relational_helpers_delegate_to_operational_comparison() { let left = Value::from(18_i64); let right = Value::from("20"); assert_eq!(less_than(&left, &right, CoercionPolicy::Implicit), Ok(true),); assert_eq!( less_than_or_equal(&left, &right, CoercionPolicy::Implicit), Ok(true), ); assert_eq!( greater_than(&left, &right, CoercionPolicy::Implicit), Ok(false), ); assert_eq!( greater_than_or_equal(&left, &right, CoercionPolicy::Implicit), Ok(false), ); }
     #[test] fn physical_equality_never_applies_coercion() { assert!(!physically_equals(&Value::from(18_i64), &Value::from("18"),)); assert_eq!( equals( &Value::from(18_i64), &Value::from("18"), CoercionPolicy::Implicit, ), Ok(true), ); }
     #[test] fn sort_orders_values_by_kind_then_value() { assert_eq!( compare_for_sort( &Value::Null, &Value::from(1_i64), CoercionPolicy::Numeric, ), Ok(Comparison::Less) ); assert_eq!( compare_for_sort( &Value::from("a"), &Value::Null, CoercionPolicy::Numeric, ), Ok(Comparison::Greater) ); assert_eq!( compare_for_sort( &Value::Null, &Value::Null, CoercionPolicy::Numeric, ), Ok(Comparison::Equal) ); assert_eq!( compare_for_sort( &Value::from(true), &Value::from("true"), CoercionPolicy::Numeric, ), Ok(Comparison::Less) ); assert_eq!(compare_for_sort(&Value::from("10"), &Value::from(9_i64), CoercionPolicy::Numeric), Ok(Comparison::Greater)); assert_eq!(compare_for_sort(&Value::from(2_i64), &Value::float(10.5).unwrap(), CoercionPolicy::Numeric), Ok(Comparison::Less)); }
-    #[test] fn compare_failure_exposes_its_category() { let incompatible = CompareFailure::IncompatibleValues; assert!(incompatible.is_incompatible_values()); assert_eq!(incompatible.coercion_failure(), None); let coercion = CompareFailure::Coercion(CoercionFailure::PrecisionLoss); assert!(!coercion.is_incompatible_values()); assert_eq!( coercion.coercion_failure(), Some(CoercionFailure::PrecisionLoss), ); }
 }

@@ -183,15 +183,6 @@ impl PhysicalPlan {
         self.changes_cardinality
     }
 
-    /// Returns the minimum storage capability needed by the executor.
-    #[must_use]
-    pub const fn required_storage_access(&self) -> StorageAccessMode {
-        match self.mode {
-            ExecutionMode::ReadOnly => StorageAccessMode::Snapshot,
-            ExecutionMode::ReadWrite => StorageAccessMode::Transaction,
-        }
-    }
-
     /// Returns the memory execution contract for this plan.
     #[must_use]
     pub const fn memory_execution_mode(&self) -> MemoryExecutionMode {
@@ -340,17 +331,6 @@ pub enum PhysicalAccess {
 
     /// Direct lookup through the collection master `_id` index.
     PrimaryKeyLookup { id: DocumentId },
-}
-
-impl PhysicalAccess {
-    /// Returns scan options when this access strategy is a collection scan.
-    #[must_use]
-    pub const fn scan_options(&self) -> Option<ScanOptions> {
-        match self {
-            Self::CollectionScan { options } => Some(*options),
-            Self::PrimaryKeyLookup { .. } => None,
-        }
-    }
 }
 
 /// Stable physical operator category.
@@ -1235,41 +1215,9 @@ impl PhysicalOperator {
     }
 
     #[must_use]
-    pub fn lookup_alias(&self) -> Option<&str> {
-        match self {
-            Self::Lookup { alias, .. } => alias.as_deref(),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn lookup_target(&self) -> Option<&str> {
-        match self {
-            Self::Lookup { into, .. } => Some(into),
-            _ => None,
-        }
-    }
-
-    #[must_use]
     pub const fn nested_pipeline(&self) -> Option<&PhysicalSubPipeline> {
         match self {
             Self::Lookup { pipeline, .. } | Self::Union { pipeline, .. } => Some(pipeline),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn streaming_load_mode(&self) -> Option<PhysicalLoadMode> {
-        match self {
-            Self::StreamingLoad { mode, .. } => Some(*mode),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn streaming_load_chunks(&self) -> Option<&[Arc<str>]> {
-        match self {
-            Self::StreamingLoad { chunks, .. } => Some(chunks),
             _ => None,
         }
     }
@@ -1318,14 +1266,6 @@ impl PhysicalOperator {
     pub fn group_keys(&self) -> Option<&[ExpressionFieldPath]> {
         match self {
             Self::Group { keys, .. } => Some(keys),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub const fn pivot_specification(&self) -> Option<&PivotSpecification> {
-        match self {
-            Self::Pivot { specification } => Some(specification),
             _ => None,
         }
     }
@@ -1451,12 +1391,6 @@ impl PhysicalPlannerOptions {
         Self {
             scan_direction: ScanDirection::Forward,
         }
-    }
-
-    #[must_use]
-    pub const fn with_scan_direction(mut self, direction: ScanDirection) -> Self {
-        self.scan_direction = direction;
-        self
     }
 
     #[must_use]
@@ -1907,7 +1841,6 @@ pub fn source_field_demand( operators: &[PhysicalOperator], demand: Option<&[Exp
     needed
 }
 
-
 /// `arguments` with each line break, carriage return or tab outside a string (`"…"`) replaced by a space.
 fn spaced_arguments(arguments: &str) -> String {
     let mut out = String::with_capacity(arguments.len());
@@ -1929,6 +1862,11 @@ fn spaced_arguments(arguments: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    impl crate::query::execution_properties::ExecutionProperties<'_> { pub(crate) const fn defers_materialization(self) -> bool { matches!(self.materialization, Materialization::Deferred) } pub(crate) const fn linear_bound(self) -> Option<usize> { if !matches!(self.fields, Fields::Preserved) || !matches!(self.bound, Bound::AtMost(_)) { return None; } self.stream_row_bound() } }
+    impl super::PhysicalPlannerOptions { pub(crate) const fn with_scan_direction(mut self, direction: ScanDirection) -> Self { self.scan_direction = direction; self } }
+    impl super::PhysicalOperator { pub(crate) const fn pivot_specification(&self) -> Option<&PivotSpecification> { match self { Self::Pivot { specification } => Some(specification), _ => None, } } pub(crate) fn streaming_load_chunks(&self) -> Option<&[Arc<str>]> { match self { Self::StreamingLoad { chunks, .. } => Some(chunks), _ => None, } } pub(crate) const fn streaming_load_mode(&self) -> Option<PhysicalLoadMode> { match self { Self::StreamingLoad { mode, .. } => Some(*mode), _ => None, } } pub(crate) fn lookup_target(&self) -> Option<&str> { match self { Self::Lookup { into, .. } => Some(into), _ => None, } } pub(crate) fn lookup_alias(&self) -> Option<&str> { match self { Self::Lookup { alias, .. } => alias.as_deref(), _ => None, } } }
+    impl super::PhysicalAccess { pub(crate) const fn scan_options(&self) -> Option<ScanOptions> { match self { Self::CollectionScan { options } => Some(*options), Self::PrimaryKeyLookup { .. } => None, } } }
+    impl super::PhysicalPlan { pub(crate) const fn required_storage_access(&self) -> StorageAccessMode { match self.mode { ExecutionMode::ReadOnly => StorageAccessMode::Snapshot, ExecutionMode::ReadWrite => StorageAccessMode::Transaction, } } }
     #[test]
     fn custom_arguments_on_several_lines_read_as_one() {
         let name = StageName::parse("derive").unwrap();
@@ -1936,7 +1874,6 @@ mod tests {
         assert!(matches!(operator, PhysicalOperator::Custom { ref arguments, .. } if &**arguments == "a = 1,          b = \"x y\""));
         assert!(PhysicalOperator::custom(name, "a = \"x\ny\"").is_err());
     }
-
 
     #[test] fn negotiates_projected_values_for_filter_group_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["x"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Group { keys: Arc::from([field]), auto: false }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
     #[test] fn negotiates_projected_values_for_filter_sort_source_prefix() { let predicate = crate::query::parse_expression(r#"x == 1"#).unwrap(); let field = ExpressionFieldPath::new(["score"]).unwrap(); let operators = vec![ PhysicalOperator::Filter { predicate }, PhysicalOperator::Sort { keys: Arc::from([SortKey::ascending(field)]), }, ]; assert_eq!( negotiate_source_access_vector(&operators), (AccessVector::ProjectedValues, 1) ); }
